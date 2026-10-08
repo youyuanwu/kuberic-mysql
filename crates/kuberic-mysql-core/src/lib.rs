@@ -5,12 +5,22 @@
 
 pub mod binding;
 pub mod error;
+pub mod gtid;
 pub mod identity;
+pub mod view;
 
 pub use binding::{ExactBinding, ExactBindingParts};
 pub use error::{IdentityError, IdentityErrorKind, IdentityField};
+pub use gtid::{
+    GtidInterval, GtidParseError, GtidParseErrorKind, GtidRelation, GtidSet, GtidSource, GtidTag,
+    MAX_SEQUENCE, SourceHistory,
+};
 pub use identity::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding, Epoch,
     GroupName, MemberAddress, MemberId, ObservationSessionId, PartitionId, ProcessSessionId,
     ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
+};
+pub use view::{
+    MemberRole, MemberState, NativeField, NativeMember, NativeValueError, NativeValueErrorKind,
+    NativeView, NativeViewError,
 };
