@@ -275,13 +275,22 @@ fn future_values_schema_and_numeric_boundaries_are_explicit() {
         }
     ));
 
-    for scenario in [
-        "gtid-boundary-9223372036854775806",
-        "gtid-boundary-9223372036854775807",
-    ] {
-        decode::decode_executed_gtids(&common::fixture(scenario).raw())
-            .expect("core retains both values pending native qualification");
-    }
+    decode::decode_executed_gtids(&common::fixture("gtid-boundary-9223372036854775806").raw())
+        .expect("qualified native maximum remains valid");
+
+    let upper =
+        decode::decode_executed_gtids(&common::fixture("gtid-boundary-9223372036854775807").raw())
+            .expect_err("native 8.4.11 rejects the value above the qualified maximum");
+    assert!(matches!(
+        upper.diagnostic,
+        AdapterDiagnostic::Evidence {
+            issue: EvidenceIssue::MalformedGtid {
+                kind: kuberic_mysql_core::GtidParseErrorKind::SequenceOutOfRange,
+                ..
+            },
+            ..
+        }
+    ));
 }
 
 #[test]

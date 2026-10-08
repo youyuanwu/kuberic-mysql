@@ -131,9 +131,12 @@ fn native_tag_group_errors_retain_component_and_token_locations() {
 
 #[test]
 fn maximum_interval_does_not_overflow_normalization() {
+    assert_eq!(MAX_SEQUENCE, 9_223_372_036_854_775_806);
     let set = parse(&format!("{A}:{}:{MAX_SEQUENCE}", MAX_SEQUENCE - 1));
     assert_eq!(
         set.to_string(),
         format!("{A}:{}-{MAX_SEQUENCE}", MAX_SEQUENCE - 1)
     );
+    let rejected = GtidSet::from_str(&format!("{A}:9223372036854775807")).unwrap_err();
+    assert_eq!(rejected.kind(), &GtidParseErrorKind::SequenceOutOfRange);
 }

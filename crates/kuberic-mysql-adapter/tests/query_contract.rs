@@ -547,6 +547,14 @@ fn diagnostic_name(diagnostic: &AdapterDiagnostic) -> &'static str {
             issue: diagnostic::EvidenceIssue::UnsupportedNativeValue { .. },
             ..
         } => "UnsupportedNativeValue",
+        AdapterDiagnostic::Evidence {
+            issue:
+                diagnostic::EvidenceIssue::MalformedGtid {
+                    kind: kuberic_mysql_core::GtidParseErrorKind::SequenceOutOfRange,
+                    ..
+                },
+            ..
+        } => "MalformedGtidSequenceOutOfRange",
         AdapterDiagnostic::Ambiguous {
             kind: diagnostic::AmbiguityKind::DuplicateMemberId,
             ..

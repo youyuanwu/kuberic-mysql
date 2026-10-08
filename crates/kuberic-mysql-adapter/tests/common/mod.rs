@@ -7,13 +7,13 @@ use serde::Deserialize;
 
 use crate::query::{ColumnKind, QueryId, RawColumn, RawResult, RawValue};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct FixtureFile {
     pub fixture_schema: String,
     pub cases: Vec<FixtureCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct FixtureCase {
     pub scenario: String,
     pub query_id: String,
@@ -26,7 +26,7 @@ pub struct FixtureCase {
     pub evidence_origin: EvidenceOrigin,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct FixtureError {
     pub kind: String,
     pub stage: String,
@@ -35,20 +35,20 @@ pub struct FixtureError {
     pub sql_state: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct FixtureColumn {
     pub name: String,
     pub kind: String,
     pub nullable: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Expected {
     pub core_class: String,
     pub diagnostic: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct EvidenceOrigin {
     pub category: String,
     pub commit: Option<String>,

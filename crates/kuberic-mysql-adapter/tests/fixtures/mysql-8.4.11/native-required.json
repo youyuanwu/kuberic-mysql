@@ -85,7 +85,7 @@
       "query_id": "Mysql8411ExecutedGtidsV1",
       "columns": [{"name": "gtid_executed", "kind": "VarString", "nullable": true}],
       "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:9223372036854775807"]],
-      "expected": {"core_class": "Valid", "diagnostic": "None"},
+      "expected": {"core_class": "Malformed", "diagnostic": "MalformedGtidSequenceOutOfRange"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
     },
     {

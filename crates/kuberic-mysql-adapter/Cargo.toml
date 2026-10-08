@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+live-mysql-8-4-11 = []
+
 [dependencies]
 kuberic-mysql-core = { path = "../kuberic-mysql-core" }
 mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust"] }
