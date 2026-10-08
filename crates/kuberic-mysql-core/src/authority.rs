@@ -38,8 +38,8 @@ pub enum CompletionRejection {
     BindingMismatch,
     /// The supplied observation outcome was not valid.
     NonValidObservation,
-    /// Completion decision time preceded observation completion.
-    FutureDated,
+    /// Completion decision time preceded the observation's recorded decision.
+    DecisionRegression,
     /// The observation expired before completion.
     Expired,
 }
@@ -221,7 +221,7 @@ impl AuthoritySession {
         if let Err(error) = valid.check_freshness(decision) {
             self.observation_credited = false;
             return Err(match error {
-                FreshnessError::FutureDated => CompletionRejection::FutureDated,
+                FreshnessError::DecisionRegression => CompletionRejection::DecisionRegression,
                 FreshnessError::Expired => CompletionRejection::Expired,
             });
         }

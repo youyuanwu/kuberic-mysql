@@ -118,7 +118,7 @@ pub enum GtidRelation {
 }
 
 /// A machine-matchable GTID parsing failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum GtidParseErrorKind {
     /// A comma-separated source component was empty.
@@ -356,7 +356,7 @@ fn parse_interval(
         ));
     }
     if let Some((start, end)) = token.split_once('-') {
-        if end.contains('-') {
+        if start.is_empty() || end.is_empty() || end.contains('-') {
             return Err(GtidParseError::new(
                 component,
                 token_index,
@@ -407,11 +407,11 @@ fn normalize_intervals(intervals: &mut Vec<GtidInterval>) {
     intervals.sort_by_key(|interval| interval.start);
     let mut merged: Vec<GtidInterval> = Vec::with_capacity(intervals.len());
     for interval in intervals.drain(..) {
-        if let Some(previous) = merged.last_mut()
-            && interval.start <= previous.end.saturating_add(1)
-        {
-            previous.end = previous.end.max(interval.end);
-            continue;
+        if let Some(previous) = merged.last_mut() {
+            if interval.start <= previous.end.saturating_add(1) {
+                previous.end = previous.end.max(interval.end);
+                continue;
+            }
         }
         merged.push(interval);
     }

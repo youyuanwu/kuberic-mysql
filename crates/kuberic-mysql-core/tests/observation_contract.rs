@@ -261,7 +261,155 @@ fn stable_but_wrong_local_member_identity_is_incoherent() {
     assert!(matches!(
         outcome,
         ObservationOutcome::Incoherent {
-            reason: IncoherentReason::LocalMemberMismatch,
+            reason: IncoherentReason::LocalMemberBindingMismatch,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn malformed_gtid_text_maps_to_structured_observation_failure() {
+    let attempted = binding();
+    for text in [
+        "not-a-uuid:1",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:bad-tag:1",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:0",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:2-1",
+    ] {
+        let error = GtidSet::from_str(text).unwrap_err();
+        let expected_kind = *error.kind();
+        let expected_component = error.component();
+        let expected_token = error.token();
+        let outcome = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+            .gtid_decode_failure(&error)
+            .finalize();
+        assert_metadata(&outcome, &attempted, 1, 2, 3, 2);
+        assert!(matches!(
+            outcome,
+            ObservationOutcome::Malformed {
+                reason: MalformedReason::Gtid {
+                    kind,
+                    component,
+                    token,
+                },
+                ..
+            } if kind == expected_kind
+                && component == expected_component
+                && token == expected_token
+        ));
+    }
+}
+
+#[test]
+fn duplicate_samples_are_permanently_incoherent() {
+    let attempted = binding();
+    let mut changed_parts = attempted.parts().clone();
+    changed_parts.process_session = kuberic_mysql_core::ProcessSessionId::new("changed").unwrap();
+    let changed = kuberic_mysql_core::ExactBinding::new(changed_parts);
+
+    let duplicate_opening = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(bracket(changed))
+        .opening(bracket(attempted.clone()))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .closing(bracket(attempted.clone()))
+        .finalize();
+    assert!(matches!(
+        duplicate_opening,
+        ObservationOutcome::Incoherent {
+            reason: IncoherentReason::DuplicateSample(ObservationField::OpeningBracket),
+            ..
+        }
+    ));
+
+    let duplicate_executed = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(bracket(attempted.clone()))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .executed(BoundGtidSet::new(
+            attempted.clone(),
+            GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1").unwrap(),
+        ))
+        .closing(bracket(attempted.clone()))
+        .finalize();
+    assert!(matches!(
+        duplicate_executed,
+        ObservationOutcome::Incoherent {
+            reason: IncoherentReason::DuplicateSample(ObservationField::ExecutedGtidSet),
+            ..
+        }
+    ));
+
+    let duplicate_closing = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(bracket(attempted.clone()))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .closing(bracket(attempted.clone()))
+        .closing(bracket(attempted))
+        .finalize();
+    assert!(matches!(
+        duplicate_closing,
+        ObservationOutcome::Incoherent {
+            reason: IncoherentReason::DuplicateSample(ObservationField::ClosingBracket),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn terminal_failure_after_complete_facts_preserves_failure_category() {
+    let attempted = binding();
+    let outcome = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(bracket(attempted.clone()))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .closing(bracket(attempted))
+        .failure(CollectionFailure::Unreachable)
+        .finalize();
+    assert!(matches!(outcome, ObservationOutcome::Unreachable(_)));
+}
+
+#[test]
+fn stable_group_and_view_binding_mismatches_have_exact_reasons() {
+    let attempted = binding();
+    let member = native_view().members()[0].clone();
+
+    let wrong_group = kuberic_mysql_core::NativeView::new(
+        kuberic_mysql_core::GroupName::new("wrong-group").unwrap(),
+        attempted.parts().view_id.clone(),
+        vec![member.clone()],
+    )
+    .unwrap();
+    let outcome = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(ObservationBracket::new(
+            attempted.clone(),
+            wrong_group.clone(),
+        ))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .closing(ObservationBracket::new(attempted.clone(), wrong_group))
+        .finalize();
+    assert!(matches!(
+        outcome,
+        ObservationOutcome::Incoherent {
+            reason: IncoherentReason::GroupMismatch,
+            ..
+        }
+    ));
+
+    let wrong_view = kuberic_mysql_core::NativeView::new(
+        attempted.parts().group_name.clone(),
+        kuberic_mysql_core::ViewId::new("wrong-view").unwrap(),
+        vec![member],
+    )
+    .unwrap();
+    let outcome = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(ObservationBracket::new(
+            attempted.clone(),
+            wrong_view.clone(),
+        ))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .closing(ObservationBracket::new(attempted, wrong_view))
+        .finalize();
+    assert!(matches!(
+        outcome,
+        ObservationOutcome::Incoherent {
+            reason: IncoherentReason::ViewIdentityMismatch,
             ..
         }
     ));

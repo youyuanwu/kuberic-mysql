@@ -3,8 +3,8 @@
 use core::fmt;
 
 use crate::{
-    AttemptId, ExactBinding, GtidSet, NativeField, NativeValueError, NativeValueErrorKind,
-    NativeView,
+    AttemptId, ExactBinding, GtidParseError, GtidParseErrorKind, GtidSet, NativeField,
+    NativeValueError, NativeValueErrorKind, NativeView,
 };
 
 /// A caller-supplied monotonic instant within one process.
@@ -197,6 +197,15 @@ pub enum MalformedReason {
     TimingOrder,
     /// A native role or state value was syntactically malformed.
     NativeValue(NativeField),
+    /// Executed-GTID text failed structured parsing.
+    Gtid {
+        /// Machine-matchable parser reason.
+        kind: GtidParseErrorKind,
+        /// Zero-based comma-separated source component.
+        component: usize,
+        /// Zero-based colon token within the source component.
+        token: usize,
+    },
 }
 
 /// A structured unsupported-evidence reason.
@@ -222,8 +231,18 @@ pub enum IncoherentReason {
     BindingMismatch,
     /// Opening and closing views differed.
     BracketMismatch,
-    /// The bound local member was absent or contradicted its binding.
-    LocalMemberMismatch,
+    /// A required sample was supplied more than once.
+    DuplicateSample(ObservationField),
+    /// A terminal collection failure was supplied more than once.
+    DuplicateFailure,
+    /// The observed native group contradicted its binding.
+    GroupMismatch,
+    /// The observed native view identity contradicted its binding.
+    ViewIdentityMismatch,
+    /// The bound local member was absent from the native view.
+    LocalMemberMissing,
+    /// The local member UUID or address contradicted its binding.
+    LocalMemberBindingMismatch,
 }
 
 /// A terminal collection failure.
@@ -272,8 +291,8 @@ impl ValidObservation {
 
     /// Rechecks freshness at a later explicit decision instant.
     pub fn check_freshness(&self, decision: ObservationInstant) -> Result<(), FreshnessError> {
-        if decision < self.metadata.end {
-            Err(FreshnessError::FutureDated)
+        if decision < self.metadata.decision {
+            Err(FreshnessError::DecisionRegression)
         } else if decision > self.metadata.deadline {
             Err(FreshnessError::Expired)
         } else {
@@ -285,8 +304,8 @@ impl ValidObservation {
 /// A completion-time freshness rejection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FreshnessError {
-    /// Decision time preceded collection completion.
-    FutureDated,
+    /// Completion decision time preceded the observation's recorded decision.
+    DecisionRegression,
     /// Decision time followed the deadline.
     Expired,
 }
@@ -383,6 +402,7 @@ pub struct ObservationDraft {
     executed: Option<BoundGtidSet>,
     closing: Option<ObservationBracket>,
     failure: Option<CollectionFailure>,
+    duplicate: Option<IncoherentReason>,
 }
 
 impl ObservationDraft {
@@ -395,34 +415,60 @@ impl ObservationDraft {
             executed: None,
             closing: None,
             failure: None,
+            duplicate: None,
         }
     }
 
     /// Adds the opening bracket.
     #[must_use]
     pub fn opening(mut self, bracket: ObservationBracket) -> Self {
-        self.opening = Some(bracket);
+        if self.opening.is_some() {
+            self.duplicate
+                .get_or_insert(IncoherentReason::DuplicateSample(
+                    ObservationField::OpeningBracket,
+                ));
+        } else {
+            self.opening = Some(bracket);
+        }
         self
     }
 
     /// Adds the explicitly observed executed GTID set.
     #[must_use]
     pub fn executed(mut self, executed: BoundGtidSet) -> Self {
-        self.executed = Some(executed);
+        if self.executed.is_some() {
+            self.duplicate
+                .get_or_insert(IncoherentReason::DuplicateSample(
+                    ObservationField::ExecutedGtidSet,
+                ));
+        } else {
+            self.executed = Some(executed);
+        }
         self
     }
 
     /// Adds the closing bracket.
     #[must_use]
     pub fn closing(mut self, bracket: ObservationBracket) -> Self {
-        self.closing = Some(bracket);
+        if self.closing.is_some() {
+            self.duplicate
+                .get_or_insert(IncoherentReason::DuplicateSample(
+                    ObservationField::ClosingBracket,
+                ));
+        } else {
+            self.closing = Some(bracket);
+        }
         self
     }
 
     /// Records a terminal collection failure.
     #[must_use]
-    pub const fn failure(mut self, failure: CollectionFailure) -> Self {
-        self.failure = Some(failure);
+    pub fn failure(mut self, failure: CollectionFailure) -> Self {
+        if self.failure.is_some() {
+            self.duplicate = Some(IncoherentReason::DuplicateFailure);
+        } else {
+            self.failure = Some(failure);
+        }
         self
     }
 
@@ -440,6 +486,16 @@ impl ObservationDraft {
         self.failure(failure)
     }
 
+    /// Records a GTID parse failure with its structured location and reason.
+    #[must_use]
+    pub fn gtid_decode_failure(self, error: &GtidParseError) -> Self {
+        self.failure(CollectionFailure::Malformed(MalformedReason::Gtid {
+            kind: *error.kind(),
+            component: error.component(),
+            token: error.token(),
+        }))
+    }
+
     /// Consumes the draft and returns one fail-closed typed outcome.
     #[must_use]
     pub fn finalize(self) -> ObservationOutcome {
@@ -447,6 +503,13 @@ impl ObservationDraft {
             return ObservationOutcome::Malformed {
                 metadata: self.metadata,
                 reason: MalformedReason::TimingOrder,
+            };
+        }
+
+        if let Some(reason) = self.duplicate {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason,
             };
         }
 
@@ -470,22 +533,21 @@ impl ObservationDraft {
             };
         }
 
-        if let (Some(opening), Some(closing)) = (&self.opening, &self.closing)
-            && opening.view != closing.view
-        {
-            return ObservationOutcome::Incoherent {
-                metadata: self.metadata,
-                reason: IncoherentReason::BracketMismatch,
-            };
+        if let (Some(opening), Some(closing)) = (&self.opening, &self.closing) {
+            if opening.view != closing.view {
+                return ObservationOutcome::Incoherent {
+                    metadata: self.metadata,
+                    reason: IncoherentReason::BracketMismatch,
+                };
+            }
         }
 
-        let has_progress =
-            self.opening.is_some() || self.executed.is_some() || self.closing.is_some();
         if let Some(failure) = self.failure {
-            if has_progress {
+            let missing = missing_fields(&self.opening, &self.executed, &self.closing);
+            if !missing.is_empty() && missing.len() != 3 {
                 return ObservationOutcome::Partial {
                     metadata: self.metadata,
-                    missing: missing_fields(&self.opening, &self.executed, &self.closing),
+                    missing,
                     cause: Some(failure),
                 };
             }
@@ -514,12 +576,16 @@ impl ObservationDraft {
         let opening = self.opening.expect("missing fields checked");
         let closing = self.closing.expect("missing fields checked");
         let executed = self.executed.expect("missing fields checked");
-        if !view_matches_binding(&opening.view, &self.metadata.binding)
-            || !view_matches_binding(&closing.view, &self.metadata.binding)
-        {
+        if let Err(reason) = validate_view_binding(&opening.view, &self.metadata.binding) {
             return ObservationOutcome::Incoherent {
                 metadata: self.metadata,
-                reason: IncoherentReason::LocalMemberMismatch,
+                reason,
+            };
+        }
+        if let Err(reason) = validate_view_binding(&closing.view, &self.metadata.binding) {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason,
             };
         }
 
@@ -567,12 +633,24 @@ fn failure_outcome(
     }
 }
 
-fn view_matches_binding(view: &NativeView, binding: &ExactBinding) -> bool {
+fn validate_view_binding(
+    view: &NativeView,
+    binding: &ExactBinding,
+) -> Result<(), IncoherentReason> {
     let parts = binding.parts();
-    view.group_name() == &parts.group_name
-        && view.id() == &parts.view_id
-        && view.member(&parts.member_id).is_some_and(|member| {
-            parts.server_uuid.as_str() == member.id().as_str()
-                && member.address() == &parts.member_address
-        })
+    if view.group_name() != &parts.group_name {
+        return Err(IncoherentReason::GroupMismatch);
+    }
+    if view.id() != &parts.view_id {
+        return Err(IncoherentReason::ViewIdentityMismatch);
+    }
+    let Some(member) = view.member(&parts.member_id) else {
+        return Err(IncoherentReason::LocalMemberMissing);
+    };
+    if parts.server_uuid.as_str() != member.id().as_str()
+        || member.address() != &parts.member_address
+    {
+        return Err(IncoherentReason::LocalMemberBindingMismatch);
+    }
+    Ok(())
 }

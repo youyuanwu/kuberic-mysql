@@ -240,12 +240,41 @@ fn completion_rechecks_freshness() {
         Err(CompletionRejection::Expired)
     );
 
-    let mut future = AuthoritySession::new(current.clone());
-    let capability = future.begin_attempt(&current).unwrap();
+    let mut regression = AuthoritySession::new(current.clone());
+    let capability = regression.begin_attempt(&current).unwrap();
     assert_eq!(
-        future.complete(capability, &outcome, ObservationInstant::new(1)),
-        Err(CompletionRejection::FutureDated)
+        regression.complete(capability, &outcome, ObservationInstant::new(1)),
+        Err(CompletionRejection::DecisionRegression)
     );
+
+    for decision in [2, 3] {
+        let mut current_session = AuthoritySession::new(current.clone());
+        let capability = current_session.begin_attempt(&current).unwrap();
+        assert_eq!(
+            current_session.complete(capability, &outcome, ObservationInstant::new(decision)),
+            Ok(CompletionCredit::ObservationAcknowledged)
+        );
+    }
+}
+
+#[test]
+fn valid_observation_for_different_binding_is_rejected_at_completion() {
+    let current = binding();
+    let mut changed_parts = current.parts().clone();
+    changed_parts.attempt = kuberic_mysql_core::AttemptId::new("different").unwrap();
+    let changed = kuberic_mysql_core::ExactBinding::new(changed_parts);
+    let outcome = valid_outcome(&changed);
+
+    let mut session = AuthoritySession::new(current.clone());
+    let capability = session.begin_attempt(&current).unwrap();
+    assert_eq!(
+        session.complete(capability, &outcome, ObservationInstant::new(2)),
+        Err(CompletionRejection::BindingMismatch)
+    );
+    assert!(!session.has_pending_attempt());
+    assert!(!session.has_observation_credit());
+    assert!(!session.access().read_open());
+    assert!(!session.access().write_open());
 }
 
 #[test]

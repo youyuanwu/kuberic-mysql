@@ -69,10 +69,23 @@ fn parser_rejects_structured_malformed_inputs() {
             "00000000-0000-0000-0000-000000000000:1".to_owned(),
             GtidParseErrorKind::InvalidUuid,
         ),
+        ("not-a-uuid:1".to_owned(), GtidParseErrorKind::InvalidUuid),
+        (format!("{A}:1-"), GtidParseErrorKind::InvalidRange),
+        (format!("{A}:-2"), GtidParseErrorKind::InvalidRange),
     ];
     for (text, expected) in cases {
         let error = GtidSet::from_str(&text).unwrap_err();
         assert_eq!(*error.kind(), expected, "{text}");
+    }
+}
+
+#[test]
+fn malformed_range_errors_retain_location() {
+    for text in [format!("{A}:1-"), format!("{A}:-2")] {
+        let error = GtidSet::from_str(&text).unwrap_err();
+        assert_eq!(error.kind(), &GtidParseErrorKind::InvalidRange);
+        assert_eq!(error.component(), 0);
+        assert_eq!(error.token(), 1);
     }
 }
 
