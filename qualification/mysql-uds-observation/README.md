@@ -29,9 +29,9 @@ this repository's `qualification/` tree.
 ./qualification/mysql-uds-observation/run-qualification.sh
 ```
 
-The repository CI performs the same run for every push and pull request on a
-pinned Ubuntu 24.04 runner after installing the exact Oracle package and
-verifying the package-owned `mysqld` digest.
+The repository CI performs the same run for every pull request and every push
+to `main` on a pinned Ubuntu 24.04 runner after installing the exact Oracle
+package and verifying the package-owned `mysqld` digest.
 
 The runner sequentially performs locked, offline, low-concurrency formatting,
 workspace tests, warnings-denied Clippy, and the effective Cargo feature-tree

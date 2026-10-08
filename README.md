@@ -79,4 +79,5 @@ manifest, data, runtime files, and socket. See the
 [qualification guide](qualification/mysql-uds-observation/README.md).
 
 GitHub Actions installs the same exact Oracle package on Ubuntu 24.04 and runs
-this full qualification runner for every push and pull request.
+this full qualification runner for every pull request and every push to
+`main`.
