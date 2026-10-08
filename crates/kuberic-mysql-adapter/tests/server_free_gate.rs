@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use kuberic_mysql_core::{
     AuthoritySession, CollectionFailure, CompletionCredit, CompletionRejection,
-    CredentialGeneration, ExactBinding, IncoherentReason, ObservationInstant, ObservationOutcome,
-    StaleReason,
+    CredentialGeneration, ExactBinding, IncoherentReason, ObservationField, ObservationInstant,
+    ObservationOutcome, StaleReason,
 };
 
 use observer::observe_with;
@@ -52,7 +52,12 @@ async fn aggregate_phase4_server_free_matrix() {
     socket_transport_authentication_and_permissions().await;
     absent_malformed_unsupported_and_schema_cases().await;
     coherence_mutations_and_row_reordering().await;
+    collection_stage_connection_loss().await;
+    future_dated().await;
     deadline_boundaries_and_actual_late_completion().await;
+    completion_expiry().await;
+    timeout_error_precedence().await;
+    disconnect_error_and_deadline().await;
     binding_and_credential_replacement().await;
     recovering_point_sample().await;
 }
@@ -319,6 +324,82 @@ async fn coherence_mutations_and_row_reordering() {
     assert!(report.outcome().valid().is_some());
 }
 
+async fn collection_stage_connection_loss() {
+    let queries = [
+        QueryId::Mysql8411ProductIdentityV1,
+        QueryId::Mysql8411LocalStateV1,
+        QueryId::Mysql8411GroupMembersV1,
+        QueryId::Mysql8411LocalMemberStatsV1,
+        QueryId::Mysql8411ExecutedGtidsV1,
+        QueryId::Mysql8411LocalStateV1,
+        QueryId::Mysql8411GroupMembersV1,
+        QueryId::Mysql8411LocalMemberStatsV1,
+    ];
+    for (index, query) in queries.into_iter().enumerate() {
+        let mut steps = success_steps();
+        steps[index] = failure_step(query, SessionErrorSpec::Transport);
+        let (report, tracking) =
+            observe_steps(&format!("gate-connection-loss-{index}"), steps).await;
+
+        match index {
+            0..=3 => assert!(matches!(
+                report.outcome(),
+                ObservationOutcome::Unreachable(_)
+            )),
+            4 => assert!(matches!(
+                report.outcome(),
+                ObservationOutcome::Partial {
+                    missing,
+                    cause: Some(CollectionFailure::Unreachable),
+                    ..
+                } if missing == &[
+                    ObservationField::ExecutedGtidSet,
+                    ObservationField::ClosingNativeSnapshot,
+                ]
+            )),
+            5..=7 => assert!(matches!(
+                report.outcome(),
+                ObservationOutcome::Partial {
+                    missing,
+                    cause: Some(CollectionFailure::Unreachable),
+                    ..
+                } if missing == &[ObservationField::ClosingNativeSnapshot]
+            )),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            report.diagnostic(),
+            &AdapterDiagnostic::Transport {
+                stage: ObservationStage::Query
+            }
+        );
+        assert_eq!(
+            tracking.query_count.load(Ordering::Acquire),
+            u64::try_from(index + 1).unwrap()
+        );
+        assert!(tracking.disconnected.load(Ordering::Acquire));
+    }
+}
+
+async fn future_dated() {
+    let socket = TestSocket::new("gate-future-dated");
+    let clock = ScriptClock::new(10);
+    let tracking = Tracking::default();
+    let connector = ScriptedConnector::new(clock.clone(), success_steps(), tracking.clone())
+        .with_disconnect_advance(5);
+    let report = observe_with(&request(&socket, clock), &connector).await;
+
+    assert!(matches!(
+        report.outcome(),
+        ObservationOutcome::FutureDated(_)
+    ));
+    assert_eq!(
+        report.diagnostic(),
+        &AdapterDiagnostic::Outcome(CoreOutcomeClass::FutureDated)
+    );
+    assert!(tracking.disconnected.load(Ordering::Acquire));
+}
+
 async fn deadline_boundaries_and_actual_late_completion() {
     let boundaries = [
         ("connect", None, DeadlineStage::Connect),
@@ -355,29 +436,6 @@ async fn deadline_boundaries_and_actual_late_completion() {
         assert_eq!(report.diagnostic(), &AdapterDiagnostic::Timeout { stage });
     }
 
-    let socket = TestSocket::new("gate-disconnect-deadline");
-    let clock = ScriptClock::new(10);
-    let tracking = Tracking::default();
-    let connector = ScriptedConnector::new(clock.clone(), success_steps(), tracking.clone())
-        .with_pending_disconnect(101);
-    let report = observe_with(&request(&socket, clock), &connector).await;
-    assert_eq!(
-        report.diagnostic(),
-        &AdapterDiagnostic::Timeout {
-            stage: DeadlineStage::Disconnect
-        }
-    );
-    assert!(tracking.disconnect_started.load(Ordering::Acquire));
-    assert!(!tracking.disconnected.load(Ordering::Acquire));
-
-    let socket = TestSocket::new("gate-exact-deadline");
-    let clock = ScriptClock::new(10);
-    let connector = ScriptedConnector::new(clock.clone(), success_steps(), Tracking::default())
-        .with_disconnect_advance(100);
-    let report = observe_with(&request(&socket, clock), &connector).await;
-    assert!(report.outcome().valid().is_some());
-    assert_eq!(report.outcome().metadata().decision().tick(), 100);
-
     let current = binding();
     let mut authority = AuthoritySession::new(current.clone());
     let capability = authority.begin_attempt(&current).expect("pending attempt");
@@ -405,6 +463,106 @@ async fn deadline_boundaries_and_actual_late_completion() {
     );
     assert!(!authority.has_observation_credit());
     assert_closed(&authority);
+}
+
+async fn completion_expiry() {
+    let socket = TestSocket::new("gate-completion-expired");
+    let clock = ScriptClock::new(10);
+    let tracking = Tracking::default();
+    let connector = ScriptedConnector::new(clock.clone(), success_steps(), tracking.clone())
+        .with_disconnect_advance(101);
+    let report = observe_with(&request(&socket, clock), &connector).await;
+    assert!(matches!(
+        report.outcome(),
+        ObservationOutcome::Stale {
+            reason: StaleReason::Expired,
+            ..
+        }
+    ));
+    assert_eq!(
+        report.diagnostic(),
+        &AdapterDiagnostic::Timeout {
+            stage: DeadlineStage::Completion
+        }
+    );
+    assert!(tracking.disconnected.load(Ordering::Acquire));
+
+    let socket = TestSocket::new("gate-completion-exact");
+    let clock = ScriptClock::new(10);
+    let connector = ScriptedConnector::new(clock.clone(), success_steps(), Tracking::default())
+        .with_disconnect_advance(100);
+    let report = observe_with(&request(&socket, clock), &connector).await;
+    assert!(report.outcome().valid().is_some());
+    assert_eq!(report.outcome().metadata().decision().tick(), 100);
+}
+
+async fn timeout_error_precedence() {
+    let socket = TestSocket::new("gate-timeout-error-precedence");
+    let clock = ScriptClock::new(10);
+    let mut steps = success_steps();
+    steps[4].action = ScriptAction::ErrorAt {
+        error: SessionErrorSpec::Transport,
+        advance_to: 101,
+    };
+    let connector = ScriptedConnector::new(clock.clone(), steps, Tracking::default());
+    let report = observe_with(&request(&socket, clock), &connector).await;
+
+    assert!(matches!(
+        report.outcome(),
+        ObservationOutcome::Stale {
+            reason: StaleReason::Expired,
+            ..
+        }
+    ));
+    assert_eq!(
+        report.diagnostic(),
+        &AdapterDiagnostic::Timeout {
+            stage: DeadlineStage::ExecutedGtids
+        }
+    );
+}
+
+async fn disconnect_error_and_deadline() {
+    let socket = TestSocket::new("gate-disconnect-error");
+    let clock = ScriptClock::new(10);
+    let tracking = Tracking::default();
+    let connector = ScriptedConnector::new(clock.clone(), success_steps(), tracking.clone())
+        .with_disconnect_error(SessionErrorSpec::Transport);
+    let report = observe_with(&request(&socket, clock), &connector).await;
+    assert!(matches!(
+        report.outcome(),
+        ObservationOutcome::Unreachable(_)
+    ));
+    assert_eq!(
+        report.diagnostic(),
+        &AdapterDiagnostic::Transport {
+            stage: ObservationStage::Disconnect
+        }
+    );
+    assert!(tracking.disconnect_started.load(Ordering::Acquire));
+    assert!(tracking.disconnected.load(Ordering::Acquire));
+
+    let socket = TestSocket::new("gate-disconnect-deadline");
+    let clock = ScriptClock::new(10);
+    let tracking = Tracking::default();
+    let connector = ScriptedConnector::new(clock.clone(), success_steps(), tracking.clone())
+        .with_pending_disconnect(101);
+    let report = observe_with(&request(&socket, clock), &connector).await;
+    assert!(matches!(
+        report.outcome(),
+        ObservationOutcome::Stale {
+            reason: StaleReason::Expired,
+            ..
+        }
+    ));
+    assert_eq!(
+        report.diagnostic(),
+        &AdapterDiagnostic::Timeout {
+            stage: DeadlineStage::Disconnect
+        }
+    );
+    assert!(tracking.disconnect_started.load(Ordering::Acquire));
+    assert!(!tracking.disconnected.load(Ordering::Acquire));
 }
 
 async fn binding_and_credential_replacement() {
