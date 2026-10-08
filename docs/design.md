@@ -8,11 +8,16 @@ claim.
 
 ### Current repository status
 
-At the revision for which this design was written, this repository contains no
-MySQL adapter, process supervisor, controller integration, deployment manifest,
-or executable test fixture. The only delivered behavior in this work is
-documentation. Words such as **must** and **requires** below are requirements
-for future implementation; they do not mean that the behavior exists today.
+This repository delivers Stage 0 documentation and the Stage 1 deterministic,
+server-free `kuberic-mysql-core` library. The library implements typed exact
+bindings, structured GTID-set relations, typed Group Replication views,
+coherent observation outcomes, and minimal stale-work rejection. It contains no
+MySQL adapter, process supervisor, SQL connectivity, controller integration,
+deployment manifest, or live test fixture.
+
+Words such as **must** and **requires** below remain requirements for stages
+whose delivery gates have not passed; they do not imply that later live
+integration behavior exists today.
 
 The first proposed validation target is:
 
@@ -32,10 +37,14 @@ or topology modes outside its pinned profile.
 
 ### Proof-of-concept boundary
 
-The first executable milestone is intentionally narrower than the complete
-safety contract in this document. Its purpose is to prove that Kuberic can own
-three local `mysqld` processes, observe Group Replication and GTID state, drive
-the custom-replicator callbacks, and complete a controlled primary handoff.
+The delivered Stage 1 executable milestone is intentionally server-free. It
+proves the pure identity, GTID-set, view, observation, and stale-authority
+contracts without starting or contacting MySQL.
+
+The first executable **server-integration** milestone is the Stage 2 PoC. Its
+purpose is to prove that Kuberic can own three local `mysqld` processes, observe
+Group Replication and GTID state, drive the custom-replicator callbacks, and
+complete a controlled primary handoff.
 
 The PoC includes:
 
@@ -960,22 +969,29 @@ stage.
 | 5. Secure cross-host qualification | Stage 4 passed. Add separate principals, secure secret handling, native TLS or an explicitly qualified equivalent network profile, real fault domains, and a production-candidate fence backend. | Cross-host network, trust rotation, host loss, storage, direct-client, and fence-lifetime gates pass. | Only the named cross-host security and infrastructure profile that passed. | No generic CNI, mesh, cloud, or cross-region assumption. |
 | 6. Kubernetes qualification | Stage 5 passed; named Kubernetes/provider versions, images, secrets, storage, routing, and platform fence integrations are fixed. | The Kubernetes gate matrix passes lifecycle, faults, storage reuse, routing, trust rotation, controller restart, old-primary survival, and exact fence/release scenarios. | Only the named Kubernetes, storage, network, and fence-provider matrix. | No generic Kubernetes or provider portability. |
 
-Stage 0 is the only stage delivered by this repository change. Later rows are a
-delivery contract, not a schedule or current feature list.
+Stages 0 and 1 are delivered. Later rows are a delivery contract, not a
+schedule or current feature list.
 
 ## Test Strategy
 
 ### Ordinary server-free gates
 
-Ordinary tests must install no database, start no process or container, and
-require no network or cluster. Future implementation should cover:
+Ordinary tests install no database, start no process or container, and require
+no socket, network, or cluster. The delivered Stage 1 gate runs with:
 
-- exact identity serialization, binding, replacement, and stale-session
-  rejection;
-- GTID-set equality, subset, superset, incomparable/divergent, purged-history,
-  and malformed-input cases without scalar sorting;
-- native-view bracketing, deadline/freshness calculations, and provenance;
-- partial collection after an intermediate query failure or deadline;
+```bash
+cargo fmt --all -- --check
+CARGO_BUILD_JOBS=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+CARGO_BUILD_JOBS=1 cargo test --locked --workspace --all-features -- --test-threads=1
+cargo tree --locked --workspace --edges normal,build,dev
+```
+
+Stage 1 covers exact identity binding and replacement, GTID parsing/
+normalization and all four set relations, native-view validation, complete
+observation outcome/freshness/coherence behavior, and stale authority/session
+completion. Later server-free stages must additionally cover:
+
+- purged-history recovery capability without treating it as executed history;
 - authority callback success/failure around the non-atomic persistence window;
 - effect-completed/receipt-not-persisted restart reconciliation;
 - expected join view transition with a fresh post-view bundle and durable
@@ -1045,7 +1061,7 @@ must record their own exact inputs and receipts.
 
 | Gate group | Prerequisites | Pass evidence and condition | Supported claim | Explicit non-claim |
 |---|---|---|---|---|
-| SF core | Deterministic fixtures only | Identity/view replacement and stale-session cases pass; GTID relations never use scalar order; malformed, absent, denied, partial, stale, and incoherent evidence produces explicit outcomes | Pure identity, GTID, and observation logic matches the PoC contract | No MySQL process, query, timing, or transport behavior validated |
+| SF core | Deterministic fixtures and the pinned Rust toolchain only | The Stage 1 Cargo gate passes identity/view replacement and stale-session cases; GTID relations never use scalar order; malformed, absent, denied, partial, stale, future-dated, and incoherent evidence produces explicit outcomes | Pure identity, GTID, view, observation, and stale-authority logic matches the PoC contract | No MySQL process, query, wall-clock, SQL, or transport behavior validated |
 | PoC observation | One pinned local `mysqld`, private UDS, fixture credential | Native identity/view/GTID evidence matches the exact process; permission denial, bad credentials, and wrong UDS/server identity remain distinct | Local adapter-to-MySQL observation works without TLS | No topology mutation or writable transition claim |
 | PoC lifecycle and switchover | Three fresh owned instances, loopback Group Replication, Kuberic hosts | Bootstrap/join completes; callbacks retain exact identities; source access closes and its process is stopped/reaped before target writes open; unexpected loss leaves writes closed | Controlled host-local Kuberic lifecycle and one planned handoff | No Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
 | Advanced repair and restart | Stage 3 implementation, durable journals, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Resumable host-local repair for the exercised profile | No automated writable failover |
@@ -1056,7 +1072,7 @@ must record their own exact inputs and receipts.
 
 Unless a later validated stage says otherwise, this design does not support:
 
-- any current executable MySQL/Kuberic behavior in this repository;
+- any executable MySQL server/Kuberic adapter behavior in this repository;
 - production use or service-level objectives;
 - MySQL releases outside a pinned Oracle MySQL 8.4 LTS patch;
 - MariaDB, Percona Server, cloud-vendor forks, or unqualified managed services;
