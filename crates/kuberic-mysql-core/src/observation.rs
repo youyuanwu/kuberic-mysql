@@ -492,6 +492,15 @@ impl ObservationDraft {
             return failure_outcome(self.metadata, failure);
         }
 
+        let missing = missing_fields(&self.opening, &self.executed, &self.closing);
+        if !missing.is_empty() {
+            return ObservationOutcome::Partial {
+                metadata: self.metadata,
+                missing,
+                cause: None,
+            };
+        }
+
         if self.metadata.decision < self.metadata.end {
             return ObservationOutcome::FutureDated(self.metadata);
         }
@@ -499,15 +508,6 @@ impl ObservationDraft {
             return ObservationOutcome::Stale {
                 metadata: self.metadata,
                 reason: StaleReason::Expired,
-            };
-        }
-
-        let missing = missing_fields(&self.opening, &self.executed, &self.closing);
-        if !missing.is_empty() {
-            return ObservationOutcome::Partial {
-                metadata: self.metadata,
-                missing,
-                cause: None,
             };
         }
 

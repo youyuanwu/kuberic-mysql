@@ -5,8 +5,8 @@ use std::str::FromStr;
 use common::{binding, bracket, metadata, native_view};
 use kuberic_mysql_core::{
     BoundGtidSet, CollectionFailure, GtidSet, IncoherentReason, MalformedReason, MemberId,
-    MemberRole, MemberState, NativeValueErrorKind, ObservationBracket, ObservationDraft,
-    ObservationField, ObservationOutcome, StaleReason,
+    MemberRole, MemberState, NativeField, NativeValueErrorKind, ObservationBracket,
+    ObservationDraft, ObservationField, ObservationOutcome, StaleReason, UnsupportedReason,
 };
 
 fn complete_draft(start: u64, end: u64, deadline: u64, decision: u64) -> ObservationDraft {
@@ -49,6 +49,11 @@ fn direct_failure_outcomes_remain_distinct_and_retain_metadata() {
             .failure(failure)
             .finalize();
         assert_eq!(outcome.metadata().binding(), &attempted);
+        assert_eq!(outcome.metadata().start().tick(), 1);
+        assert_eq!(outcome.metadata().end().tick(), 2);
+        assert_eq!(outcome.metadata().deadline().tick(), 3);
+        assert_eq!(outcome.metadata().decision().tick(), 2);
+        assert_eq!(outcome.metadata().provenance().origin(), "fixture");
         assert!(outcome.valid().is_none());
         let actual = match outcome {
             ObservationOutcome::Absent(_) => "absent",
@@ -90,6 +95,15 @@ fn missing_and_failed_partial_collection_never_become_valid() {
             ObservationField::ExecutedGtidSet,
             ObservationField::ClosingBracket
         ]
+    ));
+
+    assert!(matches!(
+        ObservationDraft::new(metadata(binding(), 1, 2, 3, 0)).finalize(),
+        ObservationOutcome::Partial { .. }
+    ));
+    assert!(matches!(
+        ObservationDraft::new(metadata(binding(), 1, 2, 3, 4)).finalize(),
+        ObservationOutcome::Partial { .. }
     ));
 }
 
@@ -175,7 +189,10 @@ fn changed_binding_or_view_is_incoherent() {
 
 #[test]
 fn stable_but_wrong_local_member_identity_is_incoherent() {
-    let attempted = binding();
+    let base = binding();
+    let mut parts = base.parts().clone();
+    parts.member_id = MemberId::new("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+    let attempted = kuberic_mysql_core::ExactBinding::new(parts);
     let wrong_view = kuberic_mysql_core::NativeView::new(
         attempted.parts().group_name.clone(),
         attempted.parts().view_id.clone(),
@@ -212,7 +229,10 @@ fn native_decode_errors_map_to_structured_outcomes() {
         ObservationDraft::new(metadata(binding(), 1, 2, 3, 2))
             .native_decode_failure(&malformed)
             .finalize(),
-        ObservationOutcome::Malformed { .. }
+        ObservationOutcome::Malformed {
+            reason: MalformedReason::NativeValue(NativeField::Role),
+            ..
+        }
     ));
 
     let unsupported = MemberRole::from_str("ARBITER").unwrap_err();
@@ -221,7 +241,10 @@ fn native_decode_errors_map_to_structured_outcomes() {
         ObservationDraft::new(metadata(binding(), 1, 2, 3, 2))
             .native_decode_failure(&unsupported)
             .finalize(),
-        ObservationOutcome::Unsupported { .. }
+        ObservationOutcome::Unsupported {
+            reason: UnsupportedReason::NativeValue(NativeField::Role),
+            ..
+        }
     ));
 
     let malformed_state = MemberState::from_str("\n").unwrap_err();
@@ -229,14 +252,20 @@ fn native_decode_errors_map_to_structured_outcomes() {
         ObservationDraft::new(metadata(binding(), 1, 2, 3, 2))
             .native_decode_failure(&malformed_state)
             .finalize(),
-        ObservationOutcome::Malformed { .. }
+        ObservationOutcome::Malformed {
+            reason: MalformedReason::NativeValue(NativeField::State),
+            ..
+        }
     ));
     let unsupported_state = MemberState::from_str("DONOR").unwrap_err();
     assert!(matches!(
         ObservationDraft::new(metadata(binding(), 1, 2, 3, 2))
             .native_decode_failure(&unsupported_state)
             .finalize(),
-        ObservationOutcome::Unsupported { .. }
+        ObservationOutcome::Unsupported {
+            reason: UnsupportedReason::NativeValue(NativeField::State),
+            ..
+        }
     ));
 }
 
