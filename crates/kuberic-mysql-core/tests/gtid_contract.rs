@@ -48,7 +48,7 @@ fn relations_use_only_set_containment() {
 #[test]
 fn parser_rejects_structured_malformed_inputs() {
     let cases = [
-        (format!("{A}"), GtidParseErrorKind::MissingInterval),
+        (A.to_owned(), GtidParseErrorKind::MissingInterval),
         (format!("{A}:"), GtidParseErrorKind::EmptyInterval),
         (format!("{A}:0"), GtidParseErrorKind::SequenceOutOfRange),
         (
