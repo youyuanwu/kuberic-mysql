@@ -134,7 +134,7 @@ fn client_errors_preserve_transport_authentication_and_server_classes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn dropping_timed_out_connect_prevents_late_completion() {
+async fn timed_out_connect_never_admits_late_completion() {
     let directory = TestDirectory::new("deadline");
     let socket = directory.socket("mysql.sock");
     let listener = UnixListener::bind(&socket).expect("bind stalled handshake socket");
@@ -162,8 +162,15 @@ async fn dropping_timed_out_connect_prevents_late_completion() {
     );
     timeout(Duration::from_secs(1), server)
         .await
-        .expect("server must observe cancellation")
+        .expect("server must observe client-internal cancellation cleanup")
         .expect("stalled server task must finish");
-    assert!(peer_closed.load(Ordering::Acquire));
-    assert!(!admitted.load(Ordering::Acquire));
+    assert!(
+        peer_closed.load(Ordering::Acquire),
+        "client-internal cleanup may continue only to close its transport"
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        !admitted.load(Ordering::Acquire),
+        "the dropped adapter future has no late evidence or admission channel"
+    );
 }

@@ -1,4 +1,8 @@
 //! Private direct native-session boundary.
+//!
+//! Adapter query futures are never detached. After cancellation, a connected
+//! session is still consumed by explicit disconnect before the attempt finishes,
+//! even if `mysql_async` has already closed its own transport.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -19,6 +23,7 @@ pub(crate) trait NativeSession {
         query: QueryId,
     ) -> Pin<Box<dyn Future<Output = Result<RawResult, SessionError>> + Send + 'a>>;
 
+    /// Consumes a connected session after its query future ends.
     fn disconnect(
         self: Box<Self>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + 'static>>;
@@ -162,7 +167,9 @@ mod tests {
     use tokio::net::UnixListener;
     use tokio::time::timeout;
 
-    use super::{ColumnKind, MysqlNativeSession, NativeSession, column_kind};
+    use super::{
+        ColumnKind, MysqlNativeSession, NativeSession, QueryId, SessionError, column_kind,
+    };
     use crate::{
         ClockContext, ClockError, ObservationClock, ObservationRequest, ObserverCredentials,
         UnixSocketPath,
@@ -191,8 +198,10 @@ mod tests {
         fs::create_dir_all(&directory).expect("create session test directory");
         let socket = directory.join("mysql.sock");
         let listener = UnixListener::bind(&socket).expect("bind fake MySQL socket");
-        let quit_seen = Arc::new(AtomicBool::new(false));
-        let server_quit_seen = Arc::clone(&quit_seen);
+        let query_seen = Arc::new(AtomicBool::new(false));
+        let teardown_seen = Arc::new(AtomicBool::new(false));
+        let server_query_seen = Arc::clone(&query_seen);
+        let server_teardown_seen = Arc::clone(&teardown_seen);
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept native session");
             write_packet(&mut stream, 0, &handshake()).await;
@@ -222,21 +231,50 @@ mod tests {
             .await;
             write_packet(&mut stream, 6, &[0xfe, 0x00, 0x00, 0x02, 0x00]).await;
 
-            let command = read_packet(&mut stream)
+            let query = read_packet(&mut stream)
                 .await
-                .expect("explicit disconnect packet");
-            assert_eq!(command, [0x01], "cancellation must send only COM_QUIT");
-            server_quit_seen.store(true, Ordering::Release);
-            let mut byte = [0_u8; 1];
+                .expect("Phase 3 query packet");
+            assert_eq!(query.first(), Some(&0x03));
             assert_eq!(
-                stream.read(&mut byte).await.expect("connection close"),
-                0,
-                "explicit disconnect must close the connected stream"
+                std::str::from_utf8(&query[1..]).expect("Phase 3 query SQL"),
+                QueryId::Mysql8411ProductIdentityV1.sql()
             );
+            server_query_seen.store(true, Ordering::Release);
+
+            let mut first_header_byte = [0_u8; 1];
+            match stream
+                .read(&mut first_header_byte)
+                .await
+                .expect("observe session teardown")
+            {
+                0 => {}
+                1 => {
+                    assert_eq!(first_header_byte, [1], "COM_QUIT payload must be one byte");
+                    let mut remaining_header = [0_u8; 3];
+                    stream
+                        .read_exact(&mut remaining_header)
+                        .await
+                        .expect("COM_QUIT packet header");
+                    let mut command = [0_u8; 1];
+                    stream
+                        .read_exact(&mut command)
+                        .await
+                        .expect("COM_QUIT packet payload");
+                    assert_eq!(command, [0x01]);
+                    let mut byte = [0_u8; 1];
+                    assert_eq!(
+                        stream.read(&mut byte).await.expect("connection close"),
+                        0,
+                        "explicit disconnect must close the connected stream"
+                    );
+                }
+                count => panic!("single-byte read returned unexpected count {count}"),
+            }
+            server_teardown_seen.store(true, Ordering::Release);
         });
 
         let request = request(&socket);
-        let session = timeout(
+        let mut session = timeout(
             Duration::from_secs(1),
             MysqlNativeSession::connect(&request),
         )
@@ -244,6 +282,21 @@ mod tests {
         .expect("connect deadline")
         .expect("connected native session");
         let admitted = Arc::new(AtomicBool::new(false));
+        let completion_admitted = Arc::clone(&admitted);
+        let query = async {
+            let result = session.query(QueryId::Mysql8411ProductIdentityV1).await?;
+            completion_admitted.store(true, Ordering::Release);
+            Ok::<_, SessionError>(result)
+        };
+
+        assert!(
+            timeout(Duration::from_millis(50), query).await.is_err(),
+            "a Phase 3 query stalled by the server must exhaust the deadline"
+        );
+        assert!(
+            query_seen.load(Ordering::Acquire),
+            "the deadline must cancel a real Phase 3 query after the server receives it"
+        );
 
         timeout(Duration::from_secs(1), Box::new(session).disconnect())
             .await
@@ -254,8 +307,12 @@ mod tests {
             .expect("server completion deadline")
             .expect("fake server");
         tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert!(quit_seen.load(Ordering::Acquire));
+        assert!(
+            teardown_seen.load(Ordering::Acquire),
+            "explicit disconnect must consume the session after client cleanup"
+        );
         assert!(
             !admitted.load(Ordering::Acquire),
             "a cancelled connected session must never admit a late result"
