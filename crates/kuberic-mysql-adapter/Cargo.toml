@@ -15,4 +15,4 @@ mysql_async = { version = "=0.37.1", default-features = false, features = ["mini
 workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "time", "io-util"] }
