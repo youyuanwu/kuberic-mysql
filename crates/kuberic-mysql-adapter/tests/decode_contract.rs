@@ -97,8 +97,8 @@ fn absence_and_oracle_placeholders_remain_distinct() {
         MembershipEvidence::Placeholder(PlaceholderKind::Stopped)
     );
     assert_eq!(
-        decode::decode_view(&common::fixture("never-started-stats-placeholder").raw()).unwrap(),
-        ViewEvidence::Placeholder(PlaceholderKind::NeverStarted)
+        decode::decode_view(&common::fixture("never-started-filtered-stats-absent").raw()).unwrap(),
+        ViewEvidence::Absent
     );
     assert!(matches!(
         decode::decode_members(&common::fixture("recovering-member").raw()).unwrap(),
@@ -281,5 +281,25 @@ fn future_values_schema_and_numeric_boundaries_are_explicit() {
     ] {
         decode::decode_executed_gtids(&common::fixture(scenario).raw())
             .expect("core retains both values pending native qualification");
+    }
+}
+
+#[test]
+fn stopped_placeholder_requires_valid_retained_identity_host_and_port() {
+    for (scenario, column) in [
+        ("stopped-placeholder-invalid-member-id", "member_id"),
+        ("stopped-placeholder-invalid-host", "member_host"),
+        ("stopped-placeholder-invalid-port", "member_port"),
+    ] {
+        let error = decode::decode_members(&common::fixture(scenario).raw())
+            .expect_err("malformed retained stopped fact");
+        assert!(matches!(
+            error.diagnostic,
+            AdapterDiagnostic::Evidence {
+                surface: NativeSurface::GroupMembers,
+                issue: EvidenceIssue::MalformedCell { column: actual }
+                    | EvidenceIssue::EmptyRequiredString { column: actual },
+            } if actual == column
+        ));
     }
 }

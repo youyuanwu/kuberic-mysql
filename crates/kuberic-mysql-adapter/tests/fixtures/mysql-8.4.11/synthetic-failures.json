@@ -5,11 +5,11 @@
       "scenario": "other-oracle-patch",
       "query_id": "Mysql8411ProductIdentityV1",
       "columns": [
-        {"name": "version", "kind": "VarString", "nullable": false},
-        {"name": "version_comment", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_machine", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_os", "kind": "VarString", "nullable": false},
-        {"name": "server_uuid", "kind": "VarString", "nullable": false}
+        {"name": "version", "kind": "VarString", "nullable": true},
+        {"name": "version_comment", "kind": "VarString", "nullable": true},
+        {"name": "version_compile_machine", "kind": "VarString", "nullable": true},
+        {"name": "version_compile_os", "kind": "VarString", "nullable": true},
+        {"name": "server_uuid", "kind": "VarString", "nullable": true}
       ],
       "rows": [["8.4.10", "MySQL Community Server - GPL", "x86_64", "Linux", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]],
       "expected": {"core_class": "Unsupported", "diagnostic": "UnsupportedPatch"},
@@ -19,11 +19,11 @@
       "scenario": "non-oracle-lookalike",
       "query_id": "Mysql8411ProductIdentityV1",
       "columns": [
-        {"name": "version", "kind": "VarString", "nullable": false},
-        {"name": "version_comment", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_machine", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_os", "kind": "VarString", "nullable": false},
-        {"name": "server_uuid", "kind": "VarString", "nullable": false}
+        {"name": "version", "kind": "VarString", "nullable": true},
+        {"name": "version_comment", "kind": "VarString", "nullable": true},
+        {"name": "version_compile_machine", "kind": "VarString", "nullable": true},
+        {"name": "version_compile_os", "kind": "VarString", "nullable": true},
+        {"name": "server_uuid", "kind": "VarString", "nullable": true}
       ],
       "rows": [["8.4.11", "Lookalike Community Server", "x86_64", "Linux", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]],
       "expected": {"core_class": "Unsupported", "diagnostic": "NonOracleCommunity"},
@@ -32,7 +32,7 @@
     {
       "scenario": "unexpected-required-null",
       "query_id": "Mysql8411ExecutedGtidsV1",
-      "columns": [{"name": "gtid_executed", "kind": "String", "nullable": false}],
+      "columns": [{"name": "gtid_executed", "kind": "VarString", "nullable": true}],
       "rows": [[null]],
       "expected": {"core_class": "Malformed", "diagnostic": "RequiredNull"},
       "evidence_origin": {"category": "synthetic", "derivation": "Replace required GTID text with SQL NULL."}
@@ -117,10 +117,10 @@
       "scenario": "malformed-read-only-switch",
       "query_id": "Mysql8411LocalStateV1",
       "columns": [
-        {"name": "group_name", "kind": "VarString", "nullable": false},
-        {"name": "group_replication_address", "kind": "VarString", "nullable": false},
-        {"name": "read_only", "kind": "LongLong", "nullable": false},
-        {"name": "super_read_only", "kind": "LongLong", "nullable": false}
+        {"name": "group_name", "kind": "VarString", "nullable": true},
+        {"name": "group_replication_address", "kind": "VarString", "nullable": true},
+        {"name": "read_only", "kind": "LongLong", "nullable": true},
+        {"name": "super_read_only", "kind": "LongLong", "nullable": true}
       ],
       "rows": [["cccccccc-cccc-cccc-cccc-cccccccccccc", "127.0.0.1:33061", 2, 0]],
       "expected": {"core_class": "Malformed", "diagnostic": "MalformedCell"},
@@ -156,14 +156,56 @@
       "scenario": "invalid-empty-group-name",
       "query_id": "Mysql8411LocalStateV1",
       "columns": [
-        {"name": "group_name", "kind": "VarString", "nullable": false},
-        {"name": "group_replication_address", "kind": "VarString", "nullable": false},
-        {"name": "read_only", "kind": "LongLong", "nullable": false},
-        {"name": "super_read_only", "kind": "LongLong", "nullable": false}
+        {"name": "group_name", "kind": "VarString", "nullable": true},
+        {"name": "group_replication_address", "kind": "VarString", "nullable": true},
+        {"name": "read_only", "kind": "LongLong", "nullable": true},
+        {"name": "super_read_only", "kind": "LongLong", "nullable": true}
       ],
       "rows": [["", "127.0.0.1:33061", 0, 0]],
       "expected": {"core_class": "Malformed", "diagnostic": "EmptyRequiredString"},
       "evidence_origin": {"category": "synthetic", "derivation": "Replace the required configured group identity with an empty string."}
+    },
+    {
+      "scenario": "stopped-placeholder-invalid-member-id",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["not-a-uuid", "mysql-a", 3306, "OFFLINE", ""]],
+      "expected": {"core_class": "Malformed", "diagnostic": "MalformedCell"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Corrupt only the retained stopped MEMBER_ID fact."}
+    },
+    {
+      "scenario": "stopped-placeholder-invalid-host",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "", 3306, "OFFLINE", ""]],
+      "expected": {"core_class": "Malformed", "diagnostic": "EmptyRequiredString"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Corrupt only the retained stopped MEMBER_HOST fact."}
+    },
+    {
+      "scenario": "stopped-placeholder-invalid-port",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mysql-a", 0, "OFFLINE", ""]],
+      "expected": {"core_class": "Malformed", "diagnostic": "MalformedCell"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Corrupt only the retained stopped MEMBER_PORT fact."}
     }
   ]
 }

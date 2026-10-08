@@ -23,6 +23,9 @@ impl UnixSocketPath {
         if !path.is_absolute() {
             return Err(SocketPathError::NotAbsolute);
         }
+        if path.as_os_str().to_str().is_none() {
+            return Err(SocketPathError::NonUtf8);
+        }
         let metadata =
             fs::symlink_metadata(&path).map_err(|error| SocketPathError::Metadata(error.kind()))?;
         if metadata.file_type().is_symlink() {
@@ -49,6 +52,8 @@ impl UnixSocketPath {
 pub enum SocketPathError {
     /// The path was not absolute.
     NotAbsolute,
+    /// The client library cannot represent the path without changing its bytes.
+    NonUtf8,
     /// Filesystem metadata could not be read.
     Metadata(ErrorKind),
     /// The final path component was a symbolic link.

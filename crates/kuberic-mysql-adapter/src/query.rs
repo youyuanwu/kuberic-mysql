@@ -54,17 +54,17 @@ impl ColumnContract {
 }
 
 const PRODUCT_COLUMNS: &[ColumnContract] = &[
-    ColumnContract::new("version", ColumnKind::VarString, false),
-    ColumnContract::new("version_comment", ColumnKind::VarString, false),
-    ColumnContract::new("version_compile_machine", ColumnKind::VarString, false),
-    ColumnContract::new("version_compile_os", ColumnKind::VarString, false),
-    ColumnContract::new("server_uuid", ColumnKind::VarString, false),
+    ColumnContract::new("version", ColumnKind::VarString, true),
+    ColumnContract::new("version_comment", ColumnKind::VarString, true),
+    ColumnContract::new("version_compile_machine", ColumnKind::VarString, true),
+    ColumnContract::new("version_compile_os", ColumnKind::VarString, true),
+    ColumnContract::new("server_uuid", ColumnKind::VarString, true),
 ];
 const LOCAL_STATE_COLUMNS: &[ColumnContract] = &[
-    ColumnContract::new("group_name", ColumnKind::VarString, false),
-    ColumnContract::new("group_replication_address", ColumnKind::VarString, false),
-    ColumnContract::new("read_only", ColumnKind::LongLong, false),
-    ColumnContract::new("super_read_only", ColumnKind::LongLong, false),
+    ColumnContract::new("group_name", ColumnKind::VarString, true),
+    ColumnContract::new("group_replication_address", ColumnKind::VarString, true),
+    ColumnContract::new("read_only", ColumnKind::LongLong, true),
+    ColumnContract::new("super_read_only", ColumnKind::LongLong, true),
 ];
 const MEMBERS_COLUMNS: &[ColumnContract] = &[
     ColumnContract::new("member_id", ColumnKind::String, false),
@@ -79,8 +79,8 @@ const STATS_COLUMNS: &[ColumnContract] = &[
 ];
 const GTID_COLUMNS: &[ColumnContract] = &[ColumnContract::new(
     "gtid_executed",
-    ColumnKind::String,
-    false,
+    ColumnKind::VarString,
+    true,
 )];
 
 /// A stable identifier for one Oracle MySQL 8.4.11 query.

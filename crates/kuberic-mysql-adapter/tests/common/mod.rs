@@ -17,10 +17,22 @@ pub struct FixtureFile {
 pub struct FixtureCase {
     pub scenario: String,
     pub query_id: String,
+    #[serde(default)]
     pub columns: Vec<FixtureColumn>,
+    #[serde(default)]
     pub rows: Vec<Vec<serde_json::Value>>,
+    pub error: Option<FixtureError>,
     pub expected: Expected,
     pub evidence_origin: EvidenceOrigin,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FixtureError {
+    pub kind: String,
+    pub stage: String,
+    pub surface: Option<String>,
+    pub code: Option<u16>,
+    pub sql_state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +101,7 @@ impl FixtureCase {
     }
 
     pub fn raw(&self) -> RawResult {
+        assert!(self.error.is_none(), "error fixture has no raw result");
         RawResult {
             columns: self
                 .columns
@@ -111,6 +124,62 @@ impl FixtureCase {
                 .map(|row| row.iter().map(raw_value).collect())
                 .collect(),
         }
+    }
+
+    pub fn validate_input(&self) -> Result<(), &'static str> {
+        match (
+            self.error.is_some(),
+            self.columns.is_empty(),
+            self.rows.is_empty(),
+        ) {
+            (true, true, true) => Ok(()),
+            (true, _, _) => Err("error input must not also declare result metadata or rows"),
+            (false, false, _) => Ok(()),
+            (false, true, _) => Err("result input must declare selected metadata"),
+        }
+    }
+}
+
+pub fn validate_required_origin(case: &FixtureCase) -> Result<(), &'static str> {
+    let required = match case.scenario.as_str() {
+        "plugin-absent-members"
+        | "never-started-members-placeholder"
+        | "stopped-members-placeholder"
+        | "recovering-member"
+        | "never-started-filtered-stats-absent" => "oracle-owned",
+        "other-oracle-patch"
+        | "non-oracle-lookalike"
+        | "unexpected-required-null"
+        | "incomplete-members-row"
+        | "members-schema-type-drift"
+        | "duplicate-member-id"
+        | "duplicate-member-address"
+        | "duplicate-local-stats-row"
+        | "malformed-read-only-switch"
+        | "future-member-role"
+        | "future-additional-column"
+        | "invalid-empty-group-name"
+        | "stopped-placeholder-invalid-member-id"
+        | "stopped-placeholder-invalid-host"
+        | "stopped-placeholder-invalid-port" => "synthetic",
+        "oracle-community-8.4.11-product"
+        | "online-local-state"
+        | "online-members"
+        | "online-local-view"
+        | "valid-empty-executed-gtids"
+        | "native-tagged-and-newline-gtids"
+        | "gtid-boundary-9223372036854775806"
+        | "gtid-boundary-9223372036854775807"
+        | "uds-transport-failure"
+        | "authentication-failure"
+        | "members-table-permission-denied"
+        | "stats-table-permission-denied" => "native-required",
+        _ => return Err("scenario has no required origin rule"),
+    };
+    if case.evidence_origin.category == required {
+        Ok(())
+    } else {
+        Err("scenario origin category does not match its required source")
     }
 }
 

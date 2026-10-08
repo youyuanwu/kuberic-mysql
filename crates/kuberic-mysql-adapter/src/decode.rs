@@ -143,7 +143,8 @@ pub(crate) fn decode_members(result: &RawResult) -> Result<MembershipEvidence, D
             PlaceholderKind::NeverStarted,
         ));
     }
-    if result.rows.len() == 1 && is_stopped_member(&result.rows[0]) {
+    if result.rows.len() == 1 && looks_like_stopped_member(&result.rows[0]) {
+        validate_stopped_member(&result.rows[0])?;
         return Ok(MembershipEvidence::Placeholder(PlaceholderKind::Stopped));
     }
 
@@ -205,9 +206,6 @@ pub(crate) fn decode_view(result: &RawResult) -> Result<ViewEvidence, DecodeErro
     }
     let row = &result.rows[0];
     ensure_complete_row(QueryId::Mysql8411LocalMemberStatsV1, row, 0)?;
-    if text(row.first()) == Some("") && text(row.get(1)) == Some("") {
-        return Ok(ViewEvidence::Placeholder(PlaceholderKind::NeverStarted));
-    }
     let member_id = MemberId::new(required_text(
         row,
         0,
@@ -520,13 +518,19 @@ fn is_never_started_member(row: &[RawValue]) -> bool {
         && text(row.get(4)) == Some("")
 }
 
-fn is_stopped_member(row: &[RawValue]) -> bool {
-    row.len() == 5
-        && text(row.first()).is_some_and(|value| !value.is_empty())
-        && text(row.get(1)).is_some_and(|value| !value.is_empty())
-        && !matches!(row.get(2), Some(RawValue::Null) | None)
-        && text(row.get(3)) == Some("OFFLINE")
-        && text(row.get(4)) == Some("")
+fn looks_like_stopped_member(row: &[RawValue]) -> bool {
+    row.len() == 5 && text(row.get(3)) == Some("OFFLINE") && text(row.get(4)) == Some("")
+}
+
+fn validate_stopped_member(row: &[RawValue]) -> Result<(), DecodeError> {
+    let member_id = required_text(row, 0, "member_id", NativeSurface::GroupMembers)?;
+    MemberId::new(member_id)
+        .map_err(|_| malformed_cell(NativeSurface::GroupMembers, "member_id"))?;
+    let host = required_text(row, 1, "member_host", NativeSurface::GroupMembers)?;
+    let port = required_port(row, 2, "member_port", NativeSurface::GroupMembers)?;
+    MemberAddress::new(format_member_address(host, port))
+        .map_err(|_| malformed_cell(NativeSurface::GroupMembers, "member_host"))?;
+    Ok(())
 }
 
 fn text(value: Option<&RawValue>) -> Option<&str> {

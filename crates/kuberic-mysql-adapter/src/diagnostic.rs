@@ -34,6 +34,8 @@ pub enum ObservationStage {
     Query,
     /// Result consumption.
     Consume,
+    /// Explicit session teardown.
+    Disconnect,
 }
 
 /// A selected result-schema mismatch.

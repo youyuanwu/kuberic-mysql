@@ -3,6 +3,30 @@ oracle_tag = "mysql-8.4.11"
 oracle_commit = "99960bf74fa919347e4f4e3ca47672f333d6e91f"
 
 [[sources]]
+surface = "system-variable selected expressions"
+url = "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/sql/item_func.cc"
+path = "sql/item_func.cc"
+sha256 = "686f156c15faa979bff76251efd209a2eab9998e35e4fd226e117e1a43ec019a"
+range = "Item_func_get_system_var::resolve_type, lines 7104-7143"
+derivation = "Every selected @@ system-variable expression calls set_nullable(true). SHOW_CHAR-family variables use set_data_type_string rather than fixed CHAR metadata; integer and boolean variables use LONGLONG."
+
+[[sources]]
+surface = "system-variable variable-length string type"
+url = "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/sql/item.h"
+path = "sql/item.h"
+sha256 = "ce20d81c16ff8f9b0492cc05e59ecc7aaef1d19179d0260e378ff2f6724b3c69"
+range = "Item::set_data_type_string, lines 1581-1596"
+derivation = "System-variable string values are assigned a variable-length string data type, which the adapter normalizes as VarString."
+
+[[sources]]
+surface = "@@GLOBAL.gtid_executed"
+url = "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/sql/sys_vars.h"
+path = "sql/sys_vars.h"
+sha256 = "728211abe20c7d250e0029a282c219d7133eaf8522ad086c3e667a21d1508958"
+range = "Sys_var_gtid_executed, lines 2589-2609"
+derivation = "gtid_executed derives from Sys_var_charptr_func, so its selected expression follows SHOW_CHAR variable-length metadata and remains nullable at the protocol metadata layer."
+
+[[sources]]
 surface = "performance_schema.replication_group_members"
 url = "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/storage/perfschema/table_replication_group_members.cc"
 path = "storage/perfschema/table_replication_group_members.cc"

@@ -5,11 +5,11 @@
       "scenario": "oracle-community-8.4.11-product",
       "query_id": "Mysql8411ProductIdentityV1",
       "columns": [
-        {"name": "version", "kind": "VarString", "nullable": false},
-        {"name": "version_comment", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_machine", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_os", "kind": "VarString", "nullable": false},
-        {"name": "server_uuid", "kind": "VarString", "nullable": false}
+        {"name": "version", "kind": "VarString", "nullable": true},
+        {"name": "version_comment", "kind": "VarString", "nullable": true},
+        {"name": "version_compile_machine", "kind": "VarString", "nullable": true},
+        {"name": "version_compile_os", "kind": "VarString", "nullable": true},
+        {"name": "server_uuid", "kind": "VarString", "nullable": true}
       ],
       "rows": [["8.4.11", "MySQL Community Server - GPL", "x86_64", "Linux", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]],
       "expected": {"core_class": "Valid", "diagnostic": "None"},
@@ -19,10 +19,10 @@
       "scenario": "online-local-state",
       "query_id": "Mysql8411LocalStateV1",
       "columns": [
-        {"name": "group_name", "kind": "VarString", "nullable": false},
-        {"name": "group_replication_address", "kind": "VarString", "nullable": false},
-        {"name": "read_only", "kind": "LongLong", "nullable": false},
-        {"name": "super_read_only", "kind": "LongLong", "nullable": false}
+        {"name": "group_name", "kind": "VarString", "nullable": true},
+        {"name": "group_replication_address", "kind": "VarString", "nullable": true},
+        {"name": "read_only", "kind": "LongLong", "nullable": true},
+        {"name": "super_read_only", "kind": "LongLong", "nullable": true}
       ],
       "rows": [["cccccccc-cccc-cccc-cccc-cccccccccccc", "127.0.0.1:33061", 0, 0]],
       "expected": {"core_class": "Valid", "diagnostic": "None"},
@@ -59,7 +59,7 @@
     {
       "scenario": "valid-empty-executed-gtids",
       "query_id": "Mysql8411ExecutedGtidsV1",
-      "columns": [{"name": "gtid_executed", "kind": "String", "nullable": false}],
+      "columns": [{"name": "gtid_executed", "kind": "VarString", "nullable": true}],
       "rows": [[""]],
       "expected": {"core_class": "Valid", "diagnostic": "None"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
@@ -67,7 +67,7 @@
     {
       "scenario": "native-tagged-and-newline-gtids",
       "query_id": "Mysql8411ExecutedGtidsV1",
-      "columns": [{"name": "gtid_executed", "kind": "String", "nullable": false}],
+      "columns": [{"name": "gtid_executed", "kind": "VarString", "nullable": true}],
       "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-3:blue:4-6,\nbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:2:green:7-9"]],
       "expected": {"core_class": "Valid", "diagnostic": "None"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
@@ -75,69 +75,62 @@
     {
       "scenario": "gtid-boundary-9223372036854775806",
       "query_id": "Mysql8411ExecutedGtidsV1",
-      "columns": [{"name": "gtid_executed", "kind": "String", "nullable": false}],
+      "columns": [{"name": "gtid_executed", "kind": "VarString", "nullable": true}],
       "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:9223372036854775806"]],
-      "expected": {"core_class": "QualificationPending", "diagnostic": "NativeBoundaryRequired"},
+      "expected": {"core_class": "Valid", "diagnostic": "None"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
     },
     {
       "scenario": "gtid-boundary-9223372036854775807",
       "query_id": "Mysql8411ExecutedGtidsV1",
-      "columns": [{"name": "gtid_executed", "kind": "String", "nullable": false}],
+      "columns": [{"name": "gtid_executed", "kind": "VarString", "nullable": true}],
       "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:9223372036854775807"]],
-      "expected": {"core_class": "QualificationPending", "diagnostic": "NativeBoundaryRequired"},
+      "expected": {"core_class": "Valid", "diagnostic": "None"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
     },
     {
       "scenario": "uds-transport-failure",
       "query_id": "Mysql8411ProductIdentityV1",
-      "columns": [
-        {"name": "version", "kind": "VarString", "nullable": false},
-        {"name": "version_comment", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_machine", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_os", "kind": "VarString", "nullable": false},
-        {"name": "server_uuid", "kind": "VarString", "nullable": false}
-      ],
-      "rows": [],
+      "error": {"kind": "transport", "stage": "Connect", "surface": null},
       "expected": {"core_class": "Unreachable", "diagnostic": "TransportConnect"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
     },
     {
       "scenario": "authentication-failure",
       "query_id": "Mysql8411ProductIdentityV1",
-      "columns": [
-        {"name": "version", "kind": "VarString", "nullable": false},
-        {"name": "version_comment", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_machine", "kind": "VarString", "nullable": false},
-        {"name": "version_compile_os", "kind": "VarString", "nullable": false},
-        {"name": "server_uuid", "kind": "VarString", "nullable": false}
-      ],
-      "rows": [],
+      "error": {
+        "kind": "server",
+        "stage": "Connect",
+        "surface": null,
+        "code": 1045,
+        "sql_state": "28000"
+      },
       "expected": {"core_class": "AuthenticationFailure", "diagnostic": "Server1045State28000"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
     },
     {
       "scenario": "members-table-permission-denied",
       "query_id": "Mysql8411GroupMembersV1",
-      "columns": [
-        {"name": "member_id", "kind": "String", "nullable": false},
-        {"name": "member_host", "kind": "String", "nullable": false},
-        {"name": "member_port", "kind": "Long", "nullable": true},
-        {"name": "member_state", "kind": "String", "nullable": false},
-        {"name": "member_role", "kind": "String", "nullable": false}
-      ],
-      "rows": [],
+      "error": {
+        "kind": "server",
+        "stage": "Query",
+        "surface": "GroupMembers",
+        "code": 1142,
+        "sql_state": "42000"
+      },
       "expected": {"core_class": "PermissionDenied", "diagnostic": "MembersServer1142"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
     },
     {
       "scenario": "stats-table-permission-denied",
       "query_id": "Mysql8411LocalMemberStatsV1",
-      "columns": [
-        {"name": "member_id", "kind": "String", "nullable": false},
-        {"name": "view_id", "kind": "String", "nullable": false}
-      ],
-      "rows": [],
+      "error": {
+        "kind": "server",
+        "stage": "Query",
+        "surface": "LocalMemberStats",
+        "code": 1142,
+        "sql_state": "42000"
+      },
       "expected": {"core_class": "PermissionDenied", "diagnostic": "StatsServer1142"},
       "evidence_origin": {"category": "native-required", "qualification": "required-live-8.4.11"}
     }

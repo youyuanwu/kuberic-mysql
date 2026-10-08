@@ -94,14 +94,14 @@
       }
     },
     {
-      "scenario": "never-started-stats-placeholder",
+      "scenario": "never-started-filtered-stats-absent",
       "query_id": "Mysql8411LocalMemberStatsV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "view_id", "kind": "String", "nullable": false}
       ],
-      "rows": [["", ""]],
-      "expected": {"core_class": "Absent", "diagnostic": "PlaceholderNeverStarted"},
+      "rows": [],
+      "expected": {"core_class": "Absent", "diagnostic": "AbsentLocalMemberStats"},
       "evidence_origin": {
         "category": "oracle-owned",
         "commit": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
@@ -110,7 +110,7 @@
         "path": "mysql-test/suite/group_replication/r/gr_perfschema_group_member_stats.result",
         "sha256": "57ba8d2f87870bdb32a286749b8e1796cd279ce5318617e90b3e09251867be85",
         "range": "lines 14-15",
-        "derivation": "Map the asserted empty MEMBER_ID and empty VIEW_ID before Group Replication starts."
+        "derivation": "The upstream unfiltered table contains an empty MEMBER_ID placeholder before Group Replication starts; the adapter query filters on MEMBER_ID = @@GLOBAL.server_uuid, so that row cannot match and the selected result has zero rows."
       }
     }
   ]

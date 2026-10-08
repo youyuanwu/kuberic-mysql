@@ -39,8 +39,9 @@ struct TestDirectory {
 impl TestDirectory {
     fn new(label: &str) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("kma-{label}-{}-{sequence}", std::process::id()));
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("kma-{label}-{}-{sequence}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create preflight directory");
         Self { path }
     }
@@ -62,7 +63,12 @@ fn socket_opts(socket: &Path) -> Opts {
         .tcp_port(1)
         .user(Some("observer"))
         .pass(Some("not-a-real-secret"))
-        .socket(Some(socket.to_string_lossy().into_owned()))
+        .socket(Some(
+            socket
+                .to_str()
+                .expect("test socket path is UTF-8")
+                .to_owned(),
+        ))
         .into()
 }
 
@@ -77,13 +83,15 @@ async fn explicit_socket_never_falls_back_to_tcp() {
     let opts: Opts = OptsBuilder::default()
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
-        .socket(Some(missing_socket.to_string_lossy().into_owned()))
+        .socket(Some(
+            missing_socket
+                .to_str()
+                .expect("test socket path is UTF-8")
+                .to_owned(),
+        ))
         .into();
 
-    assert_eq!(
-        opts.socket(),
-        Some(missing_socket.to_string_lossy().as_ref())
-    );
+    assert_eq!(opts.socket(), missing_socket.to_str());
     assert!(matches!(
         timeout(Duration::from_secs(1), Conn::new(opts))
             .await
