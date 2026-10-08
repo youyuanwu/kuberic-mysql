@@ -407,11 +407,11 @@ fn normalize_intervals(intervals: &mut Vec<GtidInterval>) {
     intervals.sort_by_key(|interval| interval.start);
     let mut merged: Vec<GtidInterval> = Vec::with_capacity(intervals.len());
     for interval in intervals.drain(..) {
-        if let Some(previous) = merged.last_mut() {
-            if interval.start <= previous.end.saturating_add(1) {
-                previous.end = previous.end.max(interval.end);
-                continue;
-            }
+        if let Some(previous) = merged.last_mut()
+            && interval.start <= previous.end.saturating_add(1)
+        {
+            previous.end = previous.end.max(interval.end);
+            continue;
         }
         merged.push(interval);
     }

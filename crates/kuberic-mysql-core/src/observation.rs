@@ -533,13 +533,13 @@ impl ObservationDraft {
             };
         }
 
-        if let (Some(opening), Some(closing)) = (&self.opening, &self.closing) {
-            if opening.view != closing.view {
-                return ObservationOutcome::Incoherent {
-                    metadata: self.metadata,
-                    reason: IncoherentReason::BracketMismatch,
-                };
-            }
+        if let (Some(opening), Some(closing)) = (&self.opening, &self.closing)
+            && opening.view != closing.view
+        {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason: IncoherentReason::BracketMismatch,
+            };
         }
 
         if let Some(failure) = self.failure {
