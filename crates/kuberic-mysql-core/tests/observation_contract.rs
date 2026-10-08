@@ -84,34 +84,34 @@ fn direct_failure_outcomes_remain_distinct_and_retain_metadata() {
         };
         assert_eq!(actual, expected);
     }
+}
 
-    #[test]
-    fn partial_stale_future_incoherent_and_valid_retain_full_metadata() {
-        let attempted = binding();
-        let partial = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2)).finalize();
-        assert_metadata(&partial, &attempted, 1, 2, 3, 2);
+#[test]
+fn partial_stale_future_incoherent_and_valid_retain_full_metadata() {
+    let attempted = binding();
+    let partial = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2)).finalize();
+    assert_metadata(&partial, &attempted, 1, 2, 3, 2);
 
-        let future = complete_draft(1, 2, 3, 1).finalize();
-        assert_metadata(&future, &attempted, 1, 2, 3, 1);
+    let future = complete_draft(1, 2, 3, 1).finalize();
+    assert_metadata(&future, &attempted, 1, 2, 3, 1);
 
-        let stale = complete_draft(1, 2, 3, 4).finalize();
-        assert_metadata(&stale, &attempted, 1, 2, 3, 4);
+    let stale = complete_draft(1, 2, 3, 4).finalize();
+    assert_metadata(&stale, &attempted, 1, 2, 3, 4);
 
-        let valid = complete_draft(1, 2, 3, 2).finalize();
-        assert_metadata(&valid, &attempted, 1, 2, 3, 2);
+    let valid = complete_draft(1, 2, 3, 2).finalize();
+    assert_metadata(&valid, &attempted, 1, 2, 3, 2);
 
-        let mut changed_parts = attempted.parts().clone();
-        changed_parts.credential_generation =
-            kuberic_mysql_core::CredentialGeneration::new("other").unwrap();
-        let incoherent = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
-            .opening(bracket(attempted.clone()))
-            .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
-            .closing(bracket(kuberic_mysql_core::ExactBinding::new(
-                changed_parts,
-            )))
-            .finalize();
-        assert_metadata(&incoherent, &attempted, 1, 2, 3, 2);
-    }
+    let mut changed_parts = attempted.parts().clone();
+    changed_parts.credential_generation =
+        kuberic_mysql_core::CredentialGeneration::new("other").unwrap();
+    let incoherent = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(bracket(attempted.clone()))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .closing(bracket(kuberic_mysql_core::ExactBinding::new(
+            changed_parts,
+        )))
+        .finalize();
+    assert_metadata(&incoherent, &attempted, 1, 2, 3, 2);
 }
 
 #[test]
