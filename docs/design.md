@@ -349,7 +349,47 @@ Each journal contains authorization, current stage, non-secret inputs, exact
 process/storage/native bindings, external effects entered, native/provider
 observations, completion receipt, cancellation, and last reconciliation time.
 Retries with the same canonical identity are idempotent. A changed authority,
-target, donor, view, or input creates a new attempt; the old result is rejected.
+target, donor, or input creates a new attempt; the old result is rejected. An
+unrelated view or process-session change does the same. A workflow may,
+however, pre-authorize a specific native view or process-session transition
+that is an expected effect of that operation. Such a transition uses the
+durable handoff rules below; it never makes an old observation or callback
+valid in the new context.
+
+### Durable workflow stages and expected handoffs
+
+The journal separates a logical operation from the fresh observation or
+process session used to reconcile each stage. Every stage transition persists
+its input binding and evidence before the next external effect. Expected
+native changes are accepted only through an explicit pre-state/post-state
+handoff:
+
+1. The pre-state record names the exact operation, authority, incarnation,
+   process session, native view, expected effect, and allowed post-state shape.
+2. After the effect, the old bundle is closed and cannot prove the new state.
+3. A fresh reconciliation session observes the post-state independently.
+4. The runtime verifies that the post-state is a permitted consequence of the
+   journaled effect and that authority, target, donor, and canonical inputs did
+   not change.
+5. The journal persists a handoff receipt containing both bindings, then
+   advances the stage. Delayed callbacks from the pre-state remain stale.
+
+The runtime never merges fields across the pre- and post-state views. The
+handoff receipt proves continuity of the authorized operation; the fresh
+post-state bundle proves current native eligibility.
+
+| Workflow | Durable stages | Expected handoff | Completion receipt | Restart action |
+|---|---|---|---|---|
+| Join / distributed recovery | `Authorized` → `JoinEntered` → `MemberObserved` → `Recovering` → `BoundaryApplied` → `Complete` | `JoinEntered` pre-authorizes a view transition that adds the exact target. `MemberObserved` requires a fresh accepted view containing that target and allowed predecessor members. | Target identity, pre/post views, recovery completion, required and executed GTID boundaries, authority, and attempt | Reobserve membership and recovery. Recover a reached stage, reissue only an idempotent join under the same binding, or fail closed. |
+| Clone | `Authorized` → `TargetFenced` → `DonorValidated` → `CloneEntered` → `TargetRestarted` → `IdentityRebound` → `Joined` → `BoundaryApplied` → `Complete` | `CloneEntered` pre-authorizes one target restart. `IdentityRebound` creates a fresh process session and verifies the same owned root, expected clone result, target incarnation, and permitted native identity before join reconciliation. | Donor/target, clone result, old/new process sessions, storage/native binding, join view, required and executed GTIDs, authority, and attempt | Query clone/provider and process state before replay. Recover a completed clone or restart, then continue from a fresh binding; never credit the old session. |
+| Reseed / rebuild | `Authorized` → `TargetFenced` → `OwnedRootCleared` → `Provisioning` → `TargetRestarted` → `IdentityRebound` → `Joined` → `BoundaryApplied` → `Complete` | The authorization fixes the replacement storage/native expectations and permits only the journaled clear, restart, and join transitions. | Destructive approval, fence, old/new storage and process bindings, donor, views, resulting identity/history, authority, and attempt | Revalidate the fence and ownership marker, discover whether clear/provision/restart completed, and continue only from proven exact state. |
+| Replacement | `Authorized` → `OldIncarnationFenced` → `NewIdentityAllocated` → `Provisioned` → `Joined` → `Complete` | The operation fixes both old and new incarnations. The new identity is not a mutation of the old binding and receives fresh process, storage, native, and view evidence. | Old fence/removal evidence plus the new incarnation's allocation, native identity, accepted view/history, authority, and attempt | Keep the old incarnation fenced; reconcile the new incarnation independently. Never transfer old progress or receipts. |
+| Cleanup | `Authorized` → `TargetContained` → `OwnershipRevalidated` → `ResourcesRemoved` → `Complete` | No identity or view transition grants broader deletion rights. Each removed resource must match the authorization recorded before removal. | Exact removed resources, pre-removal ownership/process/native evidence, containment receipt, post-removal absence, authority, and attempt | Reobserve every journaled resource. Record already-absent exact resources, continue exact idempotent removal, or stop on foreign/reused state. |
+
+An expected handoff is narrow. A join view that drops an unapproved member, a
+clone restart into an unexplained `server_uuid`, a second restart, a different
+donor, or any authority change is unrelated drift and creates a new operation
+attempt or a fail-closed recovery decision.
 
 ### Initial bootstrap
 
@@ -719,6 +759,12 @@ require no network or cluster. Future implementation should cover:
 - partial collection after an intermediate query failure or deadline;
 - authority callback success/failure around the non-atomic persistence window;
 - effect-completed/receipt-not-persisted restart reconciliation;
+- expected join view transition with a fresh post-view bundle and durable
+  pre-view/post-view handoff;
+- clone restart with a fresh process session, exact identity rebinding, and
+  rejection of completion from the old session;
+- rejection of unrelated member/view drift, unexplained native identity
+  change, or an unjournaled second process restart;
 - operation canonicalization, idempotent retry, destructive approval, donor
   change, target change, and stale completion;
 - data-loss callback rejection before its support stage and stale evidence
