@@ -2,6 +2,31 @@
 //!
 //! This crate models Stage 1 evidence only. It does not connect to MySQL,
 //! perform topology changes, or grant client access.
+//!
+//! GTID histories have a four-way set relation rather than scalar progress:
+//!
+//! ```
+//! use kuberic_mysql_core::{GtidRelation, GtidSet};
+//!
+//! let required: GtidSet =
+//!     "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-2".parse()?;
+//! let candidate: GtidSet =
+//!     "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-3".parse()?;
+//! assert_eq!(required.relation(&candidate), GtidRelation::ProperSubset);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Native role is evidence, not client-access authority:
+//!
+//! ```
+//! use kuberic_mysql_core::MemberRole;
+//! use std::str::FromStr;
+//!
+//! let native_role = MemberRole::from_str("PRIMARY")?;
+//! assert_eq!(native_role, MemberRole::Primary);
+//! // Stage 1 exposes no operation that converts this fact into write access.
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 pub mod authority;
 pub mod binding;
