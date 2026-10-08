@@ -16,15 +16,50 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Native role is evidence, not client-access authority:
+//! Even a fresh observation of a native primary grants observation credit
+//! only; Stage 1 client access remains closed:
 //!
 //! ```
-//! use kuberic_mysql_core::MemberRole;
-//! use std::str::FromStr;
-//!
-//! let native_role = MemberRole::from_str("PRIMARY")?;
-//! assert_eq!(native_role, MemberRole::Primary);
-//! // Stage 1 exposes no operation that converts this fact into write access.
+//! # use kuberic_mysql_core::*;
+//! # let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+//! # let binding = ExactBinding::new(ExactBindingParts {
+//! #   resource: ResourceId::new("r")?, partition: PartitionId::new("p")?,
+//! #   replica: ReplicaId::new("replica")?, incarnation: ReplicaIncarnation::new("i")?,
+//! #   process_session: ProcessSessionId::new("ps")?,
+//! #   observation_session: ObservationSessionId::new("os")?,
+//! #   attempt: AttemptId::new("a")?, endpoint: EndpointBinding::new("e")?,
+//! #   storage: StorageBinding::new("s")?, server_uuid: ServerUuid::new(uuid)?,
+//! #   group_name: GroupName::new("g")?, member_id: MemberId::new(uuid)?,
+//! #   member_address: MemberAddress::new("m")?,
+//! #   configuration: ConfigurationId::new("c")?, epoch: Epoch::new("epoch")?,
+//! #   authority_generation: AuthorityGeneration::new("authority")?,
+//! #   view_id: ViewId::new("view")?,
+//! #   credential_generation: CredentialGeneration::new("credential")?,
+//! # });
+//! # let view = NativeView::new(
+//! #   binding.parts().group_name.clone(), binding.parts().view_id.clone(),
+//! #   vec![NativeMember::new(
+//! #     binding.parts().member_id.clone(), binding.parts().member_address.clone(),
+//! #     MemberRole::Primary, MemberState::Online,
+//! #   )],
+//! # )?;
+//! # let metadata = ObservationMetadata::new(
+//! #   binding.clone(), ObservationProvenance::new("example", binding.parts().attempt.clone())?,
+//! #   ObservationInstant::new(1), ObservationInstant::new(2),
+//! #   ObservationInstant::new(3), ObservationInstant::new(2),
+//! # );
+//! # let outcome = ObservationDraft::new(metadata)
+//! #   .opening(ObservationBracket::new(binding.clone(), view.clone()))
+//! #   .executed(BoundGtidSet::new(binding.clone(), GtidSet::empty()))
+//! #   .closing(ObservationBracket::new(binding.clone(), view))
+//! #   .finalize();
+//! let mut authority = AuthoritySession::new(binding.clone());
+//! let capability = authority.begin_attempt(&binding).expect("current binding");
+//! authority
+//!     .complete(capability, &outcome, ObservationInstant::new(2))
+//!     .expect("fresh, current observation");
+//! assert!(authority.has_observation_credit());
+//! assert!(!authority.access().write_open());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
