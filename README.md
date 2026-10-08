@@ -77,3 +77,6 @@ only its isolated project-local fixture child, writes the canonical secret-free
 record after all scenarios and cleanup pass, and removes temporary receipts,
 manifest, data, runtime files, and socket. See the
 [qualification guide](qualification/mysql-uds-observation/README.md).
+
+GitHub Actions installs the same exact Oracle package on Ubuntu 24.04 and runs
+this full qualification runner for every push and pull request.

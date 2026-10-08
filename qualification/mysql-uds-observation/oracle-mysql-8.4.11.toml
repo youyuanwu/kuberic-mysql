@@ -15,7 +15,7 @@ mysql_async_features = ["minimal-rust"]
 tokio_version = "1.53.2"
 tokio_features = ["io-util", "macros", "net", "rt", "test-util", "time"]
 cargo_lock_sha256 = "43533B337C2C5DC15A895D82D9E05EEAE87337FFD5C296486E67042B07A66760"
-source_sha256 = "EAB13D58E16738DC8A9787359FAD391220C89466872FB60DBDA3096F2F27A84A"
+source_sha256 = "39186582809C4C429279C1D12A83CE21925EFED140DC201583C59C692C98DEE3"
 feature_graph_sha256 = "A4932B4B9B24B5873C534D953A95157706BF81D9DD54C875B053EC50851AC9B8"
 validation_results = ["fmt: success; command=cargo fmt --all -- --check", "test: success; command=CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --all-features -- --test-threads=1", "clippy: success; command=CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings", "feature-graph: success; command=CARGO_BUILD_JOBS=1 cargo tree --locked --offline -e features -p kuberic-mysql-adapter"]
 
@@ -37,11 +37,11 @@ child_executable_verified = true
 mysqld_sha256 = "5319F31BABC80A5B438C4C4E87292539818A3F0D737CFF6733FF8AAE7D801058"
 
 [setup]
-process_id = 330332
+process_id = 340793
 init_exit_code = 0
 socket_path = "/data/code/kuberic-mysql/qualification/mysql-uds-observation/local-run/work/runtime/mysql.sock"
 socket_device = 66314
-socket_inode = 407340
+socket_inode = 407415
 private_directory_mode = 448
 private_directories_verified = true
 version_comment = "MySQL Community Server - GPL"
@@ -58,7 +58,7 @@ skip_networking = true
 empty_gtid_history = ""
 gtid_forms_response = 1
 gtid_forms_oracle = "GTID_SUBSET"
-gtid_forms_input = "3da9fd21-c35a-11f1-844f-70a8a5774192:1-3,\n3da9fd21-c35a-11f1-844f-70a8a5774192:tag_live:4-5,\nbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:7-9"
+gtid_forms_input = "0c4c6fe1-c35b-11f1-8c48-70a8a5774192:1-3,\n0c4c6fe1-c35b-11f1-8c48-70a8a5774192:tag_live:4-5,\nbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:7-9"
 gtid_forms_code = ""
 gtid_forms_sql_state = ""
 gtid_lower_boundary = 9223372036854775806
@@ -71,12 +71,12 @@ gtid_upper_boundary_code = 1772
 gtid_upper_boundary_sql_state = "HY000"
 
 [identity]
-server_uuid = "3da9fd21-c35a-11f1-844f-70a8a5774192"
+server_uuid = "0c4c6fe1-c35b-11f1-8c48-70a8a5774192"
 group_name = "cccccccc-cccc-cccc-cccc-cccccccccccc"
-group_replication_address = "127.0.0.1:44803"
-member_id = "3da9fd21-c35a-11f1-844f-70a8a5774192"
-member_address = "127.0.0.1:41743"
-view_id = "17914927941240157:1"
+group_replication_address = "127.0.0.1:41311"
+member_id = "0c4c6fe1-c35b-11f1-8c48-70a8a5774192"
+member_address = "127.0.0.1:45603"
+view_id = "17914931350195173:1"
 member_role = "PRIMARY"
 member_state = "ONLINE"
 read_only = 0
@@ -108,24 +108,24 @@ sql = "SELECT @@GLOBAL.gtid_executed AS gtid_executed"
 columns = ["gtid_executed:VarString:nullable=true"]
 
 [[grant]]
-username = "q330055_setup_1"
+username = "q340632_setup_1"
 grants = ["ALL PRIVILEGES ON *.* WITH GRANT OPTION"]
 
 [[grant]]
-username = "q330055_observer_2"
-grants = ["GRANT SELECT ON performance_schema.replication_group_members TO 'q330055_observer_2'@'localhost'", "GRANT SELECT ON performance_schema.replication_group_member_stats TO 'q330055_observer_2'@'localhost'"]
+username = "q340632_observer_2"
+grants = ["GRANT SELECT ON performance_schema.replication_group_members TO 'q340632_observer_2'@'localhost'", "GRANT SELECT ON performance_schema.replication_group_member_stats TO 'q340632_observer_2'@'localhost'"]
 
 [[grant]]
-username = "q330055_nomembers_3"
-grants = ["GRANT SELECT ON performance_schema.replication_group_member_stats TO 'q330055_nomembers_3'@'localhost'"]
+username = "q340632_nomembers_3"
+grants = ["GRANT SELECT ON performance_schema.replication_group_member_stats TO 'q340632_nomembers_3'@'localhost'"]
 
 [[grant]]
-username = "q330055_nostats_4"
-grants = ["GRANT SELECT ON performance_schema.replication_group_members TO 'q330055_nostats_4'@'localhost'"]
+username = "q340632_nostats_4"
+grants = ["GRANT SELECT ON performance_schema.replication_group_members TO 'q340632_nostats_4'@'localhost'"]
 
 [[grant]]
-username = "q330055_recovery_5"
-grants = ["GRANT REPLICATION SLAVE ON *.* TO 'q330055_recovery_5'@'localhost'"]
+username = "q340632_recovery_5"
+grants = ["GRANT REPLICATION SLAVE ON *.* TO 'q340632_recovery_5'@'localhost'"]
 
 [[scenario]]
 name = "live-product-version"
@@ -167,7 +167,7 @@ name = "live-uds-observer-success"
 origin = "native-required"
 mode = "public-observer"
 passed = true
-detail = "Valid(ValidObservation { metadata: ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-success\"), attempt: AttemptId(\"attempt-success\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:41743\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914927941240157:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-success\") }, start: ObservationInstant(0), end: ObservationInstant(3), deadline: ObservationInstant(5000), decision: ObservationInstant(3) }, evidence: Native(NativeSnapshot { view: NativeView { group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), id: ViewId(\"17914927941240157:1\"), members: [NativeMember { id: MemberId(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), address: MemberAddress(\"127.0.0.1:41743\"), role: Primary, state: Online }] }, local: NativeLocalState { group_replication_address: GroupReplicationAddress(\"127.0.0.1:44803\"), access: NativeAccessState { read_only: Off, super_read_only: Off } } }), executed: GtidSet { entries: [SourceHistory { source: GtidSource { server_uuid: ServerUuid(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), tag: None }, intervals: [GtidInterval { start: 1, end: 2 }] }] } }) / None"
+detail = "Valid(ValidObservation { metadata: ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-success\"), attempt: AttemptId(\"attempt-success\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:45603\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914931350195173:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-success\") }, start: ObservationInstant(0), end: ObservationInstant(4), deadline: ObservationInstant(5000), decision: ObservationInstant(4) }, evidence: Native(NativeSnapshot { view: NativeView { group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), id: ViewId(\"17914931350195173:1\"), members: [NativeMember { id: MemberId(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), address: MemberAddress(\"127.0.0.1:45603\"), role: Primary, state: Online }] }, local: NativeLocalState { group_replication_address: GroupReplicationAddress(\"127.0.0.1:41311\"), access: NativeAccessState { read_only: Off, super_read_only: Off } } }), executed: GtidSet { entries: [SourceHistory { source: GtidSource { server_uuid: ServerUuid(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), tag: None }, intervals: [GtidInterval { start: 1, end: 2 }] }] } }) / None"
 
 [[scenario]]
 name = "live-strict-uds-only"
@@ -181,28 +181,28 @@ name = "live-uds-transport-failure"
 origin = "native-required"
 mode = "public-observer"
 passed = true
-detail = "Unreachable(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-transport-failure\"), attempt: AttemptId(\"attempt-transport-failure\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:41743\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914927941240157:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-transport-failure\") }, start: ObservationInstant(0), end: ObservationInstant(0), deadline: ObservationInstant(5000), decision: ObservationInstant(0) }) / Socket { issue: Missing }"
+detail = "Unreachable(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-transport-failure\"), attempt: AttemptId(\"attempt-transport-failure\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:45603\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914931350195173:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-transport-failure\") }, start: ObservationInstant(0), end: ObservationInstant(0), deadline: ObservationInstant(5000), decision: ObservationInstant(0) }) / Socket { issue: Missing }"
 
 [[scenario]]
 name = "live-authentication-failure"
 origin = "native-required"
 mode = "public-observer"
 passed = true
-detail = "AuthenticationFailure(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-auth-failure\"), attempt: AttemptId(\"attempt-auth-failure\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:41743\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914927941240157:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-auth-failure\") }, start: ObservationInstant(0), end: ObservationInstant(2), deadline: ObservationInstant(5000), decision: ObservationInstant(2) }) / Server { stage: Authenticate, surface: None, class: Authentication, code: 1045, sql_state: SqlState(\"28000\") }"
+detail = "AuthenticationFailure(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-auth-failure\"), attempt: AttemptId(\"attempt-auth-failure\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:45603\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914931350195173:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-auth-failure\") }, start: ObservationInstant(0), end: ObservationInstant(2), deadline: ObservationInstant(5000), decision: ObservationInstant(2) }) / Server { stage: Authenticate, surface: None, class: Authentication, code: 1045, sql_state: SqlState(\"28000\") }"
 
 [[scenario]]
 name = "live-members-table-permission-denied"
 origin = "native-required"
 mode = "public-observer"
 passed = true
-detail = "PermissionDenied(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-members-denied\"), attempt: AttemptId(\"attempt-members-denied\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:41743\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914927941240157:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-members-denied\") }, start: ObservationInstant(0), end: ObservationInstant(2), deadline: ObservationInstant(5000), decision: ObservationInstant(2) }) / Server { stage: Query, surface: Some(GroupMembers), class: Permission, code: 1142, sql_state: SqlState(\"42000\") }"
+detail = "PermissionDenied(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-members-denied\"), attempt: AttemptId(\"attempt-members-denied\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:45603\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914931350195173:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-members-denied\") }, start: ObservationInstant(0), end: ObservationInstant(2), deadline: ObservationInstant(5000), decision: ObservationInstant(2) }) / Server { stage: Query, surface: Some(GroupMembers), class: Permission, code: 1142, sql_state: SqlState(\"42000\") }"
 
 [[scenario]]
 name = "live-stats-table-permission-denied"
 origin = "native-required"
 mode = "public-observer"
 passed = true
-detail = "PermissionDenied(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-stats-denied\"), attempt: AttemptId(\"attempt-stats-denied\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"3da9fd21-c35a-11f1-844f-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:41743\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914927941240157:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-stats-denied\") }, start: ObservationInstant(0), end: ObservationInstant(2), deadline: ObservationInstant(5000), decision: ObservationInstant(2) }) / Server { stage: Query, surface: Some(LocalMemberStats), class: Permission, code: 1142, sql_state: SqlState(\"42000\") }"
+detail = "PermissionDenied(ObservationMetadata { binding: ExactBinding { parts: ExactBindingParts { resource: ResourceId(\"resource\"), partition: PartitionId(\"partition\"), replica: ReplicaId(\"replica\"), incarnation: ReplicaIncarnation(\"incarnation\"), process_session: ProcessSessionId(\"process\"), observation_session: ObservationSessionId(\"observation-stats-denied\"), attempt: AttemptId(\"attempt-stats-denied\"), endpoint: EndpointBinding(\"endpoint\"), storage: StorageBinding(\"storage\"), server_uuid: ServerUuid(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), group_name: GroupName(\"cccccccc-cccc-cccc-cccc-cccccccccccc\"), member_id: MemberId(\"0c4c6fe1-c35b-11f1-8c48-70a8a5774192\"), member_address: MemberAddress(\"127.0.0.1:45603\"), configuration: ConfigurationId(\"configuration\"), epoch: Epoch(\"epoch\"), authority_generation: AuthorityGeneration(\"authority\"), view_id: ViewId(\"17914931350195173:1\"), credential_generation: CredentialGeneration(\"credential\") } }, provenance: ObservationProvenance { origin: \"live-mysql-8.4.11\", attempt: AttemptId(\"attempt-stats-denied\") }, start: ObservationInstant(0), end: ObservationInstant(2), deadline: ObservationInstant(5000), decision: ObservationInstant(2) }) / Server { stage: Query, surface: Some(LocalMemberStats), class: Permission, code: 1142, sql_state: SqlState(\"42000\") }"
 
 [[scenario]]
 name = "plugin-absent-members"
