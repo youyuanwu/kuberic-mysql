@@ -2,11 +2,13 @@ mod common;
 
 use std::str::FromStr;
 
-use common::{binding, bracket, metadata, native_view};
+use common::{binding, bracket, metadata, native_bracket, native_snapshot, native_view};
 use kuberic_mysql_core::{
-    BoundGtidSet, CollectionFailure, GtidSet, IncoherentReason, MalformedReason, MemberId,
-    MemberRole, MemberState, NativeField, NativeValueErrorKind, ObservationBracket,
-    ObservationDraft, ObservationField, ObservationOutcome, StaleReason, UnsupportedReason,
+    BoundGtidSet, CollectionFailure, GroupName, GroupReplicationAddress, GtidSet, IncoherentReason,
+    MalformedReason, MemberId, MemberRole, MemberState, NativeAccessState, NativeEvidenceField,
+    NativeField, NativeLocalState, NativeObservationBracket, NativeObservationDraft,
+    NativeSnapshot, NativeSwitch, NativeValueErrorKind, ObservationBracket, ObservationDraft,
+    ObservationField, ObservationOutcome, StaleReason, UnsupportedReason,
 };
 
 fn complete_draft(start: u64, end: u64, deadline: u64, decision: u64) -> ObservationDraft {
@@ -15,6 +17,19 @@ fn complete_draft(start: u64, end: u64, deadline: u64, decision: u64) -> Observa
         .opening(bracket(binding.clone()))
         .executed(BoundGtidSet::new(binding.clone(), GtidSet::empty()))
         .closing(bracket(binding))
+}
+
+fn complete_native_draft(
+    start: u64,
+    end: u64,
+    deadline: u64,
+    decision: u64,
+) -> NativeObservationDraft {
+    let binding = binding();
+    NativeObservationDraft::new(metadata(binding.clone(), start, end, deadline, decision))
+        .opening(native_bracket(binding.clone()))
+        .executed(BoundGtidSet::new(binding.clone(), GtidSet::empty()))
+        .closing(native_bracket(binding))
 }
 
 fn assert_metadata(
@@ -40,6 +55,16 @@ fn complete_explicitly_empty_observation_is_valid() {
     let valid = outcome.valid().expect("must be valid");
     assert!(valid.executed().entries().is_empty());
     assert_eq!(valid.metadata().provenance().origin(), "fixture");
+    assert!(valid.native_snapshot().is_none());
+}
+
+#[test]
+fn complete_native_observation_retains_snapshot_and_empty_gtid_point_sample() {
+    let outcome = complete_native_draft(1, 2, 3, 2).finalize();
+    let valid = outcome.valid().expect("must be valid");
+    assert_eq!(valid.native_snapshot(), Some(&native_snapshot()));
+    assert_eq!(valid.view(), native_snapshot().view());
+    assert!(valid.executed().entries().is_empty());
 }
 
 #[test]
@@ -186,6 +211,55 @@ fn freshness_boundaries_are_deterministic() {
 }
 
 #[test]
+fn native_deadline_expiry_precedes_partial_progress_without_changing_legacy_behavior() {
+    let attempted = binding();
+    let expired_before_samples =
+        NativeObservationDraft::new(metadata(attempted.clone(), 1, 4, 3, 4)).finalize();
+    let expired_after_opening =
+        NativeObservationDraft::new(metadata(attempted.clone(), 1, 4, 3, 4))
+            .opening(native_bracket(attempted.clone()))
+            .finalize();
+    let expired_after_gtid = NativeObservationDraft::new(metadata(attempted.clone(), 1, 4, 3, 4))
+        .opening(native_bracket(attempted.clone()))
+        .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+        .finalize();
+    let expired_after_complete = complete_native_draft(1, 2, 3, 4).finalize();
+
+    for outcome in [
+        expired_before_samples,
+        expired_after_opening,
+        expired_after_gtid,
+        expired_after_complete,
+    ] {
+        assert!(matches!(
+            outcome,
+            ObservationOutcome::Stale {
+                reason: StaleReason::Expired,
+                ..
+            }
+        ));
+    }
+
+    assert!(
+        complete_native_draft(1, 2, 3, 3)
+            .finalize()
+            .valid()
+            .is_some()
+    );
+    assert!(matches!(
+        NativeObservationDraft::new(metadata(attempted, 2, 1, 3, 2)).finalize(),
+        ObservationOutcome::Malformed {
+            reason: MalformedReason::TimingOrder,
+            ..
+        }
+    ));
+    assert!(matches!(
+        ObservationDraft::new(metadata(binding(), 1, 2, 3, 4)).finalize(),
+        ObservationOutcome::Partial { .. }
+    ));
+}
+
+#[test]
 fn changed_binding_or_view_is_incoherent() {
     let attempted = binding();
     let mut changed_parts = attempted.parts().clone();
@@ -231,6 +305,116 @@ fn changed_binding_or_view_is_incoherent() {
             ..
         }
     ));
+}
+
+#[test]
+fn every_complete_native_snapshot_field_participates_in_bracket_coherence() {
+    let attempted = binding();
+    let base = native_snapshot();
+    let changed_group = NativeSnapshot::new(
+        kuberic_mysql_core::NativeView::new(
+            GroupName::new("other-group").unwrap(),
+            base.view().id().clone(),
+            base.view().members().to_vec(),
+        )
+        .unwrap(),
+        base.local().clone(),
+    );
+    let changed_address = NativeSnapshot::new(
+        base.view().clone(),
+        NativeLocalState::new(
+            GroupReplicationAddress::new("127.0.0.1:33062").unwrap(),
+            base.local().access(),
+        ),
+    );
+    let changed_read_only = NativeSnapshot::new(
+        base.view().clone(),
+        NativeLocalState::new(
+            base.local().group_replication_address().clone(),
+            NativeAccessState::new(NativeSwitch::On, NativeSwitch::Off),
+        ),
+    );
+    let changed_super_read_only = NativeSnapshot::new(
+        base.view().clone(),
+        NativeLocalState::new(
+            base.local().group_replication_address().clone(),
+            NativeAccessState::new(NativeSwitch::Off, NativeSwitch::On),
+        ),
+    );
+
+    for changed in [
+        changed_group,
+        changed_address,
+        changed_read_only,
+        changed_super_read_only,
+    ] {
+        let outcome = NativeObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+            .opening(NativeObservationBracket::new(
+                attempted.clone(),
+                base.clone(),
+            ))
+            .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+            .closing(NativeObservationBracket::new(attempted.clone(), changed))
+            .finalize();
+        assert!(matches!(
+            outcome,
+            ObservationOutcome::Incoherent {
+                reason: IncoherentReason::BracketMismatch,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn native_malformed_evidence_has_an_adapter_neutral_reason() {
+    for field in [
+        NativeEvidenceField::Identity,
+        NativeEvidenceField::Address,
+        NativeEvidenceField::AccessSwitch,
+        NativeEvidenceField::Cell,
+        NativeEvidenceField::Row,
+    ] {
+        let outcome = NativeObservationDraft::new(metadata(binding(), 1, 2, 3, 2))
+            .malformed_native(field)
+            .finalize();
+        assert!(matches!(
+            outcome,
+            ObservationOutcome::Malformed {
+                reason: MalformedReason::NativeEvidence(actual),
+                ..
+            } if actual == field
+        ));
+    }
+}
+
+#[test]
+fn recovering_member_gtid_is_a_point_sample_within_stable_native_brackets() {
+    let attempted = binding();
+    let recovering_view = kuberic_mysql_core::NativeView::new(
+        attempted.parts().group_name.clone(),
+        attempted.parts().view_id.clone(),
+        vec![kuberic_mysql_core::NativeMember::new(
+            attempted.parts().member_id.clone(),
+            attempted.parts().member_address.clone(),
+            MemberRole::Primary,
+            MemberState::Recovering,
+        )],
+    )
+    .unwrap();
+    let snapshot = NativeSnapshot::new(recovering_view, native_snapshot().local().clone());
+    let outcome = NativeObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+        .opening(NativeObservationBracket::new(
+            attempted.clone(),
+            snapshot.clone(),
+        ))
+        .executed(BoundGtidSet::new(
+            attempted.clone(),
+            GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-3").unwrap(),
+        ))
+        .closing(NativeObservationBracket::new(attempted, snapshot))
+        .finalize();
+    assert!(outcome.valid().is_some());
 }
 
 #[test]

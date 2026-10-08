@@ -195,6 +195,9 @@ fn every_non_valid_outcome_receives_no_credit() {
         CollectionFailure::PermissionDenied,
         CollectionFailure::AuthenticationFailure,
         CollectionFailure::Malformed(kuberic_mysql_core::MalformedReason::TimingOrder),
+        CollectionFailure::Malformed(kuberic_mysql_core::MalformedReason::NativeEvidence(
+            kuberic_mysql_core::NativeEvidenceField::Row,
+        )),
         CollectionFailure::Unsupported(kuberic_mysql_core::UnsupportedReason::CollectorCapability),
     ]
     .map(|failure| {

@@ -245,7 +245,15 @@ impl FromStr for GtidSet {
         }
 
         let mut entries: Vec<SourceHistory> = Vec::new();
-        for (component_index, component) in value.split(',').enumerate() {
+        for (component_index, raw_component) in value.split(',').enumerate() {
+            let component = if component_index == 0 {
+                raw_component
+            } else {
+                raw_component
+                    .strip_prefix("\r\n")
+                    .or_else(|| raw_component.strip_prefix('\n'))
+                    .unwrap_or(raw_component)
+            };
             if component.is_empty() {
                 return Err(GtidParseError::new(
                     component_index,
@@ -271,39 +279,57 @@ impl FromStr for GtidSet {
                 ));
             }
 
-            let tag_like = tokens[1]
-                .bytes()
-                .any(|byte| byte.is_ascii_alphabetic() || byte == b'_');
-            let (tag, interval_start) = if tag_like {
-                let tag = GtidTag::new(tokens[1])
-                    .map_err(|kind| GtidParseError::new(component_index, 1, kind))?;
-                (Some(tag), 2)
-            } else {
-                (None, 1)
-            };
-            if tokens.len() == interval_start {
+            let mut tag = None;
+            let mut group_started = false;
+            let mut group_has_interval = false;
+            let mut saw_interval = false;
+            for (token_index, token) in tokens.iter().enumerate().skip(1) {
+                let tag_like = token
+                    .bytes()
+                    .any(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+                if tag_like {
+                    if group_started && !group_has_interval {
+                        return Err(GtidParseError::new(
+                            component_index,
+                            token_index,
+                            GtidParseErrorKind::MissingInterval,
+                        ));
+                    }
+                    tag =
+                        Some(GtidTag::new(*token).map_err(|kind| {
+                            GtidParseError::new(component_index, token_index, kind)
+                        })?);
+                    group_started = true;
+                    group_has_interval = false;
+                    continue;
+                }
+
+                let interval = parse_interval(component_index, token_index, token)?;
+                let source = GtidSource::new(uuid.clone(), tag.clone());
+                if let Some(existing) = entries.iter_mut().find(|entry| entry.source == source) {
+                    existing.intervals.push(interval);
+                } else {
+                    entries.push(SourceHistory {
+                        source,
+                        intervals: vec![interval],
+                    });
+                }
+                group_started = true;
+                group_has_interval = true;
+                saw_interval = true;
+            }
+            if !saw_interval || !group_has_interval {
                 return Err(GtidParseError::new(
                     component_index,
-                    interval_start,
+                    tokens.len(),
                     GtidParseErrorKind::MissingInterval,
                 ));
             }
-
-            let source = GtidSource::new(uuid, tag);
-            let mut intervals = Vec::new();
-            for (token_index, token) in tokens.iter().enumerate().skip(interval_start) {
-                intervals.push(parse_interval(component_index, token_index, token)?);
-            }
-
-            if let Some(existing) = entries.iter_mut().find(|entry| entry.source == source) {
-                existing.intervals.extend(intervals);
-                normalize_intervals(&mut existing.intervals);
-            } else {
-                normalize_intervals(&mut intervals);
-                entries.push(SourceHistory { source, intervals });
-            }
         }
 
+        for entry in &mut entries {
+            normalize_intervals(&mut entry.intervals);
+        }
         entries.sort_by(|left, right| {
             left.source
                 .server_uuid

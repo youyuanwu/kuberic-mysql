@@ -83,16 +83,19 @@ pub use gtid::{
 };
 pub use identity::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding, Epoch,
-    GroupName, MemberAddress, MemberId, ObservationSessionId, PartitionId, ProcessSessionId,
-    ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
+    GroupName, GroupReplicationAddress, MemberAddress, MemberId, ObservationSessionId, PartitionId,
+    ProcessSessionId, ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding,
+    ViewId,
 };
 pub use observation::{
     BoundGtidSet, CollectionFailure, FreshnessError, IncoherentReason, MalformedReason,
-    ObservationBracket, ObservationDraft, ObservationField, ObservationInstant,
-    ObservationMetadata, ObservationOutcome, ObservationProvenance, ProvenanceError, StaleReason,
-    UnsupportedReason, ValidObservation,
+    NativeEvidenceField, NativeObservationBracket, NativeObservationDraft, ObservationBracket,
+    ObservationDraft, ObservationField, ObservationInstant, ObservationMetadata,
+    ObservationOutcome, ObservationProvenance, ProvenanceError, StaleReason, UnsupportedReason,
+    ValidObservation,
 };
 pub use view::{
-    MemberRole, MemberState, NativeField, NativeMember, NativeValueError, NativeValueErrorKind,
-    NativeView, NativeViewError,
+    MemberRole, MemberState, NativeAccessState, NativeField, NativeLocalState, NativeMember,
+    NativeSnapshot, NativeSwitch, NativeValueError, NativeValueErrorKind, NativeView,
+    NativeViewError,
 };

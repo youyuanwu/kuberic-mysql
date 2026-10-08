@@ -4,7 +4,7 @@ use core::fmt;
 
 use crate::{
     AttemptId, ExactBinding, GtidParseError, GtidParseErrorKind, GtidSet, NativeField,
-    NativeValueError, NativeValueErrorKind, NativeView,
+    NativeSnapshot, NativeValueError, NativeValueErrorKind, NativeView,
 };
 
 /// A caller-supplied monotonic instant within one process.
@@ -164,6 +164,21 @@ impl ObservationBracket {
     }
 }
 
+/// A binding and complete native snapshot sampled at one observation bracket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeObservationBracket {
+    binding: ExactBinding,
+    snapshot: NativeSnapshot,
+}
+
+impl NativeObservationBracket {
+    /// Creates a bracketed complete native snapshot.
+    #[must_use]
+    pub const fn new(binding: ExactBinding, snapshot: NativeSnapshot) -> Self {
+        Self { binding, snapshot }
+    }
+}
+
 /// An executed GTID set sampled under one exact binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundGtidSet {
@@ -190,6 +205,21 @@ pub enum ObservationField {
     ClosingBracket,
 }
 
+/// The adapter-neutral native evidence field that was malformed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeEvidenceField {
+    /// A native identity value.
+    Identity,
+    /// A native address value.
+    Address,
+    /// A native on/off switch.
+    AccessSwitch,
+    /// A required native result cell.
+    Cell,
+    /// A native result row.
+    Row,
+}
+
 /// A structured malformed-evidence reason.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MalformedReason {
@@ -197,6 +227,8 @@ pub enum MalformedReason {
     TimingOrder,
     /// A native role or state value was syntactically malformed.
     NativeValue(NativeField),
+    /// Other native evidence failed client-neutral structural validation.
+    NativeEvidence(NativeEvidenceField),
     /// Executed-GTID text failed structured parsing.
     Gtid {
         /// Machine-matchable parser reason.
@@ -266,8 +298,14 @@ pub enum CollectionFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidObservation {
     metadata: ObservationMetadata,
-    view: NativeView,
+    evidence: ValidEvidence,
     executed: GtidSet,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ValidEvidence {
+    Legacy(NativeView),
+    Native(NativeSnapshot),
 }
 
 impl ValidObservation {
@@ -280,7 +318,19 @@ impl ValidObservation {
     /// Returns the exact native view.
     #[must_use]
     pub const fn view(&self) -> &NativeView {
-        &self.view
+        match &self.evidence {
+            ValidEvidence::Legacy(view) => view,
+            ValidEvidence::Native(snapshot) => snapshot.view(),
+        }
+    }
+
+    /// Returns the complete native snapshot for the native observation profile.
+    #[must_use]
+    pub const fn native_snapshot(&self) -> Option<&NativeSnapshot> {
+        match &self.evidence {
+            ValidEvidence::Legacy(_) => None,
+            ValidEvidence::Native(snapshot) => Some(snapshot),
+        }
     }
 
     /// Returns the explicitly observed executed GTID set.
@@ -591,16 +641,232 @@ impl ObservationDraft {
 
         ObservationOutcome::Valid(ValidObservation {
             metadata: self.metadata,
-            view: opening.view,
+            evidence: ValidEvidence::Legacy(opening.view),
             executed: executed.executed,
         })
     }
 }
 
-fn missing_fields(
-    opening: &Option<ObservationBracket>,
+/// Incomplete native observation state with deadline-first freshness semantics.
+#[derive(Clone, Debug)]
+pub struct NativeObservationDraft {
+    metadata: ObservationMetadata,
+    opening: Option<NativeObservationBracket>,
+    executed: Option<BoundGtidSet>,
+    closing: Option<NativeObservationBracket>,
+    failure: Option<CollectionFailure>,
+    duplicate: Option<IncoherentReason>,
+}
+
+impl NativeObservationDraft {
+    /// Begins an incomplete native collection.
+    #[must_use]
+    pub const fn new(metadata: ObservationMetadata) -> Self {
+        Self {
+            metadata,
+            opening: None,
+            executed: None,
+            closing: None,
+            failure: None,
+            duplicate: None,
+        }
+    }
+
+    /// Adds the opening complete native snapshot.
+    #[must_use]
+    pub fn opening(mut self, bracket: NativeObservationBracket) -> Self {
+        if self.opening.is_some() {
+            self.duplicate
+                .get_or_insert(IncoherentReason::DuplicateSample(
+                    ObservationField::OpeningBracket,
+                ));
+        } else {
+            self.opening = Some(bracket);
+        }
+        self
+    }
+
+    /// Adds the explicitly observed executed GTID set.
+    #[must_use]
+    pub fn executed(mut self, executed: BoundGtidSet) -> Self {
+        if self.executed.is_some() {
+            self.duplicate
+                .get_or_insert(IncoherentReason::DuplicateSample(
+                    ObservationField::ExecutedGtidSet,
+                ));
+        } else {
+            self.executed = Some(executed);
+        }
+        self
+    }
+
+    /// Adds the closing complete native snapshot.
+    #[must_use]
+    pub fn closing(mut self, bracket: NativeObservationBracket) -> Self {
+        if self.closing.is_some() {
+            self.duplicate
+                .get_or_insert(IncoherentReason::DuplicateSample(
+                    ObservationField::ClosingBracket,
+                ));
+        } else {
+            self.closing = Some(bracket);
+        }
+        self
+    }
+
+    /// Records a terminal collection failure.
+    #[must_use]
+    pub fn failure(mut self, failure: CollectionFailure) -> Self {
+        if self.failure.is_some() {
+            self.duplicate = Some(IncoherentReason::DuplicateFailure);
+        } else {
+            self.failure = Some(failure);
+        }
+        self
+    }
+
+    /// Records a client-neutral malformed native-evidence failure.
+    #[must_use]
+    pub fn malformed_native(self, field: NativeEvidenceField) -> Self {
+        self.failure(CollectionFailure::Malformed(
+            MalformedReason::NativeEvidence(field),
+        ))
+    }
+
+    /// Records a native role/state decode failure with structured classification.
+    #[must_use]
+    pub fn native_decode_failure(self, error: &NativeValueError) -> Self {
+        let failure = match error.kind() {
+            NativeValueErrorKind::Malformed => {
+                CollectionFailure::Malformed(MalformedReason::NativeValue(error.field()))
+            }
+            NativeValueErrorKind::Unsupported => {
+                CollectionFailure::Unsupported(UnsupportedReason::NativeValue(error.field()))
+            }
+        };
+        self.failure(failure)
+    }
+
+    /// Records a GTID parse failure with its structured location and reason.
+    #[must_use]
+    pub fn gtid_decode_failure(self, error: &GtidParseError) -> Self {
+        self.failure(CollectionFailure::Malformed(MalformedReason::Gtid {
+            kind: *error.kind(),
+            component: error.component(),
+            token: error.token(),
+        }))
+    }
+
+    /// Consumes the native draft and returns one fail-closed typed outcome.
+    #[must_use]
+    pub fn finalize(self) -> ObservationOutcome {
+        if self.metadata.start > self.metadata.end {
+            return ObservationOutcome::Malformed {
+                metadata: self.metadata,
+                reason: MalformedReason::TimingOrder,
+            };
+        }
+
+        if let Some(reason) = self.duplicate {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason,
+            };
+        }
+
+        if self.metadata.provenance.attempt() != &self.metadata.binding.parts().attempt
+            || self
+                .opening
+                .as_ref()
+                .is_some_and(|sample| sample.binding != self.metadata.binding)
+            || self
+                .executed
+                .as_ref()
+                .is_some_and(|sample| sample.binding != self.metadata.binding)
+            || self
+                .closing
+                .as_ref()
+                .is_some_and(|sample| sample.binding != self.metadata.binding)
+        {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason: IncoherentReason::BindingMismatch,
+            };
+        }
+
+        if let (Some(opening), Some(closing)) = (&self.opening, &self.closing)
+            && opening.snapshot != closing.snapshot
+        {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason: IncoherentReason::BracketMismatch,
+            };
+        }
+
+        if self.metadata.end > self.metadata.deadline
+            || self.metadata.decision > self.metadata.deadline
+        {
+            return ObservationOutcome::Stale {
+                metadata: self.metadata,
+                reason: StaleReason::Expired,
+            };
+        }
+
+        if let Some(failure) = self.failure {
+            let missing = missing_fields(&self.opening, &self.executed, &self.closing);
+            if !missing.is_empty() && missing.len() != 3 {
+                return ObservationOutcome::Partial {
+                    metadata: self.metadata,
+                    missing,
+                    cause: Some(failure),
+                };
+            }
+            return failure_outcome(self.metadata, failure);
+        }
+
+        let missing = missing_fields(&self.opening, &self.executed, &self.closing);
+        if !missing.is_empty() {
+            return ObservationOutcome::Partial {
+                metadata: self.metadata,
+                missing,
+                cause: None,
+            };
+        }
+
+        if self.metadata.decision < self.metadata.end {
+            return ObservationOutcome::FutureDated(self.metadata);
+        }
+
+        let opening = self.opening.expect("missing fields checked");
+        let closing = self.closing.expect("missing fields checked");
+        let executed = self.executed.expect("missing fields checked");
+        if let Err(reason) = validate_view_binding(opening.snapshot.view(), &self.metadata.binding)
+        {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason,
+            };
+        }
+        if let Err(reason) = validate_view_binding(closing.snapshot.view(), &self.metadata.binding)
+        {
+            return ObservationOutcome::Incoherent {
+                metadata: self.metadata,
+                reason,
+            };
+        }
+
+        ObservationOutcome::Valid(ValidObservation {
+            metadata: self.metadata,
+            evidence: ValidEvidence::Native(opening.snapshot),
+            executed: executed.executed,
+        })
+    }
+}
+
+fn missing_fields<T>(
+    opening: &Option<T>,
     executed: &Option<BoundGtidSet>,
-    closing: &Option<ObservationBracket>,
+    closing: &Option<T>,
 ) -> Vec<ObservationField> {
     let mut missing = Vec::new();
     if opening.is_none() {

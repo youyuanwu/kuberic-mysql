@@ -1,8 +1,9 @@
 use std::str::FromStr;
 
 use kuberic_mysql_core::{
-    GroupName, GtidRelation, GtidSet, MemberAddress, MemberId, MemberRole, MemberState,
-    NativeMember, NativeValueErrorKind, NativeView, NativeViewError, ViewId,
+    GroupName, GroupReplicationAddress, GtidRelation, GtidSet, MemberAddress, MemberId, MemberRole,
+    MemberState, NativeAccessState, NativeLocalState, NativeMember, NativeSnapshot, NativeSwitch,
+    NativeValueErrorKind, NativeView, NativeViewError, ViewId,
 };
 
 fn member(uuid: &str, address: &str, role: MemberRole, state: MemberState) -> NativeMember {
@@ -163,4 +164,75 @@ fn native_view_facts_do_not_change_gtid_relations() {
 
     assert_eq!(before, GtidRelation::Incomparable);
     assert_eq!(left.relation(&right), before);
+}
+
+#[test]
+fn native_snapshot_retains_separate_address_and_access_domains() {
+    let view = view(vec![member(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "mysql.example:3306",
+        MemberRole::Primary,
+        MemberState::Online,
+    )])
+    .unwrap();
+    let snapshot = NativeSnapshot::new(
+        view,
+        NativeLocalState::new(
+            GroupReplicationAddress::new("127.0.0.1:33061").unwrap(),
+            NativeAccessState::new(NativeSwitch::Off, NativeSwitch::On),
+        ),
+    );
+
+    assert_eq!(
+        snapshot.view().members()[0].address().as_str(),
+        "mysql.example:3306"
+    );
+    assert_eq!(
+        snapshot.local().group_replication_address().as_str(),
+        "127.0.0.1:33061"
+    );
+    assert!(!snapshot.local().access().read_only().is_on());
+    assert!(snapshot.local().access().super_read_only().is_on());
+}
+
+#[test]
+fn every_local_native_fact_participates_in_snapshot_equality() {
+    let base = NativeSnapshot::new(
+        view(vec![member(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "a:3306",
+            MemberRole::Primary,
+            MemberState::Online,
+        )])
+        .unwrap(),
+        NativeLocalState::new(
+            GroupReplicationAddress::new("a:33061").unwrap(),
+            NativeAccessState::new(NativeSwitch::Off, NativeSwitch::Off),
+        ),
+    );
+    let changed_address = NativeSnapshot::new(
+        base.view().clone(),
+        NativeLocalState::new(
+            GroupReplicationAddress::new("b:33061").unwrap(),
+            base.local().access(),
+        ),
+    );
+    let changed_read_only = NativeSnapshot::new(
+        base.view().clone(),
+        NativeLocalState::new(
+            base.local().group_replication_address().clone(),
+            NativeAccessState::new(NativeSwitch::On, NativeSwitch::Off),
+        ),
+    );
+    let changed_super_read_only = NativeSnapshot::new(
+        base.view().clone(),
+        NativeLocalState::new(
+            base.local().group_replication_address().clone(),
+            NativeAccessState::new(NativeSwitch::Off, NativeSwitch::On),
+        ),
+    );
+
+    assert_ne!(base, changed_address);
+    assert_ne!(base, changed_read_only);
+    assert_ne!(base, changed_super_read_only);
 }

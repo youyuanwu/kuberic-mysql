@@ -25,6 +25,27 @@ fn sources_and_tags_remain_distinct_and_sorted() {
 }
 
 #[test]
+fn native_newlines_and_multiple_tag_groups_are_accepted_narrowly() {
+    let native = parse(&format!(
+        "{A}:1-3:tag_a:1-2:tag_b:4,\n{B}:7,\r\n{A}:tag_a:3"
+    ));
+    assert_eq!(
+        native.to_string(),
+        format!("{A}:1-3,{A}:tag_a:1-3,{A}:tag_b:4,{B}:7")
+    );
+
+    for rejected in [
+        format!("{A}:1, {B}:2"),
+        format!("{A}:1,\t{B}:2"),
+        format!("{A}:1,\r{B}:2"),
+        format!("\n{A}:1"),
+        format!("{A}:1\n"),
+    ] {
+        assert!(GtidSet::from_str(&rejected).is_err(), "{rejected:?}");
+    }
+}
+
+#[test]
 fn relations_use_only_set_containment() {
     let empty = parse("");
     let small = parse(&format!("{A}:1-2"));
@@ -63,6 +84,11 @@ fn parser_rejects_structured_malformed_inputs() {
         (
             format!("{A}:{}:1", "a".repeat(33)),
             GtidParseErrorKind::InvalidTag,
+        ),
+        (format!("{A}:tag_a"), GtidParseErrorKind::MissingInterval),
+        (
+            format!("{A}:tag_a:tag_b:1"),
+            GtidParseErrorKind::MissingInterval,
         ),
         (format!("{A}:1,"), GtidParseErrorKind::EmptySource),
         (
