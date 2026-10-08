@@ -40,9 +40,12 @@ missing, failed, changed, or stale receipts.
 
 The gate verifies package ownership, exact installed/candidate version, dpkg
 integrity, APT source stanza, executable digest, runtime libraries, and native
-product fields. It creates owner-only (`0700`) project-local work, runtime, and
-data directories. `aa-exec` transitions only the recorded fixture child so the
-Oracle AppArmor attachment cannot redirect it to system paths.
+product fields. Before creating fixture state it rejects an active
+`mysql.service` or any foreign `mysqld` process. It pins `/usr/bin/aa-exec`,
+verifies its package integrity and digest, and confirms through
+`/proc/<pid>/exe` that the launched child became the verified
+`/usr/sbin/mysqld`. It creates owner-only (`0700`) project-local work, runtime,
+and data directories.
 
 The child uses a private UDS, `skip_networking=ON`, and a one-member Group
 Replication loopback transport. The gate initializes fresh data, provisions
@@ -59,8 +62,10 @@ all native-required, pinned Oracle-owned, and synthetic scenarios pass and
 cleanup is proven.
 
 - **Native-required:** product/version, online observation, strict UDS,
-  authentication and permission distinctions, least privilege, empty/tagged
-  GTIDs, and numeric boundaries.
+  a public-observer closed/missing-UDS transport failure, authentication and
+  permission distinctions, least privilege, empty/tagged/newline/multi-source
+  `GTID_SUBSET` evidence with an exact scalar response of `1`, and numeric
+  boundaries. Missing rows, SQL `NULL`, `0`, or any other scalar are ineligible.
 - **Oracle-owned:** exact immutable commit, tag, URL, path, source digest,
   range, and derivation for absent, never-started, stopped, and recovering
   representations.
@@ -75,6 +80,8 @@ errors. An unmet prerequisite is a failed qualification, never a skipped pass.
 
 The claim covers only Oracle MySQL 8.4.11 and this installed package/digest.
 The qualified GTID maximum is `9223372036854775806`; the server rejected
-`9223372036854775807`. Any package, executable, patch, product, platform, query
+`9223372036854775807` specifically with MySQL error `1772` and SQLSTATE
+`HY000`; any other response requires specification review. Any package,
+executable, patch, product, platform, query
 shape, client graph, or fixture-source change requires a new runner result,
 canonical record, review, and explicit compatibility update.

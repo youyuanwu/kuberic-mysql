@@ -19,6 +19,7 @@ const EXPECTED_PACKAGE_NAME: &str = "mysql-community-server-core";
 const EXPECTED_PACKAGE_VERSION: &str = "8.4.11-1ubuntu24.04";
 const EXPECTED_APT_REPOSITORY_HOST: &str = "repo.mysql.com";
 const EXPECTED_APT_REPOSITORY_COMPONENT: &str = "mysql-8.4-lts";
+const EXPECTED_APPARMOR_EXEC: &str = "/usr/bin/aa-exec";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestPath(PathBuf);
@@ -126,6 +127,13 @@ impl QualificationManifest {
     }
 
     fn validate(&self) -> Result<(), QualificationError> {
+        if self.apparmor_exec_path != Path::new(EXPECTED_APPARMOR_EXEC) {
+            return Err(QualificationError::new(
+                QualificationCode::MissingInput,
+                "AppArmor launcher path",
+                format!("must be exactly {EXPECTED_APPARMOR_EXEC}"),
+            ));
+        }
         for (label, path) in [
             ("mysqld path", &self.mysqld_path),
             ("AppArmor launcher path", &self.apparmor_exec_path),
@@ -233,6 +241,11 @@ pub struct SetupReceipt {
     pub mysqld_sha256: String,
     pub mysqld_path: PathBuf,
     pub process_launcher: PathBuf,
+    pub launcher_package: String,
+    pub launcher_sha256: String,
+    pub launcher_verified: bool,
+    pub child_executable: PathBuf,
+    pub child_executable_verified: bool,
     pub init_exit_code: i32,
     pub process_id: u32,
     pub socket_path: PathBuf,
@@ -427,6 +440,13 @@ pub struct PreparedArtifact {
     package: PackageEvidence,
     mysqld_sha256: String,
     mysqld_path: PathBuf,
+    launcher: LauncherEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LauncherEvidence {
+    package: String,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -443,6 +463,8 @@ struct PackageEvidence {
 impl PreparedArtifact {
     pub fn prepare(manifest: &QualificationManifest) -> Result<Self, QualificationError> {
         verify_platform()?;
+        preflight_no_foreign_mysql()?;
+        let launcher = verify_launcher(&manifest.apparmor_exec_path)?;
         let layout = Layout::create(manifest)?;
         let verified = verify_installed_package(manifest);
         let (package, mysqld_sha256, mysqld_path) = match verified {
@@ -468,6 +490,7 @@ impl PreparedArtifact {
             package,
             mysqld_sha256,
             mysqld_path,
+            launcher,
         })
     }
 
@@ -570,6 +593,8 @@ impl PreparedArtifact {
         {
             return Err(cleanup_failed_launch(&mut child, &self.layout, error));
         }
+        let child_executable = attest_child_executable(child.id(), &self.mysqld_path)
+            .map_err(|error| cleanup_failed_launch(&mut child, &self.layout, error))?;
 
         let socket_metadata = match fs::metadata(&config.socket_path) {
             Ok(metadata) => metadata,
@@ -603,6 +628,11 @@ impl PreparedArtifact {
             mysqld_sha256: self.mysqld_sha256,
             mysqld_path: mysqld_path.clone(),
             process_launcher: manifest.apparmor_exec_path.clone(),
+            launcher_package: self.launcher.package,
+            launcher_sha256: self.launcher.sha256,
+            launcher_verified: true,
+            child_executable,
+            child_executable_verified: true,
             init_exit_code: init_status.code().unwrap_or_default(),
             process_id,
             socket_path,
@@ -634,6 +664,123 @@ fn mysqld_command(manifest: &QualificationManifest, mysqld_path: &Path) -> Comma
         .arg("--")
         .arg(mysqld_path);
     command
+}
+
+fn preflight_no_foreign_mysql() -> Result<(), QualificationError> {
+    let service = Command::new("systemctl")
+        .args(["is-active", "mysql.service"])
+        .output()
+        .map_err(|error| {
+            QualificationError::new(
+                QualificationCode::ToolUnavailable,
+                "mysql service preflight",
+                error.to_string(),
+            )
+        })?;
+    let state = String::from_utf8_lossy(&service.stdout).trim().to_owned();
+    if matches!(state.as_str(), "active" | "activating" | "reloading") {
+        return Err(QualificationError::new(
+            QualificationCode::ForeignMysqlActive,
+            "mysql service preflight",
+            format!("mysql.service is {state}"),
+        ));
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|error| {
+        QualificationError::new(
+            QualificationCode::ForeignMysqlActive,
+            "process preflight",
+            error.to_string(),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            QualificationError::new(
+                QualificationCode::ForeignMysqlActive,
+                "process preflight",
+                error.to_string(),
+            )
+        })?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            && let Ok(name) = fs::read_to_string(entry.path().join("comm"))
+        {
+            names.push(name.trim().to_owned());
+        }
+    }
+    reject_foreign_process_names(&names)
+}
+
+fn reject_foreign_process_names(names: &[String]) -> Result<(), QualificationError> {
+    if names
+        .iter()
+        .any(|name| name == "mysqld" || name == "mysqld-debug")
+    {
+        Err(QualificationError::new(
+            QualificationCode::ForeignMysqlActive,
+            "process preflight",
+            "a foreign mysqld process is already running".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_launcher(path: &Path) -> Result<LauncherEvidence, QualificationError> {
+    let owner = run_tool(
+        "dpkg-query",
+        &[OsStr::new("-S"), path.as_os_str()],
+        QualificationCode::ToolUnavailable,
+        "query AppArmor launcher owner",
+    )?;
+    let owner_text = String::from_utf8_lossy(&owner.stdout);
+    let package = owner_text
+        .split_once(':')
+        .map(|(package, _)| package.trim().to_owned())
+        .ok_or_else(|| {
+            QualificationError::new(
+                QualificationCode::PackageOwnershipMismatch,
+                "AppArmor launcher owner",
+                "dpkg-query returned no package owner".to_owned(),
+            )
+        })?;
+    verify_dpkg_files(&package)?;
+    Ok(LauncherEvidence {
+        package,
+        sha256: compute_sha256(path)?,
+    })
+}
+
+fn attest_child_executable(pid: u32, expected: &Path) -> Result<PathBuf, QualificationError> {
+    let actual = fs::read_link(format!("/proc/{pid}/exe")).map_err(|error| {
+        QualificationError::new(
+            QualificationCode::ChildExecutableMismatch,
+            "child executable attestation",
+            error.to_string(),
+        )
+    })?;
+    let expected = fs::canonicalize(expected).map_err(|error| {
+        QualificationError::new(
+            QualificationCode::ChildExecutableMismatch,
+            "expected executable attestation",
+            error.to_string(),
+        )
+    })?;
+    if actual == expected {
+        Ok(actual)
+    } else {
+        Err(QualificationError::new(
+            QualificationCode::ChildExecutableMismatch,
+            "child executable attestation",
+            format!(
+                "expected {}, found {}",
+                expected.display(),
+                actual.display()
+            ),
+        ))
+    }
 }
 
 fn verify_installed_package(
@@ -1480,8 +1627,8 @@ mod tests {
     use super::{
         EXPECTED_APT_REPOSITORY_COMPONENT, EXPECTED_APT_REPOSITORY_HOST, EXPECTED_PACKAGE_NAME,
         EXPECTED_PACKAGE_VERSION, ManifestPath, create_private_directory, normalize_hex,
-        normalize_project_path, parse_apt_policy, parse_manifest_map, validate_installed_metadata,
-        validate_package_owner, verify_match, verify_private_mode,
+        normalize_project_path, parse_apt_policy, parse_manifest_map, reject_foreign_process_names,
+        validate_installed_metadata, validate_package_owner, verify_match, verify_private_mode,
     };
 
     #[test]
@@ -1636,5 +1783,12 @@ mod tests {
         .unwrap();
         assert!(verify_private_mode(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_preflight_rejects_foreign_mysqld_only() {
+        assert!(reject_foreign_process_names(&["cargo".to_owned()]).is_ok());
+        assert!(reject_foreign_process_names(&["mysqld".to_owned()]).is_err());
+        assert!(reject_foreign_process_names(&["mysqld-debug".to_owned()]).is_err());
     }
 }

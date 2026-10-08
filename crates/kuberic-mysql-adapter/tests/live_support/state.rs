@@ -24,9 +24,23 @@ pub struct GtidBoundaryProbe {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GtidScalarResponse {
+    MissingRow,
+    Null,
+    Value(u8),
+}
+
+impl GtidScalarResponse {
+    pub fn is_exact_one(&self) -> bool {
+        matches!(self, Self::Value(1))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GtidFunctionProbe {
+    pub oracle: String,
     pub input: String,
-    pub accepted: bool,
+    pub response: GtidScalarResponse,
     pub code: Option<u16>,
     pub sql_state: Option<String>,
 }
@@ -379,16 +393,32 @@ bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:7-9"
         sql_literal(&input),
         sql_literal(&input)
     );
-    match connection.query_first::<Option<Option<u8>>, _>(&sql).await {
-        Ok(_) => Ok(GtidFunctionProbe {
+    match connection.query_first::<Option<u8>, _>(&sql).await {
+        Ok(Some(Some(response))) => Ok(GtidFunctionProbe {
+            oracle: "GTID_SUBSET".to_owned(),
             input,
-            accepted: true,
+            response: GtidScalarResponse::Value(response),
+            code: None,
+            sql_state: None,
+        }),
+        Ok(Some(None)) => Ok(GtidFunctionProbe {
+            oracle: "GTID_SUBSET".to_owned(),
+            input,
+            response: GtidScalarResponse::Null,
+            code: None,
+            sql_state: None,
+        }),
+        Ok(None) => Ok(GtidFunctionProbe {
+            oracle: "GTID_SUBSET".to_owned(),
+            input,
+            response: GtidScalarResponse::MissingRow,
             code: None,
             sql_state: None,
         }),
         Err(mysql_async::Error::Server(server)) => Ok(GtidFunctionProbe {
+            oracle: "GTID_SUBSET".to_owned(),
             input,
-            accepted: false,
+            response: GtidScalarResponse::MissingRow,
             code: Some(server.code),
             sql_state: Some(server.state),
         }),
@@ -465,7 +495,7 @@ fn sql_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sql_literal;
+    use super::{GtidScalarResponse, sql_literal};
 
     #[test]
     fn gtid_boundary_probe_values_are_exact() {
@@ -481,5 +511,14 @@ mod tests {
     #[test]
     fn sql_literal_escapes_single_quotes() {
         assert_eq!(sql_literal("o'hara"), "'o''hara'");
+    }
+
+    #[test]
+    fn gtid_subset_requires_exact_scalar_one() {
+        assert!(GtidScalarResponse::Value(1).is_exact_one());
+        assert!(!GtidScalarResponse::MissingRow.is_exact_one());
+        assert!(!GtidScalarResponse::Null.is_exact_one());
+        assert!(!GtidScalarResponse::Value(0).is_exact_one());
+        assert!(!GtidScalarResponse::Value(2).is_exact_one());
     }
 }

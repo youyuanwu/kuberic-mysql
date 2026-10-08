@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
 use kuberic_mysql_adapter as public_adapter;
@@ -144,10 +146,13 @@ pub async fn run_all(
             name: "live-native-tagged-gtid-functions".to_owned(),
             origin: EvidenceOriginKind::NativeRequired,
             mode: ScenarioMode::DirectSetup,
-            passed: baseline.gtid_forms.accepted,
+            passed: baseline.gtid_forms.oracle == "GTID_SUBSET"
+                && baseline.gtid_forms.response.is_exact_one()
+                && baseline.gtid_forms.code.is_none()
+                && baseline.gtid_forms.sql_state.is_none(),
             detail: format!(
-                "accepted={} code={:?} state={:?}",
-                baseline.gtid_forms.accepted,
+                "response={:?} code={:?} state={:?}",
+                baseline.gtid_forms.response,
                 baseline.gtid_forms.code,
                 baseline.gtid_forms.sql_state
             ),
@@ -156,7 +161,7 @@ pub async fn run_all(
             name: "live-gtid-boundary-9223372036854775806".to_owned(),
             origin: EvidenceOriginKind::NativeRequired,
             mode: ScenarioMode::DirectSetup,
-            passed: boundary_recorded(&baseline.lower_boundary),
+            passed: lower_boundary_qualified(&baseline.lower_boundary),
             detail: format!(
                 "accepted={} code={:?} state={:?}",
                 baseline.lower_boundary.accepted,
@@ -168,7 +173,7 @@ pub async fn run_all(
             name: "live-gtid-boundary-9223372036854775807".to_owned(),
             origin: EvidenceOriginKind::NativeRequired,
             mode: ScenarioMode::DirectSetup,
-            passed: boundary_recorded(&baseline.upper_boundary),
+            passed: upper_boundary_qualified(&baseline.upper_boundary),
             detail: format!(
                 "accepted={} code={:?} state={:?}",
                 baseline.upper_boundary.accepted,
@@ -196,6 +201,52 @@ pub async fn run_all(
             "skip_networking={} valid={success_passed}",
             baseline.skip_networking
         ),
+    });
+    let missing_socket = fixture.socket_path().with_file_name("x");
+    let _ = fs::remove_file(&missing_socket);
+    let listener = UnixListener::bind(&missing_socket).map_err(|error| {
+        QualificationError::new(
+            QualificationCode::LaunchFailure,
+            "create transport failure socket",
+            error.to_string(),
+        )
+    })?;
+    let validated = public_adapter::UnixSocketPath::new(&missing_socket).map_err(|error| {
+        QualificationError::new(
+            QualificationCode::LaunchFailure,
+            "validate transport failure socket",
+            error.to_string(),
+        )
+    })?;
+    drop(listener);
+    fs::remove_file(&missing_socket).map_err(|error| {
+        QualificationError::new(
+            QualificationCode::CleanupFailure,
+            "remove transport failure socket",
+            error.to_string(),
+        )
+    })?;
+    let transport = observe_live_on_socket(
+        fixture,
+        online,
+        accounts.observer().username(),
+        accounts.observer().password(),
+        "transport-failure",
+        validated,
+    )
+    .await?;
+    results.push(ScenarioResult {
+        name: "live-uds-transport-failure".to_owned(),
+        origin: EvidenceOriginKind::NativeRequired,
+        mode: ScenarioMode::PublicObserver,
+        passed: matches!(transport.outcome(), ObservationOutcome::Unreachable(_))
+            && matches!(
+                transport.diagnostic(),
+                public_adapter::AdapterDiagnostic::Socket {
+                    issue: public_adapter::SocketIssue::Missing
+                }
+            ),
+        detail: format!("{:?} / {:?}", transport.outcome(), transport.diagnostic()),
     });
 
     let auth = observe_live_with_password(
@@ -508,16 +559,28 @@ async fn observe_live_with_password(
     password: &str,
     attempt: &str,
 ) -> Result<public_adapter::ObservationReport, QualificationError> {
+    let socket = public_adapter::UnixSocketPath::new(fixture.socket_path()).map_err(|error| {
+        QualificationError::new(
+            QualificationCode::LaunchFailure,
+            "validate live socket path",
+            error.to_string(),
+        )
+    })?;
+    observe_live_on_socket(fixture, online, username, password, attempt, socket).await
+}
+
+async fn observe_live_on_socket(
+    fixture: &RunningFixture,
+    online: &OnlineIdentity,
+    username: &str,
+    password: &str,
+    attempt: &str,
+    socket: public_adapter::UnixSocketPath,
+) -> Result<public_adapter::ObservationReport, QualificationError> {
     let binding = live_binding(online, attempt)?;
     let request = public_adapter::ObservationRequest::new(
         binding.clone(),
-        public_adapter::UnixSocketPath::new(fixture.socket_path()).map_err(|error| {
-            QualificationError::new(
-                QualificationCode::LaunchFailure,
-                "validate live socket path",
-                error.to_string(),
-            )
-        })?,
+        socket,
         public_adapter::ObserverCredentials::new(username, password).map_err(|error| {
             QualificationError::new(
                 QualificationCode::AccountStateSetupFailure,
@@ -608,8 +671,18 @@ fn live_binding(
     }))
 }
 
-fn boundary_recorded(boundary: &super::state::GtidBoundaryProbe) -> bool {
-    boundary.accepted || boundary.code.is_some()
+fn lower_boundary_qualified(boundary: &super::state::GtidBoundaryProbe) -> bool {
+    boundary.value == kuberic_mysql_core::MAX_SEQUENCE
+        && boundary.accepted
+        && boundary.code.is_none()
+        && boundary.sql_state.is_none()
+}
+
+fn upper_boundary_qualified(boundary: &super::state::GtidBoundaryProbe) -> bool {
+    boundary.value == kuberic_mysql_core::MAX_SEQUENCE + 1
+        && !boundary.accepted
+        && boundary.code == Some(1772)
+        && boundary.sql_state.as_deref() == Some("HY000")
 }
 
 fn required_inventory() -> Result<BTreeSet<(String, EvidenceOriginKind)>, QualificationError> {
@@ -622,6 +695,7 @@ fn required_inventory() -> Result<BTreeSet<(String, EvidenceOriginKind)>, Qualif
         "live-gtid-boundary-9223372036854775807",
         "live-uds-observer-success",
         "live-strict-uds-only",
+        "live-uds-transport-failure",
         "live-authentication-failure",
         "live-members-table-permission-denied",
         "live-stats-table-permission-denied",

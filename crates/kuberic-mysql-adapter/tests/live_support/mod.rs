@@ -39,6 +39,8 @@ pub enum QualificationCode {
     OutputGated = 20,
     PackageMetadataMismatch = 21,
     AptProvenanceMismatch = 22,
+    ForeignMysqlActive = 23,
+    ChildExecutableMismatch = 24,
 }
 
 impl QualificationCode {
@@ -65,6 +67,8 @@ impl QualificationCode {
             Self::OutputGated => "OUTPUT_GATED",
             Self::PackageMetadataMismatch => "PACKAGE_METADATA_MISMATCH",
             Self::AptProvenanceMismatch => "APT_PROVENANCE_MISMATCH",
+            Self::ForeignMysqlActive => "FOREIGN_MYSQL_ACTIVE",
+            Self::ChildExecutableMismatch => "CHILD_EXECUTABLE_MISMATCH",
         }
     }
 
@@ -184,14 +188,13 @@ pub(crate) fn project_root() -> std::path::PathBuf {
 
 pub(crate) fn mysql_error_detail(error: &mysql_async::Error) -> String {
     match error {
-        mysql_async::Error::Io(inner) => format!("transport {inner:?}"),
-        mysql_async::Error::Server(server) => format!(
-            "server code={} state={} message={}",
-            server.code, server.state, server.message
-        ),
-        mysql_async::Error::Driver(inner) => format!("driver {inner:?}"),
-        mysql_async::Error::Url(inner) => format!("url {inner:?}"),
-        mysql_async::Error::Other(inner) => format!("other {inner:?}"),
+        mysql_async::Error::Io(_) => "transport failure".to_owned(),
+        mysql_async::Error::Server(server) => {
+            format!("server code={} state={}", server.code, server.state)
+        }
+        mysql_async::Error::Driver(_) => "driver failure".to_owned(),
+        mysql_async::Error::Url(_) => "connection configuration failure".to_owned(),
+        mysql_async::Error::Other(_) => "client failure".to_owned(),
     }
 }
 
@@ -204,7 +207,7 @@ pub(crate) fn absolute_test_path(name: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{QualificationCode, QualificationError};
+    use super::{QualificationCode, QualificationError, mysql_error_detail};
 
     #[test]
     fn display_includes_named_code_and_context() {
@@ -217,5 +220,22 @@ mod tests {
         assert!(text.contains("DIGEST_MISMATCH"));
         assert!(text.contains("mysqld digest"));
         assert!(text.contains("deadbeef"));
+    }
+
+    #[test]
+    fn mysql_errors_never_retain_server_messages_or_secrets() {
+        let error = mysql_async::Error::Server(mysql_async::ServerError {
+            code: 1045,
+            message: "password=hunter2 secret-token".to_owned(),
+            state: "28000".to_owned(),
+        });
+        let detail = mysql_error_detail(&error);
+        let qualification =
+            QualificationError::new(QualificationCode::AccountStateSetupFailure, "query", detail);
+        let rendered = format!("{qualification:?} {qualification}");
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("secret-token"));
+        assert!(rendered.contains("code=1045"));
+        assert!(rendered.contains("state=28000"));
     }
 }

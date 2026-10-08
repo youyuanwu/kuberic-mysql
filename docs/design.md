@@ -46,6 +46,9 @@ boundary before changing the core contract.
 
 The socket must be absolute, UTF-8, non-symlink, and the same socket inode at
 preflight and connection. The client is configured with no TCP fallback.
+Qualification also exercises the public observer against a validated socket
+that is then closed and removed, proving an exact unreachable UDS result
+without TCP fallback.
 Observation uses one absolute deadline across validation, connect, every query
 and row-consumption boundary, disconnect, and final admission. Expiry has
 priority and earns zero credit; explicit teardown uses only the remaining
@@ -67,8 +70,13 @@ Cargo lock/source digests, selected/effective client features, server-free
 validation receipts, fixture provenance, native scenarios, and deterministic
 cleanup before emitting the canonical record. It creates owner-only
 project-local runtime/data directories, uses `aa-exec` only for the isolated
-child, disables client TCP, and permits only one-member loopback Group
-Replication transport.
+child, rejects an active system service or foreign `mysqld`, verifies the
+launcher package/digest, attests `/proc/<pid>/exe` as the package-owned
+`/usr/sbin/mysqld`, disables client TCP, and permits only one-member loopback
+Group Replication transport. Eligibility requires the exact upper-bound
+rejection `1772/HY000` and records the precise tagged/newline/multi-source
+`GTID_SUBSET` input with an exact scalar response of `1`; no row, SQL `NULL`,
+`0`, or another scalar is not accepted evidence.
 
 This slice makes no claim for another MySQL patch or fork, production process
 ownership, three-member lifecycle, topology mutation, failover, fencing,

@@ -222,6 +222,27 @@ impl QualificationRecord {
             "process_launcher",
             &self.setup.process_launcher.display().to_string(),
         );
+        line(
+            &mut output,
+            "launcher_package",
+            &self.setup.launcher_package,
+        );
+        line(&mut output, "launcher_sha256", &self.setup.launcher_sha256);
+        bool_line(
+            &mut output,
+            "launcher_verified",
+            self.setup.launcher_verified,
+        );
+        line(
+            &mut output,
+            "child_executable",
+            &self.setup.child_executable.display().to_string(),
+        );
+        bool_line(
+            &mut output,
+            "child_executable_verified",
+            self.setup.child_executable_verified,
+        );
         line(&mut output, "mysqld_sha256", &self.setup.mysqld_sha256);
 
         output.push_str("\n[setup]\n");
@@ -292,10 +313,36 @@ impl QualificationRecord {
             "empty_gtid_history",
             &self.baseline.empty_gtid_history,
         );
-        bool_line(
+        integer_line(
             &mut output,
-            "gtid_forms_accepted",
-            self.baseline.gtid_forms.accepted,
+            "gtid_forms_response",
+            match &self.baseline.gtid_forms.response {
+                super::state::GtidScalarResponse::Value(value) => i64::from(*value),
+                super::state::GtidScalarResponse::MissingRow
+                | super::state::GtidScalarResponse::Null => {
+                    unreachable!("record eligibility requires scalar response")
+                }
+            },
+        );
+        line(
+            &mut output,
+            "gtid_forms_oracle",
+            &self.baseline.gtid_forms.oracle,
+        );
+        line(
+            &mut output,
+            "gtid_forms_input",
+            &self.baseline.gtid_forms.input,
+        );
+        integer_option_line(
+            &mut output,
+            "gtid_forms_code",
+            self.baseline.gtid_forms.code.map(i32::from),
+        );
+        line(
+            &mut output,
+            "gtid_forms_sql_state",
+            self.baseline.gtid_forms.sql_state.as_deref().unwrap_or(""),
         );
         integer_line(
             &mut output,
@@ -307,6 +354,20 @@ impl QualificationRecord {
             "gtid_lower_boundary_accepted",
             self.baseline.lower_boundary.accepted,
         );
+        integer_option_line(
+            &mut output,
+            "gtid_lower_boundary_code",
+            self.baseline.lower_boundary.code.map(i32::from),
+        );
+        line(
+            &mut output,
+            "gtid_lower_boundary_sql_state",
+            self.baseline
+                .lower_boundary
+                .sql_state
+                .as_deref()
+                .unwrap_or(""),
+        );
         integer_line(
             &mut output,
             "gtid_upper_boundary",
@@ -316,6 +377,20 @@ impl QualificationRecord {
             &mut output,
             "gtid_upper_boundary_accepted",
             self.baseline.upper_boundary.accepted,
+        );
+        integer_option_line(
+            &mut output,
+            "gtid_upper_boundary_code",
+            self.baseline.upper_boundary.code.map(i32::from),
+        );
+        line(
+            &mut output,
+            "gtid_upper_boundary_sql_state",
+            self.baseline
+                .upper_boundary
+                .sql_state
+                .as_deref()
+                .unwrap_or(""),
         );
 
         output.push_str("\n[identity]\n");
@@ -410,6 +485,11 @@ fn validate_package_gate(
         && setup.package_files_verified
         && setup.mysqld_path == manifest.mysqld_path
         && setup.process_launcher == manifest.apparmor_exec_path
+        && !setup.launcher_package.is_empty()
+        && setup.launcher_sha256.len() == 64
+        && setup.launcher_verified
+        && setup.child_executable == manifest.mysqld_path
+        && setup.child_executable_verified
         && setup.mysqld_sha256 == manifest.expected_mysqld_sha256
         && setup.private_directory_mode & 0o077 == 0
         && setup.private_directories_verified
@@ -725,7 +805,25 @@ fn validate_cleanup_gate(cleanup: &CleanupReceipt) -> Result<(), QualificationEr
 }
 
 fn validate_gtid_boundaries(baseline: &BaselineEvidence) -> Result<(), QualificationError> {
-    if !baseline.lower_boundary.accepted {
+    if baseline.gtid_forms.oracle != "GTID_SUBSET"
+        || !baseline.gtid_forms.response.is_exact_one()
+        || baseline.gtid_forms.code.is_some()
+        || baseline.gtid_forms.sql_state.is_some()
+        || !baseline.gtid_forms.input.contains('\n')
+        || !baseline.gtid_forms.input.contains(":tag_live:")
+        || baseline.gtid_forms.input.matches(',').count() < 2
+    {
+        return Err(QualificationError::new(
+            QualificationCode::OutputGated,
+            "GTID forms evidence",
+            "tagged, newline, multi-source GTID_SUBSET evidence is incomplete".to_owned(),
+        ));
+    }
+    if baseline.lower_boundary.value != kuberic_mysql_core::MAX_SEQUENCE
+        || !baseline.lower_boundary.accepted
+        || baseline.lower_boundary.code.is_some()
+        || baseline.lower_boundary.sql_state.is_some()
+    {
         return Err(QualificationError::new(
             QualificationCode::OutputGated,
             "GTID lower boundary",
@@ -733,13 +831,17 @@ fn validate_gtid_boundaries(baseline: &BaselineEvidence) -> Result<(), Qualifica
                 .to_owned(),
         ));
     }
-    if baseline.upper_boundary.accepted || baseline.upper_boundary.code.is_some() {
+    if baseline.upper_boundary.value == kuberic_mysql_core::MAX_SEQUENCE + 1
+        && !baseline.upper_boundary.accepted
+        && baseline.upper_boundary.code == Some(1772)
+        && baseline.upper_boundary.sql_state.as_deref() == Some("HY000")
+    {
         return Ok(());
     }
     Err(QualificationError::new(
         QualificationCode::OutputGated,
         "GTID upper boundary",
-        "9223372036854775807 must record either acceptance or a server rejection".to_owned(),
+        "9223372036854775807 must be rejected with MySQL 1772/HY000; any other result requires specification review".to_owned(),
     ))
 }
 
@@ -776,7 +878,11 @@ fn array_line(output: &mut String, key: &str, values: &[String]) {
 }
 
 fn escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn origin_name(origin: EvidenceOriginKind) -> &'static str {
@@ -847,11 +953,13 @@ mod tests {
     use super::super::scenarios::{EvidenceOriginKind, ScenarioMode};
     use super::super::scenarios::{ScenarioReceipt, ScenarioResult};
     use super::super::state::{
-        BaselineEvidence, GtidBoundaryProbe, GtidFunctionProbe, OnlineIdentity, ProductFields,
+        BaselineEvidence, GtidBoundaryProbe, GtidFunctionProbe, GtidScalarResponse, OnlineIdentity,
+        ProductFields,
     };
     use super::{
         QualificationRecord, ReproducibilityEvidence, validate_cleanup_gate, validate_package_gate,
-        validate_feature_graph, validate_receipt, validate_reproducibility,
+        validate_feature_graph, validate_gtid_boundaries, validate_receipt,
+        validate_reproducibility,
     };
 
     fn baseline() -> BaselineEvidence {
@@ -866,8 +974,9 @@ mod tests {
             empty_gtid_history: String::new(),
             skip_networking: true,
             gtid_forms: GtidFunctionProbe {
-                input: "gtid".to_owned(),
-                accepted: true,
+                oracle: "GTID_SUBSET".to_owned(),
+                input: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-3,\naaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:tag_live:4-5,\nbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:7-9".to_owned(),
+                response: GtidScalarResponse::Value(1),
                 code: None,
                 sql_state: None,
             },
@@ -880,7 +989,7 @@ mod tests {
             upper_boundary: GtidBoundaryProbe {
                 value: 9223372036854775807,
                 accepted: false,
-                code: Some(1234),
+                code: Some(1772),
                 sql_state: Some("HY000".to_owned()),
             },
         }
@@ -920,6 +1029,11 @@ mod tests {
             mysqld_sha256: "C".repeat(64),
             mysqld_path: "/usr/sbin/mysqld".into(),
             process_launcher: "/usr/bin/aa-exec".into(),
+            launcher_package: "apparmor-utils".to_owned(),
+            launcher_sha256: "D".repeat(64),
+            launcher_verified: true,
+            child_executable: "/usr/sbin/mysqld".into(),
+            child_executable_verified: true,
             init_exit_code: 0,
             process_id: 1,
             socket_path: "/socket".into(),
@@ -935,6 +1049,12 @@ mod tests {
         let mut wrong_package = setup.clone();
         wrong_package.package_version = "8.4.12-1ubuntu24.04".to_owned();
         assert!(validate_package_gate(&manifest, &wrong_package).is_err());
+        let mut wrong_child = setup.clone();
+        wrong_child.child_executable = "/usr/bin/aa-exec".into();
+        assert!(validate_package_gate(&manifest, &wrong_child).is_err());
+        let mut unverified_launcher = setup.clone();
+        unverified_launcher.launcher_verified = false;
+        assert!(validate_package_gate(&manifest, &unverified_launcher).is_err());
         let cleanup = CleanupReceipt {
             exit_code: Some(0),
             signal: None,
@@ -1047,5 +1167,32 @@ mod tests {
         assert!(validate_feature_graph(graph, "0.37.1", &["minimal-rust".to_owned()], "1.53.2", &["time".to_owned()]).is_ok());
         assert!(validate_feature_graph("altered", "0.37.1", &["minimal-rust".to_owned()], "1.53.2", &["time".to_owned()]).is_err());
         assert!(validate_feature_graph(graph, "0.37.1", &["not-selected".to_owned()], "1.53.2", &["time".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn gtid_eligibility_requires_exact_maximum_rejection_oracle() {
+        let qualified = baseline();
+        assert!(validate_gtid_boundaries(&qualified).is_ok());
+        for mutate in 0..4 {
+            let mut invalid = qualified.clone();
+            match mutate {
+                0 => invalid.upper_boundary.accepted = true,
+                1 => invalid.upper_boundary.code = Some(1234),
+                2 => invalid.upper_boundary.sql_state = Some("42000".to_owned()),
+                3 => invalid.lower_boundary.accepted = false,
+                _ => unreachable!(),
+            }
+            assert!(validate_gtid_boundaries(&invalid).is_err());
+        }
+        for response in [
+            GtidScalarResponse::MissingRow,
+            GtidScalarResponse::Null,
+            GtidScalarResponse::Value(0),
+            GtidScalarResponse::Value(2),
+        ] {
+            let mut invalid = qualified.clone();
+            invalid.gtid_forms.response = response;
+            assert!(validate_gtid_boundaries(&invalid).is_err());
+        }
     }
 }
