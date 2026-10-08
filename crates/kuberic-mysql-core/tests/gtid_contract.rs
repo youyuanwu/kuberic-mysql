@@ -116,6 +116,20 @@ fn malformed_range_errors_retain_location() {
 }
 
 #[test]
+fn native_tag_group_errors_retain_component_and_token_locations() {
+    for (text, component, token) in [
+        (format!("{A}:tag_a"), 0, 2),
+        (format!("{A}:tag_a:tag_b:1"), 0, 2),
+        (format!("{A}:1,\n{B}:tag_b"), 1, 2),
+        (format!("{A}:1, {B}:2"), 1, 0),
+    ] {
+        let error = GtidSet::from_str(&text).unwrap_err();
+        assert_eq!(error.component(), component, "{text:?}");
+        assert_eq!(error.token(), token, "{text:?}");
+    }
+}
+
+#[test]
 fn maximum_interval_does_not_overflow_normalization() {
     let set = parse(&format!("{A}:{}:{MAX_SEQUENCE}", MAX_SEQUENCE - 1));
     assert_eq!(

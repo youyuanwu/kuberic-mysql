@@ -197,12 +197,16 @@ impl BoundGtidSet {
 /// A required bracket or GTID fact that was not collected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationField {
-    /// Opening legacy view or complete native-snapshot bracket.
+    /// Opening legacy view bracket.
     OpeningBracket,
+    /// Opening complete native-snapshot bracket.
+    OpeningNativeSnapshot,
     /// Explicitly present executed GTID set.
     ExecutedGtidSet,
-    /// Closing legacy view or complete native-snapshot bracket.
+    /// Closing legacy view bracket.
     ClosingBracket,
+    /// Closing complete native-snapshot bracket.
+    ClosingNativeSnapshot,
 }
 
 /// The adapter-neutral native evidence field that was malformed.
@@ -261,8 +265,10 @@ pub enum StaleReason {
 pub enum IncoherentReason {
     /// A sample or provenance used a different exact binding/attempt.
     BindingMismatch,
-    /// Opening and closing legacy views or complete native snapshots differed.
+    /// Opening and closing legacy views differed.
     BracketMismatch,
+    /// Opening and closing complete native snapshots differed.
+    NativeSnapshotMismatch,
     /// A required sample was supplied more than once.
     DuplicateSample(ObservationField),
     /// A terminal collection failure was supplied more than once.
@@ -678,7 +684,7 @@ impl NativeObservationDraft {
         if self.opening.is_some() {
             self.duplicate
                 .get_or_insert(IncoherentReason::DuplicateSample(
-                    ObservationField::OpeningBracket,
+                    ObservationField::OpeningNativeSnapshot,
                 ));
         } else {
             self.opening = Some(bracket);
@@ -706,7 +712,7 @@ impl NativeObservationDraft {
         if self.closing.is_some() {
             self.duplicate
                 .get_or_insert(IncoherentReason::DuplicateSample(
-                    ObservationField::ClosingBracket,
+                    ObservationField::ClosingNativeSnapshot,
                 ));
         } else {
             self.closing = Some(bracket);
@@ -799,7 +805,7 @@ impl NativeObservationDraft {
         {
             return ObservationOutcome::Incoherent {
                 metadata: self.metadata,
-                reason: IncoherentReason::BracketMismatch,
+                reason: IncoherentReason::NativeSnapshotMismatch,
             };
         }
 
@@ -813,7 +819,7 @@ impl NativeObservationDraft {
         }
 
         if let Some(failure) = self.failure {
-            let missing = missing_fields(&self.opening, &self.executed, &self.closing);
+            let missing = missing_native_fields(&self.opening, &self.executed, &self.closing);
             if !missing.is_empty() && missing.len() != 3 {
                 return ObservationOutcome::Partial {
                     metadata: self.metadata,
@@ -824,7 +830,7 @@ impl NativeObservationDraft {
             return failure_outcome(self.metadata, failure);
         }
 
-        let missing = missing_fields(&self.opening, &self.executed, &self.closing);
+        let missing = missing_native_fields(&self.opening, &self.executed, &self.closing);
         if !missing.is_empty() {
             return ObservationOutcome::Partial {
                 metadata: self.metadata,
@@ -877,6 +883,24 @@ fn missing_fields<T>(
     }
     if closing.is_none() {
         missing.push(ObservationField::ClosingBracket);
+    }
+    missing
+}
+
+fn missing_native_fields(
+    opening: &Option<NativeObservationBracket>,
+    executed: &Option<BoundGtidSet>,
+    closing: &Option<NativeObservationBracket>,
+) -> Vec<ObservationField> {
+    let mut missing = Vec::new();
+    if opening.is_none() {
+        missing.push(ObservationField::OpeningNativeSnapshot);
+    }
+    if executed.is_none() {
+        missing.push(ObservationField::ExecutedGtidSet);
+    }
+    if closing.is_none() {
+        missing.push(ObservationField::ClosingNativeSnapshot);
     }
     missing
 }
