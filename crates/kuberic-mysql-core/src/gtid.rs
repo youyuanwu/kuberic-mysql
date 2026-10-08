@@ -9,7 +9,7 @@ use crate::{IdentityErrorKind, ServerUuid};
 pub const MAX_SEQUENCE: u64 = i64::MAX as u64;
 
 /// A validated GTID transaction tag.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GtidTag(String);
 
 impl GtidTag {

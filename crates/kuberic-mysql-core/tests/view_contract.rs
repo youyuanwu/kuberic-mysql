@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use kuberic_mysql_core::{
-    GroupName, MemberAddress, MemberId, MemberRole, MemberState, NativeMember,
-    NativeValueErrorKind, NativeView, NativeViewError, ViewId,
+    GroupName, GtidRelation, GtidSet, MemberAddress, MemberId, MemberRole, MemberState,
+    NativeMember, NativeValueErrorKind, NativeView, NativeViewError, ViewId,
 };
 
 fn member(uuid: &str, address: &str, role: MemberRole, state: MemberState) -> NativeMember {
@@ -104,19 +104,63 @@ fn duplicate_member_identity_and_address_are_distinct_errors() {
 
 #[test]
 fn changed_member_fact_changes_exact_view() {
-    let online = view(vec![member(
+    let original = view(vec![member(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         "a:3306",
         MemberRole::Primary,
         MemberState::Online,
     )])
     .unwrap();
-    let recovering = view(vec![member(
-        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-        "a:3306",
-        MemberRole::Primary,
-        MemberState::Recovering,
-    )])
+
+    let variants = [
+        member(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "a:3306",
+            MemberRole::Primary,
+            MemberState::Online,
+        ),
+        member(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "b:3306",
+            MemberRole::Primary,
+            MemberState::Online,
+        ),
+        member(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "a:3306",
+            MemberRole::Secondary,
+            MemberState::Online,
+        ),
+        member(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "a:3306",
+            MemberRole::Primary,
+            MemberState::Recovering,
+        ),
+    ];
+    for changed in variants {
+        assert_ne!(original, view(vec![changed]).unwrap());
+    }
+}
+
+#[test]
+fn native_view_facts_do_not_change_gtid_relations() {
+    let left: GtidSet = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1".parse().unwrap();
+    let right: GtidSet = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:1".parse().unwrap();
+    let before = left.relation(&right);
+
+    let _changed_view = NativeView::new(
+        GroupName::new("other-group").unwrap(),
+        ViewId::new("other-view").unwrap(),
+        vec![member(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "a:3306",
+            MemberRole::Secondary,
+            MemberState::Offline,
+        )],
+    )
     .unwrap();
-    assert_ne!(online, recovering);
+
+    assert_eq!(before, GtidRelation::Incomparable);
+    assert_eq!(left.relation(&right), before);
 }
