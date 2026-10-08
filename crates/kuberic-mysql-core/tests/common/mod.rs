@@ -2,10 +2,12 @@
 
 use kuberic_mysql_core::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding, Epoch,
-    ExactBinding, ExactBindingParts, GroupName, MemberAddress, MemberId, MemberRole, MemberState,
-    NativeMember, NativeView, ObservationBracket, ObservationInstant, ObservationMetadata,
-    ObservationProvenance, ObservationSessionId, PartitionId, ProcessSessionId, ReplicaId,
-    ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
+    ExactBinding, ExactBindingParts, GroupName, GroupReplicationAddress, MemberAddress, MemberId,
+    MemberRole, MemberState, NativeAccessState, NativeLocalState, NativeMember,
+    NativeObservationBracket, NativeSnapshot, NativeSwitch, NativeView, ObservationBracket,
+    ObservationInstant, ObservationMetadata, ObservationProvenance, ObservationSessionId,
+    PartitionId, ProcessSessionId, ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid,
+    StorageBinding, ViewId,
 };
 
 pub const UUID_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -66,4 +68,18 @@ pub fn metadata(
 
 pub fn bracket(binding: ExactBinding) -> ObservationBracket {
     ObservationBracket::new(binding, native_view())
+}
+
+pub fn native_snapshot() -> NativeSnapshot {
+    NativeSnapshot::new(
+        native_view(),
+        NativeLocalState::new(
+            GroupReplicationAddress::new("127.0.0.1:33061").unwrap(),
+            NativeAccessState::new(NativeSwitch::Off, NativeSwitch::Off),
+        ),
+    )
+}
+
+pub fn native_bracket(binding: ExactBinding) -> NativeObservationBracket {
+    NativeObservationBracket::new(binding, native_snapshot())
 }

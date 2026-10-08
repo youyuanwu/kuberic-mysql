@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install exact Oracle MySQL 8.4.11 package
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes apparmor-utils ca-certificates gnupg wget
+          wget --quiet https://dev.mysql.com/get/mysql-apt-config_0.8.39-1_all.deb
+          echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.4-lts" |
+            sudo debconf-set-selections
+          echo "mysql-apt-config mysql-apt-config/select-product select Ok" |
+            sudo debconf-set-selections
+          sudo dpkg --install mysql-apt-config_0.8.39-1_all.deb
+          rm mysql-apt-config_0.8.39-1_all.deb
+          grep --quiet 'mysql-8.4-lts' /etc/apt/sources.list.d/mysql.list
+          sudo apt-get update
+          sudo apt-get install --yes mysql-community-server-core=8.4.11-1ubuntu24.04
+          sudo systemctl disable --now mysql.service || true
+          test "$(systemctl is-active mysql.service || true)" != active
+          test "$(sha256sum /usr/sbin/mysqld | cut -d ' ' -f 1)" = \
+            "5319f31babc80a5b438c4c4e87292539818a3f0d737cff6733ff8aae7d801058"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Run full MySQL qualification
+        run: ./qualification/mysql-uds-observation/run-qualification.sh

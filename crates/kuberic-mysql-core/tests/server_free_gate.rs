@@ -2,11 +2,11 @@ mod common;
 
 use std::str::FromStr;
 
-use common::{binding, bracket, metadata};
+use common::{binding, bracket, metadata, native_bracket};
 use kuberic_mysql_core::{
     AuthoritySession, BoundGtidSet, CollectionFailure, CompletionCredit, CompletionRejection,
-    GtidParseErrorKind, GtidRelation, GtidSet, ObservationDraft, ObservationInstant,
-    ObservationOutcome, ReplicaIncarnation, UnsupportedOperation,
+    GtidParseErrorKind, GtidRelation, GtidSet, NativeObservationDraft, ObservationDraft,
+    ObservationInstant, ObservationOutcome, ReplicaIncarnation, UnsupportedOperation,
 };
 
 fn complete_outcome(binding: &kuberic_mysql_core::ExactBinding) -> ObservationOutcome {
@@ -17,6 +17,17 @@ fn complete_outcome(binding: &kuberic_mysql_core::ExactBinding) -> ObservationOu
             GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-3").unwrap(),
         ))
         .closing(bracket(binding.clone()))
+        .finalize()
+}
+
+fn complete_native_outcome(binding: &kuberic_mysql_core::ExactBinding) -> ObservationOutcome {
+    NativeObservationDraft::new(metadata(binding.clone(), 10, 20, 30, 20))
+        .opening(native_bracket(binding.clone()))
+        .executed(BoundGtidSet::new(
+            binding.clone(),
+            GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-3").unwrap(),
+        ))
+        .closing(native_bracket(binding.clone()))
         .finalize()
 }
 
@@ -31,6 +42,27 @@ fn current_coherent_observation_is_credited_but_access_stays_closed() {
         Ok(CompletionCredit::ObservationAcknowledged)
     );
     assert!(authority.has_observation_credit());
+    assert!(!authority.access().read_open());
+    assert!(!authority.access().write_open());
+}
+
+#[test]
+fn native_snapshot_observation_is_credited_but_access_stays_closed() {
+    let current = binding();
+    let outcome = complete_native_outcome(&current);
+    assert!(
+        outcome
+            .valid()
+            .and_then(kuberic_mysql_core::ValidObservation::native_snapshot)
+            .is_some()
+    );
+
+    let mut authority = AuthoritySession::new(current.clone());
+    let capability = authority.begin_attempt(&current).unwrap();
+    assert_eq!(
+        authority.complete(capability, &outcome, ObservationInstant::new(30)),
+        Ok(CompletionCredit::ObservationAcknowledged)
+    );
     assert!(!authority.access().read_open());
     assert!(!authority.access().write_open());
 }

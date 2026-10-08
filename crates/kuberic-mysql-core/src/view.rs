@@ -4,7 +4,7 @@ use core::fmt;
 use core::str::FromStr;
 use std::collections::HashSet;
 
-use crate::{GroupName, MemberAddress, MemberId, ViewId};
+use crate::{GroupName, GroupReplicationAddress, MemberAddress, MemberId, ViewId};
 
 /// The native field being decoded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +100,86 @@ pub enum MemberState {
     Error,
     /// The member reports unreachable.
     Unreachable,
+}
+
+/// One exact native on/off fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSwitch {
+    /// The native switch is off.
+    Off,
+    /// The native switch is on.
+    On,
+}
+
+impl NativeSwitch {
+    /// Returns whether the native switch is on.
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// Native read-only controls observed on one server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeAccessState {
+    read_only: NativeSwitch,
+    super_read_only: NativeSwitch,
+}
+
+impl NativeAccessState {
+    /// Creates exact native access-state evidence.
+    #[must_use]
+    pub const fn new(read_only: NativeSwitch, super_read_only: NativeSwitch) -> Self {
+        Self {
+            read_only,
+            super_read_only,
+        }
+    }
+
+    /// Returns the ordinary read-only switch.
+    #[must_use]
+    pub const fn read_only(self) -> NativeSwitch {
+        self.read_only
+    }
+
+    /// Returns the privileged read-only switch.
+    #[must_use]
+    pub const fn super_read_only(self) -> NativeSwitch {
+        self.super_read_only
+    }
+}
+
+/// Native facts local to one observed server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeLocalState {
+    group_replication_address: GroupReplicationAddress,
+    access: NativeAccessState,
+}
+
+impl NativeLocalState {
+    /// Creates exact local native-state evidence.
+    #[must_use]
+    pub const fn new(
+        group_replication_address: GroupReplicationAddress,
+        access: NativeAccessState,
+    ) -> Self {
+        Self {
+            group_replication_address,
+            access,
+        }
+    }
+
+    /// Returns the Group Replication communication address.
+    #[must_use]
+    pub const fn group_replication_address(&self) -> &GroupReplicationAddress {
+        &self.group_replication_address
+    }
+
+    /// Returns native read-only controls.
+    #[must_use]
+    pub const fn access(&self) -> NativeAccessState {
+        self.access
+    }
 }
 
 impl FromStr for MemberState {
@@ -240,5 +320,32 @@ impl NativeView {
     #[must_use]
     pub fn member(&self, id: &MemberId) -> Option<&NativeMember> {
         self.members.iter().find(|member| member.id == *id)
+    }
+}
+
+/// A complete native view plus local server state sampled together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSnapshot {
+    view: NativeView,
+    local: NativeLocalState,
+}
+
+impl NativeSnapshot {
+    /// Creates a complete native snapshot.
+    #[must_use]
+    pub const fn new(view: NativeView, local: NativeLocalState) -> Self {
+        Self { view, local }
+    }
+
+    /// Returns the exact membership view.
+    #[must_use]
+    pub const fn view(&self) -> &NativeView {
+        &self.view
+    }
+
+    /// Returns local native-state evidence.
+    #[must_use]
+    pub const fn local(&self) -> &NativeLocalState {
+        &self.local
     }
 }

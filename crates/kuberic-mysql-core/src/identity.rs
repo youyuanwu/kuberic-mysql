@@ -101,6 +101,11 @@ opaque_identity!(
     MemberAddress,
     "An opaque Group Replication member address."
 );
+opaque_identity!(
+    GroupReplicationAddress,
+    GroupReplicationAddress,
+    "An opaque Group Replication communication address."
+);
 opaque_identity!(ViewId, View, "An opaque native view identity.");
 opaque_identity!(
     ConfigurationId,

@@ -1,0 +1,117 @@
+{
+  "fixture_schema": "kuberic.mysql.native-result/v1",
+  "cases": [
+    {
+      "scenario": "plugin-absent-members",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [],
+      "expected": {"core_class": "Absent", "diagnostic": "AbsentGroupMembers"},
+      "evidence_origin": {
+        "category": "oracle-owned",
+        "commit": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
+        "tag": "mysql-8.4.11",
+        "url": "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/mysql-test/suite/group_replication/r/gr_uninstall_install_plugin.result",
+        "path": "mysql-test/suite/group_replication/r/gr_uninstall_install_plugin.result",
+        "sha256": "c9e374b6f66c88322c2022197558be23b26e08c8bb43d0d2bb88c57157aefee5",
+        "range": "lines 18-21",
+        "derivation": "Represent both asserted-empty Group Replication Performance Schema tables as exact selected metadata with zero rows."
+      }
+    },
+    {
+      "scenario": "never-started-members-placeholder",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["", "", null, "OFFLINE", ""]],
+      "expected": {"core_class": "Absent", "diagnostic": "PlaceholderNeverStarted"},
+      "evidence_origin": {
+        "category": "oracle-owned",
+        "commit": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
+        "tag": "mysql-8.4.11",
+        "url": "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/mysql-test/suite/group_replication/r/gr_perfschema_group_members.result",
+        "path": "mysql-test/suite/group_replication/r/gr_perfschema_group_members.result",
+        "sha256": "19bb50fd40f07c6e22fc7b6f7589a946ce9ad2815eccd1bf9471d5caa5e17db5",
+        "range": "lines 3-6",
+        "derivation": "Map asserted empty MEMBER_ID/HOST, NULL MEMBER_PORT, and OFFLINE state before first start; the unasserted role remains the documented empty placeholder."
+      }
+    },
+    {
+      "scenario": "stopped-members-placeholder",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mysql-a", 3306, "OFFLINE", ""]],
+      "expected": {"core_class": "Absent", "diagnostic": "PlaceholderStopped"},
+      "evidence_origin": {
+        "category": "oracle-owned",
+        "commit": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
+        "tag": "mysql-8.4.11",
+        "url": "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/mysql-test/suite/group_replication/r/gr_perfschema_group_members.result",
+        "path": "mysql-test/suite/group_replication/r/gr_perfschema_group_members.result",
+        "sha256": "19bb50fd40f07c6e22fc7b6f7589a946ce9ad2815eccd1bf9471d5caa5e17db5",
+        "range": "lines 8-17",
+        "derivation": "Retain the asserted post-start identity/address facts and asserted OFFLINE state after STOP; represent the unavailable active role as empty."
+      }
+    },
+    {
+      "scenario": "recovering-member",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "mysql-b", 3307, "RECOVERING", "SECONDARY"]],
+      "expected": {"core_class": "Valid", "diagnostic": "None"},
+      "evidence_origin": {
+        "category": "oracle-owned",
+        "commit": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
+        "tag": "mysql-8.4.11",
+        "url": "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/mysql-test/suite/group_replication/r/gr_recovery_errors_report.result",
+        "path": "mysql-test/suite/group_replication/r/gr_recovery_errors_report.result",
+        "sha256": "2ebe750c1156c8fea79c00629eaaf1b6caf1ed976d6f06c86bbe2a467e727d87",
+        "range": "lines 31-35",
+        "derivation": "Represent the asserted RECOVERING member state with deterministic non-secret fixture identity/address and the secondary role used by the decoder contract."
+      }
+    },
+    {
+      "scenario": "never-started-filtered-stats-absent",
+      "query_id": "Mysql8411LocalMemberStatsV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "view_id", "kind": "String", "nullable": false}
+      ],
+      "rows": [],
+      "expected": {"core_class": "Absent", "diagnostic": "AbsentLocalMemberStats"},
+      "evidence_origin": {
+        "category": "oracle-owned",
+        "commit": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
+        "tag": "mysql-8.4.11",
+        "url": "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/mysql-test/suite/group_replication/r/gr_perfschema_group_member_stats.result",
+        "path": "mysql-test/suite/group_replication/r/gr_perfschema_group_member_stats.result",
+        "sha256": "57ba8d2f87870bdb32a286749b8e1796cd279ce5318617e90b3e09251867be85",
+        "range": "lines 14-15",
+        "derivation": "The upstream unfiltered table contains an empty MEMBER_ID placeholder before Group Replication starts; the adapter query filters on MEMBER_ID = @@GLOBAL.server_uuid, so that row cannot match and the selected result has zero rows."
+      }
+    }
+  ]
+}

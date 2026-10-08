@@ -25,6 +25,27 @@ fn sources_and_tags_remain_distinct_and_sorted() {
 }
 
 #[test]
+fn native_newlines_and_multiple_tag_groups_are_accepted_narrowly() {
+    let native = parse(&format!(
+        "{A}:1-3:tag_a:1-2:tag_b:4,\n{B}:7,\r\n{A}:tag_a:3"
+    ));
+    assert_eq!(
+        native.to_string(),
+        format!("{A}:1-3,{A}:tag_a:1-3,{A}:tag_b:4,{B}:7")
+    );
+
+    for rejected in [
+        format!("{A}:1, {B}:2"),
+        format!("{A}:1,\t{B}:2"),
+        format!("{A}:1,\r{B}:2"),
+        format!("\n{A}:1"),
+        format!("{A}:1\n"),
+    ] {
+        assert!(GtidSet::from_str(&rejected).is_err(), "{rejected:?}");
+    }
+}
+
+#[test]
 fn relations_use_only_set_containment() {
     let empty = parse("");
     let small = parse(&format!("{A}:1-2"));
@@ -64,6 +85,11 @@ fn parser_rejects_structured_malformed_inputs() {
             format!("{A}:{}:1", "a".repeat(33)),
             GtidParseErrorKind::InvalidTag,
         ),
+        (format!("{A}:tag_a"), GtidParseErrorKind::MissingInterval),
+        (
+            format!("{A}:tag_a:tag_b:1"),
+            GtidParseErrorKind::MissingInterval,
+        ),
         (format!("{A}:1,"), GtidParseErrorKind::EmptySource),
         (
             "00000000-0000-0000-0000-000000000000:1".to_owned(),
@@ -90,10 +116,27 @@ fn malformed_range_errors_retain_location() {
 }
 
 #[test]
+fn native_tag_group_errors_retain_component_and_token_locations() {
+    for (text, component, token) in [
+        (format!("{A}:tag_a"), 0, 2),
+        (format!("{A}:tag_a:tag_b:1"), 0, 2),
+        (format!("{A}:1,\n{B}:tag_b"), 1, 2),
+        (format!("{A}:1, {B}:2"), 1, 0),
+    ] {
+        let error = GtidSet::from_str(&text).unwrap_err();
+        assert_eq!(error.component(), component, "{text:?}");
+        assert_eq!(error.token(), token, "{text:?}");
+    }
+}
+
+#[test]
 fn maximum_interval_does_not_overflow_normalization() {
+    assert_eq!(MAX_SEQUENCE, 9_223_372_036_854_775_806);
     let set = parse(&format!("{A}:{}:{MAX_SEQUENCE}", MAX_SEQUENCE - 1));
     assert_eq!(
         set.to_string(),
         format!("{A}:{}-{MAX_SEQUENCE}", MAX_SEQUENCE - 1)
     );
+    let rejected = GtidSet::from_str(&format!("{A}:9223372036854775807")).unwrap_err();
+    assert_eq!(rejected.kind(), &GtidParseErrorKind::SequenceOutOfRange);
 }

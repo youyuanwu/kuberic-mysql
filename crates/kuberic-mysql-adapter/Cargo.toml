@@ -1,0 +1,24 @@
+[package]
+name = "kuberic-mysql-adapter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+live-mysql-8-4-11 = []
+
+[dependencies]
+kuberic-mysql-core = { path = "../kuberic-mysql-core" }
+mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust"] }
+tokio = { version = "1", default-features = false, features = ["time"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "test-util"] }

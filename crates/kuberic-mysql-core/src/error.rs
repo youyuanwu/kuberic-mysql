@@ -32,6 +32,8 @@ pub enum IdentityField {
     MemberId,
     /// Group Replication member address.
     MemberAddress,
+    /// Group Replication communication address.
+    GroupReplicationAddress,
     /// Native Group Replication view identity.
     View,
     /// Kuberic configuration identity.

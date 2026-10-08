@@ -1,10 +1,10 @@
 mod common;
 
-use common::{binding, bracket, metadata};
+use common::{binding, bracket, metadata, native_bracket};
 use kuberic_mysql_core::{
     AdmissionError, AuthoritySession, BoundGtidSet, CollectionFailure, CompletionCredit,
-    CompletionRejection, GtidSet, ObservationDraft, ObservationInstant, ObservationOutcome,
-    UnsupportedOperation,
+    CompletionRejection, GtidSet, NativeObservationDraft, ObservationDraft, ObservationInstant,
+    ObservationOutcome, StaleReason, UnsupportedOperation,
 };
 
 fn complete_outcome(
@@ -195,6 +195,9 @@ fn every_non_valid_outcome_receives_no_credit() {
         CollectionFailure::PermissionDenied,
         CollectionFailure::AuthenticationFailure,
         CollectionFailure::Malformed(kuberic_mysql_core::MalformedReason::TimingOrder),
+        CollectionFailure::Malformed(kuberic_mysql_core::MalformedReason::NativeEvidence(
+            kuberic_mysql_core::NativeEvidenceField::Row,
+        )),
         CollectionFailure::Unsupported(kuberic_mysql_core::UnsupportedReason::CollectorCapability),
     ]
     .map(|failure| {
@@ -227,6 +230,31 @@ fn every_non_valid_outcome_receives_no_credit() {
         );
         assert!(!session.has_observation_credit());
     }
+}
+
+#[test]
+fn expired_partial_native_observation_receives_no_authority_credit() {
+    let current = binding();
+    let outcome = NativeObservationDraft::new(metadata(current.clone(), 1, 4, 3, 4))
+        .opening(native_bracket(current.clone()))
+        .executed(BoundGtidSet::new(current.clone(), GtidSet::empty()))
+        .failure(CollectionFailure::Unreachable)
+        .finalize();
+    assert!(matches!(
+        outcome,
+        ObservationOutcome::Stale {
+            reason: StaleReason::Expired,
+            ..
+        }
+    ));
+
+    let mut session = AuthoritySession::new(current.clone());
+    let capability = session.begin_attempt(&current).unwrap();
+    assert_eq!(
+        session.complete(capability, &outcome, ObservationInstant::new(4)),
+        Err(CompletionRejection::NonValidObservation)
+    );
+    assert!(!session.has_observation_credit());
 }
 
 #[test]

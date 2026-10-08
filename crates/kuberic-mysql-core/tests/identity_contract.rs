@@ -1,8 +1,8 @@
 use kuberic_mysql_core::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding, Epoch,
-    ExactBinding, ExactBindingParts, GroupName, IdentityErrorKind, MemberAddress, MemberId,
-    ObservationSessionId, PartitionId, ProcessSessionId, ReplicaId, ReplicaIncarnation, ResourceId,
-    ServerUuid, StorageBinding, ViewId,
+    ExactBinding, ExactBindingParts, GroupName, GroupReplicationAddress, IdentityErrorKind,
+    MemberAddress, MemberId, ObservationSessionId, PartitionId, ProcessSessionId, ReplicaId,
+    ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
 };
 use std::any::TypeId;
 
@@ -47,6 +47,10 @@ fn identity_domains_are_distinct_types() {
     assert_ne!(
         TypeId::of::<ProcessSessionId>(),
         TypeId::of::<ObservationSessionId>()
+    );
+    assert_ne!(
+        TypeId::of::<MemberAddress>(),
+        TypeId::of::<GroupReplicationAddress>()
     );
 }
 
