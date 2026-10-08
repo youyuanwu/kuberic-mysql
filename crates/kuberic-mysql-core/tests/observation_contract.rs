@@ -17,6 +17,23 @@ fn complete_draft(start: u64, end: u64, deadline: u64, decision: u64) -> Observa
         .closing(bracket(binding))
 }
 
+fn assert_metadata(
+    outcome: &ObservationOutcome,
+    expected_binding: &kuberic_mysql_core::ExactBinding,
+    start: u64,
+    end: u64,
+    deadline: u64,
+    decision: u64,
+) {
+    let metadata = outcome.metadata();
+    assert_eq!(metadata.binding(), expected_binding);
+    assert_eq!(metadata.provenance().origin(), "fixture");
+    assert_eq!(metadata.start().tick(), start);
+    assert_eq!(metadata.end().tick(), end);
+    assert_eq!(metadata.deadline().tick(), deadline);
+    assert_eq!(metadata.decision().tick(), decision);
+}
+
 #[test]
 fn complete_explicitly_empty_observation_is_valid() {
     let outcome = complete_draft(1, 2, 3, 2).finalize();
@@ -48,23 +65,52 @@ fn direct_failure_outcomes_remain_distinct_and_retain_metadata() {
         let outcome = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
             .failure(failure)
             .finalize();
-        assert_eq!(outcome.metadata().binding(), &attempted);
-        assert_eq!(outcome.metadata().start().tick(), 1);
-        assert_eq!(outcome.metadata().end().tick(), 2);
-        assert_eq!(outcome.metadata().deadline().tick(), 3);
-        assert_eq!(outcome.metadata().decision().tick(), 2);
-        assert_eq!(outcome.metadata().provenance().origin(), "fixture");
+        assert_metadata(&outcome, &attempted, 1, 2, 3, 2);
         assert!(outcome.valid().is_none());
         let actual = match outcome {
             ObservationOutcome::Absent(_) => "absent",
             ObservationOutcome::Unreachable(_) => "unreachable",
             ObservationOutcome::PermissionDenied(_) => "permission",
             ObservationOutcome::AuthenticationFailure(_) => "authentication",
-            ObservationOutcome::Malformed { .. } => "malformed",
-            ObservationOutcome::Unsupported { .. } => "unsupported",
+            ObservationOutcome::Malformed { reason, .. } => {
+                assert_eq!(reason, MalformedReason::TimingOrder);
+                "malformed"
+            }
+            ObservationOutcome::Unsupported { reason, .. } => {
+                assert_eq!(reason, UnsupportedReason::CollectorCapability);
+                "unsupported"
+            }
             _ => panic!("unexpected outcome"),
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn partial_stale_future_incoherent_and_valid_retain_full_metadata() {
+        let attempted = binding();
+        let partial = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2)).finalize();
+        assert_metadata(&partial, &attempted, 1, 2, 3, 2);
+
+        let future = complete_draft(1, 2, 3, 1).finalize();
+        assert_metadata(&future, &attempted, 1, 2, 3, 1);
+
+        let stale = complete_draft(1, 2, 3, 4).finalize();
+        assert_metadata(&stale, &attempted, 1, 2, 3, 4);
+
+        let valid = complete_draft(1, 2, 3, 2).finalize();
+        assert_metadata(&valid, &attempted, 1, 2, 3, 2);
+
+        let mut changed_parts = attempted.parts().clone();
+        changed_parts.credential_generation =
+            kuberic_mysql_core::CredentialGeneration::new("other").unwrap();
+        let incoherent = ObservationDraft::new(metadata(attempted.clone(), 1, 2, 3, 2))
+            .opening(bracket(attempted.clone()))
+            .executed(BoundGtidSet::new(attempted.clone(), GtidSet::empty()))
+            .closing(bracket(kuberic_mysql_core::ExactBinding::new(
+                changed_parts,
+            )))
+            .finalize();
+        assert_metadata(&incoherent, &attempted, 1, 2, 3, 2);
     }
 }
 
