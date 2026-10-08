@@ -18,7 +18,10 @@ source_files() {
     find "$ROOT/crates/kuberic-mysql-adapter/tests/live_support" -type f 2>/dev/null
     test ! -f "$ROOT/crates/kuberic-mysql-adapter/tests/live_mysql_8_4_11.rs" ||
       printf '%s\n' "$ROOT/crates/kuberic-mysql-adapter/tests/live_mysql_8_4_11.rs"
-    printf '%s\n' "$QUAL/manifest.example.toml" "$QUAL/run-qualification.sh"
+    printf '%s\n' \
+      "$QUAL/README.md" \
+      "$QUAL/manifest.example.toml" \
+      "$QUAL/run-qualification.sh"
   } |
     sed "s#^$ROOT/##" |
     grep -Ev '^(\.paw/|target/|qualification/mysql-uds-observation/(oracle-mysql-8\.4\.11\.toml|local-run/|\.receipts/|\.manifest\.live\.toml))' |

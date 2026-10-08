@@ -3,6 +3,37 @@
 //! The public API contains validated request values, an adapter-owned query
 //! contract, monotonic clock types, and secret-free reports. Client-library,
 //! runtime, SQL row, and protocol types remain private.
+//!
+//! Request values fail closed before any connection attempt:
+//!
+//! ```
+//! use kuberic_mysql_adapter::{SocketPathError, UnixSocketPath};
+//!
+//! assert_eq!(
+//!     UnixSocketPath::new("relative.sock").unwrap_err(),
+//!     SocketPathError::NotAbsolute,
+//! );
+//! ```
+//!
+//! Callers inspect the authoritative outcome and the separate, secret-free
+//! diagnostic. Native role and read-only switches are evidence only; this
+//! adapter never opens Kuberic client access.
+//!
+//! ```
+//! use kuberic_mysql_adapter::{CoreOutcomeClass, ObservationReport};
+//!
+//! fn inspect(report: &ObservationReport) {
+//!     if report.outcome().valid().is_some() {
+//!         assert_eq!(report.diagnostic().core_class(), CoreOutcomeClass::Valid);
+//!     } else {
+//!         let _machine_matchable_class = report.diagnostic().core_class();
+//!     }
+//! }
+//! ```
+//!
+//! The Oracle MySQL 8.4.11 lifecycle fixture is available only through the
+//! opt-in qualification runner; lifecycle automation is not part of this
+//! crate's production API.
 
 #[allow(dead_code)]
 mod decode;

@@ -8,21 +8,77 @@ claim.
 
 ### Current repository status
 
-This repository delivers Stage 0 documentation and the Stage 1 deterministic,
-server-free `kuberic-mysql-core` library. The library implements typed exact
-bindings, structured GTID-set relations, typed Group Replication views,
-coherent observation outcomes, and minimal stale-work rejection. It contains no
-MySQL adapter, process supervisor, SQL connectivity, controller integration,
-deployment manifest, or live test fixture.
+This repository delivers Stage 0 documentation, the Stage 1 deterministic
+`kuberic-mysql-core` library, and one narrow native-observation slice. The
+publish-disabled `kuberic-mysql-adapter` observes exactly one caller-selected
+Oracle MySQL Community Server 8.4.11 through a private Unix-domain socket. This
+does not complete the three-process Stage 2 lifecycle PoC.
 
 Words such as **must** and **requires** below remain requirements for stages
-whose delivery gates have not passed; they do not imply that later live
+whose delivery gates have not passed; they do not imply that broader lifecycle
 integration behavior exists today.
 
-The first proposed validation target is:
+### Delivered Oracle MySQL 8.4.11 observation slice
 
-- Oracle MySQL 8.4 LTS on Linux, with the exact patch release pinned by a later
-  implementation stage;
+The core owns dependency-neutral identities, GTID sets, native snapshots,
+outcomes, and Kuberic authority credit. The adapter owns UDS transport,
+versioned SQL, decoding, deadlines, and diagnostics. MySQL remains authoritative
+for product identity, Group Replication membership/view, native role and state,
+executed GTIDs, and native read-only switches. A valid observation grants only
+observation credit; Kuberic read and write access remain closed.
+
+One authenticated session executes these exact surfaces:
+
+1. product/version/platform and `server_uuid`;
+2. opening group identity, Group Replication address, `read_only`, and
+   `super_read_only`;
+3. opening `replication_group_members` and the local
+   `replication_group_member_stats` view;
+4. `@@GLOBAL.gtid_executed`; and
+5. the same local state, complete membership, and local view again.
+
+Any opening/closing change in group, view, membership, member address, role,
+state, Group Replication address, or either read-only switch rejects the result
+as incoherent. GTIDs are a point sample between stable brackets, not scalar
+progress. The qualified maximum sequence is `9223372036854775806`; Oracle
+8.4.11 rejected `9223372036854775807`, so later patches must requalify this
+boundary before changing the core contract.
+
+The socket must be absolute, UTF-8, non-symlink, and the same socket inode at
+preflight and connection. The client is configured with no TCP fallback.
+Observation uses one absolute deadline across validation, connect, every query
+and row-consumption boundary, disconnect, and final admission. Expiry has
+priority and earns zero credit; explicit teardown uses only the remaining
+budget. Transport, authentication, permission, authoritative absence,
+malformed evidence, unsupported product/schema/value, staleness, future timing,
+and incoherence remain distinct.
+
+The observer needs local authentication, socket access, and only `SELECT` on
+`performance_schema.replication_group_members` and
+`performance_schema.replication_group_member_stats`. Removing either grant is
+qualified independently as permission denial. No production API initializes,
+starts, stops, reaps, configures, or mutates MySQL.
+
+Qualification uses the installed Oracle
+`mysql-community-server-core=8.4.11-1ubuntu24.04` package from
+`repo.mysql.com`'s `mysql-8.4-lts` component. The opt-in runner verifies dpkg
+ownership/integrity, APT provenance, executable and library compatibility,
+Cargo lock/source digests, selected/effective client features, server-free
+validation receipts, fixture provenance, native scenarios, and deterministic
+cleanup before emitting the canonical record. It creates owner-only
+project-local runtime/data directories, uses `aa-exec` only for the isolated
+child, disables client TCP, and permits only one-member loopback Group
+Replication transport.
+
+This slice makes no claim for another MySQL patch or fork, production process
+ownership, three-member lifecycle, topology mutation, failover, fencing,
+Clone/reseed, TLS, cross-host operation, containers, Kubernetes, routing,
+availability, durability, performance, or production security.
+
+The broader host-local lifecycle target remains:
+
+- Oracle MySQL 8.4 LTS on Linux, reusing the delivered exact 8.4.11
+  observation contract until any replacement patch is independently qualified;
 - one Kuberic replica incarnation per `mysqld` process and data root;
 - a three-member, host-local development topology;
 - GTID mode and single-primary Group Replication;
@@ -37,9 +93,11 @@ or topology modes outside its pinned profile.
 
 ### Proof-of-concept boundary
 
-The delivered Stage 1 executable milestone is intentionally server-free. It
-proves the pure identity, GTID-set, view, observation, and stale-authority
-contracts without starting or contacting MySQL.
+The delivered Stage 1 core remains intentionally server-free. It proves the
+pure identity, GTID-set, view, observation, and stale-authority contracts
+without starting or contacting MySQL. The separately delivered observation
+slice contacts one exact server but does not own its production lifecycle or
+complete Stage 2.
 
 The first executable **server-integration** milestone is the Stage 2 PoC. Its
 purpose is to prove that Kuberic can own three local `mysqld` processes, observe
@@ -386,14 +444,15 @@ Outcomes are typed and fail closed:
 - **unreachable**: connection or transport could not be established;
 - **permission denied**: authentication succeeded or was attempted, but the
   observer lacks required capability;
-- **authentication failure**: local credentials or the expected UDS/server
-  identity cannot be verified;
+- **authentication failure**: the server rejects the local observer
+  credentials;
 - **malformed/unsupported**: values or profile fall outside the pinned decoder;
 - **partial/incomplete**: only part of the required multi-query bundle was
   collected before failure or deadline;
 - **stale**: collection or decision deadline expired;
-- **incoherent**: bracketing samples differ or fields describe different views,
-  sessions, or identities; and
+- **incoherent**: bracketing samples differ, authenticated server identity
+  contradicts the exact binding, or fields describe different views, sessions,
+  or identities; and
 - **valid**: all required fields, privileges, bindings, and freshness checks
   pass.
 
@@ -969,8 +1028,9 @@ stage.
 | 5. Secure cross-host qualification | Stage 4 passed. Add separate principals, secure secret handling, native TLS or an explicitly qualified equivalent network profile, real fault domains, and a production-candidate fence backend. | Cross-host network, trust rotation, host loss, storage, direct-client, and fence-lifetime gates pass. | Only the named cross-host security and infrastructure profile that passed. | No generic CNI, mesh, cloud, or cross-region assumption. |
 | 6. Kubernetes qualification | Stage 5 passed; named Kubernetes/provider versions, images, secrets, storage, routing, and platform fence integrations are fixed. | The Kubernetes gate matrix passes lifecycle, faults, storage reuse, routing, trust rotation, controller restart, old-primary survival, and exact fence/release scenarios. | Only the named Kubernetes, storage, network, and fence-provider matrix. | No generic Kubernetes or provider portability. |
 
-Stages 0 and 1 are delivered. Later rows are a delivery contract, not a
-schedule or current feature list.
+Stages 0 and 1 and the narrow Stage 2 observation slice are delivered. The full
+Stage 2 lifecycle and later rows remain a delivery contract, not a schedule or
+current feature list.
 
 ## Test Strategy
 
@@ -981,9 +1041,8 @@ no socket, network, or cluster. The delivered Stage 1 gate runs with:
 
 ```bash
 cargo fmt --all -- --check
-CARGO_BUILD_JOBS=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-CARGO_BUILD_JOBS=1 cargo test --locked --workspace --all-features -- --test-threads=1
-cargo tree --locked --workspace --edges normal,build,dev
+CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --all-features -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings
 ```
 
 Stage 1 covers exact identity binding and replacement, GTID parsing/
@@ -1072,7 +1131,8 @@ must record their own exact inputs and receipts.
 
 Unless a later validated stage says otherwise, this design does not support:
 
-- any executable MySQL server/Kuberic adapter behavior in this repository;
+- production MySQL process ownership, topology mutation, writable transition,
+  or Kuberic callback behavior beyond the delivered read-only observer;
 - production use or service-level objectives;
 - MySQL releases outside a pinned Oracle MySQL 8.4 LTS patch;
 - MariaDB, Percona Server, cloud-vendor forks, or unqualified managed services;
