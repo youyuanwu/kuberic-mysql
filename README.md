@@ -18,9 +18,16 @@ or live test fixture, and it makes no production, cross-host, or Kubernetes
 support claim.
 
 The design requires structured GTID and native-view evidence, exact
-process/storage ownership, independent old-primary fencing, and fresh
-reconciliation before client write publication. Native `PRIMARY` role or
-MySQL read-only variables alone do not grant or fence writes.
+process/storage ownership, and fresh reconciliation before client write
+publication. Its later automated-failover stages additionally require
+independent old-primary fencing. Native `PRIMARY` role or MySQL read-only
+variables alone do not grant or fence writes.
+
+The first PoC is intentionally host-local: the adapter uses private Unix-domain
+sockets, Group Replication uses loopback networking, and TLS/certificate work
+is deferred. The PoC targets fresh bootstrap/join and controlled switchover
+only. Clone/reseed, independent infrastructure fencing, automated unplanned
+failover, cross-host security, and Kubernetes qualification are later stages.
 
 See [the design's staged delivery and validation
 plan](docs/design.md#staged-delivery) for the evidence required before any

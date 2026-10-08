@@ -30,6 +30,46 @@ coverage. They do not demonstrate production fault-domain isolation. The first
 implemented stage that starts MySQL must refuse products, versions, platforms,
 or topology modes outside its pinned profile.
 
+### Proof-of-concept boundary
+
+The first executable milestone is intentionally narrower than the complete
+safety contract in this document. Its purpose is to prove that Kuberic can own
+three local `mysqld` processes, observe Group Replication and GTID state, drive
+the custom-replicator callbacks, and complete a controlled primary handoff.
+
+The PoC includes:
+
+- three independently initialized `mysqld` processes on one Linux host;
+- one private Unix-domain socket per member for adapter observation and
+  administration;
+- loopback TCP for Group Replication and distributed recovery;
+- a single-primary group created from fresh fixture-owned data roots;
+- exact process, storage, `server_uuid`, member, view, and GTID binding;
+- Kuberic role/configuration callbacks with client access initially closed;
+- one controlled switchover while every member and the source runtime remain
+  reachable; and
+- exact source process stop/reap verification before target write publication.
+
+The PoC explicitly defers:
+
+- TLS, certificate authorities, certificate rotation, and network peer
+  identity;
+- separate observer, mutation, provisioning, and client principals;
+- Clone, destructive reseed, replacement, backup, and rolling upgrade;
+- crash-resumable native mutation after an ambiguous external effect;
+- an independent infrastructure fence provider and continuing fence receipts;
+- automated unplanned failover, force recovery, and data-loss acceptance;
+- cross-host, Kubernetes, CNI, service-mesh, and production routing behavior;
+  and
+- production availability, durability, or security claims.
+
+Deferred does not mean unsafe fallback. If a PoC operation encounters an
+ambiguous process, native effect, GTID history, view, or authority transition,
+it keeps client writes closed and requires fixture reset or operator
+intervention. The PoC still preserves the foundational invariants: exact
+identity, structured GTID evidence, stale-result rejection, and no write
+publication from native role alone.
+
 ### Contract labels
 
 This document uses three labels:
@@ -55,7 +95,7 @@ Safety depends on keeping five independent kinds of authority distinct.
 | Durable effects | Runtime lifecycle host | Process/storage ownership, journals, callback fencing, cancellation, access reconciliation, and restart reconstruction | Exact process session, operation journal, and effect receipt |
 | Native facts and replication transport | MySQL engine / Group Replication | Authoritative group membership, native role/state, GTID and recovery facts, replication transport, and execution of accepted native operations | Native state exposed by the pinned MySQL profile |
 | Native integration and proof | MySQL adapter | Authorized SQL/native mutation requests, coherent observation collection and interpretation, typed proof/receipt production, and handoff to the runtime journal | Exact request context plus fresh native observation bundle or operation receipt |
-| Independent containment | Infrastructure fence provider | Terminating or isolating the exact old process or host independently of that `mysqld` and its service runtime | Durable, verifiable, exact-incarnation fence receipt |
+| Independent containment | Infrastructure fence provider, after the PoC | Terminating or isolating the exact old process or host independently of that `mysqld` and its service runtime | Durable, verifiable, exact-incarnation fence receipt |
 
 Kuberic authority is not Group Replication membership. A member may be
 `PRIMARY` in a native view while Kuberic write access is closed. Conversely, a
@@ -64,8 +104,10 @@ Only the Kuberic controller chooses desired lifecycle state; only the durable
 runtime applies authorized effects; only the MySQL engine supplies
 authoritative native history, membership, role, and transport facts; only the
 adapter issues authorized native requests and turns fresh facts into typed
-proof; and only the independent fence provider may certify that an unreachable
-old incarnation cannot continue serving writes.
+proof. The PoC supports only a reachable, controlled source whose exact
+`mysqld` process can be stopped and reaped before target write publication.
+Later automated failover requires an independent fence provider to certify that
+an unreachable old incarnation cannot continue serving writes.
 
 ### Controller, runtime, adapter, and fence boundary
 
@@ -92,15 +134,19 @@ The MySQL adapter:
 - provides the custom stateful-service and replication interfaces;
 - maintains typed MySQL identity, GTID, Group Replication, recovery, and
   observation evidence inside the application boundary;
-- requests native bootstrap, join, clone, recovery, and topology operations
-  only under an exact runtime authorization, then interprets fresh engine facts
-  and records typed receipts without claiming ownership of those facts; and
+- requests PoC bootstrap, join, and topology operations only under an exact
+  runtime authorization; later stages add clone, repair, and recovery
+  operations. It interprets fresh engine facts and records typed receipts
+  without claiming ownership of those facts; and
 - never grants client access from MySQL role alone.
 
-The fence provider is outside both the managed `mysqld` and the runtime process
-that supervises it. It must still act and provide proof if either process is
-unresponsive. A process-local boolean, Kubernetes readiness result, object
-deletion request, in-memory role, or database variable is not a fence receipt.
+The external fence provider is a post-PoC boundary outside both the managed
+`mysqld` and the runtime process that supervises it. It must still act and
+provide proof if either process is unresponsive. The PoC does not simulate that
+guarantee: it refuses automated write failover when the source runtime or
+process is unreachable. A process-local boolean, Kubernetes readiness result,
+object deletion request, in-memory role, or database variable is not a
+production fence receipt.
 
 ### Custom-authority admission
 
@@ -193,10 +239,12 @@ helpers and sockets belong to the same incarnation. Runtime restart must
 reconcile the journal with operating-system and native evidence before adopting
 or terminating a survivor.
 
-Normal process ownership is not sufficient for failover. A `mysqld` can outlive
-its supervising runtime. Automated unplanned failover therefore also requires
-an independent provider that can target the exact process cgroup, virtual
-machine, host, or network identity and prove the old incarnation is contained.
+Normal process ownership is sufficient only for the PoC's controlled
+switchover, where the source runtime is reachable and stop/reap completion is
+verified before target writes open. A `mysqld` can outlive its supervising
+runtime, so automated unplanned failover remains disabled until an independent
+provider can target the exact process cgroup, virtual machine, host, or network
+identity and prove the old incarnation is contained.
 
 ## Runtime Integration
 
@@ -216,7 +264,7 @@ The proposed service uses the existing custom-replication shape:
 | `catch_up_capability` | Return only a conservative compatibility marker; never claim recoverability without retained-history and donor proof |
 | `PrimaryReplicator` current/joint configuration | Perform the stateful, access-closed native admission contract and validate exact member descriptions |
 | catch-up quorum | Freeze and verify a native boundary under exact sessions; do not use scalar callback values as sole proof |
-| build / removal | Run journaled bootstrap/join/clone/reseed/removal workflows with typed native receipts |
+| build / removal | In the PoC, support only fresh bootstrap/join and reject destructive repair explicitly. Later stages add journaled clone/reseed/removal workflows with typed native receipts. |
 | data-loss handling | Evaluate exact authority, view, quorum, GTID compatibility, and fence evidence; reject unsupported stages explicitly |
 
 The custom bundle does not need Kuberic operation/copy replication when MySQL
@@ -247,7 +295,9 @@ earn data-loss, build, role, or access credit.
 
 The current public progress fields are scalar `i64` values. They cannot encode
 a GTID set, view identity, multi-member observation, or fence receipt. A safe
-full integration may require additive, compatibility-preserving capabilities:
+full integration may require the following additive, compatibility-preserving
+capabilities. They are not prerequisites for the PoC, which keeps structured
+evidence in private adapter state and uses conservative callback results:
 
 1. **Structured application progress** carrying typed lineage/history,
    configuration/view, recovery, and retained-history evidence.
@@ -302,21 +352,22 @@ not proof that the candidate applied the transaction.
 Every safety decision consumes one immutable observation bundle with:
 
 - resource, replica, incarnation, process session, endpoint, storage identity,
-  `server_uuid`, group/member identity, and credential/trust generation;
+  `server_uuid`, group/member identity, and local authentication generation;
 - Kuberic configuration/epoch, desired role, and read/write access generation;
 - collection start/end monotonic timestamps and a decision deadline;
 - the native view identity and exact member list sampled for the bundle;
 - each member's identity, address, role, state, and reachability;
 - executed/received/purged GTID sets and recovery state, with query provenance;
 - read-only defense-in-depth state and currently published client surfaces;
-- privilege/capability checks and verified TLS peer identity; and
+- privilege/capability checks and the exact local UDS path, ownership, and
+  connected `server_uuid`; and
 - bracketing samples sufficient to detect process, identity, or view change
   during collection.
 
-Collection is deadline-bounded. A view, identity, session, credential
+Collection is deadline-bounded. A view, identity, session, local authentication
 generation, or authority change invalidates the entire bundle. Data from
-different sessions, attempts, credential generations, or native views must not
-be merged into a synthetic observation.
+different sessions, attempts, authentication generations, or native views must
+not be merged into a synthetic observation.
 
 ### Observation outcomes
 
@@ -326,8 +377,8 @@ Outcomes are typed and fail closed:
 - **unreachable**: connection or transport could not be established;
 - **permission denied**: authentication succeeded or was attempted, but the
   observer lacks required capability;
-- **authentication/trust failure**: credentials, certificate, peer identity, or
-  trust policy cannot be verified;
+- **authentication failure**: local credentials or the expected UDS/server
+  identity cannot be verified;
 - **malformed/unsupported**: values or profile fall outside the pinned decoder;
 - **partial/incomplete**: only part of the required multi-query bundle was
   collected before failure or deadline;
@@ -432,12 +483,18 @@ that capability result and enters an explicitly authorized clone/reseed path.
 
 ### Clone or equivalent provisioning
 
+Clone is deferred beyond the PoC. The initial fixture creates fresh owned data
+roots and uses only the pinned Group Replication join/distributed-recovery path.
+If retained history is insufficient or recovery is ambiguous, the PoC tears
+down the exact owned fixture and starts again rather than entering destructive
+repair.
+
 Clone is destructive to the target and requires:
 
 - exact target incarnation, storage marker, and destructive-work approval;
 - target client/process containment;
 - eligible, fresh, history-compatible donor evidence;
-- separately scoped provisioning credentials and verified TLS;
+- separately scoped provisioning credentials and a qualified secure transport;
 - a new attempt if donor, target identity, authority, or accepted view changes;
   and
 - post-restart re-binding of the process session and native identity.
@@ -529,11 +586,18 @@ serve writes.
 
 ### Strong fence contract
 
-The required fence is issued by a provider independent of the target
-`mysqld` and its runtime supervisor. Depending on the deployment stage, the
-provider may terminate the exact process/cgroup or isolate the exact host,
-network identity, storage writer, and direct-client path. It must contain
-privileged and existing sessions, not just prevent new service discovery.
+For the PoC, strong fencing is deliberately limited to a controlled source:
+withdraw its client endpoint, close Kuberic write access, enable MySQL
+read-only defenses, stop the exact owned `mysqld`, reap it, and verify that its
+PID/session and UDS are gone before target write publication. If the source
+runtime cannot complete and prove those steps, the PoC leaves writes closed.
+
+Automated failover is a later stage. Its required fence is issued by a provider
+independent of the target `mysqld` and its runtime supervisor. Depending on the
+deployment stage, the provider may terminate the exact process/cgroup or
+isolate the exact host, network identity, storage writer, and direct-client
+path. It must contain privileged and existing sessions, not just prevent new
+service discovery.
 
 A fence receipt includes:
 
@@ -585,6 +649,30 @@ explicitly required Group Replication path. Its scope and completion must still
 be exact and verifiable.
 
 ## Planned Switchover
+
+### PoC controlled handoff
+
+The PoC implements only a reachable-source handoff:
+
+1. Bind the exact source, target, configuration, native view, and operation
+   attempt while all three members are healthy.
+2. Close source write access and withdraw its client endpoint.
+3. Freeze the source executed GTID set after client sessions are drained.
+4. Wait until the exact target has executed that boundary.
+5. Invoke the pinned single-primary Group Replication transfer while source and
+   target are still reachable.
+6. Collect a fresh coherent view proving the target is native primary and the
+   histories remain compatible.
+7. Stop and reap the exact old-source `mysqld`; verify its process session and
+   UDS are gone.
+8. Revalidate Kuberic target authority and the fresh native view, then publish
+   the target write endpoint.
+
+Failure at any step leaves writes closed. Restart during this sequence is not
+resumed automatically in the PoC; the exact fixture is reset. The old source
+may be restarted and rejoined only through a new explicit fixture operation.
+
+### Later durable handoff
 
 Planned switchover assumes a healthy quorum and reachable source and target.
 It is a durable handoff between two exact Kuberic authority attempts, not one
@@ -644,6 +732,12 @@ attempts independently and runs ambiguous-effect reconciliation; it never
 infers completion from desired role.
 
 ## Unplanned Failover and Quorum Recovery
+
+Everything in this section is deferred beyond the PoC. The PoC may observe a
+native primary change, but it never converts that observation into a writable
+Kuberic failover. Unexpected source loss, quorum loss, conflicting views, or an
+unreachable old primary closes writes and requires fixture reset or manual
+recovery.
 
 ### Quorum-confirmed history boundary
 
@@ -743,6 +837,15 @@ Force recovery is outside the initial automated support claim.
 
 ## Restart Reconstruction
 
+The PoC supports restart only from a quiescent, unambiguous state. It starts
+client access closed, revalidates the exact owned processes, storage,
+identities, view, and GTID state, and then reconciles Kuberic callbacks again.
+If restart finds a pending topology mutation, partially completed handoff, or
+ambiguous native effect, it does not resume the operation; it keeps writes
+closed and requires exact fixture reset.
+
+The resumable reconstruction contract below belongs to Stage 3 and later.
+
 Runtime or host restart creates fresh process and observation sessions. Access
 starts closed. Reconstruction joins four durable evidence sets:
 
@@ -778,7 +881,13 @@ partial membership to durable authority implicitly.
 
 ### Principals and least privilege
 
-Separate principals and secret references are required for:
+The PoC uses one fixture-scoped administrative MySQL account over each private
+UDS. Its credential is read from a private file, never passed in process
+arguments, logged, or persisted in operation evidence. This is a development
+simplification, not the production privilege model.
+
+Later secure and production profiles require separate principals and secret
+references for:
 
 - **observation**: read the exact server identity, Group Replication,
   transaction-history, recovery, and required capability metadata;
@@ -798,28 +907,37 @@ must not appear in desired-state documents, journals, receipts, logs, status,
 canonical signatures, SQL text recorded for diagnostics, process arguments,
 or connection strings.
 
-### TLS and trust boundaries
+### PoC transport and deferred TLS
 
-Verified TLS is required independently for:
+TLS, CA management, certificate rotation, and certificate peer identity are
+out of scope for the host-local PoC.
 
-- administrative and observation connections to each `mysqld`;
-- client endpoint publication;
-- Group Replication and distributed-recovery transport; and
-- clone/provisioning transport where distinct.
+- The adapter connects to its local `mysqld` through a private UDS.
+- Group Replication and distributed recovery use loopback TCP only.
+- Client probes use loopback TCP and are not exposed outside the fixture host.
+- Socket paths, directory ownership, permissions, connected `server_uuid`, and
+  exact process identity provide the PoC transport binding.
 
-The identity and trust policy for each boundary must be explicit. Successful
-TLS on the administrative path does not prove replication-peer identity, and a
-replication channel does not authorize Kuberic commands or fence-provider
-actions.
+The PoC must not expose these plaintext listeners beyond loopback or claim that
+Kubernetes networking secures them. A later cross-host stage must choose and
+validate a secure transport profile. Native MySQL TLS is the portable default;
+a named CNI or service-mesh profile may replace or supplement it only after
+proving encryption and peer identity for client, Group Replication,
+distributed-recovery, and provisioning paths.
 
 ### Rotation during an operation
 
-Every authenticated session and observation is bound to non-secret credential,
-CA/trust, peer-identity, and privilege generations. Expiry, rotation,
-revocation, privilege loss, or peer-identity change during an observation or
-long-running operation invalidates uncommitted evidence and prevents completion
-credit until a fresh authenticated session revalidates the required native and
-authority state.
+In the PoC, every authenticated session and observation is bound to the local
+credential generation, UDS path, process session, and observed `server_uuid`.
+Credential replacement or privilege loss invalidates uncommitted evidence and
+requires a new local session.
+
+Later secure profiles additionally bind sessions to CA/trust, certificate
+peer-identity, and privilege generations. Expiry, rotation, revocation,
+privilege loss, or peer-identity change during an observation or long-running
+operation invalidates uncommitted evidence and prevents completion credit until
+a fresh authenticated session revalidates the required native and authority
+state.
 
 Old sessions cannot extend old authority. Receipts record generation IDs and
 verified peer/provider provenance, never secret material. Permission loss,
@@ -835,13 +953,12 @@ stage.
 | Stage | Entry prerequisites and deliverables | Pass evidence and condition | Supported claim | Explicit non-claims |
 |---|---|---|---|---|
 | 0. Design | No prior stage. Deliver this design and concise README with current/future claims separated. | Spec, plan, cross-artifact, implementation, and final reviews pass with no unresolved safety finding. | Intended contract is documented. | No executable MySQL support. |
-| 1. Safety model | Stage 0 passed. Add typed identities, GTID relations, views, observations, journals, receipts, and state machines with no server dependency. | All deterministic unit/property suites pass, including malformed, stale, partial, divergent, expected-handoff, retry, and crash-window cases. | Pure contract logic enforces documented fail-closed decisions. | No process, SQL, native decoder, or topology management. |
-| 2. Observe-only adapter | Stage 1 passed; exact MySQL patch/profile and metadata privileges are pinned. Add native decoders, verified administrative TLS, capability checks, and a custom interface bundle whose mutation callbacks reject explicitly. | Server-free decoder/permission tests and the opt-in one-member observation gate pass with exact identity, provenance, freshness, absence/denial, and TLS evidence. | Native identity/progress can be observed for the pinned profile. | No bootstrap, writes, build, failover, or process ownership. |
-| 3. Host process and provisioning | Stage 2 passed; host binaries/plugins, isolated allocations, provisioning credentials, and a minimal independent host-local containment provider with verifiable receipts are available. Add the multi-instance manager, storage ownership, bootstrap, join, clone/reseed, replacement, cleanup, and restart journals. | Host-local build, recovery, restart, replacement, cleanup, foreign-resource refusal, in-flight provisioning trust rotation, and missing-containment-provider gates pass with exact operation, native completion, and fence receipts. | The development topology can be created, rebuilt, contained, and reconstructed on one host. | No writable failover, general access publication, production fence backend, or production fault-domain claim. |
-| 4. Access and topology transitions | Stage 3 passed; its containment provider is qualified for the fixture. Add access reconciliation, continuing fence dependencies/release, switchover/failover, lossless-boundary policy, and quorum recovery rules. | Planned/unplanned transition, orphan survival, direct-client, stale/conflicting view, fence expiry/provider-loss, in-flight topology trust rotation, quorum loss, and recovery gates pass; no write endpoint appears before all required receipts. | Controlled host-local writable transitions for the pinned fixture. | No cross-host, production, or Kubernetes claim. |
-| 5. Controller integration | Stage 4 passed. Add end-to-end Kuberic authority/configuration handoff, callback, cancellation, retry, status, and restart flow. | Deterministic authority races and host-local controller scenarios pass; stale callbacks cannot earn lifecycle or access credit across configurations. | Kuberic-driven lifecycle for the validated host-local profile. | No production or Kubernetes support. |
-| 6. Cross-host qualification | Stage 5 passed; real independent fault domains, direct-client paths, storage behavior, and a production-candidate fence backend are named. | Network partition, host loss, runtime loss, direct-client, storage-fence, continuing-fence, and readmission/release gates pass in that exact environment. | Only the named cross-host environment and fence backend that passed. | No cross-region or untested infrastructure assumption. |
-| 7. Kubernetes qualification | Stage 6 passed for the underlying environment; named Kubernetes/provider versions, images, secrets, storage, routing, and platform fence integrations are fixed. | The Kubernetes gate matrix passes lifecycle, fault, storage reuse, routing, trust rotation, controller restart, old-primary survival, and exact fence/release scenarios. | Only the named Kubernetes, storage, network, and fence-provider matrix. | No generic Kubernetes or provider portability. |
+| 1. Server-free core | Stage 0 passed. Add typed identities, GTID relations, views, observation decoding, and minimal fail-closed state machines without a server dependency. | Deterministic tests pass for malformed, stale, partial, divergent, and stale-authority cases. | Core identity/history decisions do not flatten GTIDs or accept stale work. | No process, SQL, topology mutation, TLS, or recovery automation. |
+| 2. Host-local Kuberic PoC | Stage 1 passed; an exact MySQL patch and local metadata surface are pinned. Add UDS observation, three owned local processes, fresh bootstrap/join, custom Kuberic interfaces, access reconciliation, and controlled switchover. | The fixture proves exact identity/view/GTID observation, process cleanup, Kuberic callback wiring, source stop/reap, and delayed target write publication. | Kuberic can manage a fresh three-member development group and perform one controlled local handoff. | No TLS, Clone/reseed, automated failover, independent fence provider, crash-resumable mutation, cross-host, or Kubernetes claim. |
+| 3. Resumable lifecycle and repair | Stage 2 passed. Add durable effect journals, ambiguous-effect recovery, Clone/reseed, replacement, cleanup recovery, and destructive approvals. | Restart and fault gates prove effects are recovered, retried only when idempotent, or left safely closed. | Host-local lifecycle survives interrupted provisioning and replacement. | No automated writable failover or production security claim. |
+| 4. Automated failover and independent fencing | Stage 3 passed; the pinned native commit invariant and an independent fence provider are validated. Add lossless-boundary derivation, continuing fence dependencies, unplanned failover, and quorum recovery. | Old-primary survival, direct-client, provider-loss, divergent-history, and quorum-loss gates pass with no premature write publication. | Controlled automated failover for the exact validated environment. | No portable cross-host or Kubernetes claim. |
+| 5. Secure cross-host qualification | Stage 4 passed. Add separate principals, secure secret handling, native TLS or an explicitly qualified equivalent network profile, real fault domains, and a production-candidate fence backend. | Cross-host network, trust rotation, host loss, storage, direct-client, and fence-lifetime gates pass. | Only the named cross-host security and infrastructure profile that passed. | No generic CNI, mesh, cloud, or cross-region assumption. |
+| 6. Kubernetes qualification | Stage 5 passed; named Kubernetes/provider versions, images, secrets, storage, routing, and platform fence integrations are fixed. | The Kubernetes gate matrix passes lifecycle, faults, storage reuse, routing, trust rotation, controller restart, old-primary survival, and exact fence/release scenarios. | Only the named Kubernetes, storage, network, and fence-provider matrix. | No generic Kubernetes or provider portability. |
 
 Stage 0 is the only stage delivered by this repository change. Later rows are a
 delivery contract, not a schedule or current feature list.
@@ -874,8 +991,7 @@ require no network or cluster. Future implementation should cover:
 - access state machines for PRIMARY-with-closed-access, stale native evidence,
   missing privilege, and invalid fence;
 - planned/unplanned transition ordering and “no publish before fence”;
-- credential, CA, peer-identity, and privilege rotation during observation and
-  long-running work;
+- local credential replacement and privilege loss during observation;
 - secret redaction and receipt verification; and
 - restart reconstruction with stale desired access and surviving processes.
 
@@ -883,34 +999,27 @@ require no network or cluster. Future implementation should cover:
 
 Live host-local gates are opt-in and separate from ordinary tests. When
 explicitly requested, missing MySQL binaries, required plugin/profile support,
-ports, certificates, privileges, or fence helper must fail with actionable
-prerequisite errors rather than silently skip.
+ports, UDS paths, or privileges must fail with actionable prerequisite errors
+rather than silently skip. Later stages apply the same rule to certificates,
+cross-host networking, and fence-provider prerequisites.
 
-The planned matrix includes:
+The Stage 2 PoC matrix includes:
 
 - one-member negative observation cases: absence, permission denial, invalid
-  TLS, expired/rotated credentials, malformed metadata, and provenance;
+  local credentials, unexpected UDS/server identity, malformed metadata, and
+  provenance;
 - fresh three-member bootstrap, join, native recovery, and exact identity
   validation;
-- clone/reseed, donor change, crash/restart, replacement, and foreign-resource
-  refusal;
 - switchover with source drain, frozen GTID boundary, containment, and delayed
   publication;
-- failover with old-primary survival, direct-client attempts, exact fence
-  verification, continuing containment after publication, fence
-  expiry/provider loss, safe release/readmission, quorum loss,
-  conflicting/stale views, and divergent histories;
-- credential, CA/trust, peer-identity, and metadata-privilege rotation during
-  an already authenticated observation in the Stage 2 one-member gate;
-- provisioning credential/trust rotation during Stage 3 clone or distributed
-  recovery, proving that old sessions and evidence receive no completion
-  credit; and
-- topology-mutation credential/trust rotation during Stage 4 switchover or
-  failover, proving that access stays closed until a fresh session reobserves
-  the exact native effect;
-- runtime death with surviving `mysqld`; and
-- cleanup after normal completion, setup failure, cancellation, and
-  uncatchable runtime termination.
+- source process stop/reap and UDS disappearance before target writes open;
+- refusal to publish writes after unexpected source loss, quorum loss,
+  conflicting/stale views, divergent histories, or ambiguous mutation; and
+- cleanup after normal completion, setup failure, and cancellation.
+
+Later host-local stages add Clone/reseed, ambiguous restart recovery,
+replacement, surviving-`mysqld` faults, independent fencing, automated
+failover, trust rotation, and provider-loss scenarios.
 
 Every gate records product/version/profile, fixture identities, native view,
 non-secret evidence, expected receipts, and supported claim. Live success on one
@@ -936,17 +1045,12 @@ must record their own exact inputs and receipts.
 
 | Gate group | Prerequisites | Pass evidence and condition | Supported claim | Explicit non-claim |
 |---|---|---|---|---|
-| SF-1 identity, GTID, and observation | Stage 1 types/decoders; deterministic fixtures only | Exact identity replacement and stale-session cases pass; GTID set relations never use scalar order; valid, absent, denied, trust-failed, partial, stale, and incoherent bundles produce the specified typed outcomes | Pure identity/history/observation logic matches the design | No MySQL query, privilege, or timing behavior validated |
-| SF-2 lifecycle and restart | SF-1 plus operation journals and deterministic native/provider fakes | Every workflow reaches only authorized stages; expected handoffs require fresh post-state evidence; crash-before-receipt recovers or fails closed; unrelated drift and stale completion are rejected | Resumable state-machine and receipt logic is deterministic | No external effect, process, clone, or recovery validated |
-| SF-3 access, transitions, fence, and trust | SF-1/SF-2 plus access/fence/trust fakes | No write publication precedes authority, native, and fence receipts; subset/incomparable failover histories close writes; fence expiry/provider loss closes dependent grants without releasing containment; credential/trust generation changes invalidate old evidence | Pure access/transition ordering is fail-closed | No native primary transfer, network isolation, or TLS-session behavior validated |
-| HL-1 observation and in-flight trust | Stage 2; pinned MySQL patch/profile; one exact externally provisioned server; observer credentials; test CA/peer identities | Native identity/progress and provenance match the exact server; absence and permission denial remain distinct; rotating/revoking observer credentials, CA/trust, peer identity, or metadata privilege during an active observation rejects old evidence and requires a fresh authenticated observation | Observation and trust-generation behavior for the pinned host-local profile | No native mutation, multi-member lifecycle, or writable transition claim |
-| HL-2 build, recovery, replacement, and cleanup | Stage 3; three isolated instances; provisioning credentials; owned fixture roots; minimal independent containment provider | Bootstrap/join/clone/reseed reach exact native completion boundaries; rotating provisioning credentials/trust during clone or recovery withholds completion credit until fresh authentication and exact-effect reobservation; restart handoffs rebind exact sessions; replacement fences old identity; cleanup removes only journaled resources; absent containment or other prerequisites fail actionably | Reproducible development topology lifecycle on one host | No writable failover, production durability, or cross-host claim |
-| HL-3 planned switchover | Stage 4; HL-2 passed; exact source/target; qualified fixture fence; topology-mutation credentials; direct-client probe | Source endpoint and sessions close; frozen GTID boundary reaches target; source containment persists; linked `C_source`/`C_target` and native pre/post-view receipts validate; rotating topology credentials/trust withholds completion and publication until fresh authentication and exact-effect reobservation; target endpoint appears only afterward | Planned writable handoff for the exact fixture/profile | No unplanned failover or production availability claim |
-| HL-4 failover, quorum, and fence lifetime | Stage 4; HL-2 passed; validated pinned native commit invariant; qualified fixture fence; topology-mutation credentials; fault/direct-client controls | Only a candidate containing `B_required` can publish; incomparable/ambiguous histories, quorum loss, stale views, missing fence, or stale trust generation close writes; any in-flight trust change requires fresh authentication and exact-effect reobservation; surviving old primary cannot serve direct writes; expiry/provider loss does not release containment; explicit release follows dependent-grant closure | Controlled unplanned transition contract for the exact fixture/profile | No claim when lossless boundary is unprovable, and no production/cross-host claim |
-| HL-5 restart, cancellation, and cleanup faults | Stage 3 for provisioning cases or Stage 4 for write/fence cases; signal/fault injection; exact journals | Normal failure, cancellation, runtime death, surviving `mysqld`, and effect-before-receipt cases recover or stop at a documented fail-closed state; foreign/reused resources remain untouched | Host-local reconciliation and cleanup behavior for exercised stages | No whole-host fault-domain or platform-orchestrator claim |
-| K8S-1 lifecycle and replacement | Stage 6; named cluster/provider, images, storage class, network, secrets, and platform fence | Bootstrap, scale, restart, volume reuse, replacement, and cleanup produce exact identity/native/fence receipts without adopting foreign state | Lifecycle only for the named matrix | No generic storage/provider portability |
-| K8S-2 faults, routing, and fencing | K8S-1; controllable Pod/node/API/network faults and direct-client probes | Partitions, controller/runtime loss, old-primary survival, direct access, provider loss, and fence release preserve the continuing-exclusion and no-premature-publication invariants | Fault behavior only for the named matrix | No cross-region or untested network/fence claim |
-| K8S-3 trust and reconstruction | K8S-1/K8S-2; Secret/CA rotation and controller restart controls | In-flight trust rotation invalidates old sessions/evidence; restart reconstructs from durable authority/native/fence state; access reopens only after fresh proof | Trust rotation and restart behavior for the named matrix | No guarantee for untested secret stores or certificate issuers |
+| SF core | Deterministic fixtures only | Identity/view replacement and stale-session cases pass; GTID relations never use scalar order; malformed, absent, denied, partial, stale, and incoherent evidence produces explicit outcomes | Pure identity, GTID, and observation logic matches the PoC contract | No MySQL process, query, timing, or transport behavior validated |
+| PoC observation | One pinned local `mysqld`, private UDS, fixture credential | Native identity/view/GTID evidence matches the exact process; permission denial, bad credentials, and wrong UDS/server identity remain distinct | Local adapter-to-MySQL observation works without TLS | No topology mutation or writable transition claim |
+| PoC lifecycle and switchover | Three fresh owned instances, loopback Group Replication, Kuberic hosts | Bootstrap/join completes; callbacks retain exact identities; source access closes and its process is stopped/reaped before target writes open; unexpected loss leaves writes closed | Controlled host-local Kuberic lifecycle and one planned handoff | No Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
+| Advanced repair and restart | Stage 3 implementation, durable journals, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Resumable host-local repair for the exercised profile | No automated writable failover |
+| Advanced failover and fencing | Validated native commit invariant and independent fence provider | Only a candidate containing the required history publishes; old-primary survival, provider loss, quorum loss, and divergent histories remain fail-closed | Automated failover for the exact qualified environment | No portable infrastructure or Kubernetes claim |
+| Secure cross-host and Kubernetes | Named network, TLS or qualified equivalent, separate principals, storage, routing, and fence integration | The environment-specific lifecycle, partition, trust-rotation, direct-client, restart, and replacement matrix passes | Only the exact named deployment matrix | No generic CNI, mesh, cloud, or Kubernetes portability |
 
 ## Limitations and Unsupported Modes
 
@@ -964,6 +1068,9 @@ Unless a later validated stage says otherwise, this design does not support:
 - a topology other than the staged single-primary profile;
 - cross-region latency, partitions, or disaster-recovery assumptions;
 - cross-host safety before an exact independent fence provider is qualified;
+- TLS, certificate, CA, or network peer-identity guarantees in the PoC;
+- automated unplanned failover, Clone/reseed, replacement, or crash-resumable
+  native mutation in the PoC;
 - shared data roots, adopted foreign processes, or identity reuse;
 - flattening GTID/view evidence into scalar election progress;
 - Kubernetes lifecycle, routing, storage, or fault-tolerance support before its
