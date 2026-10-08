@@ -4,6 +4,7 @@ use kuberic_mysql_core::{
     ObservationSessionId, PartitionId, ProcessSessionId, ReplicaId, ReplicaIncarnation, ResourceId,
     ServerUuid, StorageBinding, ViewId,
 };
+use std::any::TypeId;
 
 fn opaque(value: &str) -> ResourceId {
     ResourceId::new(value).expect("fixture must be valid")
@@ -34,8 +35,19 @@ fn binding_parts() -> ExactBindingParts {
 
 #[test]
 fn opaque_values_preserve_case_and_whitespace() {
+    assert_eq!(opaque("x").as_str(), "x");
     let value = opaque("  Mixed Case  ");
     assert_eq!(value.as_str(), "  Mixed Case  ");
+}
+
+#[test]
+fn identity_domains_are_distinct_types() {
+    assert_ne!(TypeId::of::<ResourceId>(), TypeId::of::<ReplicaId>());
+    assert_ne!(TypeId::of::<ServerUuid>(), TypeId::of::<MemberId>());
+    assert_ne!(
+        TypeId::of::<ProcessSessionId>(),
+        TypeId::of::<ObservationSessionId>()
+    );
 }
 
 #[test]
