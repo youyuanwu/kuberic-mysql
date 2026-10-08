@@ -148,7 +148,6 @@ fn raw_value(value: &Value) -> RawValue {
 mod tests {
     use std::fs;
     use std::io;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -187,12 +186,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn connected_session_cancellation_explicitly_disconnects_without_late_admission() {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "session-cancellation-{}-{sequence}",
-                std::process::id()
-            ));
+        let directory =
+            std::env::temp_dir().join(format!("km-sc-{}-{sequence}", std::process::id()));
         fs::create_dir_all(&directory).expect("create session test directory");
         let socket = directory.join("mysql.sock");
         let listener = UnixListener::bind(&socket).expect("bind fake MySQL socket");

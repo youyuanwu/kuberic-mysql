@@ -39,9 +39,8 @@ struct TestDirectory {
 impl TestDirectory {
     fn new(label: &str) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("kma-{label}-{}-{sequence}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("km-cp-{label}-{}-{sequence}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create preflight directory");
         Self { path }
     }

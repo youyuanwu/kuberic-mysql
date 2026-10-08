@@ -67,12 +67,10 @@ impl TestSocket {
     pub fn new(label: &str) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let short_label = &label[..label.len().min(18)];
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "p4-{short_label}-{}-{sequence}",
-                std::process::id()
-            ));
+        let directory = std::env::temp_dir().join(format!(
+            "km-p4-{short_label}-{}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir_all(&directory).expect("create Phase 4 test directory");
         let path = directory.join("mysql.sock");
         let listener = UnixListener::bind(&path).expect("bind Phase 4 request socket");

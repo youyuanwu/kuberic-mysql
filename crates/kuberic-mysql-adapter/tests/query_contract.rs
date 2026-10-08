@@ -275,7 +275,7 @@ fn named_scenarios_reject_the_wrong_origin_category() {
 
 #[test]
 fn public_request_uses_only_one_validated_socket_and_redacts_secret() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/phase3-query-contract");
+    let root = std::env::temp_dir().join(format!("km-qc-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     let socket = root.join(format!("mysql-{}.sock", std::process::id()));
     let _ = fs::remove_file(&socket);
@@ -310,7 +310,7 @@ fn public_request_uses_only_one_validated_socket_and_redacts_secret() {
 
 #[test]
 fn socket_validation_rejects_relative_regular_and_symlink_targets() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/phase3-socket-validation");
+    let root = std::env::temp_dir().join(format!("km-qv-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     let regular = root.join("regular");
     let link = root.join("link");
@@ -338,7 +338,7 @@ fn socket_validation_rejects_relative_regular_and_symlink_targets() {
 
 #[test]
 fn socket_validation_rejects_non_utf8_paths_without_lossy_target_change() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/phase3-non-utf8-socket");
+    let root = std::env::temp_dir().join(format!("km-qn-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     let mut name = b"mysql-".to_vec();
     name.push(0xff);

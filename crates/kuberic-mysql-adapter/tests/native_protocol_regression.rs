@@ -73,13 +73,11 @@ struct ProtocolSocket {
 impl ProtocolSocket {
     fn new(label: &str) -> (Self, UnixListener) {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "nr-{}-{}-{sequence}",
-                &label[..label.len().min(8)],
-                std::process::id()
-            ));
+        let directory = std::env::temp_dir().join(format!(
+            "km-nr-{}-{}-{sequence}",
+            &label[..label.len().min(8)],
+            std::process::id()
+        ));
         fs::create_dir_all(&directory).expect("create protocol test directory");
         let path = directory.join("mysql.sock");
         let listener = UnixListener::bind(&path).expect("bind protocol test socket");

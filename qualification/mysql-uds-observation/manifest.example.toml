@@ -24,12 +24,12 @@ apt_repository_component = "mysql-8.4-lts"
 expected_mysqld_sha256 = "5319F31BABC80A5B438C4C4E87292539818A3F0D737CFF6733FF8AAE7D801058"
 
 # Both paths must be absolute and beneath this repository's qualification/ tree.
-qualification_root = "/data/code/kuberic-mysql/qualification/mysql-uds-observation/local-run"
+qualification_root = "/absolute/path/to/kuberic-mysql/qualification/q"
 
 # Must be outside qualification_root/work.
-output_record_path = "/data/code/kuberic-mysql/qualification/mysql-uds-observation/oracle-mysql-8.4.11.toml"
-validation_receipt_dir = "/data/code/kuberic-mysql/qualification/mysql-uds-observation/.receipts"
-feature_graph_path = "/data/code/kuberic-mysql/qualification/mysql-uds-observation/.receipts/feature-graph.txt"
+output_record_path = "/absolute/path/to/kuberic-mysql/qualification/mysql-uds-observation/oracle-mysql-8.4.11.toml"
+validation_receipt_dir = "/absolute/path/to/kuberic-mysql/qualification/mysql-uds-observation/.receipts"
+feature_graph_path = "/absolute/path/to/kuberic-mysql/qualification/mysql-uds-observation/.receipts/feature-graph.txt"
 
 startup_timeout_ms = 30000
 observation_timeout_ms = 5000
