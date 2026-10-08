@@ -194,14 +194,14 @@ impl BoundGtidSet {
     }
 }
 
-/// A required fact that was not collected.
+/// A required bracket or GTID fact that was not collected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationField {
-    /// Opening identity/view bracket.
+    /// Opening legacy view or complete native-snapshot bracket.
     OpeningBracket,
     /// Explicitly present executed GTID set.
     ExecutedGtidSet,
-    /// Closing identity/view bracket.
+    /// Closing legacy view or complete native-snapshot bracket.
     ClosingBracket,
 }
 
@@ -261,7 +261,7 @@ pub enum StaleReason {
 pub enum IncoherentReason {
     /// A sample or provenance used a different exact binding/attempt.
     BindingMismatch,
-    /// Opening and closing views differed.
+    /// Opening and closing legacy views or complete native snapshots differed.
     BracketMismatch,
     /// A required sample was supplied more than once.
     DuplicateSample(ObservationField),
@@ -333,7 +333,7 @@ impl ValidObservation {
         }
     }
 
-    /// Returns the explicitly observed executed GTID set.
+    /// Returns the executed GTID point sample taken between the brackets.
     #[must_use]
     pub const fn executed(&self) -> &GtidSet {
         &self.executed
@@ -647,7 +647,7 @@ impl ObservationDraft {
     }
 }
 
-/// Incomplete native observation state with deadline-first freshness semantics.
+/// Incomplete native observation state with deadline-before-partial semantics.
 #[derive(Clone, Debug)]
 pub struct NativeObservationDraft {
     metadata: ObservationMetadata,
@@ -757,7 +757,7 @@ impl NativeObservationDraft {
         }))
     }
 
-    /// Consumes the native draft and returns one fail-closed typed outcome.
+    /// Returns a fail-closed outcome, classifying expiry before partial progress.
     #[must_use]
     pub fn finalize(self) -> ObservationOutcome {
         if self.metadata.start > self.metadata.end {
