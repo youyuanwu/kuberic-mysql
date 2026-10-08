@@ -7,6 +7,7 @@ pub mod binding;
 pub mod error;
 pub mod gtid;
 pub mod identity;
+pub mod observation;
 pub mod view;
 
 pub use binding::{ExactBinding, ExactBindingParts};
@@ -19,6 +20,12 @@ pub use identity::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding, Epoch,
     GroupName, MemberAddress, MemberId, ObservationSessionId, PartitionId, ProcessSessionId,
     ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
+};
+pub use observation::{
+    BoundGtidSet, CollectionFailure, FreshnessError, IncoherentReason, MalformedReason,
+    ObservationBracket, ObservationDraft, ObservationField, ObservationInstant,
+    ObservationMetadata, ObservationOutcome, ObservationProvenance, ProvenanceError, StaleReason,
+    UnsupportedReason, ValidObservation,
 };
 pub use view::{
     MemberRole, MemberState, NativeField, NativeMember, NativeValueError, NativeValueErrorKind,
