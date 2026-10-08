@@ -1,8 +1,10 @@
 //! Private direct native-session boundary.
 //!
-//! Adapter query futures are never detached. After cancellation, a connected
-//! session is still consumed by explicit disconnect before the attempt finishes,
-//! even if `mysql_async` has already closed its own transport.
+//! Adapter query futures are never detached. Normal connected paths consume the
+//! session through explicit disconnect. Forced cancellation or an exhausted
+//! observation deadline may instead drop the connection, leaving only
+//! `mysql_async`'s private transport cleanup with no adapter evidence or
+//! authority capability.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -23,24 +25,20 @@ pub(crate) trait NativeSession {
         query: QueryId,
     ) -> Pin<Box<dyn Future<Output = Result<RawResult, SessionError>> + Send + 'a>>;
 
-    /// Consumes a connected session after its query future ends.
+    /// Consumes a connected session through an explicit teardown attempt.
     fn disconnect(
         self: Box<Self>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + 'static>>;
 }
 
-#[must_use = "live native sessions must be explicitly disconnected"]
+/// One dedicated native connection.
+///
+/// Dropping a live value is the narrow forced-cancellation fallback. It must
+/// remain non-panicking because caller cancellation can drop the public
+/// observation future at any await point.
+#[must_use = "normal connected paths explicitly disconnect native sessions"]
 pub(crate) struct MysqlNativeSession {
     connection: Option<Conn>,
-}
-
-impl Drop for MysqlNativeSession {
-    fn drop(&mut self) {
-        assert!(
-            self.connection.is_none() || std::thread::panicking(),
-            "live native sessions must be explicitly disconnected"
-        );
-    }
 }
 
 impl MysqlNativeSession {

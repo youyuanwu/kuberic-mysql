@@ -61,7 +61,7 @@ async fn one_absolute_deadline_covers_connect_and_every_collection_boundary() {
         let mut steps = success_steps();
         let connector = if let Some(index) = query_index {
             let query = steps[index].query;
-            steps[index] = pending_step(query, false);
+            steps[index] = pending_step(query);
             ScriptedConnector::new(clock.clone(), steps, tracking.clone())
         } else {
             ScriptedConnector::new(clock.clone(), steps, tracking.clone())
@@ -148,14 +148,7 @@ async fn regressing_clock_is_future_dated_and_clock_advance_during_query_is_expi
     let socket = TestSocket::new("clock-change");
     let clock = ScriptClock::new(10);
     let mut steps = success_steps();
-    replace_query_step(
-        &mut steps,
-        4,
-        ScriptAction::Pending {
-            advance_to: 500,
-            force_late_completion: false,
-        },
-    );
+    replace_query_step(&mut steps, 4, ScriptAction::Pending { advance_to: 500 });
     let connector = ScriptedConnector::new(clock.clone(), steps, Tracking::default());
     let report = observe_with(&request(&socket, clock), &connector).await;
     assert_eq!(report.outcome().metadata().end().tick(), 500);
@@ -169,10 +162,7 @@ async fn deterministic_delay_within_the_same_absolute_budget_can_complete() {
     let mut steps = success_steps();
     let result = match std::mem::replace(
         &mut steps[4].action,
-        ScriptAction::Pending {
-            advance_to: 101,
-            force_late_completion: false,
-        },
+        ScriptAction::Pending { advance_to: 101 },
     ) {
         ScriptAction::Result(result) => result,
         _ => unreachable!("success step"),
@@ -206,4 +196,33 @@ async fn expiry_precedes_a_simultaneous_terminal_failure() {
             stage: DeadlineStage::ExecutedGtids
         }
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn explicit_disconnect_uses_only_the_remaining_absolute_budget() {
+    let socket = TestSocket::new("disconnect-pending");
+    let clock = ScriptClock::new(10);
+    let tracking = Tracking::default();
+    let connector = ScriptedConnector::new(clock.clone(), success_steps(), tracking.clone())
+        .with_pending_disconnect(101);
+    let report = observe_with(&request(&socket, clock), &connector).await;
+
+    assert!(matches!(
+        report.outcome(),
+        ObservationOutcome::Stale {
+            reason: StaleReason::Expired,
+            ..
+        }
+    ));
+    assert_eq!(
+        report.diagnostic(),
+        &AdapterDiagnostic::Timeout {
+            stage: DeadlineStage::Disconnect
+        }
+    );
+    assert_eq!(report.outcome().metadata().start().tick(), 10);
+    assert_eq!(report.outcome().metadata().end().tick(), 10);
+    assert_eq!(report.outcome().metadata().decision().tick(), 101);
+    assert!(tracking.disconnect_started.load(Ordering::Acquire));
+    assert!(!tracking.disconnected.load(Ordering::Acquire));
 }

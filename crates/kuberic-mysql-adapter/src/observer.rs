@@ -133,7 +133,7 @@ where
         }
     };
     if is_expired(request, deadline) {
-        let _ = session.disconnect().await;
+        let _ = run_until(runtime_deadline, session.disconnect()).await;
         return finish_timeout(request, start, Collected::default(), DeadlineStage::Connect);
     }
 
@@ -148,17 +148,18 @@ where
     .await;
     let collection_end = request.clock().clock().now();
 
-    let disconnect_error = session
-        .disconnect()
-        .await
-        .err()
-        .map(|error| map_session(&error));
+    let (disconnect_error, disconnect_timed_out) =
+        match run_until(runtime_deadline, session.disconnect()).await {
+            Ok(Ok(())) => (None, false),
+            Ok(Err(error)) => (Some(map_session(&error)), false),
+            Err(()) => (None, true),
+        };
     let decision = request.clock().clock().now();
 
-    if collection_end > deadline || decision > deadline {
+    if collection_end > deadline || decision > deadline || disconnect_timed_out {
         let timeout_stage = match terminal.as_ref() {
             Some(Terminal::Timeout(stage)) => *stage,
-            _ if disconnect_error.is_some() => DeadlineStage::Disconnect,
+            _ if disconnect_error.is_some() || disconnect_timed_out => DeadlineStage::Disconnect,
             _ => DeadlineStage::Completion,
         };
         return report_timeout(request, start, collection_end, decision, timeout_stage);

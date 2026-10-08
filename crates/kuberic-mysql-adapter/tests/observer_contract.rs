@@ -441,7 +441,7 @@ async fn recovering_gtid_is_a_single_valid_point_sample() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn cancelled_query_disconnects_and_forced_late_completion_has_no_result_channel() {
+async fn actual_late_result_is_ignored_without_a_valid_report() {
     let socket = TestSocket::new("late");
     let clock = ScriptClock::new(10);
     let tracking = Tracking::default();
@@ -449,16 +449,16 @@ async fn cancelled_query_disconnects_and_forced_late_completion_has_no_result_ch
     replace_query_step(
         &mut steps,
         4,
-        ScriptAction::Pending {
+        ScriptAction::LateResult {
+            result: crate::common::fixture("native-tagged-and-newline-gtids").raw(),
+            delay: std::time::Duration::from_millis(1),
             advance_to: 101,
-            force_late_completion: true,
         },
     );
     let connector = ScriptedConnector::new(clock.clone(), steps, tracking.clone());
     let report = observe_with(&request(&socket, clock), &connector).await;
-    tokio::task::yield_now().await;
     assert!(matches!(report.outcome(), ObservationOutcome::Stale { .. }));
-    assert!(tracking.disconnected.load(Ordering::Acquire));
+    assert!(tracking.disconnect_started.load(Ordering::Acquire));
     assert!(tracking.late_completion.load(Ordering::Acquire));
     assert!(report.outcome().valid().is_none());
 }

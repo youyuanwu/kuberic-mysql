@@ -114,6 +114,11 @@ pub enum ScriptAction {
         delay: Duration,
         advance_to: u64,
     },
+    LateResult {
+        result: RawResult,
+        delay: Duration,
+        advance_to: u64,
+    },
     Error(SessionErrorSpec),
     ErrorAt {
         error: SessionErrorSpec,
@@ -121,7 +126,6 @@ pub enum ScriptAction {
     },
     Pending {
         advance_to: u64,
-        force_late_completion: bool,
     },
 }
 
@@ -141,6 +145,7 @@ pub struct ScriptStep {
 #[derive(Clone, Default)]
 pub struct Tracking {
     pub connected: Arc<AtomicBool>,
+    pub disconnect_started: Arc<AtomicBool>,
     pub disconnected: Arc<AtomicBool>,
     pub late_completion: Arc<AtomicBool>,
     pub query_count: Arc<AtomicU64>,
@@ -169,6 +174,7 @@ impl ScriptedConnector {
                 tracking,
                 disconnect_error: None,
                 disconnect_advance_to: None,
+                disconnect_pending: false,
             })),
         }
     }
@@ -200,6 +206,16 @@ impl ScriptedConnector {
             .as_mut()
             .expect("scripted session")
             .disconnect_advance_to = Some(tick);
+        self
+    }
+
+    pub fn with_pending_disconnect(self, tick: u64) -> Self {
+        {
+            let mut session = self.session.lock().expect("session lock");
+            let session = session.as_mut().expect("scripted session");
+            session.disconnect_advance_to = Some(tick);
+            session.disconnect_pending = true;
+        }
         self
     }
 }
@@ -252,6 +268,7 @@ pub struct ScriptedSession {
     tracking: Tracking,
     disconnect_error: Option<SessionErrorSpec>,
     disconnect_advance_to: Option<u64>,
+    disconnect_pending: bool,
 }
 
 impl NativeSession for ScriptedSession {
@@ -276,22 +293,23 @@ impl NativeSession for ScriptedSession {
                     clock.set(advance_to);
                     Ok(result)
                 }
+                ScriptAction::LateResult {
+                    result,
+                    delay,
+                    advance_to,
+                } => {
+                    tokio::time::sleep(delay).await;
+                    clock.set(advance_to);
+                    late_completion.store(true, Ordering::Release);
+                    Ok(result)
+                }
                 ScriptAction::Error(error) => Err(session_error(error, Some(query))),
                 ScriptAction::ErrorAt { error, advance_to } => {
                     clock.set(advance_to);
                     Err(session_error(error, Some(query)))
                 }
-                ScriptAction::Pending {
-                    advance_to,
-                    force_late_completion,
-                } => {
+                ScriptAction::Pending { advance_to } => {
                     clock.set(advance_to);
-                    if force_late_completion {
-                        tokio::spawn(async move {
-                            tokio::task::yield_now().await;
-                            late_completion.store(true, Ordering::Release);
-                        });
-                    }
                     std::future::pending().await
                 }
             }
@@ -302,8 +320,14 @@ impl NativeSession for ScriptedSession {
         self: Box<Self>,
     ) -> Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + 'static>> {
         Box::pin(async move {
+            self.tracking
+                .disconnect_started
+                .store(true, Ordering::Release);
             if let Some(tick) = self.disconnect_advance_to {
                 self.clock.set(tick);
+            }
+            if self.disconnect_pending {
+                std::future::pending::<()>().await;
             }
             self.tracking.disconnected.store(true, Ordering::Release);
             match self.disconnect_error {
@@ -390,13 +414,10 @@ pub fn failure_step(query: QueryId, error: SessionErrorSpec) -> ScriptStep {
     }
 }
 
-pub fn pending_step(query: QueryId, force_late_completion: bool) -> ScriptStep {
+pub fn pending_step(query: QueryId) -> ScriptStep {
     ScriptStep {
         query,
-        action: ScriptAction::Pending {
-            advance_to: 101,
-            force_late_completion,
-        },
+        action: ScriptAction::Pending { advance_to: 101 },
     }
 }
 

@@ -34,8 +34,7 @@ use kuberic_mysql_core::{
 
 use observer::observe_with;
 use phase4_common::{
-    ScriptClock, ScriptedConnector, TestSocket, Tracking, binding, pending_step, request,
-    success_steps,
+    ScriptClock, ScriptedConnector, TestSocket, Tracking, binding, request, success_steps,
 };
 
 #[tokio::test(flavor = "current_thread")]
@@ -92,19 +91,49 @@ async fn binding_and_credential_replacement_revoke_pending_observation() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn timeout_and_forced_late_completion_receive_zero_credit() {
+async fn actual_late_completion_receives_zero_credit() {
     let socket = TestSocket::new("authority-timeout");
     let clock = ScriptClock::new(10);
     let current = binding();
     let mut authority = AuthoritySession::new(current.clone());
     let capability = authority.begin_attempt(&current).expect("pending attempt");
     let mut steps = success_steps();
-    let query = steps[4].query;
-    steps[4] = pending_step(query, true);
-    let connector = ScriptedConnector::new(clock.clone(), steps, Tracking::default());
+    let result = match std::mem::replace(
+        &mut steps[4].action,
+        phase4_common::ScriptAction::Pending { advance_to: 101 },
+    ) {
+        phase4_common::ScriptAction::Result(result) => result,
+        _ => unreachable!("success step"),
+    };
+    steps[4].action = phase4_common::ScriptAction::LateResult {
+        result,
+        delay: std::time::Duration::from_millis(1),
+        advance_to: 101,
+    };
+    let tracking = Tracking::default();
+    let connector = ScriptedConnector::new(clock.clone(), steps, tracking.clone());
     let report = observe_with(&request(&socket, clock), &connector).await;
 
     assert!(matches!(report.outcome(), ObservationOutcome::Stale { .. }));
+    assert_eq!(report.outcome().metadata().start().tick(), 10);
+    assert_eq!(report.outcome().metadata().end().tick(), 101);
+    assert_eq!(report.outcome().metadata().decision().tick(), 101);
+    assert_eq!(report.outcome().metadata().binding(), &current);
+    assert!(
+        tracking
+            .late_completion
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(
+        tracking
+            .disconnect_started
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(
+        tracking
+            .disconnected
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     assert_eq!(
         authority.complete(capability, report.outcome(), ObservationInstant::new(101)),
         Err(CompletionRejection::NonValidObservation)
