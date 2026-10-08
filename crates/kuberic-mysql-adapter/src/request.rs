@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 use kuberic_mysql_core::{ExactBinding, ObservationProvenance};
 
@@ -14,7 +14,17 @@ use crate::{ClockContext, ClockError, ObservationClock};
 
 /// A validated absolute path to an existing, non-symlink Unix socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnixSocketPath(PathBuf);
+pub struct UnixSocketPath {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
 
 impl UnixSocketPath {
     /// Validates path shape and the current filesystem object type.
@@ -37,13 +47,47 @@ impl UnixSocketPath {
         }
         #[cfg(not(unix))]
         return Err(SocketPathError::UnsupportedPlatform);
-        Ok(Self(path))
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
     }
 
     /// Returns the validated path.
     #[must_use]
     pub fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), SocketPathError> {
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|error| SocketPathError::Metadata(error.kind()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(SocketPathError::Symlink);
+        }
+        #[cfg(unix)]
+        {
+            if !metadata.file_type().is_socket() {
+                return Err(SocketPathError::NotSocket);
+            }
+            if metadata.dev() != self.device
+                || metadata.ino() != self.inode
+                || metadata.ctime() != self.changed_seconds
+                || metadata.ctime_nsec() != self.changed_nanoseconds
+            {
+                return Err(SocketPathError::Replaced);
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(SocketPathError::UnsupportedPlatform);
+        Ok(())
     }
 }
 
@@ -60,6 +104,8 @@ pub enum SocketPathError {
     Symlink,
     /// The final path component was not a Unix socket.
     NotSocket,
+    /// The socket object changed after request validation.
+    Replaced,
     /// Unix socket validation is unavailable on this platform.
     UnsupportedPlatform,
 }

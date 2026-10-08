@@ -7,6 +7,8 @@
 #[allow(dead_code)]
 mod decode;
 mod diagnostic;
+mod error;
+mod observer;
 mod query;
 mod report;
 mod request;
@@ -15,10 +17,11 @@ mod session;
 mod time;
 
 pub use diagnostic::{
-    AdapterDiagnostic, AmbiguityKind, CoreOutcomeClass, EvidenceIssue, IdentityField,
-    NativeSurface, ObservationStage, PlaceholderKind, ProductIssue, SchemaIssue, ServerErrorClass,
-    SqlState,
+    AdapterDiagnostic, AmbiguityKind, CoreOutcomeClass, DeadlineStage, EvidenceIssue,
+    IdentityField, NativeSurface, ObservationStage, PlaceholderKind, ProductIssue, SchemaIssue,
+    ServerErrorClass, SocketIssue, SqlState,
 };
+pub use observer::MysqlObserver;
 pub use query::{ColumnContract, ColumnKind, QueryId};
 pub use report::ObservationReport;
 pub use request::{

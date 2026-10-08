@@ -3,7 +3,8 @@
 use core::fmt;
 
 use kuberic_mysql_core::{
-    GtidParseErrorKind, IncoherentReason, MalformedReason, NativeEvidenceField, UnsupportedReason,
+    GtidParseErrorKind, IncoherentReason, MalformedReason, NativeEvidenceField, StaleReason,
+    UnsupportedReason,
 };
 
 /// A versioned native surface queried by the adapter.
@@ -36,6 +37,54 @@ pub enum ObservationStage {
     Consume,
     /// Explicit session teardown.
     Disconnect,
+}
+
+/// The exact bounded step whose absolute deadline expired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeadlineStage {
+    /// Final socket revalidation.
+    SocketValidation,
+    /// Direct UDS connection and authentication.
+    Connect,
+    /// Product and server identity collection.
+    ProductIdentity,
+    /// Opening local state collection.
+    OpeningLocalState,
+    /// Opening complete membership collection.
+    OpeningMembers,
+    /// Opening local view collection.
+    OpeningView,
+    /// Executed-GTID point sample.
+    ExecutedGtids,
+    /// Closing local state collection.
+    ClosingLocalState,
+    /// Closing complete membership collection.
+    ClosingMembers,
+    /// Closing local view collection.
+    ClosingView,
+    /// Explicit connected-session teardown.
+    Disconnect,
+    /// Final report construction.
+    Completion,
+}
+
+/// A final Unix-socket validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketIssue {
+    /// The socket disappeared.
+    Missing,
+    /// Filesystem metadata access was denied.
+    Inaccessible,
+    /// Another filesystem metadata failure occurred.
+    Metadata,
+    /// The final component became a symbolic link.
+    Symlink,
+    /// The final component was not a socket.
+    NotSocket,
+    /// The validated socket object was replaced.
+    Replaced,
+    /// Unix socket validation is unavailable.
+    UnsupportedPlatform,
 }
 
 /// A selected result-schema mismatch.
@@ -186,8 +235,14 @@ impl std::error::Error for SqlStateError {}
 pub enum AdapterDiagnostic {
     /// No adapter-level rejection accompanied the authoritative outcome.
     None,
+    /// Core finalization rejected otherwise completely collected evidence.
+    Outcome(CoreOutcomeClass),
     /// The UDS transport failed.
     Transport { stage: ObservationStage },
+    /// Final socket validation failed.
+    Socket { issue: SocketIssue },
+    /// The single absolute deadline expired.
+    Timeout { stage: DeadlineStage },
     /// The server returned a structured error.
     Server {
         stage: ObservationStage,
@@ -232,7 +287,9 @@ impl AdapterDiagnostic {
     pub fn core_class(&self) -> CoreOutcomeClass {
         match self {
             Self::None => CoreOutcomeClass::Valid,
-            Self::Transport { .. } => CoreOutcomeClass::Unreachable,
+            Self::Outcome(class) => *class,
+            Self::Transport { .. } | Self::Socket { .. } => CoreOutcomeClass::Unreachable,
+            Self::Timeout { .. } => CoreOutcomeClass::Stale(StaleReason::Expired),
             Self::Server { class, .. } => match class {
                 ServerErrorClass::Authentication => CoreOutcomeClass::AuthenticationFailure,
                 ServerErrorClass::Permission => CoreOutcomeClass::PermissionDenied,
@@ -289,6 +346,12 @@ pub enum CoreOutcomeClass {
     AuthenticationFailure,
     /// Authenticated access was denied.
     PermissionDenied,
+    /// Required evidence was incomplete.
+    Partial,
+    /// The observation deadline expired.
+    Stale(StaleReason),
+    /// The decision clock preceded collection completion.
+    FutureDated,
     /// Native evidence was malformed.
     Malformed(MalformedReason),
     /// Product, schema, or value was unsupported.
