@@ -1,12 +1,24 @@
 //! Minimal fail-closed authority and observation-credit state.
 
+use std::sync::Arc;
+
 use crate::{ExactBinding, FreshnessError, ObservationInstant, ObservationOutcome};
 
 /// A session-private, non-reusable admission capability.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AdmissionCapability {
+    session_identity: Arc<()>,
     generation: u64,
 }
+
+impl PartialEq for AdmissionCapability {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.session_identity, &other.session_identity)
+            && self.generation == other.generation
+    }
+}
+
+impl Eq for AdmissionCapability {}
 
 /// A failure to begin a new pending attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,8 +32,6 @@ pub enum AdmissionError {
 /// A structured completion rejection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionRejection {
-    /// No work is currently pending.
-    NoPendingAttempt,
     /// The capability belongs to revoked, consumed, or older work.
     StaleCapability,
     /// The evidence did not use the exact current pending binding.
@@ -100,15 +110,16 @@ impl UnsupportedResult {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct PendingAttempt {
     capability: AdmissionCapability,
     binding: ExactBinding,
 }
 
 /// An in-memory Stage 1 session that grants observation credit only.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct AuthoritySession {
+    session_identity: Arc<()>,
     current: ExactBinding,
     next_generation: u64,
     pending: Option<PendingAttempt>,
@@ -118,8 +129,9 @@ pub struct AuthoritySession {
 impl AuthoritySession {
     /// Creates a session with closed access and no pending work.
     #[must_use]
-    pub const fn new(current: ExactBinding) -> Self {
+    pub fn new(current: ExactBinding) -> Self {
         Self {
+            session_identity: Arc::new(()),
             current,
             next_generation: 0,
             pending: None,
@@ -171,9 +183,12 @@ impl AuthoritySession {
             .checked_add(1)
             .ok_or(AdmissionError::GenerationExhausted)?;
         self.next_generation = generation;
-        let capability = AdmissionCapability { generation };
+        let capability = AdmissionCapability {
+            session_identity: Arc::clone(&self.session_identity),
+            generation,
+        };
         self.pending = Some(PendingAttempt {
-            capability,
+            capability: capability.clone(),
             binding: offered.clone(),
         });
         self.observation_credited = false;
@@ -259,6 +274,7 @@ mod tests {
     fn capability_generation_exhaustion_fails_closed() {
         let current = binding();
         let mut session = AuthoritySession {
+            session_identity: Arc::new(()),
             current: current.clone(),
             next_generation: u64::MAX,
             pending: None,

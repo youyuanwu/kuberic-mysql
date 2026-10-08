@@ -29,7 +29,7 @@ fn exact_current_valid_completion_receives_observation_credit_only() {
     let capability = session.begin_attempt(&current).unwrap();
     assert_eq!(
         session.complete(
-            capability,
+            capability.clone(),
             &valid_outcome(&current),
             ObservationInstant::new(3)
         ),
@@ -269,10 +269,42 @@ fn mismatched_admission_and_unsupported_operations_fail_closed() {
         UnsupportedOperation::DataLossAcceptance,
         UnsupportedOperation::AccessPublication,
     ] {
-        let before = session.clone();
+        let before_binding = session.current_binding().clone();
+        let before_pending = session.has_pending_attempt();
+        let before_credit = session.has_observation_credit();
         assert_eq!(session.reject_unsupported(operation).operation(), operation);
-        assert_eq!(session, before);
+        assert_eq!(session.current_binding(), &before_binding);
+        assert_eq!(session.has_pending_attempt(), before_pending);
+        assert_eq!(session.has_observation_credit(), before_credit);
     }
     assert!(!session.access().read_open());
     assert!(!session.access().write_open());
+}
+
+#[test]
+fn capabilities_cannot_cross_authority_sessions() {
+    let current = binding();
+    let mut first = AuthoritySession::new(current.clone());
+    let mut second = AuthoritySession::new(current.clone());
+    let first_capability = first.begin_attempt(&current).unwrap();
+    let second_capability = second.begin_attempt(&current).unwrap();
+    assert_ne!(first_capability, second_capability);
+
+    assert_eq!(
+        second.complete(
+            first_capability,
+            &valid_outcome(&current),
+            ObservationInstant::new(2)
+        ),
+        Err(CompletionRejection::StaleCapability)
+    );
+    assert!(second.has_pending_attempt());
+    assert_eq!(
+        second.complete(
+            second_capability,
+            &valid_outcome(&current),
+            ObservationInstant::new(2)
+        ),
+        Ok(CompletionCredit::ObservationAcknowledged)
+    );
 }
