@@ -1,0 +1,169 @@
+{
+  "fixture_schema": "kuberic.mysql.native-result/v1",
+  "cases": [
+    {
+      "scenario": "other-oracle-patch",
+      "query_id": "Mysql8411ProductIdentityV1",
+      "columns": [
+        {"name": "version", "kind": "VarString", "nullable": false},
+        {"name": "version_comment", "kind": "VarString", "nullable": false},
+        {"name": "version_compile_machine", "kind": "VarString", "nullable": false},
+        {"name": "version_compile_os", "kind": "VarString", "nullable": false},
+        {"name": "server_uuid", "kind": "VarString", "nullable": false}
+      ],
+      "rows": [["8.4.10", "MySQL Community Server - GPL", "x86_64", "Linux", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]],
+      "expected": {"core_class": "Unsupported", "diagnostic": "UnsupportedPatch"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Change only the qualified patch field."}
+    },
+    {
+      "scenario": "non-oracle-lookalike",
+      "query_id": "Mysql8411ProductIdentityV1",
+      "columns": [
+        {"name": "version", "kind": "VarString", "nullable": false},
+        {"name": "version_comment", "kind": "VarString", "nullable": false},
+        {"name": "version_compile_machine", "kind": "VarString", "nullable": false},
+        {"name": "version_compile_os", "kind": "VarString", "nullable": false},
+        {"name": "server_uuid", "kind": "VarString", "nullable": false}
+      ],
+      "rows": [["8.4.11", "Lookalike Community Server", "x86_64", "Linux", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]],
+      "expected": {"core_class": "Unsupported", "diagnostic": "NonOracleCommunity"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Keep the version string and replace the Oracle product comment."}
+    },
+    {
+      "scenario": "unexpected-required-null",
+      "query_id": "Mysql8411ExecutedGtidsV1",
+      "columns": [{"name": "gtid_executed", "kind": "String", "nullable": false}],
+      "rows": [[null]],
+      "expected": {"core_class": "Malformed", "diagnostic": "RequiredNull"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Replace required GTID text with SQL NULL."}
+    },
+    {
+      "scenario": "incomplete-members-row",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mysql-a", 3306]],
+      "expected": {"core_class": "Malformed", "diagnostic": "IncompleteRow"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Remove state and role cells while retaining exact metadata."}
+    },
+    {
+      "scenario": "members-schema-type-drift",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "VarString", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [],
+      "expected": {"core_class": "Unsupported", "diagnostic": "ChangedType"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Change MEMBER_ID metadata from fixed to variable string."}
+    },
+    {
+      "scenario": "duplicate-member-id",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [
+        ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mysql-a", 3306, "ONLINE", "PRIMARY"],
+        ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mysql-b", 3307, "ONLINE", "SECONDARY"]
+      ],
+      "expected": {"core_class": "Incoherent", "diagnostic": "DuplicateMemberId"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Duplicate the native member UUID with a distinct address."}
+    },
+    {
+      "scenario": "duplicate-member-address",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [
+        ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mysql-a", 3306, "ONLINE", "PRIMARY"],
+        ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "mysql-a", 3306, "ONLINE", "SECONDARY"]
+      ],
+      "expected": {"core_class": "Incoherent", "diagnostic": "DuplicateMemberAddress"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Duplicate the SQL member address with a distinct UUID."}
+    },
+    {
+      "scenario": "duplicate-local-stats-row",
+      "query_id": "Mysql8411LocalMemberStatsV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "view_id", "kind": "String", "nullable": false}
+      ],
+      "rows": [
+        ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "view-0001"],
+        ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "view-0002"]
+      ],
+      "expected": {"core_class": "Incoherent", "diagnostic": "DuplicateLocalRow"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Return two bound-local rows with contradictory view IDs."}
+    },
+    {
+      "scenario": "malformed-read-only-switch",
+      "query_id": "Mysql8411LocalStateV1",
+      "columns": [
+        {"name": "group_name", "kind": "VarString", "nullable": false},
+        {"name": "group_replication_address", "kind": "VarString", "nullable": false},
+        {"name": "read_only", "kind": "LongLong", "nullable": false},
+        {"name": "super_read_only", "kind": "LongLong", "nullable": false}
+      ],
+      "rows": [["cccccccc-cccc-cccc-cccc-cccccccccccc", "127.0.0.1:33061", 2, 0]],
+      "expected": {"core_class": "Malformed", "diagnostic": "MalformedCell"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Replace the binary read_only value with integer 2."}
+    },
+    {
+      "scenario": "future-member-role",
+      "query_id": "Mysql8411GroupMembersV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "member_host", "kind": "String", "nullable": false},
+        {"name": "member_port", "kind": "Long", "nullable": true},
+        {"name": "member_state", "kind": "String", "nullable": false},
+        {"name": "member_role", "kind": "String", "nullable": false}
+      ],
+      "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mysql-a", 3306, "ONLINE", "ARBITER"]],
+      "expected": {"core_class": "Unsupported", "diagnostic": "UnsupportedNativeValue"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Replace the qualified native role with a well-formed future role."}
+    },
+    {
+      "scenario": "future-additional-column",
+      "query_id": "Mysql8411LocalMemberStatsV1",
+      "columns": [
+        {"name": "member_id", "kind": "String", "nullable": false},
+        {"name": "view_id", "kind": "String", "nullable": false},
+        {"name": "future_field", "kind": "String", "nullable": false}
+      ],
+      "rows": [["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "view-0001", "future"]],
+      "expected": {"core_class": "Unsupported", "diagnostic": "AdditionalColumns"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Append one well-formed future selected column and cell."}
+    },
+    {
+      "scenario": "invalid-empty-group-name",
+      "query_id": "Mysql8411LocalStateV1",
+      "columns": [
+        {"name": "group_name", "kind": "VarString", "nullable": false},
+        {"name": "group_replication_address", "kind": "VarString", "nullable": false},
+        {"name": "read_only", "kind": "LongLong", "nullable": false},
+        {"name": "super_read_only", "kind": "LongLong", "nullable": false}
+      ],
+      "rows": [["", "127.0.0.1:33061", 0, 0]],
+      "expected": {"core_class": "Malformed", "diagnostic": "EmptyRequiredString"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Replace the required configured group identity with an empty string."}
+    }
+  ]
+}

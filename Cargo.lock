@@ -432,6 +432,8 @@ version = "0.1.0"
 dependencies = [
  "kuberic-mysql-core",
  "mysql_async",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

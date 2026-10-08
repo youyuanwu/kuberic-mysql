@@ -1,0 +1,19 @@
+schema = "kuberic.mysql.query-contract-provenance/v1"
+oracle_tag = "mysql-8.4.11"
+oracle_commit = "99960bf74fa919347e4f4e3ca47672f333d6e91f"
+
+[[sources]]
+surface = "performance_schema.replication_group_members"
+url = "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/storage/perfschema/table_replication_group_members.cc"
+path = "storage/perfschema/table_replication_group_members.cc"
+sha256 = "76f29b8caa0cb036866e1ab057b5f11d9249a2b441f62cf88d600483578d6f90"
+range = "Plugin_table table_replication_group_members::m_table_def"
+derivation = "Select MEMBER_ID CHAR(36) NOT NULL, MEMBER_HOST CHAR(255) NOT NULL, MEMBER_PORT INTEGER NULL, MEMBER_STATE CHAR(64) NOT NULL, and MEMBER_ROLE CHAR(64) NOT NULL in declared order; retain the implementation's port-zero-to-NULL behavior."
+
+[[sources]]
+surface = "performance_schema.replication_group_member_stats"
+url = "https://raw.githubusercontent.com/mysql/mysql-server/99960bf74fa919347e4f4e3ca47672f333d6e91f/storage/perfschema/table_replication_group_member_stats.cc"
+path = "storage/perfschema/table_replication_group_member_stats.cc"
+sha256 = "54be38203e0c4bc0da9ee0c4d838dd5ef300534b8b5c6166e5406f1469fa601c"
+range = "Plugin_table table_replication_group_member_stats::m_table_def"
+derivation = "Select MEMBER_ID CHAR(36) NOT NULL and VIEW_ID CHAR(60) NOT NULL in adapter order; bind the row with WHERE MEMBER_ID = @@GLOBAL.server_uuid."
