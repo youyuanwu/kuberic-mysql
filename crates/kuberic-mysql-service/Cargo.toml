@@ -13,6 +13,7 @@ live-mysql-8-4-11 = []
 [dependencies]
 kuberic-mysql-adapter = { path = "../kuberic-mysql-adapter" }
 kuberic-mysql-core = { path = "../kuberic-mysql-core" }
+rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
 mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust"] }

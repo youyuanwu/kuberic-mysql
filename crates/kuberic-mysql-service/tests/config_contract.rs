@@ -274,3 +274,19 @@ fn socket_path_must_fit_the_linux_unix_address() {
     .unwrap_err();
     assert_eq!(error, ConfigError::PathNotRepresentable);
 }
+
+#[test]
+fn option_file_metacharacters_are_rejected_in_every_path() {
+    let root = TestRoot::new("option");
+    for suffix in ["hash#root", "back\\slash", "space root", "trailing "] {
+        let error = MysqlInstanceConfig::new(
+            "/usr/bin/sleep",
+            "/usr/bin/env",
+            root.root.join(suffix),
+            &root.scratch,
+            timeouts(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ConfigError::PathNotRepresentable, "{suffix:?}");
+    }
+}

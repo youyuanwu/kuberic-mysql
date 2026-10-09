@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ConfigError;
 
@@ -16,13 +16,13 @@ const PID_FILE: &str = "mysqld.pid";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MysqlOperationTimeouts {
     /// Product inspection and `--initialize-insecure` deadline.
-    pub initialization: Duration,
+    initialization: Duration,
     /// Socket readiness and ownership-attestation deadline.
-    pub startup: Duration,
+    startup: Duration,
     /// TERM/KILL/reap deadline.
-    pub shutdown: Duration,
+    shutdown: Duration,
     /// Socket disappearance deadline after reaping.
-    pub socket_disappearance: Duration,
+    socket_disappearance: Duration,
 }
 
 impl MysqlOperationTimeouts {
@@ -39,12 +39,53 @@ impl MysqlOperationTimeouts {
         {
             return Err(ConfigError::ZeroTimeout);
         }
-        Ok(Self {
+        let timeouts = Self {
             initialization,
             startup,
             shutdown,
             socket_disappearance,
-        })
+        };
+        timeouts.validate()?;
+        Ok(timeouts)
+    }
+
+    /// Product inspection and initialization deadline.
+    #[must_use]
+    pub const fn initialization(self) -> Duration {
+        self.initialization
+    }
+
+    /// Startup readiness deadline.
+    #[must_use]
+    pub const fn startup(self) -> Duration {
+        self.startup
+    }
+
+    /// End-to-end TERM, KILL, and reap deadline.
+    #[must_use]
+    pub const fn shutdown(self) -> Duration {
+        self.shutdown
+    }
+
+    /// Socket disappearance deadline.
+    #[must_use]
+    pub const fn socket_disappearance(self) -> Duration {
+        self.socket_disappearance
+    }
+
+    fn validate(self) -> Result<(), ConfigError> {
+        if [
+            self.initialization,
+            self.startup,
+            self.shutdown,
+            self.socket_disappearance,
+        ]
+        .into_iter()
+        .any(|timeout| Instant::now().checked_add(timeout).is_none())
+        {
+            return Err(ConfigError::UnrepresentableTimeout);
+        }
+        Ok(())
     }
 }
 
@@ -149,9 +190,62 @@ struct FileIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnedRoot {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+    parent_device: u64,
+    parent_inode: u64,
+}
+
+impl OwnedRoot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) const fn device(&self) -> u64 {
+        self.device
+    }
+
+    pub(crate) const fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    pub(crate) const fn parent_device(&self) -> u64 {
+        self.parent_device
+    }
+
+    pub(crate) const fn parent_inode(&self) -> u64 {
+        self.parent_inode
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), crate::OwnershipError> {
+        let metadata =
+            fs::symlink_metadata(&self.path).map_err(|_| crate::OwnershipError::RootMismatch)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || metadata.uid() != self.uid
+            || metadata.permissions().mode() & 0o777 != self.mode
+        {
+            return Err(crate::OwnershipError::RootMismatch);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct OwnedRoots {
+    pub(crate) data: OwnedRoot,
+    pub(crate) scratch: OwnedRoot,
+}
+
 pub(crate) struct LayoutCreationError {
     pub(crate) error: ConfigError,
-    pub(crate) created_roots: Vec<PathBuf>,
+    pub(crate) created_roots: Vec<OwnedRoot>,
 }
 
 impl MysqlInstanceConfig {
@@ -170,6 +264,7 @@ impl MysqlInstanceConfig {
         let launcher = launcher.into();
         let data_root = data_root.into();
         let scratch_root = scratch_root.into();
+        timeouts.validate()?;
 
         let mysqld_identity = validate_executable(&mysqld)?;
         let launcher_identity = validate_executable(&launcher)?;
@@ -265,7 +360,7 @@ impl MysqlInstanceConfig {
         )
     }
 
-    pub(crate) fn create_layout(&self) -> Result<(), LayoutCreationError> {
+    pub(crate) fn create_layout(&self) -> Result<OwnedRoots, LayoutCreationError> {
         // Revalidate immediately before ownership is claimed.
         validate_fresh_root(&self.data_root).map_err(|error| LayoutCreationError {
             error,
@@ -275,18 +370,19 @@ impl MysqlInstanceConfig {
             error,
             created_roots: Vec::new(),
         })?;
-        create_private_directory(&self.data_root).map_err(|error| LayoutCreationError {
-            error,
-            created_roots: Vec::new(),
-        })?;
-        let mut created_roots = vec![self.data_root.clone()];
-        if let Err(error) = create_private_directory(&self.runtime.scratch_root) {
-            return Err(LayoutCreationError {
+        let data =
+            create_private_directory(&self.data_root).map_err(|error| LayoutCreationError {
                 error,
-                created_roots,
-            });
-        }
-        created_roots.push(self.runtime.scratch_root.clone());
+                created_roots: Vec::new(),
+            })?;
+        let mut created_roots = vec![data.clone()];
+        let scratch = create_private_directory(&self.runtime.scratch_root).map_err(|error| {
+            LayoutCreationError {
+                error,
+                created_roots: created_roots.clone(),
+            }
+        })?;
+        created_roots.push(scratch.clone());
         for directory in [&self.runtime.temporary, &self.runtime.secure_files] {
             if let Err(error) = create_private_directory(directory) {
                 return Err(LayoutCreationError {
@@ -295,7 +391,7 @@ impl MysqlInstanceConfig {
                 });
             }
         }
-        Ok(())
+        Ok(OwnedRoots { data, scratch })
     }
 
     pub(crate) fn revalidate_executables(&self) -> Result<(), ConfigError> {
@@ -362,7 +458,10 @@ fn validate_path_shape(path: &Path) -> Result<(), ConfigError> {
         return Err(ConfigError::PathNotNormalized);
     }
     let value = path.to_str().ok_or(ConfigError::PathNotRepresentable)?;
-    if value.chars().any(char::is_control) || value.contains('=') {
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
         return Err(ConfigError::PathNotRepresentable);
     }
     Ok(())
@@ -390,7 +489,10 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
-fn create_private_directory(path: &Path) -> Result<(), ConfigError> {
+fn create_private_directory(path: &Path) -> Result<OwnedRoot, ConfigError> {
+    let parent = path.parent().ok_or(ConfigError::InvalidRootParent)?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).map_err(|error| ConfigError::Filesystem(error.kind()))?;
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     builder
@@ -407,7 +509,15 @@ fn create_private_directory(path: &Path) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::InvalidRootParent);
     }
-    Ok(())
+    Ok(OwnedRoot {
+        path: path.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        mode: metadata.permissions().mode() & 0o777,
+        parent_device: parent_metadata.dev(),
+        parent_inode: parent_metadata.ino(),
+    })
 }
 
 fn effective_uid() -> u32 {
@@ -439,6 +549,15 @@ mod tests {
                 Duration::from_secs(1),
             ),
             Err(ConfigError::ZeroTimeout)
+        );
+        assert_eq!(
+            MysqlOperationTimeouts::new(
+                Duration::MAX,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(ConfigError::UnrepresentableTimeout)
         );
     }
 

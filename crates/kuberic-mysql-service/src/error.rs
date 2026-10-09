@@ -28,6 +28,8 @@ pub enum ConfigError {
     RootOverlap,
     /// An operation timeout was zero.
     ZeroTimeout,
+    /// An operation timeout cannot be represented by the monotonic clock.
+    UnrepresentableTimeout,
     /// The host platform is not the qualified Linux x86-64 target.
     UnsupportedPlatform,
     /// Filesystem inspection failed.
@@ -74,6 +76,8 @@ pub enum OwnershipError {
     PidMismatch,
     /// The live process executable was not the configured executable.
     ExecutableMismatch,
+    /// An owned data or scratch root was replaced or changed.
+    RootMismatch,
     /// Process identity could not be inspected.
     InspectionFailed,
 }

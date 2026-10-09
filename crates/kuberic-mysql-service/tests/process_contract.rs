@@ -176,6 +176,26 @@ fn unexpected_child_exit_is_an_explicit_ownership_failure() {
 }
 
 #[test]
+fn post_initialization_root_replacement_faults_without_deleting_replacement() {
+    let root = TestRoot::new("root-replace");
+    let mut manager = MysqlInstanceManager::new(root.config());
+    manager.initialize().unwrap();
+    let original = root.root.join("original-data");
+    fs::rename(&root.data, &original).unwrap();
+    fs::create_dir(&root.data).unwrap();
+    fs::set_permissions(&root.data, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = manager.start().unwrap_err();
+    assert!(matches!(
+        error,
+        MysqlInstanceError::Ownership(OwnershipError::RootMismatch)
+    ));
+    assert_eq!(manager.state(), MysqlInstanceState::Faulted);
+    assert!(root.data.is_dir());
+    assert!(original.is_dir());
+}
+
+#[test]
 fn scratch_cleanup_failure_is_explicit_and_preserves_data() {
     let root = TestRoot::new("cleanup-error");
     let mut manager = MysqlInstanceManager::new(root.config());
