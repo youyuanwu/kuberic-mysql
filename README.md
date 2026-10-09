@@ -45,10 +45,8 @@ supervision, three-member topology ownership, mutation, switchover, failover,
 Clone/reseed, TLS, controller callbacks, routing, containers, Kubernetes, and
 production availability or security claims remain out of scope.
 
-The exact installed-package qualification record is
-[`qualification/mysql-uds-observation/oracle-mysql-8.4.11.toml`](qualification/mysql-uds-observation/oracle-mysql-8.4.11.toml).
-Any other patch requires a new qualification run and explicit compatibility
-update.
+The live gate qualifies the exact installed Oracle MySQL 8.4.11 package.
+Any other patch requires an explicit compatibility update.
 
 See [the design's staged delivery and validation
 plan](docs/design.md#staged-delivery) for the evidence required before any
@@ -69,15 +67,15 @@ The opt-in native qualification is separate and requires the exact documented
 Oracle package and stopped system service:
 
 ```bash
-./qualification/mysql-uds-observation/run-qualification.sh
+CARGO_BUILD_JOBS=1 cargo test --locked --offline -p kuberic-mysql-adapter \
+  --features live-mysql-8-4-11 --test live_mysql_8_4_11 \
+  qualify_oracle_mysql_8_4_11 -- --ignored --exact --test-threads=1
 ```
 
-The runner produces current validation and feature-graph receipts, launches
-only its isolated project-local fixture child, writes the canonical secret-free
-record after all scenarios and cleanup pass, and removes temporary receipts,
-manifest, data, runtime files, and socket. See the
+The live test launches only its isolated project-local fixture child, requires
+all scenarios and cleanup to pass, and removes temporary data, runtime files,
+and socket. See the
 [qualification guide](qualification/mysql-uds-observation/README.md).
 
 GitHub Actions installs the same exact Oracle package on Ubuntu 24.04 and runs
-this full qualification runner for every pull request and every push to
-`main`.
+the Cargo gates directly for every pull request and every push to `main`.

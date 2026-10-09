@@ -55,12 +55,6 @@ impl fmt::Debug for MysqlCredentials {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccountReceipt {
-    pub username: String,
-    pub grants: Vec<String>,
-}
-
 #[derive(Clone, Debug)]
 pub struct FixtureAccounts {
     pub(crate) setup: MysqlCredentials,
@@ -69,7 +63,6 @@ pub struct FixtureAccounts {
     pub(crate) members_denied: MysqlCredentials,
     pub(crate) stats_denied: MysqlCredentials,
     pub(crate) recovery: MysqlCredentials,
-    pub(crate) receipts: Vec<AccountReceipt>,
 }
 
 impl FixtureAccounts {
@@ -95,10 +88,6 @@ impl FixtureAccounts {
 
     pub fn recovery(&self) -> &MysqlCredentials {
         &self.recovery
-    }
-
-    pub fn receipts(&self) -> &[AccountReceipt] {
-        &self.receipts
     }
 }
 
@@ -134,36 +123,22 @@ pub async fn provision_accounts(
     )
     .await?;
 
-    let mut receipts = vec![AccountReceipt {
-        username: setup.username().to_owned(),
-        grants: vec!["ALL PRIVILEGES ON *.* WITH GRANT OPTION".to_owned()],
-    }];
-    receipts.push(
-        create_account_with_grants(&mut setup_conn, &observer, &OBSERVER_GRANTS, "observer")
-            .await?,
-    );
-    receipts.push(
-        create_account_with_grants(
-            &mut setup_conn,
-            &members_denied,
-            &MEMBERS_DENIED_GRANTS,
-            "members denied",
-        )
-        .await?,
-    );
-    receipts.push(
-        create_account_with_grants(
-            &mut setup_conn,
-            &stats_denied,
-            &STATS_DENIED_GRANTS,
-            "stats denied",
-        )
-        .await?,
-    );
-    receipts.push(
-        create_account_with_grants(&mut setup_conn, &recovery, &RECOVERY_GRANTS, "recovery")
-            .await?,
-    );
+    create_account_with_grants(&mut setup_conn, &observer, &OBSERVER_GRANTS, "observer").await?;
+    create_account_with_grants(
+        &mut setup_conn,
+        &members_denied,
+        &MEMBERS_DENIED_GRANTS,
+        "members denied",
+    )
+    .await?;
+    create_account_with_grants(
+        &mut setup_conn,
+        &stats_denied,
+        &STATS_DENIED_GRANTS,
+        "stats denied",
+    )
+    .await?;
+    create_account_with_grants(&mut setup_conn, &recovery, &RECOVERY_GRANTS, "recovery").await?;
     let _ = setup_conn.disconnect().await;
 
     Ok(FixtureAccounts {
@@ -173,7 +148,6 @@ pub async fn provision_accounts(
         members_denied,
         stats_denied,
         recovery,
-        receipts,
     })
 }
 
@@ -182,19 +156,14 @@ async fn create_account_with_grants(
     credentials: &MysqlCredentials,
     grants: &[&str],
     context: &'static str,
-) -> Result<AccountReceipt, QualificationError> {
+) -> Result<(), QualificationError> {
     create_user(connection, credentials, context).await?;
     let target = account_target(credentials.username());
-    let mut rendered = Vec::with_capacity(grants.len());
     for grant in grants {
         let statement = grant.replace("{account}", &target);
         run_drop(connection, &statement, context).await?;
-        rendered.push(statement);
     }
-    Ok(AccountReceipt {
-        username: credentials.username().to_owned(),
-        grants: rendered,
-    })
+    Ok(())
 }
 
 async fn create_user(

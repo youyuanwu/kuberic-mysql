@@ -32,8 +32,8 @@
 //! ```
 //!
 //! The Oracle MySQL 8.4.11 lifecycle fixture is available only through the
-//! opt-in qualification runner; lifecycle automation is not part of this
-//! crate's production API.
+//! opt-in ignored live test; lifecycle automation is not part of this crate's
+//! production API.
 
 #[allow(dead_code)]
 mod decode;

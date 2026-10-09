@@ -66,15 +66,13 @@ Qualification uses the installed Oracle
 `mysql-community-server-core=8.4.11-1ubuntu24.04` package from
 `repo.mysql.com`'s `mysql-8.4-lts` component. The opt-in runner verifies dpkg
 ownership/integrity, APT provenance, executable and library compatibility,
-Cargo lock/source digests, selected/effective client features, server-free
-validation receipts, fixture provenance, native scenarios, and deterministic
-cleanup before emitting the canonical record. It creates owner-only
+fixture provenance, native scenarios, and deterministic cleanup. It creates owner-only
 project-local runtime/data directories, uses `aa-exec` only for the isolated
 child, rejects an active system service or foreign `mysqld`, verifies the
-launcher package/digest, attests `/proc/<pid>/exe` as the package-owned
+launcher package, attests `/proc/<pid>/exe` as the package-owned
 `/usr/sbin/mysqld`, disables client TCP, and permits only one-member loopback
 Group Replication transport. Eligibility requires the exact upper-bound
-rejection `1772/HY000` and records the precise tagged/newline/multi-source
+rejection `1772/HY000` and checks the precise tagged/newline/multi-source
 `GTID_SUBSET` input with an exact scalar response of `1`; no row, SQL `NULL`,
 `0`, or another scalar is not accepted evidence.
 
@@ -1104,9 +1102,9 @@ Later host-local stages add Clone/reseed, ambiguous restart recovery,
 replacement, surviving-`mysqld` faults, independent fencing, automated
 failover, trust rotation, and provider-loss scenarios.
 
-Every gate records product/version/profile, fixture identities, native view,
-non-secret evidence, expected receipts, and supported claim. Live success on one
-host does not establish production availability.
+Every gate checks its product/version/profile, fixture identities, native view,
+and expected outcomes directly. CI retains the command results. Live success
+on one host does not establish production availability.
 
 ### Later Kubernetes and fault gates
 
@@ -1124,7 +1122,7 @@ version, storage class, network model, and fence provider pass the full suite.
 
 These gate groups make prerequisites, pass conditions, claims, and non-claims
 explicit. Individual scenarios named above inherit their group's contract and
-must record their own exact inputs and receipts.
+must define their exact inputs and pass conditions.
 
 | Gate group | Prerequisites | Pass evidence and condition | Supported claim | Explicit non-claim |
 |---|---|---|---|---|

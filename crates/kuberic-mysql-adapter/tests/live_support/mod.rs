@@ -1,6 +1,5 @@
 pub mod accounts;
 pub mod fixture;
-pub mod record;
 pub mod scenarios;
 pub mod state;
 
@@ -8,25 +7,15 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use accounts::FixtureAccounts;
-use fixture::{QualificationManifest, RunningFixture};
-use scenarios::ScenarioReceipt;
-use state::{BaselineEvidence, OnlineIdentity};
-
-pub const MANIFEST_ENV: &str = "KUBERIC_MYSQL_8_4_11_MANIFEST";
+use fixture::{QualificationConfig, RunningFixture};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
 pub enum QualificationCode {
-    MissingManifestPath = 2,
-    ManifestPathNotAbsolute = 3,
-    ManifestReadFailure = 4,
-    ManifestSyntax = 5,
     MissingInput = 6,
     NonAbsoluteInput = 7,
     ToolUnavailable = 8,
     PackageOwnershipMismatch = 9,
-    DigestMismatch = 10,
     PackageVerificationMismatch = 11,
     UnsupportedVersion = 12,
     IncompatiblePlatform = 13,
@@ -36,7 +25,7 @@ pub enum QualificationCode {
     CleanupFailure = 17,
     UnwritableOutput = 18,
     OriginMismatch = 19,
-    OutputGated = 20,
+    ScenarioFailure = 20,
     PackageMetadataMismatch = 21,
     AptProvenanceMismatch = 22,
     ForeignMysqlActive = 23,
@@ -46,15 +35,10 @@ pub enum QualificationCode {
 impl QualificationCode {
     pub const fn name(self) -> &'static str {
         match self {
-            Self::MissingManifestPath => "MISSING_MANIFEST_PATH",
-            Self::ManifestPathNotAbsolute => "MANIFEST_PATH_NOT_ABSOLUTE",
-            Self::ManifestReadFailure => "MANIFEST_READ_FAILURE",
-            Self::ManifestSyntax => "MANIFEST_SYNTAX",
             Self::MissingInput => "MISSING_INPUT",
             Self::NonAbsoluteInput => "NON_ABSOLUTE_INPUT",
             Self::ToolUnavailable => "TOOL_UNAVAILABLE",
             Self::PackageOwnershipMismatch => "PACKAGE_OWNERSHIP_MISMATCH",
-            Self::DigestMismatch => "DIGEST_MISMATCH",
             Self::PackageVerificationMismatch => "PACKAGE_VERIFICATION_MISMATCH",
             Self::UnsupportedVersion => "UNSUPPORTED_VERSION",
             Self::IncompatiblePlatform => "INCOMPATIBLE_PLATFORM",
@@ -64,7 +48,7 @@ impl QualificationCode {
             Self::CleanupFailure => "CLEANUP_FAILURE",
             Self::UnwritableOutput => "UNWRITABLE_OUTPUT",
             Self::OriginMismatch => "ORIGIN_MISMATCH",
-            Self::OutputGated => "OUTPUT_GATED",
+            Self::ScenarioFailure => "SCENARIO_FAILURE",
             Self::PackageMetadataMismatch => "PACKAGE_METADATA_MISMATCH",
             Self::AptProvenanceMismatch => "APT_PROVENANCE_MISMATCH",
             Self::ForeignMysqlActive => "FOREIGN_MYSQL_ACTIVE",
@@ -121,17 +105,16 @@ impl fmt::Display for QualificationError {
 
 impl Error for QualificationError {}
 
-pub async fn run(manifest_path: &Path) -> Result<(), QualificationError> {
-    let manifest = QualificationManifest::load(manifest_path)?;
-    let prepared = fixture::PreparedArtifact::prepare(&manifest)?;
+pub async fn run() -> Result<(), QualificationError> {
+    let config = QualificationConfig::for_repository()?;
+    let prepared = fixture::PreparedArtifact::prepare(&config)?;
     let mut running = prepared.launch().await?;
 
     let execution = execute_qualification(&mut running).await;
-    let setup_receipt = running.setup_receipt().clone();
     let cleanup_result = running.cleanup();
 
-    let cleanup = match cleanup_result {
-        Ok(cleanup) => cleanup,
+    match cleanup_result {
+        Ok(()) => {}
         Err(error) => {
             if let Err(run_error) = execution {
                 return Err(QualificationError::new(
@@ -142,38 +125,16 @@ pub async fn run(manifest_path: &Path) -> Result<(), QualificationError> {
             }
             return Err(error);
         }
-    };
-
-    let (baseline, accounts, online, scenarios) = execution?;
-    let record = record::QualificationRecord::from_parts(
-        &manifest,
-        &setup_receipt,
-        cleanup,
-        &baseline,
-        &accounts,
-        &online,
-        scenarios,
-    )?;
-    record.write_output(&manifest.output_record_path)?;
-    Ok(())
+    }
+    execution
 }
 
-async fn execute_qualification(
-    running: &mut RunningFixture,
-) -> Result<
-    (
-        BaselineEvidence,
-        FixtureAccounts,
-        OnlineIdentity,
-        ScenarioReceipt,
-    ),
-    QualificationError,
-> {
+async fn execute_qualification(running: &mut RunningFixture) -> Result<(), QualificationError> {
     let baseline = state::collect_pre_account(running).await?;
     let accounts = accounts::provision_accounts(running).await?;
     let online = state::bring_group_replication_online(running, &accounts).await?;
-    let scenarios = scenarios::run_all(running, &accounts, &baseline, &online).await?;
-    Ok((baseline, accounts, online, scenarios))
+    scenarios::run_all(running, &accounts, &baseline, &online).await?;
+    Ok(())
 }
 
 #[allow(clippy::std_instead_of_alloc)]
@@ -212,14 +173,14 @@ mod tests {
     #[test]
     fn display_includes_named_code_and_context() {
         let error = QualificationError::new(
-            QualificationCode::DigestMismatch,
-            "mysqld digest",
-            "expected deadbeef, found cafe",
+            QualificationCode::PackageVerificationMismatch,
+            "package integrity",
+            "dpkg verification failed",
         );
         let text = error.to_string();
-        assert!(text.contains("DIGEST_MISMATCH"));
-        assert!(text.contains("mysqld digest"));
-        assert!(text.contains("deadbeef"));
+        assert!(text.contains("PACKAGE_VERIFICATION_MISMATCH"));
+        assert!(text.contains("package integrity"));
+        assert!(text.contains("dpkg verification failed"));
     }
 
     #[test]
