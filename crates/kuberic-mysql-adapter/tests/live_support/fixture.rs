@@ -1,11 +1,10 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,111 +18,44 @@ const EXPECTED_PACKAGE_NAME: &str = "mysql-community-server-core";
 const EXPECTED_PACKAGE_VERSION: &str = "8.4.11-1ubuntu24.04";
 const EXPECTED_APT_REPOSITORY_HOST: &str = "repo.mysql.com";
 const EXPECTED_APT_REPOSITORY_COMPONENT: &str = "mysql-8.4-lts";
+const EXPECTED_MYSQLD: &str = "/usr/sbin/mysqld";
 const EXPECTED_APPARMOR_EXEC: &str = "/usr/bin/aa-exec";
+const STARTUP_TIMEOUT_MS: u64 = 30_000;
+const OBSERVATION_TIMEOUT_MS: u64 = 5_000;
+const CLEANUP_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManifestPath(PathBuf);
-
-impl ManifestPath {
-    pub fn from_env(name: &str) -> Result<Self, QualificationError> {
-        Self::from_os_value(std::env::var_os(name), name)
-    }
-
-    pub fn from_os_value(value: Option<OsString>, name: &str) -> Result<Self, QualificationError> {
-        let Some(value) = value else {
-            return Err(QualificationError::new(
-                QualificationCode::MissingManifestPath,
-                "manifest env",
-                format!("{name} must be set to one absolute manifest path"),
-            ));
-        };
-        let path = PathBuf::from(value);
-        if !path.is_absolute() {
-            return Err(QualificationError::new(
-                QualificationCode::ManifestPathNotAbsolute,
-                "manifest env",
-                format!("{name} must be absolute: {}", path.display()),
-            ));
-        }
-        Ok(Self(path))
-    }
-
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QualificationManifest {
-    pub manifest_path: PathBuf,
+pub struct QualificationConfig {
     pub mysqld_path: PathBuf,
     pub apparmor_exec_path: PathBuf,
     pub package_name: String,
     pub package_version: String,
     pub apt_repository_host: String,
     pub apt_repository_component: String,
-    pub expected_mysqld_sha256: String,
     pub qualification_root: PathBuf,
-    pub output_record_path: PathBuf,
-    pub validation_receipt_dir: PathBuf,
-    pub feature_graph_path: PathBuf,
     pub startup_timeout_ms: u64,
     pub observation_timeout_ms: u64,
     pub cleanup_timeout_ms: u64,
 }
 
-impl QualificationManifest {
-    pub fn load(path: &Path) -> Result<Self, QualificationError> {
-        if !path.is_absolute() {
-            return Err(QualificationError::new(
-                QualificationCode::ManifestPathNotAbsolute,
-                "manifest path",
-                format!("manifest path must be absolute: {}", path.display()),
-            ));
-        }
-        let text = fs::read_to_string(path).map_err(|error| {
-            QualificationError::new(
-                QualificationCode::ManifestReadFailure,
-                "read manifest",
-                format!("{}: {error}", path.display()),
-            )
-        })?;
-        let mut values = parse_manifest_map(&text)?;
-        let manifest = Self {
-            manifest_path: path.to_path_buf(),
-            mysqld_path: parse_absolute_path(&mut values, "mysqld_path")?,
-            apparmor_exec_path: parse_absolute_path(&mut values, "apparmor_exec_path")?,
-            package_name: take_required(&mut values, "package_name")?,
-            package_version: take_required(&mut values, "package_version")?,
-            apt_repository_host: take_required(&mut values, "apt_repository_host")?,
-            apt_repository_component: take_required(&mut values, "apt_repository_component")?,
-            expected_mysqld_sha256: normalize_hex(
-                &take_required(&mut values, "expected_mysqld_sha256")?,
-                64,
-                QualificationCode::ManifestSyntax,
-                "mysqld digest",
-            )?,
-            qualification_root: parse_project_local_root(&mut values, "qualification_root")?,
-            output_record_path: parse_project_local_output(&mut values, "output_record_path")?,
-            validation_receipt_dir: parse_project_local_root(
-                &mut values,
-                "validation_receipt_dir",
-            )?,
-            feature_graph_path: parse_project_local_root(&mut values, "feature_graph_path")?,
-            startup_timeout_ms: parse_u64(&mut values, "startup_timeout_ms")?,
-            observation_timeout_ms: parse_u64(&mut values, "observation_timeout_ms")?,
-            cleanup_timeout_ms: parse_u64(&mut values, "cleanup_timeout_ms")?,
+impl QualificationConfig {
+    pub fn for_repository() -> Result<Self, QualificationError> {
+        let root = project_root();
+        let qualification = root.join("qualification");
+        let config = Self {
+            mysqld_path: EXPECTED_MYSQLD.into(),
+            apparmor_exec_path: EXPECTED_APPARMOR_EXEC.into(),
+            package_name: EXPECTED_PACKAGE_NAME.to_owned(),
+            package_version: EXPECTED_PACKAGE_VERSION.to_owned(),
+            apt_repository_host: EXPECTED_APT_REPOSITORY_HOST.to_owned(),
+            apt_repository_component: EXPECTED_APT_REPOSITORY_COMPONENT.to_owned(),
+            qualification_root: qualification.join("q"),
+            startup_timeout_ms: STARTUP_TIMEOUT_MS,
+            observation_timeout_ms: OBSERVATION_TIMEOUT_MS,
+            cleanup_timeout_ms: CLEANUP_TIMEOUT_MS,
         };
-        if !values.is_empty() {
-            let keys = values.keys().cloned().collect::<Vec<_>>().join(", ");
-            return Err(QualificationError::new(
-                QualificationCode::ManifestSyntax,
-                "manifest keys",
-                format!("unexpected keys: {keys}"),
-            ));
-        }
-        manifest.validate()?;
-        Ok(manifest)
+        config.validate()?;
+        Ok(config)
     }
 
     fn validate(&self) -> Result<(), QualificationError> {
@@ -186,21 +118,15 @@ impl QualificationManifest {
                 ));
             }
         }
-        if self
-            .output_record_path
-            .starts_with(self.qualification_root.join("work"))
-        {
+        let qualification = project_root().join("qualification");
+        if !self.qualification_root.starts_with(&qualification) {
             return Err(QualificationError::new(
                 QualificationCode::NonAbsoluteInput,
-                "output path",
-                "output_record_path must not be inside qualification_root/work".to_owned(),
-            ));
-        }
-        if !self.validation_receipt_dir.is_dir() || !self.feature_graph_path.is_file() {
-            return Err(QualificationError::new(
-                QualificationCode::MissingInput,
-                "validation receipts",
-                "validation_receipt_dir and feature_graph_path must exist".to_owned(),
+                "qualification paths",
+                format!(
+                    "qualification root must stay beneath {}",
+                    qualification.display()
+                ),
             ));
         }
         if self.startup_timeout_ms == 0
@@ -208,9 +134,9 @@ impl QualificationManifest {
             || self.cleanup_timeout_ms == 0
         {
             return Err(QualificationError::new(
-                QualificationCode::ManifestSyntax,
+                QualificationCode::MissingInput,
                 "timeouts",
-                "timeouts must be positive millisecond values".to_owned(),
+                "qualification timeouts must be positive".to_owned(),
             ));
         }
         Ok(())
@@ -230,44 +156,6 @@ impl QualificationManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SetupReceipt {
-    pub package_name: String,
-    pub package_version: String,
-    pub package_owner_verified: bool,
-    pub package_files_verified: bool,
-    pub apt_installed_version: String,
-    pub apt_candidate_version: String,
-    pub apt_repository: String,
-    pub mysqld_sha256: String,
-    pub mysqld_path: PathBuf,
-    pub process_launcher: PathBuf,
-    pub launcher_package: String,
-    pub launcher_sha256: String,
-    pub launcher_verified: bool,
-    pub child_executable: PathBuf,
-    pub child_executable_verified: bool,
-    pub init_exit_code: i32,
-    pub process_id: u32,
-    pub socket_path: PathBuf,
-    pub socket_device: u64,
-    pub socket_inode: u64,
-    pub private_directory_mode: u32,
-    pub private_directories_verified: bool,
-    pub product_version: Option<String>,
-    pub version_comment: Option<String>,
-    pub version_compile_machine: Option<String>,
-    pub version_compile_os: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CleanupReceipt {
-    pub exit_code: Option<i32>,
-    pub signal: Option<&'static str>,
-    pub removed_paths: Vec<PathBuf>,
-    pub work_root_removed: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct Layout {
     work_root: PathBuf,
     runtime_root: PathBuf,
@@ -275,8 +163,8 @@ struct Layout {
 }
 
 impl Layout {
-    fn create(manifest: &QualificationManifest) -> Result<Self, QualificationError> {
-        let work_root = manifest.qualification_root.join("work");
+    fn create(config: &QualificationConfig) -> Result<Self, QualificationError> {
+        let work_root = config.qualification_root.join("work");
         if work_root.exists() {
             fs::remove_dir_all(&work_root).map_err(|error| {
                 QualificationError::new(
@@ -286,25 +174,13 @@ impl Layout {
                 )
             })?;
         }
-        fs::create_dir_all(&manifest.qualification_root).map_err(|error| {
+        fs::create_dir_all(&config.qualification_root).map_err(|error| {
             QualificationError::new(
                 QualificationCode::UnwritableOutput,
                 "qualification root",
-                format!("{}: {error}", manifest.qualification_root.display()),
+                format!("{}: {error}", config.qualification_root.display()),
             )
         })?;
-        let output_parent = manifest
-            .output_record_path
-            .parent()
-            .expect("absolute output path has parent");
-        fs::create_dir_all(output_parent).map_err(|error| {
-            QualificationError::new(
-                QualificationCode::UnwritableOutput,
-                "output parent",
-                format!("{}: {error}", output_parent.display()),
-            )
-        })?;
-
         let layout = Self {
             work_root: work_root.clone(),
             runtime_root: work_root.join("runtime"),
@@ -435,39 +311,19 @@ impl ServerConfig {
 
 #[derive(Clone, Debug)]
 pub struct PreparedArtifact {
-    manifest: QualificationManifest,
+    qualification_config: QualificationConfig,
     layout: Layout,
-    package: PackageEvidence,
-    mysqld_sha256: String,
     mysqld_path: PathBuf,
-    launcher: LauncherEvidence,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LauncherEvidence {
-    package: String,
-    sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PackageEvidence {
-    name: String,
-    version: String,
-    owner_verified: bool,
-    files_verified: bool,
-    apt_installed_version: String,
-    apt_candidate_version: String,
-    apt_repository: String,
 }
 
 impl PreparedArtifact {
-    pub fn prepare(manifest: &QualificationManifest) -> Result<Self, QualificationError> {
+    pub fn prepare(config: &QualificationConfig) -> Result<Self, QualificationError> {
         verify_platform()?;
         preflight_no_foreign_mysql()?;
-        let launcher = verify_launcher(&manifest.apparmor_exec_path)?;
-        let layout = Layout::create(manifest)?;
-        let verified = verify_installed_package(manifest);
-        let (package, mysqld_sha256, mysqld_path) = match verified {
+        verify_launcher(&config.apparmor_exec_path)?;
+        let layout = Layout::create(config)?;
+        let verified = verify_installed_package(config);
+        let mysqld_path = match verified {
             Ok(verified) => verified,
             Err(prior) => {
                 if let Err(error) = fs::remove_dir_all(&layout.work_root) {
@@ -485,33 +341,36 @@ impl PreparedArtifact {
         };
 
         Ok(Self {
-            manifest: manifest.clone(),
+            qualification_config: config.clone(),
             layout,
-            package,
-            mysqld_sha256,
             mysqld_path,
-            launcher,
         })
     }
 
     pub async fn launch(self) -> Result<RunningFixture, QualificationError> {
-        let config = match ServerConfig::new(&self.layout) {
+        let server_config = match ServerConfig::new(&self.layout) {
             Ok(config) => config,
             Err(error) => return Err(cleanup_unlaunched(&self.layout, error)),
         };
-        if let Err(error) = fs::write(&config.config_path, config.render(&self.layout.data_root)) {
+        if let Err(error) = fs::write(
+            &server_config.config_path,
+            server_config.render(&self.layout.data_root),
+        ) {
             return Err(cleanup_unlaunched(
                 &self.layout,
                 QualificationError::new(
                     QualificationCode::InitializationFailure,
                     "write mysqld config",
-                    format!("{}: {error}", config.config_path.display()),
+                    format!("{}: {error}", server_config.config_path.display()),
                 ),
             ));
         }
 
-        let init_status = match mysqld_command(&self.manifest, &self.mysqld_path)
-            .arg(format!("--defaults-file={}", config.config_path.display()))
+        let init_status = match mysqld_command(&self.qualification_config, &self.mysqld_path)
+            .arg(format!(
+                "--defaults-file={}",
+                server_config.config_path.display()
+            ))
             .arg("--initialize-insecure")
             .status()
         {
@@ -538,7 +397,7 @@ impl PreparedArtifact {
             ));
         }
 
-        let stdout = match File::create(&config.stdout_log_path) {
+        let stdout = match File::create(&server_config.stdout_log_path) {
             Ok(stdout) => stdout,
             Err(error) => {
                 return Err(cleanup_unlaunched(
@@ -546,12 +405,12 @@ impl PreparedArtifact {
                     QualificationError::new(
                         QualificationCode::LaunchFailure,
                         "open mysqld stdout log",
-                        format!("{}: {error}", config.stdout_log_path.display()),
+                        format!("{}: {error}", server_config.stdout_log_path.display()),
                     ),
                 ));
             }
         };
-        let stderr = match File::create(&config.error_log_path) {
+        let stderr = match File::create(&server_config.error_log_path) {
             Ok(stderr) => stderr,
             Err(error) => {
                 return Err(cleanup_unlaunched(
@@ -559,14 +418,17 @@ impl PreparedArtifact {
                     QualificationError::new(
                         QualificationCode::LaunchFailure,
                         "open mysqld stderr log",
-                        format!("{}: {error}", config.error_log_path.display()),
+                        format!("{}: {error}", server_config.error_log_path.display()),
                     ),
                 ));
             }
         };
 
-        let mut child = match mysqld_command(&self.manifest, &self.mysqld_path)
-            .arg(format!("--defaults-file={}", config.config_path.display()))
+        let mut child = match mysqld_command(&self.qualification_config, &self.mysqld_path)
+            .arg(format!(
+                "--defaults-file={}",
+                server_config.config_path.display()
+            ))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -586,78 +448,30 @@ impl PreparedArtifact {
 
         if let Err(error) = wait_for_socket_ready(
             &mut child,
-            &config.socket_path,
-            self.manifest.startup_timeout(),
+            &server_config.socket_path,
+            self.qualification_config.startup_timeout(),
         )
         .await
         {
             return Err(cleanup_failed_launch(&mut child, &self.layout, error));
         }
-        let child_executable = attest_child_executable(child.id(), &self.mysqld_path)
+        attest_child_executable(child.id(), &self.mysqld_path)
             .map_err(|error| cleanup_failed_launch(&mut child, &self.layout, error))?;
 
-        let socket_metadata = match fs::metadata(&config.socket_path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                let launch_error = QualificationError::new(
-                    QualificationCode::LaunchFailure,
-                    "stat ready socket",
-                    format!("{}: {error}", config.socket_path.display()),
-                );
-                return Err(cleanup_failed_launch(
-                    &mut child,
-                    &self.layout,
-                    launch_error,
-                ));
-            }
-        };
-
-        let manifest = self.manifest;
+        let qualification_config = self.qualification_config;
         let layout = self.layout;
-        let mysqld_path = self.mysqld_path.clone();
-        let process_id = child.id();
-        let socket_path = config.socket_path.clone();
-        let setup_receipt = SetupReceipt {
-            package_name: self.package.name,
-            package_version: self.package.version,
-            package_owner_verified: self.package.owner_verified,
-            package_files_verified: self.package.files_verified,
-            apt_installed_version: self.package.apt_installed_version,
-            apt_candidate_version: self.package.apt_candidate_version,
-            apt_repository: self.package.apt_repository,
-            mysqld_sha256: self.mysqld_sha256,
-            mysqld_path: mysqld_path.clone(),
-            process_launcher: manifest.apparmor_exec_path.clone(),
-            launcher_package: self.launcher.package,
-            launcher_sha256: self.launcher.sha256,
-            launcher_verified: true,
-            child_executable,
-            child_executable_verified: true,
-            init_exit_code: init_status.code().unwrap_or_default(),
-            process_id,
-            socket_path,
-            socket_device: socket_metadata.dev(),
-            socket_inode: socket_metadata.ino(),
-            private_directory_mode: 0o700,
-            private_directories_verified: true,
-            product_version: None,
-            version_comment: None,
-            version_compile_machine: None,
-            version_compile_os: None,
-        };
 
         Ok(RunningFixture {
-            manifest,
+            qualification_config,
             layout,
-            config,
+            server_config,
             child,
-            setup_receipt,
         })
     }
 }
 
-fn mysqld_command(manifest: &QualificationManifest, mysqld_path: &Path) -> Command {
-    let mut command = Command::new(&manifest.apparmor_exec_path);
+fn mysqld_command(config: &QualificationConfig, mysqld_path: &Path) -> Command {
+    let mut command = Command::new(&config.apparmor_exec_path);
     command
         .arg("-p")
         .arg("unconfined")
@@ -728,7 +542,7 @@ fn reject_foreign_process_names(names: &[String]) -> Result<(), QualificationErr
     }
 }
 
-fn verify_launcher(path: &Path) -> Result<LauncherEvidence, QualificationError> {
+fn verify_launcher(path: &Path) -> Result<(), QualificationError> {
     let owner = run_tool(
         "dpkg-query",
         &[OsStr::new("-S"), path.as_os_str()],
@@ -747,10 +561,7 @@ fn verify_launcher(path: &Path) -> Result<LauncherEvidence, QualificationError> 
             )
         })?;
     verify_dpkg_files(&package)?;
-    Ok(LauncherEvidence {
-        package,
-        sha256: compute_sha256(path)?,
-    })
+    Ok(())
 }
 
 fn attest_child_executable(pid: u32, expected: &Path) -> Result<PathBuf, QualificationError> {
@@ -783,10 +594,8 @@ fn attest_child_executable(pid: u32, expected: &Path) -> Result<PathBuf, Qualifi
     }
 }
 
-fn verify_installed_package(
-    manifest: &QualificationManifest,
-) -> Result<(PackageEvidence, String, PathBuf), QualificationError> {
-    let mysqld_path = manifest.mysqld_path.clone();
+fn verify_installed_package(config: &QualificationConfig) -> Result<PathBuf, QualificationError> {
+    let mysqld_path = config.mysqld_path.clone();
     let owner = run_tool(
         "dpkg-query",
         &[OsStr::new("-S"), mysqld_path.as_os_str()],
@@ -794,7 +603,7 @@ fn verify_installed_package(
         "query mysqld package owner",
     )?;
     let owner_text = String::from_utf8_lossy(&owner.stdout).trim().to_owned();
-    validate_package_owner(&owner_text, &manifest.package_name, &mysqld_path)?;
+    validate_package_owner(&owner_text, &config.package_name, &mysqld_path)?;
 
     let query_format = "${Package}\t${Version}\t${Status}";
     let installed = run_tool(
@@ -803,7 +612,7 @@ fn verify_installed_package(
             OsStr::new("-W"),
             OsStr::new("-f"),
             OsStr::new(query_format),
-            OsStr::new(&manifest.package_name),
+            OsStr::new(&config.package_name),
         ],
         QualificationCode::ToolUnavailable,
         "query installed package version",
@@ -811,35 +620,16 @@ fn verify_installed_package(
     let installed_text = String::from_utf8_lossy(&installed.stdout);
     validate_installed_metadata(
         installed_text.trim(),
-        &manifest.package_name,
-        &manifest.package_version,
+        &config.package_name,
+        &config.package_version,
     )?;
 
-    verify_dpkg_files(&manifest.package_name)?;
-    let apt = verify_apt_policy(manifest)?;
+    verify_dpkg_files(&config.package_name)?;
+    verify_apt_policy(config)?;
 
-    let mysqld_sha256 = compute_sha256(&mysqld_path)?;
-    verify_match(
-        "mysqld sha256",
-        &manifest.expected_mysqld_sha256,
-        &mysqld_sha256,
-        QualificationCode::DigestMismatch,
-    )?;
     verify_runtime_libraries(&mysqld_path)?;
 
-    Ok((
-        PackageEvidence {
-            name: manifest.package_name.clone(),
-            version: manifest.package_version.clone(),
-            owner_verified: true,
-            files_verified: true,
-            apt_installed_version: apt.installed,
-            apt_candidate_version: apt.candidate,
-            apt_repository: apt.repository,
-        },
-        mysqld_sha256,
-        mysqld_path,
-    ))
+    Ok(mysqld_path)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -914,19 +704,19 @@ fn verify_dpkg_files(package_name: &str) -> Result<(), QualificationError> {
     Ok(())
 }
 
-fn verify_apt_policy(manifest: &QualificationManifest) -> Result<AptPolicy, QualificationError> {
+fn verify_apt_policy(config: &QualificationConfig) -> Result<AptPolicy, QualificationError> {
     let output = run_tool(
         "apt-cache",
-        &[OsStr::new("policy"), OsStr::new(&manifest.package_name)],
+        &[OsStr::new("policy"), OsStr::new(&config.package_name)],
         QualificationCode::ToolUnavailable,
         "query APT package policy",
     )?;
     let policy = String::from_utf8_lossy(&output.stdout);
     parse_apt_policy(
         &policy,
-        &manifest.package_version,
-        &manifest.apt_repository_host,
-        &manifest.apt_repository_component,
+        &config.package_version,
+        &config.apt_repository_host,
+        &config.apt_repository_component,
     )
 }
 
@@ -1092,11 +882,10 @@ fn cleanup_failed_launch(
 
 #[derive(Debug)]
 pub struct RunningFixture {
-    manifest: QualificationManifest,
+    qualification_config: QualificationConfig,
     layout: Layout,
-    config: ServerConfig,
+    server_config: ServerConfig,
     child: Child,
-    setup_receipt: SetupReceipt,
 }
 
 impl Drop for RunningFixture {
@@ -1112,41 +901,24 @@ impl Drop for RunningFixture {
 }
 
 impl RunningFixture {
-    pub fn manifest(&self) -> &QualificationManifest {
-        &self.manifest
+    pub fn qualification_config(&self) -> &QualificationConfig {
+        &self.qualification_config
     }
 
     pub fn socket_path(&self) -> &Path {
-        &self.config.socket_path
+        &self.server_config.socket_path
     }
 
     pub fn sql_port(&self) -> u16 {
-        self.config.sql_port
+        self.server_config.sql_port
     }
 
     pub fn group_port(&self) -> u16 {
-        self.config.group_port
+        self.server_config.group_port
     }
 
     pub fn group_name(&self) -> &str {
-        &self.config.group_name
-    }
-
-    pub fn setup_receipt(&self) -> &SetupReceipt {
-        &self.setup_receipt
-    }
-
-    pub fn note_product_identity(
-        &mut self,
-        version: &str,
-        comment: &str,
-        machine: &str,
-        operating_system: &str,
-    ) {
-        self.setup_receipt.product_version = Some(version.to_owned());
-        self.setup_receipt.version_comment = Some(comment.to_owned());
-        self.setup_receipt.version_compile_machine = Some(machine.to_owned());
-        self.setup_receipt.version_compile_os = Some(operating_system.to_owned());
+        &self.server_config.group_name
     }
 
     pub async fn connect_root(&self) -> Result<Conn, QualificationError> {
@@ -1158,7 +930,7 @@ impl RunningFixture {
         username: &str,
         password: Option<&str>,
     ) -> Result<Conn, QualificationError> {
-        open_connection(&self.config.socket_path, username, password)
+        open_connection(&self.server_config.socket_path, username, password)
             .await
             .map_err(|error| {
                 QualificationError::new(
@@ -1169,8 +941,7 @@ impl RunningFixture {
             })
     }
 
-    pub fn cleanup(mut self) -> Result<CleanupReceipt, QualificationError> {
-        let mut signal = None;
+    pub fn cleanup(mut self) -> Result<(), QualificationError> {
         let mut status = self.child.try_wait().map_err(|error| {
             QualificationError::new(
                 QualificationCode::CleanupFailure,
@@ -1180,8 +951,7 @@ impl RunningFixture {
         })?;
         if status.is_none() {
             send_signal(self.child.id(), "TERM")?;
-            signal = Some("TERM");
-            let deadline = Instant::now() + self.manifest.cleanup_timeout();
+            let deadline = Instant::now() + self.qualification_config.cleanup_timeout();
             while Instant::now() < deadline {
                 status = self.child.try_wait().map_err(|error| {
                     QualificationError::new(
@@ -1198,17 +968,15 @@ impl RunningFixture {
         }
         if status.is_none() {
             send_signal(self.child.id(), "KILL")?;
-            signal = Some("KILL");
-            status = Some(self.child.wait().map_err(|error| {
+            self.child.wait().map_err(|error| {
                 QualificationError::new(
                     QualificationCode::CleanupFailure,
                     "reap mysqld",
                     error.to_string(),
                 )
-            })?);
+            })?;
         }
 
-        let mut removed_paths = Vec::new();
         for path in [&self.layout.data_root, &self.layout.runtime_root] {
             if path.exists() {
                 fs::remove_dir_all(path).map_err(|error| {
@@ -1218,7 +986,6 @@ impl RunningFixture {
                         format!("{}: {error}", path.display()),
                     )
                 })?;
-                removed_paths.push(path.clone());
             }
         }
         if self.layout.work_root.exists() {
@@ -1229,15 +996,16 @@ impl RunningFixture {
                     format!("{}: {error}", self.layout.work_root.display()),
                 )
             })?;
-            removed_paths.push(self.layout.work_root.clone());
         }
 
-        Ok(CleanupReceipt {
-            exit_code: status.and_then(|status| status.code()),
-            signal,
-            removed_paths,
-            work_root_removed: !self.layout.work_root.exists(),
-        })
+        if self.layout.work_root.exists() {
+            return Err(QualificationError::new(
+                QualificationCode::CleanupFailure,
+                "verify work root removal",
+                format!("{} still exists", self.layout.work_root.display()),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1307,46 +1075,6 @@ fn verify_platform() -> Result<(), QualificationError> {
         ));
     }
     Ok(())
-}
-
-fn compute_sha256(path: &Path) -> Result<String, QualificationError> {
-    let output = run_tool(
-        "sha256sum",
-        &[path.as_os_str()],
-        QualificationCode::ToolUnavailable,
-        "compute sha256",
-    )?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let digest = text.split_whitespace().next().ok_or_else(|| {
-        QualificationError::new(
-            QualificationCode::DigestMismatch,
-            "sha256 output",
-            format!("missing digest output for {}", path.display()),
-        )
-    })?;
-    normalize_hex(
-        digest,
-        64,
-        QualificationCode::DigestMismatch,
-        "sha256 output",
-    )
-}
-
-fn verify_match(
-    label: &'static str,
-    expected: &str,
-    actual: &str,
-    code: QualificationCode,
-) -> Result<(), QualificationError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(QualificationError::new(
-            code,
-            label,
-            format!("expected {expected}, found {actual}"),
-        ))
-    }
 }
 
 fn verify_runtime_libraries(mysqld_path: &Path) -> Result<(), QualificationError> {
@@ -1430,269 +1158,21 @@ fn allocate_loopback_port() -> Result<u16, QualificationError> {
     Ok(port.port())
 }
 
-fn parse_manifest_map(text: &str) -> Result<BTreeMap<String, String>, QualificationError> {
-    let mut values = BTreeMap::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line = raw_line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(QualificationError::new(
-                QualificationCode::ManifestSyntax,
-                "manifest line",
-                format!("line {} is not key = value", index + 1),
-            ));
-        };
-        let key = key.trim().to_owned();
-        if values.contains_key(&key) {
-            return Err(QualificationError::new(
-                QualificationCode::ManifestSyntax,
-                "manifest line",
-                format!("duplicate key on line {}: {key}", index + 1),
-            ));
-        }
-        values.insert(key, parse_manifest_value(value.trim(), index + 1)?);
-    }
-    Ok(values)
-}
-
-fn parse_manifest_value(value: &str, line: usize) -> Result<String, QualificationError> {
-    if let Some(stripped) = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    {
-        let mut rendered = String::new();
-        let mut escape = false;
-        for character in stripped.chars() {
-            if escape {
-                rendered.push(match character {
-                    '"' | '\\' => character,
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    other => {
-                        return Err(QualificationError::new(
-                            QualificationCode::ManifestSyntax,
-                            "manifest string",
-                            format!("unsupported escape \\{other} on line {line}"),
-                        ));
-                    }
-                });
-                escape = false;
-            } else if character == '\\' {
-                escape = true;
-            } else {
-                rendered.push(character);
-            }
-        }
-        if escape {
-            return Err(QualificationError::new(
-                QualificationCode::ManifestSyntax,
-                "manifest string",
-                format!("dangling escape on line {line}"),
-            ));
-        }
-        Ok(rendered)
-    } else if value.starts_with('"') || value.ends_with('"') {
-        Err(QualificationError::new(
-            QualificationCode::ManifestSyntax,
-            "manifest string",
-            format!("unterminated quoted string on line {line}"),
-        ))
-    } else {
-        Ok(value.to_owned())
-    }
-}
-
-fn take_required(
-    values: &mut BTreeMap<String, String>,
-    key: &str,
-) -> Result<String, QualificationError> {
-    values.remove(key).ok_or_else(|| {
-        QualificationError::new(
-            QualificationCode::ManifestSyntax,
-            "manifest keys",
-            format!("missing required key {key}"),
-        )
-    })
-}
-
-fn parse_absolute_path(
-    values: &mut BTreeMap<String, String>,
-    key: &str,
-) -> Result<PathBuf, QualificationError> {
-    normalize_project_path(&take_required(values, key)?, key, false)
-}
-
-fn parse_project_local_root(
-    values: &mut BTreeMap<String, String>,
-    key: &str,
-) -> Result<PathBuf, QualificationError> {
-    let path = normalize_project_path(&take_required(values, key)?, key, true)?;
-    let required_root = project_root().join("qualification");
-    if !path.starts_with(&required_root) {
-        return Err(QualificationError::new(
-            QualificationCode::NonAbsoluteInput,
-            "project-local qualification path",
-            format!(
-                "{key}={} must stay beneath {}",
-                path.display(),
-                required_root.display()
-            ),
-        ));
-    }
-    Ok(path)
-}
-
-fn parse_project_local_output(
-    values: &mut BTreeMap<String, String>,
-    key: &str,
-) -> Result<PathBuf, QualificationError> {
-    parse_project_local_root(values, key)
-}
-
-fn normalize_project_path(
-    raw: &str,
-    key: &str,
-    require_project_local: bool,
-) -> Result<PathBuf, QualificationError> {
-    let path = Path::new(raw);
-    if !path.is_absolute() {
-        return Err(QualificationError::new(
-            QualificationCode::NonAbsoluteInput,
-            "absolute path input",
-            format!("{key} must be absolute: {raw}"),
-        ));
-    }
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(value) => normalized.push(value),
-            Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
-                return Err(QualificationError::new(
-                    QualificationCode::NonAbsoluteInput,
-                    "absolute path input",
-                    format!("{key} must not contain parent traversal: {raw}"),
-                ));
-            }
-        }
-    }
-    if require_project_local {
-        let root = project_root();
-        if !normalized.starts_with(&root) {
-            return Err(QualificationError::new(
-                QualificationCode::NonAbsoluteInput,
-                "project-local path",
-                format!("{key} must stay beneath {}", root.display()),
-            ));
-        }
-    }
-    Ok(normalized)
-}
-
-fn parse_u64(values: &mut BTreeMap<String, String>, key: &str) -> Result<u64, QualificationError> {
-    let value = take_required(values, key)?;
-    value.parse::<u64>().map_err(|error| {
-        QualificationError::new(
-            QualificationCode::ManifestSyntax,
-            "integer manifest field",
-            format!("{key} must be an integer: {error}"),
-        )
-    })
-}
-
-pub(crate) fn normalize_hex(
-    raw: &str,
-    expected_len: usize,
-    code: QualificationCode,
-    context: &'static str,
-) -> Result<String, QualificationError> {
-    let normalized = raw.trim().to_ascii_uppercase();
-    if normalized.len() != expected_len || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(QualificationError::new(
-            code,
-            context,
-            format!("expected {expected_len} hexadecimal characters, found {raw}"),
-        ));
-    }
-    Ok(normalized)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         EXPECTED_APT_REPOSITORY_COMPONENT, EXPECTED_APT_REPOSITORY_HOST, EXPECTED_PACKAGE_NAME,
-        EXPECTED_PACKAGE_VERSION, ManifestPath, create_private_directory, normalize_hex,
-        normalize_project_path, parse_apt_policy, parse_manifest_map, reject_foreign_process_names,
-        validate_installed_metadata, validate_package_owner, verify_match, verify_private_mode,
+        EXPECTED_PACKAGE_VERSION, create_private_directory, parse_apt_policy,
+        reject_foreign_process_names, validate_installed_metadata, validate_package_owner,
+        verify_private_mode,
     };
 
     #[test]
-    fn missing_and_non_absolute_manifest_paths_are_rejected() {
-        let missing = ManifestPath::from_os_value(None, "KUBERIC_MYSQL_8_4_11_MANIFEST");
-        assert!(missing.is_err());
-        let relative = ManifestPath::from_os_value(
-            Some("relative.toml".into()),
-            "KUBERIC_MYSQL_8_4_11_MANIFEST",
-        );
-        assert!(relative.is_err());
-    }
-
-    #[test]
-    fn manifest_requires_absolute_project_local_paths() {
-        let root = super::project_root();
-        let allowed = normalize_project_path(
-            &root.join("qualification/tests/live").display().to_string(),
-            "qualification_root",
-            true,
-        )
-        .unwrap();
-        assert!(allowed.starts_with(root.join("qualification")));
-
-        let rejected = normalize_project_path(
-            &root.join("../outside").display().to_string(),
-            "qualification_root",
-            true,
-        );
-        assert!(rejected.is_err());
-
+    fn qualification_package_contract_is_exact() {
         assert_eq!(EXPECTED_PACKAGE_NAME, "mysql-community-server-core");
         assert_eq!(EXPECTED_PACKAGE_VERSION, "8.4.11-1ubuntu24.04");
         assert_eq!(EXPECTED_APT_REPOSITORY_HOST, "repo.mysql.com");
         assert_eq!(EXPECTED_APT_REPOSITORY_COMPONENT, "mysql-8.4-lts");
-    }
-
-    #[test]
-    fn malformed_manifest_syntax_is_rejected() {
-        assert!(parse_manifest_map("mysqld_path").is_err());
-        assert!(parse_manifest_map("mysqld_path = \"/one\"\nmysqld_path = \"/two\"\n").is_err());
-        assert!(parse_manifest_map("mysqld_path = \"unterminated").is_err());
-    }
-
-    #[test]
-    fn digest_and_package_match_helpers_are_exact() {
-        let digest = normalize_hex("aa", 64, super::QualificationCode::DigestMismatch, "digest");
-        assert!(digest.is_err());
-        let digest = normalize_hex(
-            &"a".repeat(64),
-            64,
-            super::QualificationCode::DigestMismatch,
-            "digest",
-        )
-        .unwrap();
-        assert_eq!(digest, "A".repeat(64));
-
-        let mismatch = verify_match(
-            "mysqld digest",
-            "A".repeat(64).as_str(),
-            "B".repeat(64).as_str(),
-            super::QualificationCode::DigestMismatch,
-        );
-        assert!(mismatch.is_err());
     }
 
     #[test]

@@ -1,6 +1,4 @@
 .paw/
 target/
-qualification/mysql-uds-observation/.manifest.live.toml
-qualification/mysql-uds-observation/.receipts/
 qualification/mysql-uds-observation/local-run/
 qualification/q/

@@ -74,17 +74,13 @@ pub struct ScenarioResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScenarioReceipt {
+pub struct ScenarioResults {
     results: Vec<ScenarioResult>,
 }
 
-impl ScenarioReceipt {
+impl ScenarioResults {
     pub fn new(results: Vec<ScenarioResult>) -> Self {
         Self { results }
-    }
-
-    pub fn results(&self) -> &[ScenarioResult] {
-        &self.results
     }
 
     pub fn validate_complete(&self) -> Result<(), QualificationError> {
@@ -96,14 +92,14 @@ impl ScenarioReceipt {
         for (name, origin) in &expected {
             let Some(result) = actual.get(&(name.clone(), *origin)) else {
                 return Err(QualificationError::new(
-                    QualificationCode::OutputGated,
+                    QualificationCode::ScenarioFailure,
                     "scenario completeness",
                     format!("missing required scenario {name} ({origin:?})"),
                 ));
             };
             if !result.passed {
                 return Err(QualificationError::new(
-                    QualificationCode::OutputGated,
+                    QualificationCode::ScenarioFailure,
                     "scenario completeness",
                     format!("required scenario failed: {name}: {}", result.detail),
                 ));
@@ -118,7 +114,7 @@ pub async fn run_all(
     accounts: &FixtureAccounts,
     baseline: &BaselineEvidence,
     online: &OnlineIdentity,
-) -> Result<ScenarioReceipt, QualificationError> {
+) -> Result<(), QualificationError> {
     let mut results = vec![
         ScenarioResult {
             name: "live-product-version".to_owned(),
@@ -289,9 +285,7 @@ pub async fn run_all(
     results.extend(run_fixture_origin_scenarios(EvidenceOriginKind::Synthetic)?);
     results.extend(run_scripted_scenarios().await);
 
-    let receipt = ScenarioReceipt::new(results);
-    receipt.validate_complete()?;
-    Ok(receipt)
+    ScenarioResults::new(results).validate_complete()
 }
 
 pub fn validate_fixture_origin_contract(
@@ -594,7 +588,7 @@ async fn observe_live_on_socket(
             SystemClock {
                 origin: Instant::now(),
             },
-            ObservationInstant::new(fixture.manifest().observation_timeout_ms),
+            ObservationInstant::new(fixture.qualification_config().observation_timeout_ms),
         )
         .map_err(|error| {
             QualificationError::new(

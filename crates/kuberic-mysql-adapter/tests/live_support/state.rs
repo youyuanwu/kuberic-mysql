@@ -75,12 +75,6 @@ pub async fn collect_pre_account(
     let mut connection = fixture.connect_root().await?;
     let product = query_product(&mut connection).await?;
     validate_product(&product)?;
-    fixture.note_product_identity(
-        &product.version,
-        &product.version_comment,
-        &product.version_compile_machine,
-        &product.version_compile_os,
-    );
     let empty_gtid_history = query_string(
         &mut connection,
         "SELECT @@GLOBAL.gtid_executed AS gtid_executed",
@@ -126,7 +120,7 @@ pub async fn bring_group_replication_online(
         run_drop(&mut connection, &statement, "bootstrap group replication").await?;
     }
 
-    let deadline = std::time::Instant::now() + fixture.manifest().startup_timeout();
+    let deadline = std::time::Instant::now() + fixture.qualification_config().startup_timeout();
     loop {
         let identity = query_online_identity(&mut connection).await?;
         if identity.member_state == "ONLINE" && !identity.view_id.is_empty() {

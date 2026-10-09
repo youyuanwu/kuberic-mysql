@@ -29,14 +29,10 @@ pub use report::ObservationReport;
 pub use request::*;
 pub use time::*;
 
-use live_support::{MANIFEST_ENV, fixture};
-
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires explicit Oracle MySQL 8.4.11 installed-package manifest"]
+#[ignore = "requires the exact Oracle MySQL 8.4.11 system package"]
 async fn qualify_oracle_mysql_8_4_11() {
-    let manifest =
-        fixture::ManifestPath::from_env(MANIFEST_ENV).unwrap_or_else(|error| panic!("{error}"));
-    live_support::run(manifest.as_path())
+    live_support::run()
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 }
