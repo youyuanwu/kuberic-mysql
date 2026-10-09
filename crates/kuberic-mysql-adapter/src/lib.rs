@@ -31,9 +31,9 @@
 //! }
 //! ```
 //!
-//! The Oracle MySQL 8.4.11 lifecycle fixture is available only through the
-//! opt-in ignored live test; lifecycle automation is not part of this crate's
-//! production API.
+//! The standard repository test gate runs the Oracle MySQL 8.4.11 live
+//! qualification; lifecycle automation is not part of this crate's production
+//! API.
 
 #[allow(dead_code)]
 mod decode;

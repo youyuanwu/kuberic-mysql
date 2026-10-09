@@ -1,5 +1,3 @@
-#![cfg(feature = "live-mysql-8-4-11")]
-
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -42,7 +40,6 @@ impl ObservationClock for SystemClock {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires exact Oracle MySQL Community Server 8.4.11 and aa-exec"]
 async fn one_fresh_owned_instance_lifecycle() {
     let root = live_root();
     let data = root.join("data");

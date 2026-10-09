@@ -68,44 +68,60 @@ See [the design's staged delivery and validation
 plan](docs/design.md#staged-delivery) for the evidence required before any
 future support claim.
 
+## Prerequisites
+
+Repository development and CI require Oracle MySQL Community Server 8.4.11 on
+Linux x86-64. The supported package is
+`mysql-community-server-core=8.4.11-1ubuntu24.04` from `repo.mysql.com`'s
+`mysql-8.4-lts` component. `/usr/sbin/mysqld` and `/usr/bin/aa-exec` must be
+installed, and the system `mysql.service` must remain stopped. Install the
+repository-pinned, checksum-verified `cargo-nextest` binary with:
+
+```bash
+scripts/install_nextest.sh
+```
+
 ## Validation
 
-The ordinary gate is deterministic and requires no MySQL installation,
-process, container, socket, network, or Kubernetes resource:
+The standard workspace test starts isolated MySQL fixtures and runs both the
+observer qualification and single-process lifecycle gate:
 
 ```bash
 cargo fmt --all -- --check
-CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --all-features -- --test-threads=1
-CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --workspace --profile ci
+CARGO_BUILD_JOBS=1 cargo test --locked --offline --doc --workspace
+CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets -- -D warnings
 ```
 
-The bounded host's deterministic contracts can be run independently:
+The bounded host's deterministic contracts can be run without launching
+MySQL:
 
 ```bash
-CARGO_BUILD_JOBS=1 cargo test --locked --offline -p kuberic-mysql-service -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-service --test config_contract --test process_contract
 ```
 
-The opt-in native qualification is separate and requires the exact documented
-Oracle package and stopped system service:
+The native observer gate can be rerun independently:
 
 ```bash
-CARGO_BUILD_JOBS=1 cargo test --locked --offline -p kuberic-mysql-adapter \
-  --features live-mysql-8-4-11 --test live_mysql_8_4_11 \
-  qualify_oracle_mysql_8_4_11 -- --ignored --exact --test-threads=1
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-adapter --test live_mysql_8_4_11 \
+  -E 'test(=qualify_oracle_mysql_8_4_11)'
 ```
 
-The corresponding single-process lifecycle gate is:
+The single-process lifecycle gate can be rerun independently:
 
 ```bash
-CARGO_BUILD_JOBS=1 cargo test --locked --offline -p kuberic-mysql-service \
-  --features live-mysql-8-4-11 --test live_mysql_8_4_11 \
-  one_fresh_owned_instance_lifecycle -- --ignored --exact --test-threads=1
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-service --test live_mysql_8_4_11 \
+  -E 'test(=one_fresh_owned_instance_lifecycle)'
 ```
 
-The live test launches only its isolated project-local fixture child, requires
-all scenarios and cleanup to pass, and removes temporary data, runtime files,
-and socket. See the
+The live tests launch only isolated project-local fixture children, require all
+scenarios and cleanup to pass, and remove temporary data, runtime files, and
+sockets. See the
 [qualification guide](qualification/mysql-uds-observation/README.md).
 
-GitHub Actions installs the same exact Oracle package on Ubuntu 24.04 and runs
-the Cargo gates directly for every pull request and every push to `main`.
+GitHub Actions installs the same exact Oracle package and pinned nextest binary
+on Ubuntu 24.04 and runs the standard workspace gate for every pull request and
+every push to `main`.
