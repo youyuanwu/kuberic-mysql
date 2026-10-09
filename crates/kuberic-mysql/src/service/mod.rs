@@ -20,7 +20,10 @@ mod error;
 mod instance;
 mod process;
 
-pub use config::{MysqlInstanceConfig, MysqlOperationTimeouts, MysqlRuntimePaths};
+pub use config::{
+    MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts,
+    MysqlRuntimePaths, MysqlTopologyConfig,
+};
 pub use error::{
     ConfigError, LifecycleOperation, MysqlInstanceError, OwnershipError, ProductError,
 };

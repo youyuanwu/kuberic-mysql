@@ -605,7 +605,10 @@ fn io_error(operation: LifecycleOperation, error: rustix::io::Errno) -> MysqlIns
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::MysqlOperationTimeouts;
+    use crate::service::{
+        MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts, MysqlTopologyConfig,
+    };
+    use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -623,6 +626,8 @@ mod tests {
             "/usr/bin/env",
             parent.join("data"),
             parent.join("scratch"),
+            topology(),
+            MysqlMemberIndex::First,
             MysqlOperationTimeouts::new(
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -668,5 +673,45 @@ mod tests {
         fs::remove_dir_all(roots.data.path()).unwrap();
         fs::remove_file(replacement_file).unwrap();
         fs::remove_dir(parent).unwrap();
+    }
+
+    fn topology() -> MysqlTopologyConfig {
+        let sql = [
+            SocketAddr::from(([127, 0, 0, 1], 33061)),
+            SocketAddr::from(([127, 0, 0, 1], 33062)),
+            SocketAddr::from(([127, 0, 0, 1], 33063)),
+        ];
+        let group = [
+            SocketAddr::from(([127, 0, 0, 1], 43061)),
+            SocketAddr::from(([127, 0, 0, 1], 43062)),
+            SocketAddr::from(([127, 0, 0, 1], 43063)),
+        ];
+        MysqlTopologyConfig::new([
+            MysqlMemberConfig::new(
+                1,
+                sql[0],
+                group[0],
+                "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                group,
+            )
+            .unwrap(),
+            MysqlMemberConfig::new(
+                2,
+                sql[1],
+                group[1],
+                "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                group,
+            )
+            .unwrap(),
+            MysqlMemberConfig::new(
+                3,
+                sql[2],
+                group[2],
+                "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                group,
+            )
+            .unwrap(),
+        ])
+        .unwrap()
     }
 }

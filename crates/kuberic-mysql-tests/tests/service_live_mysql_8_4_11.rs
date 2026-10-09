@@ -1,3 +1,6 @@
+#[path = "service_common/mod.rs"]
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -13,9 +16,13 @@ use kuberic_mysql::core::{
     ObservationOutcome, ObservationProvenance, ObservationSessionId, PartitionId, ProcessSessionId,
     ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
 };
-use kuberic_mysql::service::{MysqlInstanceConfig, MysqlInstanceManager, MysqlOperationTimeouts};
+use kuberic_mysql::service::{
+    MysqlInstanceConfig, MysqlInstanceManager, MysqlMemberIndex, MysqlOperationTimeouts,
+};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
+
+use common::topology;
 
 #[derive(Clone)]
 struct SystemClock {
@@ -60,6 +67,8 @@ async fn one_fresh_owned_instance_lifecycle() {
         "/usr/bin/aa-exec",
         &data,
         &scratch,
+        topology(),
+        MysqlMemberIndex::First,
         timeouts,
     )
     .unwrap();

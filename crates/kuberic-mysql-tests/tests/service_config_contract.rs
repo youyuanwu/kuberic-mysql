@@ -2,21 +2,32 @@
 mod common;
 
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::time::Duration;
 
-use common::{TestRoot, timeouts};
+use common::{GROUP_UUID, TestRoot, loopback_address, member_configs, timeouts, topology};
 use kuberic_mysql::service::{
     ConfigError, MysqlInstanceConfig, MysqlInstanceError, MysqlInstanceManager, MysqlInstanceState,
-    MysqlOperationTimeouts, ProductError,
+    MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts, MysqlTopologyConfig, ProductError,
 };
 
 #[test]
-fn exact_render_separates_persistent_data_from_disposable_runtime() {
-    let root = TestRoot::new("render");
-    let config = root.config();
-    let rendered = config.render_server_config();
+fn exact_three_member_render_is_unique_and_keeps_runtime_disposable() {
+    let roots = [
+        TestRoot::new("render-1"),
+        TestRoot::new("render-2"),
+        TestRoot::new("render-3"),
+    ];
+    let configs = [
+        roots[0].config_for_member(MysqlMemberIndex::First),
+        roots[1].config_for_member(MysqlMemberIndex::Second),
+        roots[2].config_for_member(MysqlMemberIndex::Third),
+    ];
+    let rendered = configs
+        .each_ref()
+        .map(|config| config.render_server_config());
     let expected = format!(
         "[mysqld]\n\
          datadir={}\n\
@@ -29,6 +40,9 @@ fn exact_render_separates_persistent_data_from_disposable_runtime() {
          relay-log={}/relay-bin\n\
          skip-networking=ON\n\
          mysqlx=OFF\n\
+         port=33061\n\
+         report-host=127.0.0.1\n\
+         report-port=33061\n\
          server-id=1\n\
          binlog-format=ROW\n\
          binlog-checksum=NONE\n\
@@ -37,39 +51,293 @@ fn exact_render_separates_persistent_data_from_disposable_runtime() {
          enforce-gtid-consistency=ON\n\
          plugin-load-add=group_replication.so\n\
          loose-group-replication-group-name=cccccccc-cccc-cccc-cccc-cccccccccccc\n\
-         loose-group-replication-local-address=127.0.0.1:33061\n\
-         loose-group-replication-group-seeds=127.0.0.1:33061\n\
+         loose-group-replication-local-address=127.0.0.1:43061\n\
+         loose-group-replication-group-seeds=127.0.0.1:43061,127.0.0.1:43062,127.0.0.1:43063\n\
          loose-group-replication-single-primary-mode=ON\n\
          loose-group-replication-enforce-update-everywhere-checks=OFF\n\
          loose-group-replication-start-on-boot=OFF\n\
          loose-group-replication-bootstrap-group=OFF\n",
-        root.data.display(),
-        root.scratch.join("mysql.sock").display(),
-        root.scratch.join("mysqld.pid").display(),
-        root.scratch.join("mysqld.err").display(),
-        root.scratch.display(),
-        root.scratch.display(),
-        root.scratch.display(),
-        root.scratch.display(),
+        roots[0].data.display(),
+        roots[0].scratch.join("mysql.sock").display(),
+        roots[0].scratch.join("mysqld.pid").display(),
+        roots[0].scratch.join("mysqld.err").display(),
+        roots[0].scratch.display(),
+        roots[0].scratch.display(),
+        roots[0].scratch.display(),
+        roots[0].scratch.display(),
     );
 
-    assert_eq!(rendered, expected);
-    for line in rendered.lines().filter(|line| {
-        [
-            "socket=",
-            "pid-file=",
-            "log-error=",
-            "tmpdir=",
-            "secure-file-priv=",
-            "log-bin=",
-            "relay-log=",
-        ]
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
-    }) {
-        assert!(line.contains(root.scratch.to_str().unwrap()), "{line}");
-        assert!(!line.contains(root.data.to_str().unwrap()), "{line}");
+    assert_eq!(rendered[0], expected);
+    for (index, value) in rendered.iter().enumerate() {
+        let member = configs[index].member();
+        assert!(value.contains(&format!("server-id={}", member.server_id())));
+        assert!(value.contains(&format!("port={}", member.sql_address().port())));
+        assert!(value.contains(&format!("report-host={}", member.sql_address().ip())));
+        assert!(value.contains(&format!(
+            "loose-group-replication-local-address={}",
+            member.group_replication_address()
+        )));
+        assert!(value.contains(&format!("loose-group-replication-group-name={GROUP_UUID}")));
+        assert!(value.contains(
+            "loose-group-replication-group-seeds=127.0.0.1:43061,127.0.0.1:43062,127.0.0.1:43063"
+        ));
+        assert!(value.contains("skip-networking=ON"));
+        assert!(value.contains("mysqlx=OFF"));
+        assert!(value.contains("gtid-mode=ON"));
+        assert!(value.contains("enforce-gtid-consistency=ON"));
+        assert!(value.contains("loose-group-replication-start-on-boot=OFF"));
+        assert!(value.contains("loose-group-replication-bootstrap-group=OFF"));
+
+        for line in value.lines().filter(|line| {
+            [
+                "socket=",
+                "pid-file=",
+                "log-error=",
+                "tmpdir=",
+                "secure-file-priv=",
+                "log-bin=",
+                "relay-log=",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        }) {
+            assert!(
+                line.contains(roots[index].scratch.to_str().unwrap()),
+                "{line}"
+            );
+            assert!(
+                !line.contains(roots[index].data.to_str().unwrap()),
+                "{line}"
+            );
+        }
     }
+    assert_eq!(
+        configs.each_ref().map(|config| config.member().server_id()),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        configs
+            .each_ref()
+            .map(|config| config.member().sql_address()),
+        [
+            loopback_address(33061),
+            loopback_address(33062),
+            loopback_address(33063)
+        ]
+    );
+    assert_eq!(
+        configs
+            .each_ref()
+            .map(|config| config.member().group_replication_address()),
+        [
+            loopback_address(43061),
+            loopback_address(43062),
+            loopback_address(43063)
+        ]
+    );
+    assert_ne!(configs[0].data_root(), configs[1].data_root());
+    assert_ne!(configs[0].runtime().socket(), configs[1].runtime().socket());
+    assert_ne!(configs[1].runtime().pid(), configs[2].runtime().pid());
+}
+
+#[test]
+fn invalid_member_topology_values_are_rejected_precisely() {
+    let seeds = [
+        loopback_address(43061),
+        loopback_address(43062),
+        loopback_address(43063),
+    ];
+    assert_eq!(
+        MysqlMemberConfig::new(
+            0,
+            loopback_address(33061),
+            loopback_address(43061),
+            GROUP_UUID,
+            seeds
+        ),
+        Err(ConfigError::ZeroServerId)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            loopback_address(0),
+            loopback_address(43061),
+            GROUP_UUID,
+            seeds
+        ),
+        Err(ConfigError::ZeroSqlPort)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            loopback_address(33061),
+            loopback_address(0),
+            GROUP_UUID,
+            seeds
+        ),
+        Err(ConfigError::ZeroGroupReplicationPort)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            SocketAddr::from(([192, 0, 2, 1], 33061)),
+            loopback_address(43061),
+            GROUP_UUID,
+            seeds
+        ),
+        Err(ConfigError::NonLoopbackSqlAddress)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            loopback_address(33061),
+            SocketAddr::from(([192, 0, 2, 1], 43061)),
+            GROUP_UUID,
+            seeds
+        ),
+        Err(ConfigError::NonLoopbackGroupReplicationAddress)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            loopback_address(33061),
+            loopback_address(43061),
+            GROUP_UUID,
+            [
+                loopback_address(43061),
+                loopback_address(43062),
+                SocketAddr::from(([192, 0, 2, 1], 43063)),
+            ],
+        ),
+        Err(ConfigError::NonLoopbackGroupReplicationSeed)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            loopback_address(33061),
+            loopback_address(43061),
+            GROUP_UUID,
+            [
+                loopback_address(43061),
+                loopback_address(43062),
+                loopback_address(0),
+            ],
+        ),
+        Err(ConfigError::ZeroGroupReplicationSeedPort)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            loopback_address(33061),
+            loopback_address(43061),
+            "not-a-uuid",
+            seeds
+        ),
+        Err(ConfigError::InvalidGroupUuid)
+    );
+    assert_eq!(
+        MysqlMemberConfig::new(
+            1,
+            loopback_address(33061),
+            loopback_address(43061),
+            GROUP_UUID,
+            [seeds[0], seeds[0], seeds[2]]
+        ),
+        Err(ConfigError::DuplicateGroupReplicationSeed)
+    );
+}
+
+#[test]
+fn conflicting_three_member_topologies_are_rejected_precisely() {
+    let baseline = member_configs();
+    let duplicate_id = [
+        baseline[0].clone(),
+        MysqlMemberConfig::new(
+            1,
+            baseline[1].sql_address(),
+            baseline[1].group_replication_address(),
+            GROUP_UUID,
+            *baseline[1].group_seeds(),
+        )
+        .unwrap(),
+        baseline[2].clone(),
+    ];
+    assert_eq!(
+        MysqlTopologyConfig::new(duplicate_id),
+        Err(ConfigError::DuplicateServerId)
+    );
+
+    let duplicate_sql = [
+        baseline[0].clone(),
+        MysqlMemberConfig::new(
+            2,
+            baseline[0].sql_address(),
+            baseline[1].group_replication_address(),
+            GROUP_UUID,
+            *baseline[1].group_seeds(),
+        )
+        .unwrap(),
+        baseline[2].clone(),
+    ];
+    assert_eq!(
+        MysqlTopologyConfig::new(duplicate_sql),
+        Err(ConfigError::DuplicateSqlAddress)
+    );
+
+    let duplicate_group = [
+        baseline[0].clone(),
+        MysqlMemberConfig::new(
+            2,
+            baseline[1].sql_address(),
+            baseline[0].group_replication_address(),
+            GROUP_UUID,
+            *baseline[1].group_seeds(),
+        )
+        .unwrap(),
+        baseline[2].clone(),
+    ];
+    assert_eq!(
+        MysqlTopologyConfig::new(duplicate_group),
+        Err(ConfigError::DuplicateGroupReplicationAddress)
+    );
+
+    let mismatched_group = [
+        baseline[0].clone(),
+        MysqlMemberConfig::new(
+            2,
+            baseline[1].sql_address(),
+            baseline[1].group_replication_address(),
+            "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            *baseline[1].group_seeds(),
+        )
+        .unwrap(),
+        baseline[2].clone(),
+    ];
+    assert_eq!(
+        MysqlTopologyConfig::new(mismatched_group),
+        Err(ConfigError::MismatchedGroupUuid)
+    );
+
+    let wrong_seeds = [
+        baseline[0].clone(),
+        MysqlMemberConfig::new(
+            2,
+            baseline[1].sql_address(),
+            baseline[1].group_replication_address(),
+            GROUP_UUID,
+            [
+                loopback_address(43061),
+                loopback_address(43062),
+                loopback_address(43064),
+            ],
+        )
+        .unwrap(),
+        baseline[2].clone(),
+    ];
+    assert_eq!(
+        MysqlTopologyConfig::new(wrong_seeds),
+        Err(ConfigError::GroupReplicationSeedSetMismatch)
+    );
 }
 
 #[test]
@@ -81,6 +349,8 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
         "/usr/bin/env",
         &root.data,
         &root.scratch,
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -92,6 +362,8 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
         "/usr/bin/env",
         &root.data,
         root.data.join("runtime"),
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -104,6 +376,8 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
         "/usr/bin/env",
         &root.data,
         &root.scratch,
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -114,6 +388,8 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
         "/usr/bin/env",
         root.root.join("missing").join("..").join("data"),
         &root.scratch,
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -129,6 +405,8 @@ fn overlapping_existing_parent_is_rejected_as_overlap() {
         "/usr/bin/env",
         &root.data,
         &nested,
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -186,6 +464,8 @@ fn fresh_root_parent_must_be_private_and_owned_by_the_caller() {
         "/usr/bin/env",
         public_parent.join("data"),
         public_parent.join("scratch"),
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -196,6 +476,8 @@ fn fresh_root_parent_must_be_private_and_owned_by_the_caller() {
         "/usr/bin/env",
         format!("/tmp/kms-foreign-data-{}", std::process::id()),
         root.root.join("scratch"),
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -231,6 +513,8 @@ fn unsupported_product_identity_fails_and_releases_fresh_roots() {
         &root.launcher,
         &root.data,
         &root.scratch,
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap();
@@ -270,6 +554,8 @@ fn socket_path_must_fit_the_linux_unix_address() {
         "/usr/bin/env",
         &root.data,
         long,
+        topology(),
+        MysqlMemberIndex::First,
         timeouts(),
     )
     .unwrap_err();
@@ -285,6 +571,8 @@ fn option_file_metacharacters_are_rejected_in_every_path() {
             "/usr/bin/env",
             root.root.join(suffix),
             &root.scratch,
+            topology(),
+            MysqlMemberIndex::First,
             timeouts(),
         )
         .unwrap_err();

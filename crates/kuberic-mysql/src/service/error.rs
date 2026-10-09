@@ -8,6 +8,36 @@ use crate::service::MysqlInstanceState;
 /// Configuration validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
+    /// A Group Replication member used server ID zero.
+    ZeroServerId,
+    /// Two Group Replication members used the same server ID.
+    DuplicateServerId,
+    /// A reported SQL address used port zero.
+    ZeroSqlPort,
+    /// A reported SQL address was not loopback-only.
+    NonLoopbackSqlAddress,
+    /// Two members used the same reported SQL address.
+    DuplicateSqlAddress,
+    /// A Group Replication address used port zero.
+    ZeroGroupReplicationPort,
+    /// A Group Replication address was not loopback-only.
+    NonLoopbackGroupReplicationAddress,
+    /// Two members used the same Group Replication address.
+    DuplicateGroupReplicationAddress,
+    /// A Group Replication group identity was not a canonicalizable non-nil
+    /// UUID.
+    InvalidGroupUuid,
+    /// Members did not use one shared Group Replication group UUID.
+    MismatchedGroupUuid,
+    /// A Group Replication seed used port zero.
+    ZeroGroupReplicationSeedPort,
+    /// A Group Replication seed was not loopback-only.
+    NonLoopbackGroupReplicationSeed,
+    /// A member's Group Replication seed set contained a duplicate.
+    DuplicateGroupReplicationSeed,
+    /// A member's seed set was not the exact configured three-member Group
+    /// Replication address set.
+    GroupReplicationSeedSetMismatch,
     /// A path was not absolute.
     PathNotAbsolute,
     /// A path was not lexically normalized.
