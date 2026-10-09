@@ -1,4 +1,4 @@
-# Oracle MySQL 8.4.11 UDS qualification
+# Oracle MySQL 8.4.11 Qualification
 
 This required repository gate qualifies the read-only observer against one exact installed
 Oracle MySQL Community Server 8.4.11. It never starts or uses the system MySQL

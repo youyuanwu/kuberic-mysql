@@ -125,7 +125,7 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
 The live tests launch only isolated project-local fixture children, require all
 scenarios and cleanup to pass, and remove temporary data, runtime files, and
 sockets. See the
-[qualification guide](qualification/mysql-uds-observation/README.md).
+[qualification guide](docs/mysql-qualification.md).
 
 GitHub Actions installs the same exact Oracle package and pinned nextest binary
 on Ubuntu 24.04 and runs the standard workspace gate for every pull request and
