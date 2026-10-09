@@ -694,4 +694,3 @@ The architecture is accepted only when tests demonstrate:
 
 - [MySQL high-level design](design.md)
 - [PostgreSQL restart-stateless metadata proposal](https://github.com/youyuanwu/kuberic/blob/cfc27498ce1c67336d284e7b9c51813907e2efae/docs/features/postgres/stateless-metadata.md)
-- [MySQL qualification](mysql-qualification.md)
