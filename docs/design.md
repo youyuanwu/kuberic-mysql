@@ -9,13 +9,14 @@ claim.
 ### Current repository status
 
 This repository delivers Stage 0 documentation, the Stage 1 deterministic
-`kuberic-mysql-core` library, one narrow native-observation slice, and the
-first bounded Stage 2 process-host chunk. The publish-disabled
-`kuberic-mysql-adapter` observes exactly one caller-selected Oracle MySQL
-Community Server 8.4.11 through a private Unix-domain socket. The
-publish-disabled `kuberic-mysql-service` owns one fresh, restart-stateless
-process generation. This does not complete the three-process Stage 2
-lifecycle PoC.
+safety core, one narrow native-observation slice, and the first bounded Stage
+2 process-host chunk. The publish-disabled `kuberic-mysql` crate exposes these
+as the `core`, `adapter`, and `service` modules. The adapter observes exactly
+one caller-selected Oracle MySQL Community Server 8.4.11 through a private
+Unix-domain socket. The service owns one fresh, restart-stateless process
+generation. The separate `kuberic-mysql-tests` package owns integration
+contracts, shared fixtures, protocol simulators, and live qualification. This
+does not complete the three-process Stage 2 lifecycle PoC.
 
 Future lifecycle work follows the
 [restart-stateless metadata design](stateless-metadata.md): the MySQL adapter
@@ -88,7 +89,7 @@ rejection `1772/HY000` and checks the precise tagged/newline/multi-source
 
 ### Delivered bounded process-host chunk
 
-`kuberic-mysql-service` validates exact executable and launcher files, absent
+`kuberic_mysql::service` validates exact executable and launcher files, absent
 non-overlapping data and scratch roots, and positive operation deadlines. It
 creates owner-only roots, renders runtime files under scratch, runs
 `--initialize-insecure`, retains and attests the sole child and PID, waits for

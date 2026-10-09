@@ -34,10 +34,10 @@ The workspace test runs both required live gates. To rerun them individually:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-adapter --test live_mysql_8_4_11 \
+  -p kuberic-mysql-tests --test adapter_live_mysql_8_4_11 \
   -E 'test(=qualify_oracle_mysql_8_4_11)'
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-service --test live_mysql_8_4_11 \
+  -p kuberic-mysql-tests --test service_live_mysql_8_4_11 \
   -E 'test(=one_fresh_owned_instance_lifecycle)'
 ```
 

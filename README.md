@@ -19,8 +19,8 @@ facilities, while native database facts remain in the MySQL data directory.
 
 ## Status
 
-Stage 1 is delivered as the publish-disabled `kuberic-mysql-core` crate. It
-provides:
+Stage 1 is delivered in the publish-disabled `kuberic-mysql` crate's `core`
+module. It provides:
 
 - validated, typed identities and exact evidence/work bindings;
 - normalized MySQL GTID sets with equal, proper-subset, proper-superset, and
@@ -30,22 +30,26 @@ provides:
 - a minimal authority session that rejects stale completion and keeps client
   access closed.
 
-The publish-disabled `kuberic-mysql-adapter` crate adds one deadline-bounded,
-read-only observation attempt over a validated UDS. It verifies the exact
-Oracle 8.4.11 product, collects opening native state, executed GTIDs, and
-closing native state on one authenticated session, and returns a typed core
-outcome plus a secret-free diagnostic. Transport, authentication, permission,
-absence, malformed, unsupported, stale, and incoherent results remain
+The `kuberic_mysql::adapter` module adds one deadline-bounded, read-only
+observation attempt over a validated UDS. It verifies the exact Oracle 8.4.11
+product, collects opening native state, executed GTIDs, and closing native
+state on one authenticated session, and returns a typed core outcome plus a
+secret-free diagnostic. Transport, authentication, permission, absence,
+malformed, unsupported, stale, and incoherent results remain
 machine-distinguishable.
 
-The publish-disabled `kuberic-mysql-service` crate owns one fresh local process
-generation. It keeps persistent MySQL data separate from disposable
+The `kuberic_mysql::service` module owns one fresh local process generation. It
+keeps persistent MySQL data separate from disposable
 configuration, logs, PID state, temporary files, and the private socket;
 retains and attests the exact child in memory; delegates observation to the
 adapter; and stops, reaps, and proves socket disappearance before removing
 scratch. It writes no application metadata store and has no restart,
 reattachment, or survivor-adoption path. Loss of its in-memory ownership
 context requires fixture reset.
+
+The second and only other workspace package, `kuberic-mysql-tests`, owns the
+integration contracts, protocol simulators, fixtures, shared test
+infrastructure, and live Oracle qualification targets.
 
 The design requires structured GTID and native-view evidence, exact
 process/storage ownership, and fresh reconciliation before client write
@@ -98,14 +102,15 @@ MySQL:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-service --test config_contract --test process_contract
+  -p kuberic-mysql-tests \
+  --test service_config_contract --test service_process_contract
 ```
 
 The native observer gate can be rerun independently:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-adapter --test live_mysql_8_4_11 \
+  -p kuberic-mysql-tests --test adapter_live_mysql_8_4_11 \
   -E 'test(=qualify_oracle_mysql_8_4_11)'
 ```
 
@@ -113,7 +118,7 @@ The single-process lifecycle gate can be rerun independently:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-service --test live_mysql_8_4_11 \
+  -p kuberic-mysql-tests --test service_live_mysql_8_4_11 \
   -E 'test(=one_fresh_owned_instance_lifecycle)'
 ```
 

@@ -8,14 +8,14 @@ chunk owns one fresh process generation with memory-only context and separate
 persistent data/disposable scratch roots. It does not claim topology mutation,
 restart continuation, switchover, failover, or Kubernetes integration.
 
-The delivered `kuberic-mysql-adapter` already satisfies the application-state
-part of this proposal: it accepts one observation request, keeps only
-attempt-local state, and returns typed evidence without opening a durable
-store.
+The delivered `kuberic_mysql::adapter` module already satisfies the
+application-state part of this proposal: it accepts one observation request,
+keeps only attempt-local state, and returns typed evidence without opening a
+durable store.
 
-The delivered `kuberic-mysql-service` applies the same boundary to one process:
-it writes no application metadata, journal, receipt database, state JSON, or
-adoption record. Loss of its manager context requires fixture reset.
+The delivered `kuberic_mysql::service` module applies the same boundary to one
+process: it writes no application metadata, journal, receipt database, state
+JSON, or adoption record. Loss of its manager context requires fixture reset.
 
 This design applies the ownership principle from the
 [PostgreSQL restart-stateless metadata proposal](https://github.com/youyuanwu/kuberic/blob/cfc27498ce1c67336d284e7b9c51813907e2efae/docs/features/postgres/stateless-metadata.md)
@@ -214,7 +214,7 @@ replace the complete relation.
 A durable GTID receipt must therefore:
 
 - use the canonical parser and normalized representation from
-  `kuberic-mysql-core`;
+  `kuberic_mysql::core`;
 - bind the exact resource, storage incarnation, `server_uuid`, group identity,
   configuration, epoch, process session, native view, and operation;
 - distinguish executed, purged, required, and observed histories;

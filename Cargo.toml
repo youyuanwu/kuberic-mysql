@@ -1,8 +1,7 @@
 [workspace]
 members = [
-    "crates/kuberic-mysql-adapter",
-    "crates/kuberic-mysql-core",
-    "crates/kuberic-mysql-service",
+    "crates/kuberic-mysql",
+    "crates/kuberic-mysql-tests",
 ]
 resolver = "3"
 

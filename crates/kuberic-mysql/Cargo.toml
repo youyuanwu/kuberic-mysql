@@ -1,0 +1,19 @@
+[package]
+name = "kuberic-mysql"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust"] }
+rustix = { version = "1.1.5", features = ["fs"] }
+tokio = { version = "1", default-features = false, features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "test-util"] }
+
+[lints]
+workspace = true
