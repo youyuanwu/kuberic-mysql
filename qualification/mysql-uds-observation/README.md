@@ -1,6 +1,6 @@
 # Oracle MySQL 8.4.11 UDS qualification
 
-This opt-in gate qualifies the read-only observer against one exact installed
+This required repository gate qualifies the read-only observer against one exact installed
 Oracle MySQL Community Server 8.4.11. It never starts or uses the system MySQL
 service.
 
@@ -12,6 +12,8 @@ service.
   `repo.mysql.com` and the `mysql-8.4-lts` component.
 - `/usr/bin/aa-exec`, `dpkg-query`, `dpkg`, `apt-cache`, `ldd`, and the pinned
   Rust 1.98.1 toolchain.
+- The repository-pinned `cargo-nextest`, installed with
+  `scripts/install_nextest.sh`.
 - No reusable MySQL credential. The fixture creates deterministic, ephemeral
   local setup, observer, denied-permission, and recovery accounts for that
   isolated run.
@@ -23,19 +25,28 @@ and repository-local qualification paths.
 
 ```bash
 cargo fmt --all -- --check
-CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --all-features -- --test-threads=1
-CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings
-CARGO_BUILD_JOBS=1 cargo test --locked --offline -p kuberic-mysql-adapter \
-  --features live-mysql-8-4-11 --test live_mysql_8_4_11 \
-  qualify_oracle_mysql_8_4_11 -- --ignored --exact --test-threads=1
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --workspace --profile ci
+CARGO_BUILD_JOBS=1 cargo test --locked --offline --doc --workspace
+CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets -- -D warnings
+```
+
+The workspace test runs both required live gates. To rerun them individually:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-adapter --test live_mysql_8_4_11 \
+  -E 'test(=qualify_oracle_mysql_8_4_11)'
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-service --test live_mysql_8_4_11 \
+  -E 'test(=one_fresh_owned_instance_lifecycle)'
 ```
 
 The repository CI performs the same run for every pull request and every push
 to `main` on a pinned Ubuntu 24.04 runner after installing the exact Oracle
 package.
 
-Run the commands sequentially so formatting, workspace tests, and
-warnings-denied Clippy pass before the live Oracle qualification.
+Run the standard commands sequentially. The nextest workspace run performs
+both live Oracle gates before doctests and warnings-denied Clippy.
 
 ## Fixture lifecycle
 

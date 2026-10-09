@@ -1,4 +1,3 @@
-#![cfg(feature = "live-mysql-8-4-11")]
 #![allow(dead_code)]
 
 #[path = "../src/decode.rs"]
@@ -30,7 +29,6 @@ pub use request::*;
 pub use time::*;
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires the exact Oracle MySQL 8.4.11 system package"]
 async fn qualify_oracle_mysql_8_4_11() {
     live_support::run()
         .await

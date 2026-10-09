@@ -73,7 +73,8 @@ initialize, start, stop, reap, configure, or mutate MySQL.
 
 Qualification uses the installed Oracle
 `mysql-community-server-core=8.4.11-1ubuntu24.04` package from
-`repo.mysql.com`'s `mysql-8.4-lts` component. The opt-in runner verifies dpkg
+`repo.mysql.com`'s `mysql-8.4-lts` component. Repository development and CI
+require that exact installation. The runner verifies dpkg
 ownership/integrity, APT provenance, executable and library compatibility,
 fixture provenance, native scenarios, and deterministic cleanup. It creates owner-only
 project-local runtime/data directories, uses `aa-exec` only for the isolated
@@ -1096,15 +1097,17 @@ schedule or current feature list.
 
 ## Test Strategy
 
-### Ordinary server-free gates
+### Repository gates
 
-Ordinary tests install no database, start no process or container, and require
-no socket, network, or cluster. The delivered Stage 1 gate runs with:
+Repository development requires the exact installed Oracle MySQL package. The
+standard nextest workspace run starts isolated local fixtures and runs the
+delivered observer qualification and single-process lifecycle gate:
 
 ```bash
 cargo fmt --all -- --check
-CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --all-features -- --test-threads=1
-CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --workspace --profile ci
+CARGO_BUILD_JOBS=1 cargo test --locked --offline --doc --workspace
+CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets -- -D warnings
 ```
 
 Stage 1 covers exact identity binding and replacement, GTID parsing/
@@ -1132,13 +1135,13 @@ completion. Later server-free stages must additionally cover:
 - secret redaction and receipt verification; and
 - restart reconstruction with stale desired access and surviving processes.
 
-### Explicit host-local gates
+### Mandatory host-local gates
 
-Live host-local gates are opt-in and separate from ordinary tests. When
-explicitly requested, missing MySQL binaries, required plugin/profile support,
-ports, UDS paths, or privileges must fail with actionable prerequisite errors
-rather than silently skip. Later stages apply the same rule to certificates,
-cross-host networking, and fence-provider prerequisites.
+Live host-local gates are part of the standard nextest workspace run. Missing
+MySQL binaries, required plugin/profile support, ports, UDS paths, or privileges
+fail with actionable prerequisite errors rather than silently skip. Later
+stages apply the same rule to certificates, cross-host networking, and
+fence-provider prerequisites.
 
 The Stage 2 PoC matrix includes:
 
@@ -1240,7 +1243,8 @@ repositories:
 - generic effect records, stale-result rejection, restart reobservation, and
   conservative access reconstruction;
 - independently verifiable fencing before new write publication; and
-- server-free ordinary tests separated from explicit live gates.
+- deterministic core contracts retained alongside mandatory live repository
+  gates.
 
 The existing callback and custom-authority behavior is evidenced in:
 

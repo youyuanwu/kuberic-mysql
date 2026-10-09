@@ -50,17 +50,17 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run workspace tests
-        run: cargo test --locked --offline --workspace --all-features -- --test-threads=1
+      - name: Run workspace tests with nextest
+        run: cargo nextest run --locked --offline --workspace --profile ci
+
+      - name: Run workspace documentation tests
+        run: cargo test --locked --offline --doc --workspace
 
       - name: Run Clippy
-        run: cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings
-
-      - name: Run live MySQL qualification
-        run: |
-          cargo test --locked --offline -p kuberic-mysql-adapter \
-            --features live-mysql-8-4-11 --test live_mysql_8_4_11 \
-            qualify_oracle_mysql_8_4_11 -- --ignored --exact --test-threads=1
+        run: cargo clippy --locked --offline --workspace --all-targets -- -D warnings
