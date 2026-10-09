@@ -437,28 +437,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuberic-mysql-adapter"
+name = "kuberic-mysql"
 version = "0.1.0"
 dependencies = [
- "kuberic-mysql-core",
  "mysql_async",
- "serde",
- "serde_json",
+ "rustix",
  "tokio",
 ]
 
 [[package]]
-name = "kuberic-mysql-core"
-version = "0.1.0"
-
-[[package]]
-name = "kuberic-mysql-service"
+name = "kuberic-mysql-tests"
 version = "0.1.0"
 dependencies = [
- "kuberic-mysql-adapter",
- "kuberic-mysql-core",
+ "kuberic-mysql",
  "mysql_async",
- "rustix",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
