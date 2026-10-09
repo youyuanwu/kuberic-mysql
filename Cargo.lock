@@ -442,6 +442,16 @@ name = "kuberic-mysql-core"
 version = "0.1.0"
 
 [[package]]
+name = "kuberic-mysql-service"
+version = "0.1.0"
+dependencies = [
+ "kuberic-mysql-adapter",
+ "kuberic-mysql-core",
+ "mysql_async",
+ "tokio",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
