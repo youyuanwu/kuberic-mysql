@@ -2,7 +2,7 @@
 mod common;
 
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::time::Duration;
@@ -245,6 +245,45 @@ fn invalid_member_topology_values_are_rejected_precisely() {
         ),
         Err(ConfigError::DuplicateGroupReplicationSeed)
     );
+}
+
+#[test]
+fn noncanonical_ipv6_endpoint_metadata_is_rejected_before_comparison() {
+    let seeds = [
+        loopback_address(43061),
+        loopback_address(43062),
+        loopback_address(43063),
+    ];
+    let scoped_sql = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 33061, 0, 1));
+    let flowed_sql = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 33061, 1, 0));
+    for address in [scoped_sql, flowed_sql] {
+        assert_eq!(
+            MysqlMemberConfig::new(1, address, loopback_address(43061), GROUP_UUID, seeds),
+            Err(ConfigError::NonCanonicalSqlAddress)
+        );
+    }
+
+    let scoped_group = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 43061, 0, 1));
+    let flowed_group = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 43061, 1, 0));
+    for address in [scoped_group, flowed_group] {
+        assert_eq!(
+            MysqlMemberConfig::new(1, loopback_address(33061), address, GROUP_UUID, seeds),
+            Err(ConfigError::NonCanonicalGroupReplicationAddress)
+        );
+    }
+
+    for seed in [scoped_group, flowed_group] {
+        assert_eq!(
+            MysqlMemberConfig::new(
+                1,
+                loopback_address(33061),
+                loopback_address(43061),
+                GROUP_UUID,
+                [loopback_address(43061), seed, loopback_address(43063)],
+            ),
+            Err(ConfigError::NonCanonicalGroupReplicationSeed)
+        );
+    }
 }
 
 #[test]

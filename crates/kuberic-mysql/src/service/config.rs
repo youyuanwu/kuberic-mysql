@@ -592,6 +592,9 @@ fn validate_sql_address(address: SocketAddr) -> Result<(), ConfigError> {
     if address.port() == 0 {
         return Err(ConfigError::ZeroSqlPort);
     }
+    if has_noncanonical_ipv6_metadata(address) {
+        return Err(ConfigError::NonCanonicalSqlAddress);
+    }
     if !address.ip().is_loopback() {
         return Err(ConfigError::NonLoopbackSqlAddress);
     }
@@ -601,6 +604,9 @@ fn validate_sql_address(address: SocketAddr) -> Result<(), ConfigError> {
 fn validate_group_replication_address(address: SocketAddr) -> Result<(), ConfigError> {
     if address.port() == 0 {
         return Err(ConfigError::ZeroGroupReplicationPort);
+    }
+    if has_noncanonical_ipv6_metadata(address) {
+        return Err(ConfigError::NonCanonicalGroupReplicationAddress);
     }
     if !address.ip().is_loopback() {
         return Err(ConfigError::NonLoopbackGroupReplicationAddress);
@@ -612,10 +618,17 @@ fn validate_group_replication_seed(address: SocketAddr) -> Result<(), ConfigErro
     if address.port() == 0 {
         return Err(ConfigError::ZeroGroupReplicationSeedPort);
     }
+    if has_noncanonical_ipv6_metadata(address) {
+        return Err(ConfigError::NonCanonicalGroupReplicationSeed);
+    }
     if !address.ip().is_loopback() {
         return Err(ConfigError::NonLoopbackGroupReplicationSeed);
     }
     Ok(())
+}
+
+fn has_noncanonical_ipv6_metadata(address: SocketAddr) -> bool {
+    matches!(address, SocketAddr::V6(address) if address.flowinfo() != 0 || address.scope_id() != 0)
 }
 
 fn display(path: &Path) -> &str {

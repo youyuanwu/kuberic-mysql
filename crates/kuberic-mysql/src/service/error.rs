@@ -16,12 +16,16 @@ pub enum ConfigError {
     ZeroSqlPort,
     /// A reported SQL address was not loopback-only.
     NonLoopbackSqlAddress,
+    /// A reported IPv6 SQL address used nonzero flow or scope metadata.
+    NonCanonicalSqlAddress,
     /// Two members used the same reported SQL address.
     DuplicateSqlAddress,
     /// A Group Replication address used port zero.
     ZeroGroupReplicationPort,
     /// A Group Replication address was not loopback-only.
     NonLoopbackGroupReplicationAddress,
+    /// An IPv6 Group Replication address used nonzero flow or scope metadata.
+    NonCanonicalGroupReplicationAddress,
     /// Two members used the same Group Replication address.
     DuplicateGroupReplicationAddress,
     /// A Group Replication group identity was not a canonicalizable non-nil
@@ -33,6 +37,8 @@ pub enum ConfigError {
     ZeroGroupReplicationSeedPort,
     /// A Group Replication seed was not loopback-only.
     NonLoopbackGroupReplicationSeed,
+    /// An IPv6 Group Replication seed used nonzero flow or scope metadata.
+    NonCanonicalGroupReplicationSeed,
     /// A member's Group Replication seed set contained a duplicate.
     DuplicateGroupReplicationSeed,
     /// A member's seed set was not the exact configured three-member Group
