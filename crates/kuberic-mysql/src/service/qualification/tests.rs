@@ -327,6 +327,10 @@ fn qualification_ownership_stops_restarts_and_rebinds_phase() {
             QualificationMemberPhase::ProcessStopped
         );
         ownership.restart(MysqlMemberIndex::Second).unwrap();
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::Second),
+            QualificationMemberPhase::Restarting
+        );
         ownership.finish_restart(MysqlMemberIndex::Second).unwrap();
         assert_eq!(
             ownership.phase(MysqlMemberIndex::Second),
@@ -576,6 +580,66 @@ fn qualification_cleanup_reports_failures_and_deadline_overrun() {
             .stop(MysqlMemberIndex::First, QualificationStopKind::Abrupt)
             .is_err()
     );
+    assert_eq!(
+        ownership.phase(MysqlMemberIndex::First),
+        QualificationMemberPhase::Contained
+    );
+}
+
+#[test]
+fn qualification_rebinding_failure_contains_and_propagates_cleanup_overrun() {
+    let mut members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    members[0].contain_delay = Duration::from_millis(5);
+    let mut ownership = QualificationOwnership::with_deadlines(
+        &mut members,
+        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_millis(1),
+    );
+    ownership
+        .stop(MysqlMemberIndex::First, QualificationStopKind::Graceful)
+        .unwrap();
+    ownership.restart(MysqlMemberIndex::First).unwrap();
+    assert_eq!(
+        ownership.phase(MysqlMemberIndex::First),
+        QualificationMemberPhase::Restarting
+    );
+    let cleanup = ownership
+        .reject_restart_binding(MysqlMemberIndex::First)
+        .unwrap();
+    assert!(cleanup.deadline_overrun);
+    assert_eq!(
+        ownership.phase(MysqlMemberIndex::First),
+        QualificationMemberPhase::Contained
+    );
+    let failures =
+        MysqlNativeQualification::qualification_cleanup_failures(MysqlMemberIndex::First, cleanup);
+    assert_eq!(failures.len(), 1);
+}
+
+#[test]
+fn invalid_or_late_rejoin_contains_immediately() {
+    let mut invalid_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    let mut ownership = QualificationOwnership::with_deadlines(
+        &mut invalid_members,
+        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(2),
+    );
+    ownership
+        .stop(MysqlMemberIndex::First, QualificationStopKind::Graceful)
+        .unwrap();
+    assert!(ownership.begin_rejoin(MysqlMemberIndex::First).is_err());
+    assert_eq!(
+        ownership.phase(MysqlMemberIndex::First),
+        QualificationMemberPhase::Contained
+    );
+
+    let mut late_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    let mut ownership = QualificationOwnership::with_deadlines(
+        &mut late_members,
+        Instant::now() - Duration::from_millis(1),
+        Instant::now() + Duration::from_secs(1),
+    );
+    assert!(ownership.begin_rejoin(MysqlMemberIndex::First).is_err());
     assert_eq!(
         ownership.phase(MysqlMemberIndex::First),
         QualificationMemberPhase::Contained

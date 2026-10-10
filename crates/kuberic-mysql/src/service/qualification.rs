@@ -148,13 +148,30 @@ impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
         Ok(())
     }
 
+    fn reject_restart_binding(
+        &mut self,
+        member: MysqlMemberIndex,
+    ) -> Result<QualificationCleanupReport, ()> {
+        if self.phase(member) != QualificationMemberPhase::Restarting {
+            return Err(());
+        }
+        Ok(self.contain())
+    }
+
     fn begin_rejoin(
         &mut self,
         member: MysqlMemberIndex,
-    ) -> Result<QualificationOperationGuard<'_, 'a, M>, ()> {
-        self.require_work_budget()?;
+    ) -> Result<QualificationOperationGuard<'_, 'a, M>, QualificationOperationFailure> {
+        if self.require_work_budget().is_err() {
+            return Err(self.fail(MysqlInstanceError::Timeout(
+                crate::service::LifecycleOperation::Startup,
+            )));
+        }
         if self.phase(member) != QualificationMemberPhase::Running {
-            return Err(());
+            return Err(self.fail(MysqlInstanceError::InvalidState {
+                expected: crate::service::MysqlInstanceState::Running,
+                actual: crate::service::MysqlInstanceState::Initialized,
+            }));
         }
         self.phases[member.as_usize()] = QualificationMemberPhase::Rejoining;
         Ok(QualificationOperationGuard {
@@ -307,13 +324,17 @@ impl<'a> MysqlNativeQualification<'a> {
                 Ok(binding)
             }
             Err(primary) => {
-                let cleanup = self.ownership.contain();
-                if cleanup.failures.is_empty() && !cleanup.deadline_overrun {
+                let cleanup = self
+                    .ownership
+                    .reject_restart_binding(member)
+                    .expect("failed binding follows a retained restart");
+                let failures = Self::qualification_cleanup_failures(member, cleanup);
+                if failures.is_empty() {
                     Err(primary)
                 } else {
                     Err(MysqlTopologyManagerError::Cleanup {
                         primary: Some(Box::new(primary)),
-                        failures: cleanup.failures,
+                        failures,
                     })
                 }
             }
@@ -328,14 +349,28 @@ impl<'a> MysqlNativeQualification<'a> {
             member,
             error: failure.primary,
         };
-        if failure.cleanup.failures.is_empty() && !failure.cleanup.deadline_overrun {
+        let failures = Self::qualification_cleanup_failures(member, failure.cleanup);
+        if failures.is_empty() {
             primary
         } else {
             MysqlTopologyManagerError::Cleanup {
                 primary: Some(Box::new(primary)),
-                failures: failure.cleanup.failures,
+                failures,
             }
         }
+    }
+
+    fn qualification_cleanup_failures(
+        member: MysqlMemberIndex,
+        mut cleanup: QualificationCleanupReport,
+    ) -> Vec<MemberCleanupFailure> {
+        if cleanup.deadline_overrun {
+            cleanup.failures.push(MemberCleanupFailure::new(
+                member,
+                MysqlInstanceError::Timeout(crate::service::LifecycleOperation::Shutdown),
+            ));
+        }
+        cleanup.failures
     }
 
     fn phase(&self, member: MysqlMemberIndex) -> QualificationMemberPhase {
