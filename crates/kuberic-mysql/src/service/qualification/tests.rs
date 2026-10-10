@@ -500,6 +500,59 @@ async fn qualify_profile_gtid_transitions() {
     fixture.cleanup();
 }
 
+async fn run_peer_live(candidate: RevocationCandidate) -> (RevocationEvidence, RevocationVerdict) {
+    let mut fixture = LiveQualificationFixture::bootstrap().await;
+    let outcome = {
+        let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
+        qualification.qualify_peer_revocation(candidate).await
+    };
+    let result = match outcome {
+        QualificationPeerOutcome::Qualified { evidence, verdict } => (*evidence, verdict),
+        outcome => panic!("peer qualification did not complete: {outcome:?}"),
+    };
+    fixture.cleanup();
+    result
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_peer_account_lock() {
+    let (evidence, verdict) = run_peer_live(RevocationCandidate::AccountLock).await;
+    assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
+    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
+    assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_peer_credential_replacement() {
+    let (evidence, verdict) = run_peer_live(RevocationCandidate::CredentialReplacement).await;
+    assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
+    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
+    assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_peer_privilege_removal() {
+    let (evidence, verdict) = run_peer_live(RevocationCandidate::PrivilegeRemoval).await;
+    assert_eq!(evidence.new_login, ProbeOutcome::Accepted);
+    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
+    assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_peer_stop_rejoin() {
+    let (evidence, verdict) = run_peer_live(RevocationCandidate::StopAndRejoin).await;
+    assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
+    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.established_participation, ProbeOutcome::Absent);
+    assert_eq!(evidence.predecessor_absence, ProbeOutcome::Absent);
+    assert!(evidence.absence_observed_before_replacement);
+    assert_eq!(evidence.replacement_admission, ProbeOutcome::Accepted);
+    assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
+}
+
 fn assert_view_same_or_advanced(before: &str, after: &str) {
     let (before_fixed, before_monotonic) = before.split_once(':').unwrap();
     let (after_fixed, after_monotonic) = after.split_once(':').unwrap();

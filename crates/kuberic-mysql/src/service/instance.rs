@@ -540,6 +540,18 @@ impl MysqlInstanceManager {
         self.child.as_ref().map(std::process::Child::id)
     }
 
+    #[cfg(test)]
+    pub(super) async fn qualification_mutate_recovery(
+        &mut self,
+        current: &ControlCredential,
+        mutation: crate::service::control::QualificationRecoveryMutation<'_>,
+        deadline: &NativeControlDeadline,
+    ) -> Result<(), MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::qualification_mutate_recovery(target, current, mutation, deadline)
+            .await
+    }
+
     fn require_state(&self, expected: MysqlInstanceState) -> Result<(), MysqlInstanceError> {
         if self.state == expected {
             Ok(())

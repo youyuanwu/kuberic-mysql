@@ -3,14 +3,15 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use crate::core::GtidSet;
+use crate::core::{CredentialGeneration, GtidSet};
 use crate::service::config::TOPOLOGY_NATIVE_PROFILE_OPTIONS;
+use crate::service::control::QualificationRecoveryMutation;
 use crate::service::instance::QualificationStopKind;
 use crate::service::topology::QualificationManagerParts;
 use crate::service::{
-    ControlStage, MemberCleanupFailure, MemberControlBinding, MysqlInstanceError,
-    MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManager,
-    MysqlTopologyManagerError, NativeControlDeadline,
+    ControlCredential, ControlStage, MemberCleanupFailure, MemberControlBinding,
+    MysqlInstanceError, MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError,
+    MysqlTopologyManager, MysqlTopologyManagerError, NativeControlDeadline,
 };
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
@@ -837,10 +838,229 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 
     async fn start_group_replication(&mut self, member: MysqlMemberIndex) -> Result<(), String> {
+        self.start_group_replication_with(member, self.recovery)
+            .await
+    }
+
+    async fn start_group_replication_with(
+        &mut self,
+        member: MysqlMemberIndex,
+        recovery: &crate::service::ControlCredential,
+    ) -> Result<(), String> {
         self.ownership.members[member.as_usize()]
-            .qualification_start_group_replication(self.recovery, &self.native_deadline)
+            .qualification_start_group_replication(recovery, &self.native_deadline)
             .await
             .map_err(|error| format!("Group Replication start failed: {error}"))
+    }
+
+    async fn qualify_peer_revocation(
+        &mut self,
+        candidate: RevocationCandidate,
+    ) -> QualificationPeerOutcome {
+        let deadline = tokio::time::Instant::from_std(self.ownership.work_cutoff);
+        match tokio::time::timeout_at(deadline, self.qualify_peer_revocation_inner(candidate)).await
+        {
+            Ok(Ok(evidence)) => {
+                let expected = RevocationExpectation {
+                    binding: evidence.binding.clone(),
+                    exact_member: evidence.exact_member.clone(),
+                    predecessor_process_session: evidence.predecessor_process_session.clone(),
+                    predecessor_credential_generation: evidence
+                        .predecessor_credential_generation
+                        .clone(),
+                    replacement_credential_generation: evidence
+                        .replacement_credential_generation
+                        .clone(),
+                };
+                let verdict = evidence.verdict(&expected);
+                QualificationPeerOutcome::Qualified {
+                    evidence: Box::new(evidence),
+                    verdict,
+                }
+            }
+            Ok(Err(reason)) if reason.contains("unsupported") => {
+                QualificationPeerOutcome::Unsupported { candidate, reason }
+            }
+            Ok(Err(reason)) => QualificationPeerOutcome::Unproved { candidate, reason },
+            Err(_) => QualificationPeerOutcome::Unproved {
+                candidate,
+                reason: "peer scenario reached scenario work cutoff".to_owned(),
+            },
+        }
+    }
+
+    async fn qualify_peer_revocation_inner(
+        &mut self,
+        candidate: RevocationCandidate,
+    ) -> Result<RevocationEvidence, String> {
+        let profile = self.read_profile_evidence().await?;
+        let expected_profile = profile.binding.clone();
+        profile
+            .qualify(&expected_profile)
+            .map_err(|error| format!("profile evidence rejected: {error:?}"))?;
+        self.prepare_transaction_table().await?;
+        self.commit_token("peer-baseline").await?;
+        let owned_identities: [String; 3] = profile
+            .members
+            .iter()
+            .map(|member| member.server_uuid.clone())
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| "profile member cardinality changed".to_owned())?;
+        let primary = self.current_primary().await?;
+        let target = MysqlMemberIndex::all()
+            .into_iter()
+            .find(|member| *member != primary)
+            .unwrap();
+        let target_identity = owned_identities[target.as_usize()].clone();
+        let predecessor_binding = self.member_binding(target)?;
+        let opening_view = self.snapshots().await?[0].view_id.clone();
+        let replacement = ControlCredential::new(
+            self.attempt.id().clone(),
+            CredentialGeneration::new(format!(
+                "peer-replacement-{}-{}",
+                target.as_usize() + 1,
+                NEXT_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .map_err(|_| "replacement credential generation was invalid".to_owned())?,
+            crate::service::ControlCredentialRole::Recovery,
+            self.recovery.username().to_owned(),
+            format!(
+                "KmqReplacement{}C5",
+                NEXT_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        )
+        .map_err(|_| "replacement credential was invalid".to_owned())?;
+
+        if candidate == RevocationCandidate::StopAndRejoin {
+            self.stop_group_replication(target).await?;
+        } else {
+            let mutation = match candidate {
+                RevocationCandidate::AccountLock => QualificationRecoveryMutation::Lock,
+                RevocationCandidate::CredentialReplacement => {
+                    QualificationRecoveryMutation::Replace(&replacement)
+                }
+                RevocationCandidate::PrivilegeRemoval => QualificationRecoveryMutation::Revoke,
+                RevocationCandidate::StopAndRejoin => unreachable!(),
+            };
+            self.ownership.members[target.as_usize()]
+                .qualification_mutate_recovery(self.recovery, mutation, &self.native_deadline)
+                .await
+                .map_err(|error| format!("recovery mutation failed: {error}"))?;
+            self.commit_token("peer-after-mutation").await?;
+            self.stop_group_replication(target).await?;
+        }
+
+        let expected_without = owned_identities
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != target.as_usize())
+            .map(|(_, identity)| identity.clone())
+            .collect();
+        let mut successor = self
+            .wait_exact_membership(
+                &expected_without,
+                &owned_identities,
+                None,
+                Some(&opening_view),
+            )
+            .await?;
+        if candidate == RevocationCandidate::StopAndRejoin {
+            self.ownership.members[target.as_usize()]
+                .qualification_mutate_recovery(
+                    self.recovery,
+                    QualificationRecoveryMutation::Replace(&replacement),
+                    &self.native_deadline,
+                )
+                .await
+                .map_err(|error| format!("recovery replacement failed: {error}"))?;
+        }
+        let new_login = self.probe_recovery_login(target, self.recovery).await;
+        let old_recovery = match self
+            .start_group_replication_with(target, self.recovery)
+            .await
+        {
+            Ok(()) => ProbeOutcome::Accepted,
+            Err(_) => ProbeOutcome::Rejected,
+        };
+
+        let replacement_admission = if candidate == RevocationCandidate::StopAndRejoin {
+            if old_recovery == ProbeOutcome::Accepted {
+                self.wait_exact_membership(
+                    &owned_identities.iter().cloned().collect(),
+                    &owned_identities,
+                    None,
+                    Some(&successor.view_id),
+                )
+                .await?;
+                let rejoined_view = self.snapshots().await?[0].view_id.clone();
+                self.stop_group_replication(target).await?;
+                successor = self
+                    .wait_exact_membership(
+                        &expected_without,
+                        &owned_identities,
+                        None,
+                        Some(&rejoined_view),
+                    )
+                    .await?;
+            }
+            self.start_group_replication_with(target, &replacement)
+                .await?;
+            self.wait_exact_membership(
+                &owned_identities.iter().cloned().collect(),
+                &owned_identities,
+                None,
+                Some(&successor.view_id),
+            )
+            .await?;
+            ProbeOutcome::Accepted
+        } else {
+            ProbeOutcome::Unproved
+        };
+
+        Ok(RevocationEvidence {
+            candidate,
+            binding: expected_profile,
+            exact_member: target_identity,
+            predecessor_process_session: predecessor_binding.process_session().as_str().to_owned(),
+            predecessor_credential_generation: self.recovery.generation().as_str().to_owned(),
+            replacement_credential_generation: replacement.generation().as_str().to_owned(),
+            opening_view,
+            successor_view: Some(successor.view_id),
+            new_login,
+            recovery_admission: old_recovery,
+            established_participation: if candidate == RevocationCandidate::StopAndRejoin {
+                ProbeOutcome::Absent
+            } else {
+                ProbeOutcome::Continued
+            },
+            predecessor_absence: ProbeOutcome::Absent,
+            absence_observed_before_replacement: true,
+            replacement_admission,
+            credential_bound_session_identity: false,
+        })
+    }
+
+    async fn probe_recovery_login(
+        &self,
+        member: MysqlMemberIndex,
+        credential: &crate::service::ControlCredential,
+    ) -> ProbeOutcome {
+        let options = OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(1)
+            .socket(Some(
+                self.member_socket(member).to_str().unwrap().to_owned(),
+            ))
+            .user(Some(credential.username().to_owned()))
+            .pass(Some(credential.password().to_owned()));
+        match Conn::new(options).await {
+            Ok(connection) => {
+                let _ = connection.disconnect().await;
+                ProbeOutcome::Accepted
+            }
+            Err(_) => ProbeOutcome::Rejected,
+        }
     }
 
     async fn wait_exact_membership(
@@ -1026,6 +1246,22 @@ enum QualificationLiveOutcome {
     },
     Unproved {
         stage: QualificationStage,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QualificationPeerOutcome {
+    Qualified {
+        evidence: Box<RevocationEvidence>,
+        verdict: RevocationVerdict,
+    },
+    Unsupported {
+        candidate: RevocationCandidate,
+        reason: String,
+    },
+    Unproved {
+        candidate: RevocationCandidate,
         reason: String,
     },
 }
