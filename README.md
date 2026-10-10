@@ -68,10 +68,15 @@ Cancelling bootstrap cannot detach a query future: bootstrap-off and proof are
 attempted after every enable attempt, while cancellation synchronously contains
 the exact owned topology before returning control.
 
-A test-only native feasibility gate pins GTID assignment blocks of 1,
-automatic view-change UUIDs, `AFTER` consistency, flush-at-commit and binlog
-sync of 1, 30-day binlog expiry, and a 5-second member-expulsion extension. It
-reads every effective value back on all members and qualifies one untagged
+A test-only native feasibility gate pins and reads back all nine effective
+values on every member: `gtid_mode = ON`,
+`enforce_gtid_consistency = ON`,
+`group_replication_gtid_assignment_block_size = 1`,
+`group_replication_view_change_uuid = AUTOMATIC`, global and workload-session
+`group_replication_consistency = AFTER`,
+`innodb_flush_log_at_trx_commit = 1`, `sync_binlog = 1`,
+`binlog_expire_logs_seconds = 2592000`, and
+`group_replication_member_expel_timeout = 5`. It qualifies one untagged
 group-source, contiguous-from-1 GTID history across primary transfer, graceful
 departure/rejoin, retained-data restart of every process, and binary-log
 purge. Full GTID sets remain authoritative; purged sets and opaque log
@@ -196,10 +201,7 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
 
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql --lib \
-  -E 'test(=service::qualification::tests::qualify_normal_acknowledgement) \
-      | test(=service::qualification::tests::qualify_ambiguous_disconnect) \
-      | test(=service::qualification::tests::qualify_secondary_loss_during_after) \
-      | test(=service::qualification::tests::qualify_post_ack_primary_crash_restart)'
+  -E 'test(=service::qualification::tests::qualify_normal_acknowledgement) | test(=service::qualification::tests::qualify_ambiguous_disconnect) | test(=service::qualification::tests::qualify_secondary_loss_during_after) | test(=service::qualification::tests::qualify_post_ack_primary_crash_restart)'
 ```
 
 The live tests launch only isolated project-local fixture children, require all
