@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::path::Path;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crate::core::GtidSet;
@@ -10,9 +12,13 @@ use crate::service::{
     MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManager,
     MysqlTopologyManagerError,
 };
+use mysql_async::prelude::Queryable;
+use mysql_async::{Conn, OptsBuilder};
+use tokio::time::sleep;
 
 const ORACLE_PACKAGE: &str = "mysql-community-server-core=8.4.11-1ubuntu24.04";
 const CLEANUP_RESERVE: Duration = Duration::from_secs(120);
+static NEXT_TRANSACTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QualificationMemberPhase {
@@ -376,6 +382,593 @@ impl<'a> MysqlNativeQualification<'a> {
     fn phase(&self, member: MysqlMemberIndex) -> QualificationMemberPhase {
         self.ownership.phase(member)
     }
+
+    async fn qualify_profile_gtid_transitions(
+        &mut self,
+    ) -> Result<ProfileGtidQualificationReport, String> {
+        let profile = self.read_profile_evidence().await?;
+        let expected = profile.binding.clone();
+        let qualified_profile = profile
+            .qualify(&expected)
+            .map_err(|error| format!("profile evidence rejected: {error:?}"))?;
+
+        self.prepare_transaction_table().await?;
+        let mut checkpoints = Vec::new();
+        checkpoints.push(self.commit_token("before-primary-transfer").await?);
+        self.transfer_primary().await?;
+        checkpoints.push(self.commit_token("after-primary-transfer").await?);
+
+        let primary = self.current_primary().await?;
+        let departure = MysqlMemberIndex::all()
+            .into_iter()
+            .find(|member| *member != primary)
+            .expect("three-member topology has a secondary");
+        checkpoints.push(self.commit_token("before-secondary-departure").await?);
+        self.stop_group_replication(departure).await?;
+        self.wait_membership(2, None).await?;
+        self.start_group_replication(departure).await?;
+        self.wait_membership(3, None).await?;
+        checkpoints.push(self.commit_token("after-secondary-rejoin").await?);
+
+        let mut restart_bindings = Vec::new();
+        for member in MysqlMemberIndex::all() {
+            checkpoints.push(
+                self.commit_token(&format!("before-member-{}-restart", member.as_usize() + 1))
+                    .await?,
+            );
+            if self.current_primary().await? == member {
+                self.transfer_primary().await?;
+            }
+            self.stop_group_replication(member).await?;
+            self.wait_membership(2, None).await?;
+            let old = self.member_binding(member)?;
+            self.stop_member(member, QualificationStopKind::Graceful)
+                .map_err(|error| format!("owned stop failed: {error}"))?;
+            let new = self
+                .restart_member(member)
+                .map_err(|error| format!("retained restart failed: {error}"))?;
+            if old.process_session() == new.process_session() {
+                return Err("retained restart reused a process session".to_owned());
+            }
+            restart_bindings.push((
+                old.process_session().as_str().to_owned(),
+                new.process_session().as_str().to_owned(),
+            ));
+            self.start_group_replication(member).await?;
+            self.wait_membership(3, None).await?;
+            checkpoints.push(
+                self.commit_token(&format!("after-member-{}-restart", member.as_usize() + 1))
+                    .await?,
+            );
+        }
+
+        checkpoints.push(self.commit_token("before-purge").await?);
+        let (purged, binary_logs) = self.rotate_and_purge_binary_logs().await?;
+        checkpoints.push(self.commit_token("after-purge").await?);
+        let final_snapshots = self.snapshots().await?;
+        for snapshot in &final_snapshots {
+            if !purged.is_subset_of(&snapshot.executed) {
+                return Err("purged history was outside executed history".to_owned());
+            }
+            match classify_gtid_profile(&snapshot.executed, self.attempt.group_name().as_str()) {
+                GtidProfileCompatibility::CompatibleContiguous { .. } => {}
+                compatibility => {
+                    return Err(format!(
+                        "final GTID history was incompatible: {compatibility:?}"
+                    ));
+                }
+            }
+        }
+
+        Ok(ProfileGtidQualificationReport {
+            qualified_profile,
+            checkpoints,
+            restart_bindings,
+            purged,
+            binary_logs,
+            final_members: final_snapshots
+                .iter()
+                .flat_map(|snapshot| snapshot.members.iter())
+                .map(|member| member.member_id.clone())
+                .collect::<HashSet<_>>(),
+        })
+    }
+
+    async fn read_profile_evidence(&mut self) -> Result<NativeProfileEvidence, String> {
+        let snapshots = self.snapshots().await?;
+        let opening_view = snapshots[0].view_id.clone();
+        if snapshots.iter().any(|snapshot| {
+            snapshot.view_id != opening_view || snapshot.members != snapshots[0].members
+        }) {
+            return Err("profile readback did not begin in one coherent view".to_owned());
+        }
+        let mut members = Vec::new();
+        for member in MysqlMemberIndex::all() {
+            let binding = self.member_binding(member)?;
+            let mut connection = self.root_connection(member).await?;
+            let mut settings = Vec::new();
+            for spec in NATIVE_PROFILE {
+                let global = match connection.query_first::<String, _>(spec.global_query).await {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        settings.push(SettingReadback::Missing {
+                            variable: spec.variable.to_owned(),
+                        });
+                        continue;
+                    }
+                    Err(_) => {
+                        settings.push(SettingReadback::Unsupported {
+                            variable: spec.variable.to_owned(),
+                        });
+                        continue;
+                    }
+                };
+                let session = match spec.session_query {
+                    Some(query) => match connection.query_first::<String, _>(query).await {
+                        Ok(Some(value)) => Some(value),
+                        Ok(None) => {
+                            settings.push(SettingReadback::Missing {
+                                variable: spec.variable.to_owned(),
+                            });
+                            continue;
+                        }
+                        Err(_) => {
+                            settings.push(SettingReadback::Unsupported {
+                                variable: spec.variable.to_owned(),
+                            });
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                settings.push(SettingReadback::Value {
+                    variable: spec.variable.to_owned(),
+                    global,
+                    session,
+                });
+            }
+            connection
+                .disconnect()
+                .await
+                .map_err(|_| "profile connection disconnect failed".to_owned())?;
+            members.push(MemberProfileEvidence {
+                server_uuid: snapshots[member.as_usize()].server_uuid.clone(),
+                process_session: binding.process_session().as_str().to_owned(),
+                settings,
+            });
+        }
+        Ok(NativeProfileEvidence {
+            binding: QualificationBinding {
+                package: ORACLE_PACKAGE.to_owned(),
+                attempt: self.attempt.id().as_str().to_owned(),
+                group: self.attempt.group_name().as_str().to_owned(),
+                opening_view,
+            },
+            members,
+        })
+    }
+
+    fn member_binding(&mut self, member: MysqlMemberIndex) -> Result<MemberControlBinding, String> {
+        self.ownership.members[member.as_usize()]
+            .topology_binding(
+                self.attempt.id().clone(),
+                self.observer.generation().clone(),
+                self.recovery.generation().clone(),
+            )
+            .map_err(|error| format!("member binding failed: {error}"))
+    }
+
+    async fn root_connection(&self, member: MysqlMemberIndex) -> Result<Conn, String> {
+        root_connection(self.member_socket(member)).await
+    }
+
+    fn member_socket(&self, member: MysqlMemberIndex) -> &Path {
+        self.ownership.members[member.as_usize()]
+            .config()
+            .runtime()
+            .socket()
+    }
+
+    async fn snapshots(&self) -> Result<[NativeMemberSnapshot; 3], String> {
+        let mut snapshots = Vec::new();
+        for member in MysqlMemberIndex::all() {
+            snapshots.push(read_snapshot(self.member_socket(member)).await?);
+        }
+        snapshots
+            .try_into()
+            .map_err(|_| "snapshot cardinality changed".to_owned())
+    }
+
+    async fn prepare_transaction_table(&self) -> Result<(), String> {
+        let primary = self.current_primary().await?;
+        let mut connection = self.root_connection(primary).await?;
+        connection
+            .query_drop("CREATE DATABASE IF NOT EXISTS kuberic_native_qualification")
+            .await
+            .map_err(|_| "qualification database creation failed".to_owned())?;
+        connection
+            .query_drop(
+                "CREATE TABLE IF NOT EXISTS kuberic_native_qualification.tokens (\
+                 token_name VARCHAR(96) PRIMARY KEY, token_value BIGINT NOT NULL) ENGINE=InnoDB",
+            )
+            .await
+            .map_err(|_| "qualification table creation failed".to_owned())?;
+        connection
+            .disconnect()
+            .await
+            .map_err(|_| "transaction setup disconnect failed".to_owned())
+    }
+
+    async fn commit_token(&self, label: &str) -> Result<GtidCheckpoint, String> {
+        self.ownership
+            .require_work_budget()
+            .map_err(|()| "scenario work cutoff reached".to_owned())?;
+        let before = self.wait_common_tail(0).await?;
+        let before_tail = compatible_common_tail(&before, self.attempt.group_name().as_str())?;
+        let primary = current_primary_from(&before)?;
+        let serial = NEXT_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let token = format!("{label}-{serial}");
+        let mut connection = self.root_connection(primary).await?;
+        connection
+            .exec_drop(
+                "INSERT INTO kuberic_native_qualification.tokens(token_name, token_value) \
+                 VALUES (?, ?)",
+                (token, serial),
+            )
+            .await
+            .map_err(|_| "qualification transaction failed".to_owned())?;
+        connection
+            .disconnect()
+            .await
+            .map_err(|_| "qualification transaction disconnect failed".to_owned())?;
+        let after = self.wait_common_tail(before_tail + 1).await?;
+        let tail = compatible_common_tail(&after, self.attempt.group_name().as_str())?;
+        if tail != before_tail + 1 {
+            return Err(format!(
+                "transaction advanced GTID tail from {before_tail} to {tail}"
+            ));
+        }
+        Ok(GtidCheckpoint {
+            label: label.to_owned(),
+            before_tail,
+            transaction_tail: tail,
+            view_id: after[0].view_id.clone(),
+            members: after[0]
+                .members
+                .iter()
+                .map(|member| member.member_id.clone())
+                .collect(),
+        })
+    }
+
+    async fn wait_common_tail(
+        &self,
+        minimum_tail: u64,
+    ) -> Result<[NativeMemberSnapshot; 3], String> {
+        loop {
+            self.ownership
+                .require_work_budget()
+                .map_err(|()| "GTID wait reached scenario cutoff".to_owned())?;
+            let snapshots = self.snapshots().await?;
+            if require_coherent_full_view(&snapshots).is_ok()
+                && compatible_common_tail(&snapshots, self.attempt.group_name().as_str())
+                    .is_ok_and(|tail| tail >= minimum_tail)
+            {
+                return Ok(snapshots);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn current_primary(&self) -> Result<MysqlMemberIndex, String> {
+        current_primary_from(&self.snapshots().await?)
+    }
+
+    async fn transfer_primary(&self) -> Result<(), String> {
+        let snapshots = self.snapshots().await?;
+        require_coherent_full_view(&snapshots)?;
+        let current = current_primary_from(&snapshots)?;
+        let target = MysqlMemberIndex::all()
+            .into_iter()
+            .find(|member| *member != current)
+            .unwrap();
+        let target_uuid = snapshots[target.as_usize()].server_uuid.clone();
+        crate::core::ServerUuid::new(target_uuid.clone())
+            .map_err(|_| "primary target UUID was malformed".to_owned())?;
+        let mut connection = self.root_connection(current).await?;
+        connection
+            .query_drop(format!(
+                "SELECT group_replication_set_as_primary('{target_uuid}')"
+            ))
+            .await
+            .map_err(|error| format!("primary transfer function failed: {error}"))?;
+        connection
+            .disconnect()
+            .await
+            .map_err(|_| "primary transfer disconnect failed".to_owned())?;
+        self.wait_membership(3, Some(&target_uuid)).await?;
+        Ok(())
+    }
+
+    async fn stop_group_replication(&self, member: MysqlMemberIndex) -> Result<(), String> {
+        let mut connection = self.root_connection(member).await?;
+        connection
+            .query_drop("STOP GROUP_REPLICATION")
+            .await
+            .map_err(|_| "Group Replication stop failed".to_owned())?;
+        connection
+            .disconnect()
+            .await
+            .map_err(|_| "Group Replication stop disconnect failed".to_owned())
+    }
+
+    async fn start_group_replication(&self, member: MysqlMemberIndex) -> Result<(), String> {
+        let statement = format!(
+            "START GROUP_REPLICATION USER='{}', PASSWORD='{}', \
+             DEFAULT_AUTH='caching_sha2_password'",
+            self.recovery.username(),
+            self.recovery.password()
+        );
+        let mut connection = self.root_connection(member).await?;
+        let result = connection.query_drop(statement).await;
+        connection
+            .disconnect()
+            .await
+            .map_err(|_| "Group Replication start disconnect failed".to_owned())?;
+        result.map_err(|_| "Group Replication start failed".to_owned())
+    }
+
+    async fn wait_membership(
+        &self,
+        expected_count: usize,
+        expected_primary: Option<&str>,
+    ) -> Result<NativeMemberSnapshot, String> {
+        loop {
+            self.ownership
+                .require_work_budget()
+                .map_err(|()| "membership wait reached scenario cutoff".to_owned())?;
+            for member in MysqlMemberIndex::all() {
+                if !self.member_socket(member).exists() {
+                    continue;
+                }
+                if let Ok(snapshot) = read_snapshot(self.member_socket(member)).await
+                    && snapshot.members.len() == expected_count
+                    && snapshot
+                        .members
+                        .iter()
+                        .all(|member| member.state == "ONLINE")
+                    && expected_primary.is_none_or(|expected| {
+                        snapshot
+                            .members
+                            .iter()
+                            .any(|member| member.member_id == expected && member.role == "PRIMARY")
+                    })
+                {
+                    return Ok(snapshot);
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn rotate_and_purge_binary_logs(&self) -> Result<(GtidSet, Vec<String>), String> {
+        let primary = self.current_primary().await?;
+        let mut connection = self.root_connection(primary).await?;
+        connection
+            .query_drop("FLUSH BINARY LOGS")
+            .await
+            .map_err(|_| "first binary-log rotation failed".to_owned())?;
+        connection
+            .query_drop("FLUSH BINARY LOGS")
+            .await
+            .map_err(|_| "second binary-log rotation failed".to_owned())?;
+        let rows = connection
+            .query::<mysql_async::Row, _>("SHOW BINARY LOGS")
+            .await
+            .map_err(|_| "binary-log inventory failed".to_owned())?;
+        let before = rows
+            .iter()
+            .map(|row| {
+                row.get::<String, _>(0)
+                    .ok_or_else(|| "binary-log name was malformed".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if before.len() < 2 {
+            return Err("binary-log rotation produced no purge boundary".to_owned());
+        }
+        let retained = before.last().unwrap();
+        if !retained
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err("binary-log name used an unsupported alphabet".to_owned());
+        }
+        connection
+            .query_drop(format!("PURGE BINARY LOGS TO '{retained}'"))
+            .await
+            .map_err(|_| "binary-log purge failed".to_owned())?;
+        let rows = connection
+            .query::<mysql_async::Row, _>("SHOW BINARY LOGS")
+            .await
+            .map_err(|_| "post-purge binary-log inventory failed".to_owned())?;
+        let after = rows
+            .iter()
+            .map(|row| {
+                row.get::<String, _>(0)
+                    .ok_or_else(|| "post-purge binary-log name was malformed".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if after.first() != Some(retained)
+            || after
+                .iter()
+                .any(|name| before[..before.len() - 1].contains(name))
+        {
+            return Err("binary-log purge retained an unexpected inventory".to_owned());
+        }
+        let purged_text = connection
+            .query_first::<String, _>("SELECT @@GLOBAL.gtid_purged")
+            .await
+            .map_err(|_| "purged GTID query failed".to_owned())?
+            .ok_or_else(|| "purged GTID query returned no row".to_owned())?;
+        connection
+            .disconnect()
+            .await
+            .map_err(|_| "binary-log connection disconnect failed".to_owned())?;
+        let purged = GtidSet::from_str(&purged_text)
+            .map_err(|error| format!("purged GTID was malformed: {error}"))?;
+        Ok((purged, after))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeMemberRow {
+    member_id: String,
+    role: String,
+    state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeMemberSnapshot {
+    server_uuid: String,
+    view_id: String,
+    members: Vec<NativeMemberRow>,
+    executed: GtidSet,
+    purged: GtidSet,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GtidCheckpoint {
+    label: String,
+    before_tail: u64,
+    transaction_tail: u64,
+    view_id: String,
+    members: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProfileGtidQualificationReport {
+    qualified_profile: QualifiedNativeProfile,
+    checkpoints: Vec<GtidCheckpoint>,
+    restart_bindings: Vec<(String, String)>,
+    purged: GtidSet,
+    binary_logs: Vec<String>,
+    final_members: HashSet<String>,
+}
+
+async fn root_connection(socket: &Path) -> Result<Conn, String> {
+    let options = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(1)
+        .socket(Some(
+            socket.to_str().ok_or("socket was not UTF-8")?.to_owned(),
+        ))
+        .user(Some("root".to_owned()));
+    Conn::new(options)
+        .await
+        .map_err(|_| "root UDS connection failed".to_owned())
+}
+
+async fn read_snapshot(socket: &Path) -> Result<NativeMemberSnapshot, String> {
+    let mut connection = root_connection(socket).await?;
+    let server_uuid = connection
+        .query_first::<String, _>("SELECT @@GLOBAL.server_uuid")
+        .await
+        .map_err(|_| "server UUID query failed".to_owned())?
+        .ok_or_else(|| "server UUID query returned no row".to_owned())?;
+    let view_id = connection
+        .query_first::<String, _>(
+            "SELECT VIEW_ID FROM performance_schema.replication_group_member_stats \
+             WHERE MEMBER_ID = @@GLOBAL.server_uuid",
+        )
+        .await
+        .map_err(|_| "view query failed".to_owned())?
+        .ok_or_else(|| "view query returned no local row".to_owned())?;
+    let members = connection
+        .query_map(
+            "SELECT MEMBER_ID, MEMBER_ROLE, MEMBER_STATE \
+             FROM performance_schema.replication_group_members ORDER BY MEMBER_ID",
+            |(member_id, role, state): (String, String, String)| NativeMemberRow {
+                member_id,
+                role,
+                state,
+            },
+        )
+        .await
+        .map_err(|_| "membership query failed".to_owned())?;
+    let executed = connection
+        .query_first::<String, _>("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .map_err(|_| "executed GTID query failed".to_owned())?
+        .ok_or_else(|| "executed GTID query returned no row".to_owned())?;
+    let purged = connection
+        .query_first::<String, _>("SELECT @@GLOBAL.gtid_purged")
+        .await
+        .map_err(|_| "purged GTID query failed".to_owned())?
+        .ok_or_else(|| "purged GTID query returned no row".to_owned())?;
+    connection
+        .disconnect()
+        .await
+        .map_err(|_| "snapshot disconnect failed".to_owned())?;
+    Ok(NativeMemberSnapshot {
+        server_uuid,
+        view_id,
+        members,
+        executed: GtidSet::from_str(&executed)
+            .map_err(|error| format!("executed GTID was malformed: {error}"))?,
+        purged: GtidSet::from_str(&purged)
+            .map_err(|error| format!("purged GTID was malformed: {error}"))?,
+    })
+}
+
+fn require_coherent_full_view(snapshots: &[NativeMemberSnapshot; 3]) -> Result<(), String> {
+    let first = &snapshots[0];
+    if first.members.len() != 3
+        || first.members.iter().any(|member| member.state != "ONLINE")
+        || snapshots.iter().any(|snapshot| {
+            snapshot.view_id != first.view_id
+                || snapshot.members != first.members
+                || !snapshot
+                    .members
+                    .iter()
+                    .any(|member| member.member_id == snapshot.server_uuid)
+        })
+    {
+        return Err("native snapshots did not form one coherent online view".to_owned());
+    }
+    Ok(())
+}
+
+fn compatible_common_tail(
+    snapshots: &[NativeMemberSnapshot; 3],
+    group_uuid: &str,
+) -> Result<u64, String> {
+    let tails = snapshots
+        .iter()
+        .map(
+            |snapshot| match classify_gtid_profile(&snapshot.executed, group_uuid) {
+                GtidProfileCompatibility::CompatibleContiguous { tail } => Ok(tail),
+                GtidProfileCompatibility::CompatibleEmpty => Ok(0),
+                compatibility => Err(format!("GTID profile was incompatible: {compatibility:?}")),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    if tails.iter().any(|tail| *tail != tails[0]) {
+        return Err("members did not share one executed GTID tail".to_owned());
+    }
+    Ok(tails[0])
+}
+
+fn current_primary_from(snapshots: &[NativeMemberSnapshot; 3]) -> Result<MysqlMemberIndex, String> {
+    require_coherent_full_view(snapshots)?;
+    let primary = snapshots[0]
+        .members
+        .iter()
+        .find(|member| member.role == "PRIMARY")
+        .ok_or_else(|| "coherent view had no primary".to_owned())?;
+    MysqlMemberIndex::all()
+        .into_iter()
+        .find(|member| snapshots[member.as_usize()].server_uuid == primary.member_id)
+        .ok_or_else(|| "primary identity did not match an owned member".to_owned())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -409,7 +1002,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "gtid-mode=ON",
         variable: "gtid_mode",
-        global_query: "SELECT @@GLOBAL.gtid_mode",
+        global_query: "SELECT CAST(@@GLOBAL.gtid_mode AS CHAR)",
         session_query: None,
         expected: "ON",
         scope: NativeSettingScope::Global,
@@ -418,7 +1011,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "enforce-gtid-consistency=ON",
         variable: "enforce_gtid_consistency",
-        global_query: "SELECT @@GLOBAL.enforce_gtid_consistency",
+        global_query: "SELECT CAST(@@GLOBAL.enforce_gtid_consistency AS CHAR)",
         session_query: None,
         expected: "ON",
         scope: NativeSettingScope::Global,
@@ -427,7 +1020,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "loose-group-replication-gtid-assignment-block-size=1",
         variable: "group_replication_gtid_assignment_block_size",
-        global_query: "SELECT @@GLOBAL.group_replication_gtid_assignment_block_size",
+        global_query: "SELECT CAST(@@GLOBAL.group_replication_gtid_assignment_block_size AS CHAR)",
         session_query: None,
         expected: "1",
         scope: NativeSettingScope::Global,
@@ -436,7 +1029,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "loose-group-replication-view-change-uuid=AUTOMATIC",
         variable: "group_replication_view_change_uuid",
-        global_query: "SELECT @@GLOBAL.group_replication_view_change_uuid",
+        global_query: "SELECT CAST(@@GLOBAL.group_replication_view_change_uuid AS CHAR)",
         session_query: None,
         expected: "AUTOMATIC",
         scope: NativeSettingScope::Global,
@@ -445,8 +1038,8 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "loose-group-replication-consistency=AFTER",
         variable: "group_replication_consistency",
-        global_query: "SELECT @@GLOBAL.group_replication_consistency",
-        session_query: Some("SELECT @@SESSION.group_replication_consistency"),
+        global_query: "SELECT CAST(@@GLOBAL.group_replication_consistency AS CHAR)",
+        session_query: Some("SELECT CAST(@@SESSION.group_replication_consistency AS CHAR)"),
         expected: "AFTER",
         scope: NativeSettingScope::GlobalAndSession,
         mutability: NativeSettingMutability::DynamicGlobalAndSession,
@@ -454,7 +1047,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "innodb-flush-log-at-trx-commit=1",
         variable: "innodb_flush_log_at_trx_commit",
-        global_query: "SELECT @@GLOBAL.innodb_flush_log_at_trx_commit",
+        global_query: "SELECT CAST(@@GLOBAL.innodb_flush_log_at_trx_commit AS CHAR)",
         session_query: None,
         expected: "1",
         scope: NativeSettingScope::Global,
@@ -463,7 +1056,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "sync-binlog=1",
         variable: "sync_binlog",
-        global_query: "SELECT @@GLOBAL.sync_binlog",
+        global_query: "SELECT CAST(@@GLOBAL.sync_binlog AS CHAR)",
         session_query: None,
         expected: "1",
         scope: NativeSettingScope::Global,
@@ -472,7 +1065,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "binlog-expire-logs-seconds=2592000",
         variable: "binlog_expire_logs_seconds",
-        global_query: "SELECT @@GLOBAL.binlog_expire_logs_seconds",
+        global_query: "SELECT CAST(@@GLOBAL.binlog_expire_logs_seconds AS CHAR)",
         session_query: None,
         expected: "2592000",
         scope: NativeSettingScope::Global,
@@ -481,7 +1074,7 @@ const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
         option: "loose-group-replication-member-expel-timeout=5",
         variable: "group_replication_member_expel_timeout",
-        global_query: "SELECT @@GLOBAL.group_replication_member_expel_timeout",
+        global_query: "SELECT CAST(@@GLOBAL.group_replication_member_expel_timeout AS CHAR)",
         session_query: None,
         expected: "5",
         scope: NativeSettingScope::Global,
@@ -900,5 +1493,7 @@ struct QualificationDiagnostic {
     category: &'static str,
 }
 
+#[cfg(test)]
+mod live;
 #[cfg(test)]
 mod tests;

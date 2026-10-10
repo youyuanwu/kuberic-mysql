@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
+use super::live::LiveQualificationFixture;
 use super::*;
 use crate::core::{AttemptId, CredentialGeneration, GroupName};
 use crate::service::{
@@ -438,6 +439,71 @@ fn retained_restart_rejects_foreign_endpoints_and_changes_process_session() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_profile_gtid_transitions() {
+    let mut fixture = LiveQualificationFixture::bootstrap().await;
+    let expected_members = fixture.identities.iter().cloned().collect::<HashSet<_>>();
+    assert!(
+        fixture
+            .sql_addresses
+            .iter()
+            .all(|address| address.ip().is_loopback()
+                && std::net::TcpStream::connect_timeout(address, Duration::from_millis(50))
+                    .is_err())
+    );
+    let report = {
+        let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
+        qualification
+            .qualify_profile_gtid_transitions()
+            .await
+            .unwrap()
+    };
+    assert_eq!(report.qualified_profile.member_process_sessions.len(), 3);
+    assert_eq!(report.checkpoints.len(), 12);
+    assert_eq!(report.restart_bindings.len(), 3);
+    assert!(report.restart_bindings.iter().all(|(old, new)| old != new));
+    assert_eq!(report.final_members, expected_members);
+    assert!(!report.binary_logs.is_empty());
+    assert!(
+        report
+            .checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.transaction_tail == checkpoint.before_tail + 1)
+    );
+    for checkpoint in &report.checkpoints {
+        assert_eq!(checkpoint.members, expected_members);
+    }
+    assert_view_same_or_advanced(
+        &report.checkpoints[0].view_id,
+        &report.checkpoints[1].view_id,
+    );
+    for (before, after) in [(2, 3), (4, 5), (6, 7), (8, 9)] {
+        assert_view_advanced(
+            &report.checkpoints[before].view_id,
+            &report.checkpoints[after].view_id,
+        );
+    }
+    assert_eq!(
+        report.checkpoints[10].view_id,
+        report.checkpoints[11].view_id
+    );
+    fixture.cleanup();
+}
+
+fn assert_view_same_or_advanced(before: &str, after: &str) {
+    let (before_fixed, before_monotonic) = before.split_once(':').unwrap();
+    let (after_fixed, after_monotonic) = after.split_once(':').unwrap();
+    assert_eq!(before_fixed, after_fixed);
+    assert!(after_monotonic.parse::<u32>().unwrap() >= before_monotonic.parse::<u32>().unwrap());
+}
+
+fn assert_view_advanced(before: &str, after: &str) {
+    let (before_fixed, before_monotonic) = before.split_once(':').unwrap();
+    let (after_fixed, after_monotonic) = after.split_once(':').unwrap();
+    assert_eq!(before_fixed, after_fixed);
+    assert!(after_monotonic.parse::<u32>().unwrap() > before_monotonic.parse::<u32>().unwrap());
+}
+
 #[test]
 fn qualification_ownership_contains_on_failure_and_cancelled_rejoin() {
     let mut failed_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
@@ -657,9 +723,10 @@ fn exact_profile_matrix_and_binding_qualify_all_three_members() {
         TOPOLOGY_NATIVE_PROFILE_OPTIONS
     );
     assert!(NATIVE_PROFILE.iter().all(|spec| {
-        spec.global_query.starts_with("SELECT @@GLOBAL.")
+        spec.global_query.starts_with("SELECT CAST(@@GLOBAL.")
             && (spec.scope != NativeSettingScope::GlobalAndSession
-                || spec.session_query == Some("SELECT @@SESSION.group_replication_consistency"))
+                || spec.session_query
+                    == Some("SELECT CAST(@@SESSION.group_replication_consistency AS CHAR)"))
     }));
     assert_eq!(
         NATIVE_PROFILE
@@ -854,6 +921,14 @@ fn gtid_profile_preserves_full_shape_and_rejects_every_incompatible_class() {
         ),
         GtidProfileCompatibility::DoesNotBeginAtOne
     );
+
+    let predecessor = GtidSet::from_str(&format!("{GROUP_UUID}:1-8")).unwrap();
+    let shorter_but_contiguous = GtidSet::from_str(&format!("{GROUP_UUID}:1-7")).unwrap();
+    assert_eq!(
+        classify_gtid_profile(&shorter_but_contiguous, GROUP_UUID),
+        GtidProfileCompatibility::CompatibleContiguous { tail: 7 }
+    );
+    assert!(!predecessor.is_subset_of(&shorter_but_contiguous));
 }
 
 #[test]
