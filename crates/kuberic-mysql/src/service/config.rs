@@ -637,7 +637,14 @@ impl MysqlInstanceConfig {
                     format!(
                         "loose-group-replication-group-name={}\n\
                          loose-group-replication-local-address={}\n\
-                         loose-group-replication-group-seeds={}\n",
+                         loose-group-replication-group-seeds={}\n\
+                         loose-group-replication-gtid-assignment-block-size=1\n\
+                         loose-group-replication-view-change-uuid=AUTOMATIC\n\
+                         loose-group-replication-consistency=AFTER\n\
+                         innodb-flush-log-at-trx-commit=1\n\
+                         sync-binlog=1\n\
+                         binlog-expire-logs-seconds=2592000\n\
+                         loose-group-replication-member-expel-timeout=5\n",
                         member.group_uuid, member.group_replication_address, seeds,
                     ),
                 )

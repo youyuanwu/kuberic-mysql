@@ -53,6 +53,13 @@ fn exact_three_member_render_is_unique_and_keeps_runtime_disposable() {
          loose-group-replication-group-name=cccccccc-cccc-cccc-cccc-cccccccccccc\n\
          loose-group-replication-local-address=127.0.0.1:43061\n\
          loose-group-replication-group-seeds=127.0.0.1:43061,127.0.0.1:43062,127.0.0.1:43063\n\
+         loose-group-replication-gtid-assignment-block-size=1\n\
+         loose-group-replication-view-change-uuid=AUTOMATIC\n\
+         loose-group-replication-consistency=AFTER\n\
+         innodb-flush-log-at-trx-commit=1\n\
+         sync-binlog=1\n\
+         binlog-expire-logs-seconds=2592000\n\
+         loose-group-replication-member-expel-timeout=5\n\
          loose-group-replication-single-primary-mode=ON\n\
          loose-group-replication-enforce-update-everywhere-checks=OFF\n\
          loose-group-replication-start-on-boot=OFF\n\
@@ -85,6 +92,13 @@ fn exact_three_member_render_is_unique_and_keeps_runtime_disposable() {
         assert!(value.contains("mysqlx=OFF"));
         assert!(value.contains("gtid-mode=ON"));
         assert!(value.contains("enforce-gtid-consistency=ON"));
+        assert!(value.contains("loose-group-replication-gtid-assignment-block-size=1"));
+        assert!(value.contains("loose-group-replication-view-change-uuid=AUTOMATIC"));
+        assert!(value.contains("loose-group-replication-consistency=AFTER"));
+        assert!(value.contains("innodb-flush-log-at-trx-commit=1"));
+        assert!(value.contains("sync-binlog=1"));
+        assert!(value.contains("binlog-expire-logs-seconds=2592000"));
+        assert!(value.contains("loose-group-replication-member-expel-timeout=5"));
         assert!(value.contains("loose-group-replication-start-on-boot=OFF"));
         assert!(value.contains("loose-group-replication-bootstrap-group=OFF"));
 
@@ -157,6 +171,11 @@ fn five_argument_constructor_preserves_the_single_instance_profile() {
     assert!(!rendered.contains("\nport="));
     assert!(!rendered.contains("\nreport-host="));
     assert!(!rendered.contains("\nreport-port="));
+    assert!(!rendered.contains("group-replication-gtid-assignment-block-size"));
+    assert!(!rendered.contains("group-replication-view-change-uuid"));
+    assert!(!rendered.contains("group-replication-consistency"));
+    assert!(!rendered.contains("binlog-expire-logs-seconds"));
+    assert!(!rendered.contains("group-replication-member-expel-timeout"));
 }
 
 #[test]
