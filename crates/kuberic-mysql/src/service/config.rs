@@ -117,7 +117,7 @@ impl MysqlMemberConfig {
     }
 }
 
-/// Validated fixed three-member Group Replication topology.
+/// Validated fixed three-member, loopback-only Group Replication topology.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlTopologyConfig {
     members: [MysqlMemberConfig; 3],
@@ -330,8 +330,8 @@ impl MysqlRuntimePaths {
     }
 }
 
-/// Exact executable, storage, and timeout configuration for one fresh
-/// generation.
+/// Exact executable, storage, topology position, and timeout configuration for
+/// one fresh generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlInstanceConfig {
     mysqld: PathBuf,

@@ -3,10 +3,13 @@
 ## Status
 
 Partially implemented architecture. This document defines the persistence and
-restart model for MySQL lifecycle integration. The first bounded process-host
-chunk owns one fresh process generation with memory-only context and separate
-persistent data/disposable scratch roots. It does not claim topology mutation,
-restart continuation, switchover, failover, or Kubernetes integration.
+restart model for MySQL lifecycle integration. The delivered bounded service
+owns fresh process generations with memory-only context and separate persistent
+data/disposable scratch roots. It also composes exactly three fresh members for
+one designated Group Replication bootstrap and two sequential joins while the
+same host retains exact ownership and attempt context. It does not claim
+restart continuation, access publication, switchover, repair, failover, or
+Kubernetes integration.
 
 The delivered `kuberic_mysql::adapter` module already satisfies the
 application-state part of this proposal: it accepts one observation request,
@@ -14,8 +17,12 @@ keeps only attempt-local state, and returns typed evidence without opening a
 durable store.
 
 The delivered `kuberic_mysql::service` module applies the same boundary to one
-process: it writes no application metadata, journal, receipt database, state
-JSON, or adoption record. Loss of its manager context requires fixture reset.
+process and to the fixed fresh three-member topology: it writes no application
+metadata, journal, receipt database, state JSON, workflow cursor, or adoption
+record. Bootstrap/join capabilities, credentials, observations, and transition
+credit remain in memory. Loss of manager ownership or topology-attempt context
+requires closed-access fixture reset even if surviving MySQL state appears
+healthy.
 
 This design applies the ownership principle from the
 [PostgreSQL restart-stateless metadata proposal](https://github.com/youyuanwu/kuberic/blob/cfc27498ce1c67336d284e7b9c51813907e2efae/docs/features/postgres/stateless-metadata.md)
@@ -446,9 +453,20 @@ or a reused PID is rejected.
 
 ### Group bootstrap and join
 
-Bootstrap and join use the generic pre-action and completion protocol described
-above. Native membership is reobserved; the application never writes a private
-member list.
+The bounded delivered Phase 2 slice uses retained in-memory attempt authority,
+exact process/storage/endpoint enrollment, and fresh post-effect native
+observation. Exactly one designated member may bootstrap; bootstrap mode is
+proved off before observation receives credit; and the remaining two fresh
+members join sequentially. Each join captures a structured GTID boundary from
+the accepted predecessor view and requires the target's accepted `ONLINE`
+evidence to contain it. Native membership is reobserved; the application never
+writes a private member list.
+
+This is deliberately not a restart protocol. If the component, retained child
+ownership, credential generation, pending effect, or topology-attempt context
+is lost, the surviving topology is not discovered, adopted, or resumed. Client
+access remains closed and the fixture is reset. A later resumable stage must
+use the generic durable pre-action and completion protocol described above.
 
 ### Controlled switchover
 
@@ -612,18 +630,23 @@ effective while disconnected.
 ### Phase 2: Stateless Stage 2 PoC
 
 1. Implement process ownership with memory-only process handles and generic
-   authority supplied by the test host. The first single-instance process-host
-   chunk is delivered.
+   authority supplied by the test host. The single-instance process host and
+   fixed three-member composition are delivered.
 2. Keep sockets, logs, configuration, and credentials under disposable
-   fixture scratch storage. The first chunk keeps its generated runtime files
-   under a separate scratch root.
+   fixture scratch storage. The delivered managers keep generated runtime files
+   under separate per-member scratch roots.
 3. Bootstrap and join three fresh members without a MySQL metadata store.
+   This bounded retained-ownership slice is delivered.
 4. Execute one controlled switchover with in-memory operation context.
 5. Permit component replacement only while a surviving fixture host retains
    exact ownership context and proves effective closure and that no mutation is
    pending.
 6. If that host context is lost, treat the interruption as a closed-access
    fixture reset regardless of apparently healthy MySQL state.
+
+Items 1 through 3 and the reset rule in item 6 are delivered for the bounded
+fresh topology. Controlled switchover and component replacement in items 4 and
+5 remain future work.
 
 ### Phase 3: Generic durable continuation
 
@@ -655,8 +678,9 @@ The architecture is accepted only when tests demonstrate:
   credit until effective client-path closure is independently verified;
 - retained data roots reconstruct exact native identity and GTID evidence;
 - missing generic authority keeps a healthy-looking MySQL server closed;
-- bootstrap and join cannot advance without durable generic pre-action
-  acknowledgement;
+- delivered bootstrap and join cannot advance without the retained exact
+  in-memory attempt authorization; later restart-safe bootstrap and join
+  require durable generic pre-action acknowledgement;
 - action-completed/acknowledgement-lost cases reobserve rather than blindly
   reissue;
 - a surviving unowned `mysqld` is contained or rejected;

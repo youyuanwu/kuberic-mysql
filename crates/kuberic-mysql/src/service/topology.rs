@@ -1043,6 +1043,9 @@ pub enum TransitionEvaluation {
 }
 
 /// Pure fixed-topology authority and sequential-transition state.
+///
+/// This grants bootstrap/join lifecycle credit only. Its read and write access
+/// projections are permanently closed.
 #[derive(Debug)]
 pub struct TopologyAuthority {
     attempt: TopologyAttempt,
@@ -1657,7 +1660,14 @@ fn contain_members<M: MysqlTopologyMemberRuntime>(
 }
 
 /// Owns exactly three fresh instance generations and their in-memory topology
-/// attempt. It has no adoption, resume, publication, or durable store surface.
+/// attempt.
+///
+/// The only successful order is initialize all members, start/enroll the
+/// designated bootstrap member, accept bootstrap observation, then
+/// start/enroll/join and accept each remaining member sequentially. Any
+/// operation or evidence failure invalidates the attempt and contains every
+/// exactly owned member. The manager has no callback, adoption, resume,
+/// publication, switchover, repair, or durable-store surface.
 pub struct MysqlTopologyManager<M: MysqlTopologyMemberRuntime = MysqlInstanceManager> {
     instances: [M; 3],
     authority: TopologyAuthority,

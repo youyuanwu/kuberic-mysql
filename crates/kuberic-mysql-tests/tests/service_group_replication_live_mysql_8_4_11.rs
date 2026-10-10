@@ -174,7 +174,7 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     );
     assert_eq!(query_bootstrap_enabled(&sockets[0]).await, 0);
     assert_group_sources(bootstrap_credit.executed());
-    assert_membership(&sockets[0], &[first_identity.clone()]).await;
+    assert_membership(&sockets[0], std::slice::from_ref(&first_identity)).await;
     assert_tcp_refuses(sql_addresses[0]).unwrap();
     assert_tcp_refuses(([127, 0, 0, 1], MYSQL_X_PORT).into()).unwrap();
 

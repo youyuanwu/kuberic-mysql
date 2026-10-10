@@ -5,7 +5,8 @@
 //!
 //! - [`core`] models identity, GTID history, native views, and authority.
 //! - [`adapter`] observes one exact Oracle MySQL instance over a private UDS.
-//! - [`service`] owns one bounded, restart-stateless local MySQL process.
+//! - [`service`] owns fresh local processes and one fixed, closed-access
+//!   three-member bootstrap/join attempt.
 
 pub mod adapter;
 pub mod core;

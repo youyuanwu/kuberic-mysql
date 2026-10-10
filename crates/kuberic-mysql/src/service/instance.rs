@@ -53,6 +53,9 @@ pub enum MysqlInstanceState {
 }
 
 /// Owns one fresh MySQL generation and its sole retained child.
+///
+/// Topology control methods remain bound to the currently attested private UDS
+/// and do not independently publish client access or provide restart adoption.
 pub struct MysqlInstanceManager {
     config: MysqlInstanceConfig,
     state: MysqlInstanceState,
@@ -517,6 +520,9 @@ impl MysqlInstanceManager {
 
     /// Contains any exact process generation owned by this manager and removes
     /// disposable scratch even when startup or topology control failed.
+    ///
+    /// Persistent data is retained unless fresh initialization itself failed
+    /// before a usable generation was established.
     pub fn contain(&mut self) -> Result<(), MysqlInstanceError> {
         match self.state {
             MysqlInstanceState::Configured | MysqlInstanceState::Stopped => return Ok(()),
