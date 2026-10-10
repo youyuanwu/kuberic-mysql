@@ -174,6 +174,8 @@ fn five_argument_constructor_preserves_the_single_instance_profile() {
     assert!(!rendered.contains("group-replication-gtid-assignment-block-size"));
     assert!(!rendered.contains("group-replication-view-change-uuid"));
     assert!(!rendered.contains("group-replication-consistency"));
+    assert!(!rendered.contains("innodb-flush-log-at-trx-commit"));
+    assert!(!rendered.contains("sync-binlog"));
     assert!(!rendered.contains("binlog-expire-logs-seconds"));
     assert!(!rendered.contains("group-replication-member-expel-timeout"));
 }

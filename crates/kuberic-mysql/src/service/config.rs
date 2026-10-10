@@ -14,6 +14,17 @@ const CONFIG_FILE: &str = "my.cnf";
 const SOCKET_FILE: &str = "mysql.sock";
 const PID_FILE: &str = "mysqld.pid";
 const TOPOLOGY_MEMBER_COUNT: usize = 3;
+pub(crate) const TOPOLOGY_NATIVE_PROFILE_OPTIONS: [&str; 9] = [
+    "gtid-mode=ON",
+    "enforce-gtid-consistency=ON",
+    "loose-group-replication-gtid-assignment-block-size=1",
+    "loose-group-replication-view-change-uuid=AUTOMATIC",
+    "loose-group-replication-consistency=AFTER",
+    "innodb-flush-log-at-trx-commit=1",
+    "sync-binlog=1",
+    "binlog-expire-logs-seconds=2592000",
+    "loose-group-replication-member-expel-timeout=5",
+];
 
 /// One owned or generated path whose overlap could make topology cleanup
 /// destructive across member boundaries.
@@ -623,6 +634,7 @@ impl MysqlInstanceConfig {
             |_| {
                 let member = self.member();
                 let seeds = member.group_seeds.map(|seed| seed.to_string()).join(",");
+                let qualification_profile = TOPOLOGY_NATIVE_PROFILE_OPTIONS[2..].join("\n");
                 (
                     format!(
                         "port={}\n\
@@ -638,14 +650,11 @@ impl MysqlInstanceConfig {
                         "loose-group-replication-group-name={}\n\
                          loose-group-replication-local-address={}\n\
                          loose-group-replication-group-seeds={}\n\
-                         loose-group-replication-gtid-assignment-block-size=1\n\
-                         loose-group-replication-view-change-uuid=AUTOMATIC\n\
-                         loose-group-replication-consistency=AFTER\n\
-                         innodb-flush-log-at-trx-commit=1\n\
-                         sync-binlog=1\n\
-                         binlog-expire-logs-seconds=2592000\n\
-                         loose-group-replication-member-expel-timeout=5\n",
-                        member.group_uuid, member.group_replication_address, seeds,
+                         {}\n",
+                        member.group_uuid,
+                        member.group_replication_address,
+                        seeds,
+                        qualification_profile,
                     ),
                 )
             },
@@ -666,8 +675,7 @@ impl MysqlInstanceConfig {
              binlog-format=ROW\n\
              binlog-checksum=NONE\n\
              relay-log-recovery=ON\n\
-             gtid-mode=ON\n\
-             enforce-gtid-consistency=ON\n\
+             {}\n\
              plugin-load-add=group_replication.so\n\
              {}\
              loose-group-replication-single-primary-mode=ON\n\
@@ -683,6 +691,7 @@ impl MysqlInstanceConfig {
             display(&self.runtime.binary_log),
             display(&self.runtime.relay_log),
             member_profile,
+            TOPOLOGY_NATIVE_PROFILE_OPTIONS[..2].join("\n"),
             group_profile,
         )
     }

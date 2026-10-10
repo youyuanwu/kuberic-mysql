@@ -46,16 +46,28 @@ fn exact_profile_matrix_and_binding_qualify_all_three_members() {
             .iter()
             .map(|spec| spec.option)
             .collect::<Vec<_>>(),
+        TOPOLOGY_NATIVE_PROFILE_OPTIONS
+    );
+    assert!(NATIVE_PROFILE.iter().all(|spec| {
+        spec.global_query.starts_with("SELECT @@GLOBAL.")
+            && (spec.scope != NativeSettingScope::GlobalAndSession
+                || spec.session_query == Some("SELECT @@SESSION.group_replication_consistency"))
+    }));
+    assert_eq!(
+        NATIVE_PROFILE
+            .iter()
+            .map(|spec| spec.mutability)
+            .collect::<Vec<_>>(),
         [
-            "gtid_mode=ON",
-            "enforce_gtid_consistency=ON",
-            "group_replication_gtid_assignment_block_size=1",
-            "group_replication_view_change_uuid=AUTOMATIC",
-            "group_replication_consistency=AFTER",
-            "innodb_flush_log_at_trx_commit=1",
-            "sync_binlog=1",
-            "binlog_expire_logs_seconds=2592000",
-            "group_replication_member_expel_timeout=5",
+            NativeSettingMutability::RestrictedDynamicGlobal,
+            NativeSettingMutability::RestrictedDynamicGlobal,
+            NativeSettingMutability::GroupReboot,
+            NativeSettingMutability::ReadOnlyGroupWide,
+            NativeSettingMutability::DynamicGlobalAndSession,
+            NativeSettingMutability::DynamicGlobal,
+            NativeSettingMutability::DynamicGlobal,
+            NativeSettingMutability::DynamicGlobal,
+            NativeSettingMutability::DynamicGroupWide,
         ]
     );
     let qualified = complete_evidence().qualify(&binding()).unwrap();
@@ -65,17 +77,43 @@ fn exact_profile_matrix_and_binding_qualify_all_three_members() {
 
 #[test]
 fn profile_rejects_wrong_binding_and_member_identity_cardinality() {
-    let mut wrong_package = complete_evidence();
-    wrong_package.binding.package = "mysql-community-server-core=8.4.12".to_owned();
+    let mutations: [fn(&mut QualificationBinding); 4] = [
+        |binding: &mut QualificationBinding| {
+            binding.package = "mysql-community-server-core=8.4.12".to_owned();
+        },
+        |binding: &mut QualificationBinding| binding.attempt = "attempt-2".to_owned(),
+        |binding: &mut QualificationBinding| binding.group = "other-group".to_owned(),
+        |binding: &mut QualificationBinding| binding.opening_view = "1:4".to_owned(),
+    ];
+    for mutate in mutations {
+        let expected = binding();
+        let mut evidence = complete_evidence();
+        mutate(&mut evidence.binding);
+        assert_eq!(
+            evidence.qualify(&expected),
+            Err(ProfileEvidenceError::BindingMismatch)
+        );
+    }
+
+    let mut wrong_count = complete_evidence();
+    wrong_count.members.pop();
     assert_eq!(
-        wrong_package.qualify(&binding()),
-        Err(ProfileEvidenceError::BindingMismatch)
+        wrong_count.qualify(&binding()),
+        Err(ProfileEvidenceError::WrongMemberCount)
     );
 
     let mut duplicate_member = complete_evidence();
     duplicate_member.members[2].server_uuid = duplicate_member.members[1].server_uuid.clone();
     assert_eq!(
         duplicate_member.qualify(&binding()),
+        Err(ProfileEvidenceError::DuplicateMember)
+    );
+
+    let mut duplicate_session = complete_evidence();
+    duplicate_session.members[2].process_session =
+        duplicate_session.members[1].process_session.clone();
+    assert_eq!(
+        duplicate_session.qualify(&binding()),
         Err(ProfileEvidenceError::DuplicateMember)
     );
 }
@@ -258,10 +296,15 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
     ] {
         let evidence = RevocationEvidence {
             candidate,
+            exact_member: "member-2".to_owned(),
+            predecessor_process_session: "process-2".to_owned(),
+            opening_view: "1:3".to_owned(),
+            successor_view: None,
             new_login: ProbeOutcome::Rejected,
             recovery_admission: ProbeOutcome::Rejected,
             established_participation: ProbeOutcome::Continued,
             predecessor_absence: ProbeOutcome::Unproved,
+            absence_observed_before_replacement: false,
             replacement_admission: ProbeOutcome::Unproved,
             credential_bound_session_identity: false,
         };
@@ -273,10 +316,15 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
 
     let stop_rejoin = RevocationEvidence {
         candidate: RevocationCandidate::StopAndRejoin,
+        exact_member: "member-2".to_owned(),
+        predecessor_process_session: "process-2".to_owned(),
+        opening_view: "1:3".to_owned(),
+        successor_view: Some("1:4".to_owned()),
         new_login: ProbeOutcome::Rejected,
         recovery_admission: ProbeOutcome::Rejected,
         established_participation: ProbeOutcome::Absent,
         predecessor_absence: ProbeOutcome::Absent,
+        absence_observed_before_replacement: true,
         replacement_admission: ProbeOutcome::Accepted,
         credential_bound_session_identity: false,
     };
@@ -284,6 +332,20 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
         stop_rejoin.verdict(),
         RevocationVerdict::ExactProcessBarrier
     );
+
+    let invalidations: [fn(&mut RevocationEvidence); 4] = [
+        |evidence: &mut RevocationEvidence| evidence.exact_member.clear(),
+        |evidence: &mut RevocationEvidence| evidence.predecessor_process_session.clear(),
+        |evidence: &mut RevocationEvidence| evidence.successor_view = None,
+        |evidence: &mut RevocationEvidence| {
+            evidence.absence_observed_before_replacement = false;
+        },
+    ];
+    for invalidate in invalidations {
+        let mut evidence = stop_rejoin.clone();
+        invalidate(&mut evidence);
+        assert_ne!(evidence.verdict(), RevocationVerdict::ExactProcessBarrier);
+    }
 }
 
 #[test]
@@ -295,12 +357,77 @@ fn result_enums_keep_outcomes_and_diagnostics_distinct_and_secret_free() {
     );
     assert_ne!(ProbeOutcome::Accepted, ProbeOutcome::Rejected);
     assert_eq!(
+        TransactionOutcomeEvidence {
+            client: ClientOutcome::Acknowledged,
+            exact_gtid_bound: true,
+            inclusion: InclusionEvidence::PresentOnEveryRequiredMember,
+        }
+        .verdict(),
+        TransactionVerdict::AcknowledgedDurable
+    );
+    assert_eq!(
+        TransactionOutcomeEvidence {
+            client: ClientOutcome::Acknowledged,
+            exact_gtid_bound: false,
+            inclusion: InclusionEvidence::IncompleteOrIncoherent,
+        }
+        .verdict(),
+        TransactionVerdict::IncompatibleAcknowledgement
+    );
+    for (inclusion, verdict) in [
+        (
+            InclusionEvidence::PresentOnEveryRequiredMember,
+            TransactionVerdict::AmbiguousIncluded,
+        ),
+        (
+            InclusionEvidence::AbsentFromCoherentRequiredHistory,
+            TransactionVerdict::AmbiguousAbsent,
+        ),
+        (
+            InclusionEvidence::IncompleteOrIncoherent,
+            TransactionVerdict::AmbiguousUnresolved,
+        ),
+    ] {
+        assert_eq!(
+            TransactionOutcomeEvidence {
+                client: ClientOutcome::DisconnectedAfterDispatch,
+                exact_gtid_bound: true,
+                inclusion,
+            }
+            .verdict(),
+            verdict
+        );
+    }
+    assert_eq!(
+        TransactionOutcomeEvidence {
+            client: ClientOutcome::DeadlineExpired,
+            exact_gtid_bound: false,
+            inclusion: InclusionEvidence::PresentOnEveryRequiredMember,
+        }
+        .verdict(),
+        TransactionVerdict::AmbiguousUnresolved
+    );
+    assert_eq!(
+        TransactionOutcomeEvidence {
+            client: ClientOutcome::ServerRejected,
+            exact_gtid_bound: false,
+            inclusion: InclusionEvidence::IncompleteOrIncoherent,
+        }
+        .verdict(),
+        TransactionVerdict::Rejected
+    );
+    assert_eq!(
         RevocationEvidence {
             candidate: RevocationCandidate::AccountLock,
+            exact_member: "member-1".to_owned(),
+            predecessor_process_session: "process-1".to_owned(),
+            opening_view: "1:3".to_owned(),
+            successor_view: None,
             new_login: ProbeOutcome::Accepted,
             recovery_admission: ProbeOutcome::Accepted,
             established_participation: ProbeOutcome::Continued,
             predecessor_absence: ProbeOutcome::Unproved,
+            absence_observed_before_replacement: false,
             replacement_admission: ProbeOutcome::Unproved,
             credential_bound_session_identity: true,
         }

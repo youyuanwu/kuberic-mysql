@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::core::GtidSet;
+use crate::service::config::TOPOLOGY_NATIVE_PROFILE_OPTIONS;
 
 const ORACLE_PACKAGE: &str = "mysql-community-server-core=8.4.11-1ubuntu24.04";
 
@@ -12,15 +13,20 @@ enum NativeSettingScope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeSettingMutability {
-    StartupPinned,
-    StartupPinnedDynamic,
-    GroupWide,
+    RestrictedDynamicGlobal,
+    GroupReboot,
+    ReadOnlyGroupWide,
+    DynamicGlobal,
+    DynamicGlobalAndSession,
+    DynamicGroupWide,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeSettingSpec {
     option: &'static str,
     variable: &'static str,
+    global_query: &'static str,
+    session_query: Option<&'static str>,
     expected: &'static str,
     scope: NativeSettingScope,
     mutability: NativeSettingMutability,
@@ -28,67 +34,85 @@ struct NativeSettingSpec {
 
 const NATIVE_PROFILE: [NativeSettingSpec; 9] = [
     NativeSettingSpec {
-        option: "gtid_mode=ON",
+        option: "gtid-mode=ON",
         variable: "gtid_mode",
+        global_query: "SELECT @@GLOBAL.gtid_mode",
+        session_query: None,
         expected: "ON",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::StartupPinned,
+        mutability: NativeSettingMutability::RestrictedDynamicGlobal,
     },
     NativeSettingSpec {
-        option: "enforce_gtid_consistency=ON",
+        option: "enforce-gtid-consistency=ON",
         variable: "enforce_gtid_consistency",
+        global_query: "SELECT @@GLOBAL.enforce_gtid_consistency",
+        session_query: None,
         expected: "ON",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::StartupPinned,
+        mutability: NativeSettingMutability::RestrictedDynamicGlobal,
     },
     NativeSettingSpec {
-        option: "group_replication_gtid_assignment_block_size=1",
+        option: "loose-group-replication-gtid-assignment-block-size=1",
         variable: "group_replication_gtid_assignment_block_size",
+        global_query: "SELECT @@GLOBAL.group_replication_gtid_assignment_block_size",
+        session_query: None,
         expected: "1",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::GroupWide,
+        mutability: NativeSettingMutability::GroupReboot,
     },
     NativeSettingSpec {
-        option: "group_replication_view_change_uuid=AUTOMATIC",
+        option: "loose-group-replication-view-change-uuid=AUTOMATIC",
         variable: "group_replication_view_change_uuid",
+        global_query: "SELECT @@GLOBAL.group_replication_view_change_uuid",
+        session_query: None,
         expected: "AUTOMATIC",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::GroupWide,
+        mutability: NativeSettingMutability::ReadOnlyGroupWide,
     },
     NativeSettingSpec {
-        option: "group_replication_consistency=AFTER",
+        option: "loose-group-replication-consistency=AFTER",
         variable: "group_replication_consistency",
+        global_query: "SELECT @@GLOBAL.group_replication_consistency",
+        session_query: Some("SELECT @@SESSION.group_replication_consistency"),
         expected: "AFTER",
         scope: NativeSettingScope::GlobalAndSession,
-        mutability: NativeSettingMutability::StartupPinnedDynamic,
+        mutability: NativeSettingMutability::DynamicGlobalAndSession,
     },
     NativeSettingSpec {
-        option: "innodb_flush_log_at_trx_commit=1",
+        option: "innodb-flush-log-at-trx-commit=1",
         variable: "innodb_flush_log_at_trx_commit",
+        global_query: "SELECT @@GLOBAL.innodb_flush_log_at_trx_commit",
+        session_query: None,
         expected: "1",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::StartupPinnedDynamic,
+        mutability: NativeSettingMutability::DynamicGlobal,
     },
     NativeSettingSpec {
-        option: "sync_binlog=1",
+        option: "sync-binlog=1",
         variable: "sync_binlog",
+        global_query: "SELECT @@GLOBAL.sync_binlog",
+        session_query: None,
         expected: "1",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::StartupPinnedDynamic,
+        mutability: NativeSettingMutability::DynamicGlobal,
     },
     NativeSettingSpec {
-        option: "binlog_expire_logs_seconds=2592000",
+        option: "binlog-expire-logs-seconds=2592000",
         variable: "binlog_expire_logs_seconds",
+        global_query: "SELECT @@GLOBAL.binlog_expire_logs_seconds",
+        session_query: None,
         expected: "2592000",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::StartupPinnedDynamic,
+        mutability: NativeSettingMutability::DynamicGlobal,
     },
     NativeSettingSpec {
-        option: "group_replication_member_expel_timeout=5",
+        option: "loose-group-replication-member-expel-timeout=5",
         variable: "group_replication_member_expel_timeout",
+        global_query: "SELECT @@GLOBAL.group_replication_member_expel_timeout",
+        session_query: None,
         expected: "5",
         scope: NativeSettingScope::Global,
-        mutability: NativeSettingMutability::GroupWide,
+        mutability: NativeSettingMutability::DynamicGroupWide,
     },
 ];
 
@@ -150,6 +174,7 @@ struct QualifiedNativeProfile {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProfileEvidenceError {
+    ProfileMatrixMismatch,
     BindingMismatch,
     WrongMemberCount,
     DuplicateMember,
@@ -165,6 +190,13 @@ impl NativeProfileEvidence {
         &self,
         expected: &QualificationBinding,
     ) -> Result<QualifiedNativeProfile, ProfileEvidenceError> {
+        if !NATIVE_PROFILE
+            .iter()
+            .map(|setting| setting.option)
+            .eq(TOPOLOGY_NATIVE_PROFILE_OPTIONS)
+        {
+            return Err(ProfileEvidenceError::ProfileMatrixMismatch);
+        }
         if &self.binding != expected || self.binding.package != ORACLE_PACKAGE {
             return Err(ProfileEvidenceError::BindingMismatch);
         }
@@ -345,6 +377,57 @@ enum ClientOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InclusionEvidence {
+    PresentOnEveryRequiredMember,
+    AbsentFromCoherentRequiredHistory,
+    IncompleteOrIncoherent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransactionOutcomeEvidence {
+    client: ClientOutcome,
+    exact_gtid_bound: bool,
+    inclusion: InclusionEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionVerdict {
+    AcknowledgedDurable,
+    AmbiguousIncluded,
+    AmbiguousAbsent,
+    AmbiguousUnresolved,
+    Rejected,
+    IncompatibleAcknowledgement,
+}
+
+impl TransactionOutcomeEvidence {
+    fn verdict(self) -> TransactionVerdict {
+        match (self.client, self.exact_gtid_bound, self.inclusion) {
+            (
+                ClientOutcome::Acknowledged,
+                true,
+                InclusionEvidence::PresentOnEveryRequiredMember,
+            ) => TransactionVerdict::AcknowledgedDurable,
+            (ClientOutcome::Acknowledged, _, _) => TransactionVerdict::IncompatibleAcknowledgement,
+            (
+                ClientOutcome::DisconnectedAfterDispatch | ClientOutcome::DeadlineExpired,
+                true,
+                InclusionEvidence::PresentOnEveryRequiredMember,
+            ) => TransactionVerdict::AmbiguousIncluded,
+            (
+                ClientOutcome::DisconnectedAfterDispatch | ClientOutcome::DeadlineExpired,
+                true,
+                InclusionEvidence::AbsentFromCoherentRequiredHistory,
+            ) => TransactionVerdict::AmbiguousAbsent,
+            (ClientOutcome::DisconnectedAfterDispatch | ClientOutcome::DeadlineExpired, _, _) => {
+                TransactionVerdict::AmbiguousUnresolved
+            }
+            (ClientOutcome::ServerRejected, _, _) => TransactionVerdict::Rejected,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RevocationCandidate {
     AccountLock,
     CredentialReplacement,
@@ -364,10 +447,15 @@ enum ProbeOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RevocationEvidence {
     candidate: RevocationCandidate,
+    exact_member: String,
+    predecessor_process_session: String,
+    opening_view: String,
+    successor_view: Option<String>,
     new_login: ProbeOutcome,
     recovery_admission: ProbeOutcome,
     established_participation: ProbeOutcome,
     predecessor_absence: ProbeOutcome,
+    absence_observed_before_replacement: bool,
     replacement_admission: ProbeOutcome,
     credential_bound_session_identity: bool,
 }
@@ -381,8 +469,17 @@ enum RevocationVerdict {
 
 impl RevocationEvidence {
     fn verdict(&self) -> RevocationVerdict {
+        let exact_binding = !self.exact_member.is_empty()
+            && !self.predecessor_process_session.is_empty()
+            && !self.opening_view.is_empty()
+            && self
+                .successor_view
+                .as_ref()
+                .is_some_and(|successor| successor != &self.opening_view);
         if self.candidate == RevocationCandidate::StopAndRejoin
+            && exact_binding
             && self.predecessor_absence == ProbeOutcome::Absent
+            && self.absence_observed_before_replacement
             && self.replacement_admission == ProbeOutcome::Accepted
         {
             RevocationVerdict::ExactProcessBarrier
