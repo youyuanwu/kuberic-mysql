@@ -514,36 +514,60 @@ async fn run_peer_live(candidate: RevocationCandidate) -> (RevocationEvidence, R
     result
 }
 
+fn assert_peer_binding(evidence: &RevocationEvidence) {
+    assert_eq!(evidence.binding.package, ORACLE_PACKAGE);
+    assert!(!evidence.binding.attempt.is_empty());
+    assert_eq!(evidence.binding.group, GROUP_UUID);
+    assert_eq!(evidence.binding.opening_view, evidence.opening_view);
+    assert!(!evidence.exact_member.is_empty());
+    assert!(!evidence.predecessor_process_session.is_empty());
+    assert_ne!(
+        evidence.predecessor_credential_generation,
+        evidence.replacement_credential_generation
+    );
+    assert_ne!(
+        evidence.successor_view.as_deref(),
+        Some(evidence.opening_view.as_str())
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn qualify_peer_account_lock() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::AccountLock).await;
+    assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
     assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
     assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
+    assert!(!evidence.absence_observed_before_replacement);
     assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn qualify_peer_credential_replacement() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::CredentialReplacement).await;
+    assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
     assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
     assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
+    assert!(!evidence.absence_observed_before_replacement);
     assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn qualify_peer_privilege_removal() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::PrivilegeRemoval).await;
+    assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Accepted);
     assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
     assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
+    assert!(!evidence.absence_observed_before_replacement);
     assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn qualify_peer_stop_rejoin() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::StopAndRejoin).await;
+    assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
     assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
     assert_eq!(evidence.established_participation, ProbeOutcome::Absent);

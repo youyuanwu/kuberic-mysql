@@ -860,18 +860,7 @@ impl<'a> MysqlNativeQualification<'a> {
         let deadline = tokio::time::Instant::from_std(self.ownership.work_cutoff);
         match tokio::time::timeout_at(deadline, self.qualify_peer_revocation_inner(candidate)).await
         {
-            Ok(Ok(evidence)) => {
-                let expected = RevocationExpectation {
-                    binding: evidence.binding.clone(),
-                    exact_member: evidence.exact_member.clone(),
-                    predecessor_process_session: evidence.predecessor_process_session.clone(),
-                    predecessor_credential_generation: evidence
-                        .predecessor_credential_generation
-                        .clone(),
-                    replacement_credential_generation: evidence
-                        .replacement_credential_generation
-                        .clone(),
-                };
+            Ok(Ok((evidence, expected))) => {
                 let verdict = evidence.verdict(&expected);
                 QualificationPeerOutcome::Qualified {
                     evidence: Box::new(evidence),
@@ -892,7 +881,7 @@ impl<'a> MysqlNativeQualification<'a> {
     async fn qualify_peer_revocation_inner(
         &mut self,
         candidate: RevocationCandidate,
-    ) -> Result<RevocationEvidence, String> {
+    ) -> Result<(RevocationEvidence, RevocationExpectation), String> {
         let profile = self.read_profile_evidence().await?;
         let expected_profile = profile.binding.clone();
         profile
@@ -931,6 +920,13 @@ impl<'a> MysqlNativeQualification<'a> {
             ),
         )
         .map_err(|_| "replacement credential was invalid".to_owned())?;
+        let expected = RevocationExpectation {
+            binding: expected_profile.clone(),
+            exact_member: target_identity.clone(),
+            predecessor_process_session: predecessor_binding.process_session().as_str().to_owned(),
+            predecessor_credential_generation: self.recovery.generation().as_str().to_owned(),
+            replacement_credential_generation: replacement.generation().as_str().to_owned(),
+        };
 
         if candidate == RevocationCandidate::StopAndRejoin {
             self.stop_group_replication(target).await?;
@@ -1018,7 +1014,7 @@ impl<'a> MysqlNativeQualification<'a> {
             ProbeOutcome::Unproved
         };
 
-        Ok(RevocationEvidence {
+        let evidence = RevocationEvidence {
             candidate,
             binding: expected_profile,
             exact_member: target_identity,
@@ -1035,10 +1031,11 @@ impl<'a> MysqlNativeQualification<'a> {
                 ProbeOutcome::Continued
             },
             predecessor_absence: ProbeOutcome::Absent,
-            absence_observed_before_replacement: true,
+            absence_observed_before_replacement: candidate == RevocationCandidate::StopAndRejoin,
             replacement_admission,
             credential_bound_session_identity: false,
-        })
+        };
+        Ok((evidence, expected))
     }
 
     async fn probe_recovery_login(
