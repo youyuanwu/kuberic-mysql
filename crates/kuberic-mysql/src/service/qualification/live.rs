@@ -62,12 +62,19 @@ impl FixtureRoot {
         &self.path
     }
 
-    fn remove(&mut self) {
-        let metadata = fs::symlink_metadata(&self.path).unwrap();
-        assert_eq!((metadata.dev(), metadata.ino()), (self.device, self.inode));
-        assert!(!metadata.file_type().is_symlink() && metadata.is_dir());
-        fs::remove_dir_all(&self.path).unwrap();
+    fn try_remove(&mut self) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("fixture root inspection failed: {error}"))?;
+        if (metadata.dev(), metadata.ino()) != (self.device, self.inode)
+            || metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+        {
+            return Err("fixture root identity changed".to_owned());
+        }
+        fs::remove_dir_all(&self.path)
+            .map_err(|error| format!("fixture root removal failed: {error}"))?;
         self.remove_on_drop = false;
+        Ok(())
     }
 
     fn retain(&mut self) {
@@ -78,7 +85,48 @@ impl FixtureRoot {
 impl Drop for FixtureRoot {
     fn drop(&mut self) {
         if self.remove_on_drop && self.path.exists() {
-            self.remove();
+            let _ = self.try_remove();
+        }
+    }
+}
+
+struct SetupGuard {
+    manager: Option<MysqlTopologyManager>,
+    root: Option<FixtureRoot>,
+}
+
+impl SetupGuard {
+    fn new(manager: MysqlTopologyManager, root: FixtureRoot) -> Self {
+        Self {
+            manager: Some(manager),
+            root: Some(root),
+        }
+    }
+
+    fn manager(&mut self) -> &mut MysqlTopologyManager {
+        self.manager.as_mut().expect("setup retains manager")
+    }
+
+    fn complete(mut self) -> (MysqlTopologyManager, FixtureRoot) {
+        (
+            self.manager.take().expect("setup retains manager"),
+            self.root.take().expect("setup retains root"),
+        )
+    }
+}
+
+impl Drop for SetupGuard {
+    fn drop(&mut self) {
+        let contained = self
+            .manager
+            .as_mut()
+            .is_none_or(|manager| manager.stop().is_ok());
+        if contained {
+            if let Some(root) = self.root.as_mut() {
+                let _ = root.try_remove();
+            }
+        } else if let Some(root) = self.root.as_mut() {
+            root.retain();
         }
     }
 }
@@ -96,9 +144,9 @@ impl LiveQualificationFixture {
         let (reservations, sql_addresses, group_addresses) = reserve_ports();
         let topology = topology(sql_addresses, group_addresses);
         let timeouts = MysqlOperationTimeouts::new(
-            Duration::from_secs(180),
             Duration::from_secs(60),
             Duration::from_secs(30),
+            Duration::from_secs(20),
             Duration::from_secs(10),
         )
         .unwrap();
@@ -149,7 +197,7 @@ impl LiveQualificationFixture {
             format!("KmqRecovery{}B9", std::process::id()),
         )
         .unwrap();
-        let mut manager = MysqlTopologyManager::new(
+        let manager = MysqlTopologyManager::new(
             configs.map(MysqlInstanceManager::new),
             attempt,
             observer,
@@ -157,26 +205,30 @@ impl LiveQualificationFixture {
         )
         .unwrap();
         let deadline = manager.qualification_runtime_deadline();
+        let mut setup = SetupGuard::new(manager, root);
         drop(reservations);
-        manager.initialize().unwrap();
-        manager.start_designated_member().await.unwrap();
+        setup.manager().initialize().unwrap();
+        setup.manager().start_designated_member().await.unwrap();
         let first = query_server_uuid(&sockets[0]).await;
-        manager.bootstrap().await.unwrap();
-        await_accepted(&mut manager, "bootstrap").await;
-        manager.start_second_member().await.unwrap();
+        setup.manager().bootstrap().await.unwrap();
+        await_accepted(setup.manager(), "bootstrap").await;
+        setup.manager().start_second_member().await.unwrap();
         let second = query_server_uuid(&sockets[1]).await;
-        manager
+        setup
+            .manager()
             .join_second_member(observation_context("source-second"))
             .await
             .unwrap();
-        await_accepted(&mut manager, "second").await;
-        manager.start_third_member().await.unwrap();
+        await_accepted(setup.manager(), "second").await;
+        setup.manager().start_third_member().await.unwrap();
         let third = query_server_uuid(&sockets[2]).await;
-        manager
+        setup
+            .manager()
             .join_third_member(observation_context("source-third"))
             .await
             .unwrap();
-        await_accepted(&mut manager, "third").await;
+        await_accepted(setup.manager(), "third").await;
+        let (manager, root) = setup.complete();
 
         Self {
             manager,
@@ -214,12 +266,12 @@ impl LiveQualificationFixture {
         }
         let mysql_x = SocketAddr::from(([127, 0, 0, 1], 33_060));
         assert!(std::net::TcpStream::connect_timeout(&mysql_x, Duration::from_millis(50)).is_err());
-        self.root.remove();
+        self.cleaned = true;
+        self.root.try_remove().unwrap();
         assert!(
             Instant::now() <= self.deadline,
             "qualification fixture cleanup exceeded its attempt deadline"
         );
-        self.cleaned = true;
     }
 }
 
@@ -229,7 +281,7 @@ impl Drop for LiveQualificationFixture {
             return;
         }
         if self.manager.stop().is_ok() {
-            self.root.remove();
+            let _ = self.root.try_remove();
         } else {
             self.root.retain();
         }
@@ -328,14 +380,18 @@ async fn query_server_uuid(socket: &Path) -> String {
         .tcp_port(1)
         .socket(Some(socket.to_str().unwrap().to_owned()))
         .user(Some("root".to_owned()));
-    let mut connection = Conn::new(options).await.unwrap();
-    let value = connection
-        .query_first::<String, _>("SELECT @@GLOBAL.server_uuid")
-        .await
-        .unwrap()
-        .unwrap();
-    connection.disconnect().await.unwrap();
-    value
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut connection = Conn::new(options).await.unwrap();
+        let value = connection
+            .query_first::<String, _>("SELECT @@GLOBAL.server_uuid")
+            .await
+            .unwrap()
+            .unwrap();
+        connection.disconnect().await.unwrap();
+        value
+    })
+    .await
+    .expect("server UUID query timed out")
 }
 
 fn preflight() {

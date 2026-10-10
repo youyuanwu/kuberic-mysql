@@ -74,6 +74,7 @@ pub struct MysqlInstanceManager {
     data_root: Option<OwnedRoot>,
     scratch_root: Option<OwnedRoot>,
     process_generation: u64,
+    cleanup_quarantined: bool,
 }
 
 impl MysqlInstanceManager {
@@ -87,6 +88,7 @@ impl MysqlInstanceManager {
             data_root: None,
             scratch_root: None,
             process_generation: 0,
+            cleanup_quarantined: false,
         }
     }
 
@@ -518,6 +520,7 @@ impl MysqlInstanceManager {
                 {
                     if abrupt_socket_identity != Some((metadata.dev(), metadata.ino())) {
                         self.state = MysqlInstanceState::Faulted;
+                        self.cleanup_quarantined = true;
                         return Err(MysqlInstanceError::Ownership(
                             crate::service::OwnershipError::RootMismatch,
                         ));
@@ -533,6 +536,7 @@ impl MysqlInstanceManager {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => {
                     self.state = MysqlInstanceState::Faulted;
+                    self.cleanup_quarantined = true;
                     return Err(MysqlInstanceError::Ownership(
                         crate::service::OwnershipError::InspectionFailed,
                     ));
@@ -787,6 +791,11 @@ impl MysqlInstanceManager {
             )?;
         }
         self.revalidate_roots()?;
+        if self.cleanup_quarantined {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::RootMismatch,
+            ));
+        }
         if let Some(scratch) = self.scratch_root.as_ref() {
             remove_owned_root(scratch, LifecycleOperation::ScratchCleanup)?;
             self.scratch_root = None;

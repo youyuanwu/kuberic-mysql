@@ -101,6 +101,14 @@ impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
         (Instant::now() < self.work_cutoff).then_some(()).ok_or(())
     }
 
+    fn require_operation_budget(&self, duration: Duration) -> Result<(), ()> {
+        Instant::now()
+            .checked_add(duration)
+            .filter(|deadline| *deadline <= self.work_cutoff)
+            .map(|_| ())
+            .ok_or(())
+    }
+
     fn phase(&self, member: MysqlMemberIndex) -> QualificationMemberPhase {
         self.phases[member.as_usize()]
     }
@@ -110,7 +118,10 @@ impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
         member: MysqlMemberIndex,
         kind: QualificationStopKind,
     ) -> Result<(), QualificationOperationFailure> {
-        if self.require_work_budget().is_err() {
+        if self
+            .require_operation_budget(Duration::from_secs(20))
+            .is_err()
+        {
             return Err(self.fail(MysqlInstanceError::Timeout(
                 crate::service::LifecycleOperation::Shutdown,
             )));
@@ -131,7 +142,10 @@ impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
     }
 
     fn restart(&mut self, member: MysqlMemberIndex) -> Result<(), QualificationOperationFailure> {
-        if self.require_work_budget().is_err() {
+        if self
+            .require_operation_budget(Duration::from_secs(30))
+            .is_err()
+        {
             return Err(self.fail(MysqlInstanceError::Timeout(
                 crate::service::LifecycleOperation::Startup,
             )));
@@ -466,19 +480,21 @@ impl<'a> MysqlNativeQualification<'a> {
             .filter(|(index, _)| *index != departure.as_usize())
             .map(|(_, identity)| identity.clone())
             .collect::<HashSet<_>>();
-        self.wait_exact_membership(
-            &expected_without,
-            &owned_identities,
-            None,
-            Some(&opening_view),
-        )
-        .await?;
+        let departure_view = self
+            .wait_exact_membership(
+                &expected_without,
+                &owned_identities,
+                None,
+                Some(&opening_view),
+            )
+            .await?
+            .view_id;
         self.start_group_replication(departure).await?;
         self.wait_exact_membership(
             &owned_identities.iter().cloned().collect(),
             &owned_identities,
             None,
-            None,
+            Some(&departure_view),
         )
         .await?;
         checkpoints.push(self.commit_token("after-secondary-rejoin").await?);
@@ -500,13 +516,15 @@ impl<'a> MysqlNativeQualification<'a> {
                 .filter(|(index, _)| *index != member.as_usize())
                 .map(|(_, identity)| identity.clone())
                 .collect::<HashSet<_>>();
-            self.wait_exact_membership(
-                &expected_without,
-                &owned_identities,
-                None,
-                Some(&opening_view),
-            )
-            .await?;
+            let departure_view = self
+                .wait_exact_membership(
+                    &expected_without,
+                    &owned_identities,
+                    None,
+                    Some(&opening_view),
+                )
+                .await?
+                .view_id;
             let old = self.member_binding(member)?;
             self.stop_member(member, QualificationStopKind::Graceful)
                 .map_err(|error| format!("owned stop failed: {error}"))?;
@@ -527,14 +545,14 @@ impl<'a> MysqlNativeQualification<'a> {
                 &owned_identities.iter().cloned().collect(),
                 &owned_identities,
                 None,
-                None,
+                Some(&departure_view),
             )
             .await?;
             let rebound_profile = self.read_profile_evidence().await?;
             let rebound_expected = rebound_profile.binding.clone();
             rebound_profile
                 .qualify(&rebound_expected)
-                .map_err(|error| format!("restarted profile evidence rejected: {error:?}"))?;
+                .map_err(QualificationFailure::from_profile_error)?;
             checkpoints.push(
                 self.commit_token(&format!("after-member-{}-restart", member.as_usize() + 1))
                     .await?,
@@ -640,13 +658,25 @@ impl<'a> MysqlNativeQualification<'a> {
                         });
                         continue;
                     }
-                    Err(_) => {
+                    Err(mysql_async::Error::Server(error)) if error.code == 1193 => {
                         settings.push(SettingReadback::Unsupported {
                             variable: spec.variable.to_owned(),
                         });
                         continue;
                     }
+                    Err(error) => {
+                        return Err(format!(
+                            "setting readback operational failure for {}: {}",
+                            spec.variable, error
+                        ));
+                    }
                 };
+                if global.is_empty() {
+                    settings.push(SettingReadback::Malformed {
+                        variable: spec.variable.to_owned(),
+                    });
+                    continue;
+                }
                 let session = match spec.session_query {
                     Some(query) => match connection.query_first::<String, _>(query).await {
                         Ok(Some(value)) => Some(value),
@@ -656,15 +686,27 @@ impl<'a> MysqlNativeQualification<'a> {
                             });
                             continue;
                         }
-                        Err(_) => {
+                        Err(mysql_async::Error::Server(error)) if error.code == 1193 => {
                             settings.push(SettingReadback::Unsupported {
                                 variable: spec.variable.to_owned(),
                             });
                             continue;
                         }
+                        Err(error) => {
+                            return Err(format!(
+                                "session setting readback operational failure for {}: {}",
+                                spec.variable, error
+                            ));
+                        }
                     },
                     None => None,
                 };
+                if session.as_deref() == Some("") {
+                    settings.push(SettingReadback::Malformed {
+                        variable: spec.variable.to_owned(),
+                    });
+                    continue;
+                }
                 settings.push(SettingReadback::Value {
                     variable: spec.variable.to_owned(),
                     global,
@@ -861,6 +903,7 @@ impl<'a> MysqlNativeQualification<'a> {
     async fn transfer_primary(&mut self, owned_identities: &[String; 3]) -> Result<(), String> {
         let snapshots = self.snapshots().await?;
         require_coherent_full_view(&snapshots)?;
+        let opening_view = snapshots[0].view_id.clone();
         let current = current_primary_from(&snapshots)?;
         let target = MysqlMemberIndex::all()
             .into_iter()
@@ -880,13 +923,17 @@ impl<'a> MysqlNativeQualification<'a> {
             .disconnect()
             .await
             .map_err(|_| "primary transfer disconnect failed".to_owned())?;
-        self.wait_exact_membership(
-            &owned_identities.iter().cloned().collect(),
-            owned_identities,
-            Some(&target_uuid),
-            None,
-        )
-        .await?;
+        let accepted = self
+            .wait_exact_membership(
+                &owned_identities.iter().cloned().collect(),
+                owned_identities,
+                Some(&target_uuid),
+                None,
+            )
+            .await?;
+        if accepted.view_id != opening_view {
+            return Err("primary transfer unexpectedly changed the native view".to_owned());
+        }
         Ok(())
     }
 
@@ -932,11 +979,10 @@ impl<'a> MysqlNativeQualification<'a> {
         &mut self,
         member: MysqlMemberIndex,
         recovery: &crate::service::ControlCredential,
-    ) -> Result<(), String> {
+    ) -> Result<(), MysqlTopologyError> {
         self.ownership.members[member.as_usize()]
             .qualification_start_group_replication(recovery, &self.native_deadline)
             .await
-            .map_err(|error| format!("Group Replication start probe failed: {error}"))
     }
 
     async fn qualify_peer_revocation(
@@ -1063,7 +1109,11 @@ impl<'a> MysqlNativeQualification<'a> {
             .await
         {
             Ok(()) => ProbeOutcome::Accepted,
-            Err(_) => ProbeOutcome::Rejected,
+            Err(
+                MysqlTopologyError::ControlAuthentication(_)
+                | MysqlTopologyError::ControlPermission(_),
+            ) => ProbeOutcome::Rejected,
+            Err(_) => ProbeOutcome::Unproved,
         };
 
         let replacement_admission = if candidate == RevocationCandidate::StopAndRejoin {
@@ -1143,7 +1193,10 @@ impl<'a> MysqlNativeQualification<'a> {
                 let _ = connection.disconnect().await;
                 ProbeOutcome::Accepted
             }
-            Err(_) => ProbeOutcome::Rejected,
+            Err(mysql_async::Error::Server(error)) if matches!(error.code, 1045 | 3118 | 3119) => {
+                ProbeOutcome::Rejected
+            }
+            Err(_) => ProbeOutcome::Unproved,
         }
     }
 
@@ -1538,8 +1591,10 @@ impl<'a> MysqlNativeQualification<'a> {
                 .filter(|(index, _)| *index != member.as_usize())
                 .map(|(_, identity)| identity.clone())
                 .collect::<HashSet<_>>();
-            self.wait_exact_membership(&expected_without, &owned_identities, None, Some(&opening))
-                .await?;
+            let departure_view = self
+                .wait_exact_membership(&expected_without, &owned_identities, None, Some(&opening))
+                .await?
+                .view_id;
             let old = self.member_binding(member)?;
             self.stop_member(member, QualificationStopKind::Graceful)
                 .map_err(|error| format!("participant stop failed: {error}"))?;
@@ -1555,7 +1610,7 @@ impl<'a> MysqlNativeQualification<'a> {
                 &owned_identities.iter().cloned().collect(),
                 &owned_identities,
                 None,
-                None,
+                Some(&departure_view),
             )
             .await?;
         }
