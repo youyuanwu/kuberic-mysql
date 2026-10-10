@@ -1,13 +1,22 @@
-use std::str::FromStr;
+#[path = "service_common/mod.rs"]
+mod common;
 
+use std::fs;
+use std::net::TcpStream;
+use std::os::unix::fs::PermissionsExt;
+use std::str::FromStr;
+use std::time::Duration;
+
+use common::TestRoot;
 use kuberic_mysql::core::{
     AttemptId, CredentialGeneration, EndpointBinding, GroupName, GtidSet, MemberAddress, MemberId,
     MemberRole, MemberState, NativeMember, ProcessSessionId, ServerUuid, StorageBinding, ViewId,
 };
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, BootstrapEffect, ControlCredential, ControlCredentialRole,
-    ControlStage, ControlStep, JoinEffect, MemberControlBinding, MysqlMemberIndex,
-    MysqlTopologyError, NativeIdentityEnrollment, ObservedLocalBinding, SourceGtidBoundary,
+    ControlStage, ControlStep, JoinEffect, MemberControlBinding, MysqlInstanceManager,
+    MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManager, MysqlTopologyManagerError,
+    MysqlTopologyState, NativeIdentityEnrollment, ObservedLocalBinding, SourceGtidBoundary,
     TopologyAttempt, TopologyAuthority, TopologyAuthorityError, TopologyEvidenceError,
     TopologyGtidError, TopologyInstant, TopologyNativeStateError, TopologyObservation,
     TopologyObservationStatus, TopologyStateError, TransitionCredit, TransitionEvaluation,
@@ -20,6 +29,148 @@ const MEMBER_UUIDS: [&str; 3] = [
     "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
     "dddddddd-dddd-dddd-dddd-dddddddddddd",
 ];
+
+#[test]
+fn manager_owns_exactly_three_existing_instances_and_cleans_initialized_layouts() {
+    let roots = [
+        TestRoot::new("topology-one"),
+        TestRoot::new("topology-two"),
+        TestRoot::new("topology-three"),
+    ];
+    let instances = std::array::from_fn(|index| {
+        MysqlInstanceManager::new(
+            roots[index].config_for_member(MysqlMemberIndex::all_for_test()[index]),
+        )
+    });
+    let topology_attempt = attempt("manager-layout-attempt", 100);
+    let (observer, recovery) = credentials(&topology_attempt);
+    let mut manager =
+        MysqlTopologyManager::new(instances, topology_attempt, observer, recovery).unwrap();
+
+    assert_eq!(manager.members().len(), 3);
+    assert_eq!(manager.state(), MysqlTopologyState::Configured);
+    assert!(!manager.read_access_open());
+    assert!(!manager.write_access_open());
+    manager.initialize().unwrap();
+    assert_eq!(manager.state(), MysqlTopologyState::Initialized);
+
+    for root in &roots {
+        let names = inventory(&root.scratch);
+        for forbidden in [
+            "metadata", "journal", "receipt", "cursor", "adoption", "store",
+        ] {
+            assert!(
+                names.iter().all(|name| !name.contains(forbidden)),
+                "{names:?}"
+            );
+        }
+    }
+
+    manager.stop().unwrap();
+    assert_eq!(manager.state(), MysqlTopologyState::Stopped);
+    for (index, root) in roots.iter().enumerate() {
+        assert!(root.data.is_dir());
+        assert!(!root.scratch.exists());
+        assert!(
+            !manager.members()[index]
+                .config()
+                .runtime()
+                .socket()
+                .exists()
+        );
+        assert_endpoint_refuses(
+            manager.members()[index]
+                .config()
+                .member()
+                .group_replication_address(),
+        );
+    }
+}
+
+#[test]
+fn manager_initialization_failure_contains_prior_members_without_starting_later_members() {
+    let roots = [
+        TestRoot::new("init-fail-one"),
+        TestRoot::new("init-fail-two"),
+        TestRoot::new("init-fail-three"),
+    ];
+    let instances = std::array::from_fn(|index| {
+        MysqlInstanceManager::new(
+            roots[index].config_for_member(MysqlMemberIndex::all_for_test()[index]),
+        )
+    });
+    fs::set_permissions(&roots[1].launcher, fs::Permissions::from_mode(0o600)).unwrap();
+    let topology_attempt = attempt("manager-init-failure", 100);
+    let (observer, recovery) = credentials(&topology_attempt);
+    let mut manager =
+        MysqlTopologyManager::new(instances, topology_attempt, observer, recovery).unwrap();
+
+    let result = manager.initialize();
+    assert!(
+        matches!(
+            &result,
+            Err(MysqlTopologyManagerError::Instance {
+                member: MysqlMemberIndex::Second,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert_eq!(manager.state(), MysqlTopologyState::Failed);
+    assert!(roots[0].data.is_dir());
+    assert!(!roots[0].scratch.exists());
+    assert!(!roots[1].data.exists());
+    assert!(!roots[1].scratch.exists());
+    assert!(!roots[2].data.exists());
+    assert!(!roots[2].scratch.exists());
+    for member in manager.members() {
+        assert_endpoint_refuses(member.config().member().group_replication_address());
+    }
+}
+
+#[test]
+fn manager_stop_aggregates_every_member_cleanup_failure() {
+    let roots = [
+        TestRoot::new("cleanup-one"),
+        TestRoot::new("cleanup-two"),
+        TestRoot::new("cleanup-three"),
+    ];
+    let instances = std::array::from_fn(|index| {
+        MysqlInstanceManager::new(
+            roots[index].config_for_member(MysqlMemberIndex::all_for_test()[index]),
+        )
+    });
+    let topology_attempt = attempt("manager-cleanup-failure", 100);
+    let (observer, recovery) = credentials(&topology_attempt);
+    let mut manager =
+        MysqlTopologyManager::new(instances, topology_attempt, observer, recovery).unwrap();
+    manager.initialize().unwrap();
+    for root in &roots {
+        fs::set_permissions(&root.root, fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
+    let error = manager.stop().unwrap_err();
+    for root in &roots {
+        fs::set_permissions(&root.root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let MysqlTopologyManagerError::Cleanup { primary, failures } = error else {
+        panic!("expected aggregate cleanup failure");
+    };
+    assert!(primary.is_none());
+    assert_eq!(failures.len(), 3);
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| failure.member())
+            .collect::<Vec<_>>(),
+        MysqlMemberIndex::all_for_test()
+    );
+    assert_eq!(manager.state(), MysqlTopologyState::Failed);
+    for root in &roots {
+        assert!(root.data.is_dir());
+        assert!(root.scratch.is_dir());
+    }
+}
 
 #[test]
 fn control_contract_uses_exact_minimum_accounts_and_restores_binary_logging() {
@@ -1211,6 +1362,28 @@ fn assert_closed_no_credit(authority: &TopologyAuthority, expected_credits: u8) 
     assert_eq!(authority.lifecycle_credits(), expected_credits);
     assert!(!authority.read_access_open());
     assert!(!authority.write_access_open());
+}
+
+fn inventory(root: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            }
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names
+}
+
+fn assert_endpoint_refuses(address: std::net::SocketAddr) {
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err(),
+        "{address} unexpectedly accepted a connection"
+    );
 }
 
 trait MemberIndicesForTest {

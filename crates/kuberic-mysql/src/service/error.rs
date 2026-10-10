@@ -3,7 +3,8 @@
 use core::fmt;
 use std::io::ErrorKind;
 
-use crate::service::MysqlInstanceState;
+use crate::adapter::RequestError;
+use crate::service::{MysqlInstanceState, MysqlMemberIndex, MysqlTopologyState};
 
 /// Configuration validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,6 +311,69 @@ impl fmt::Display for MysqlTopologyError {
 }
 
 impl std::error::Error for MysqlTopologyError {}
+
+/// One member cleanup failure retained by topology-wide containment.
+#[derive(Debug)]
+pub struct MemberCleanupFailure {
+    member: MysqlMemberIndex,
+    error: MysqlInstanceError,
+}
+
+impl MemberCleanupFailure {
+    pub(crate) const fn new(member: MysqlMemberIndex, error: MysqlInstanceError) -> Self {
+        Self { member, error }
+    }
+
+    /// Member whose exact containment failed.
+    #[must_use]
+    pub const fn member(&self) -> MysqlMemberIndex {
+        self.member
+    }
+
+    /// Exact lifecycle cleanup failure.
+    #[must_use]
+    pub const fn error(&self) -> &MysqlInstanceError {
+        &self.error
+    }
+}
+
+/// One public three-member manager failure.
+#[derive(Debug)]
+pub enum MysqlTopologyManagerError {
+    /// The requested manager transition was out of order.
+    InvalidState {
+        /// Required manager state.
+        expected: MysqlTopologyState,
+        /// Current manager state.
+        actual: MysqlTopologyState,
+    },
+    /// One exact member lifecycle operation failed.
+    Instance {
+        /// Member whose operation failed.
+        member: MysqlMemberIndex,
+        /// Exact member lifecycle failure.
+        error: MysqlInstanceError,
+    },
+    /// Native control or topology evidence validation failed.
+    Topology(MysqlTopologyError),
+    /// The manager could not construct an exact observer request.
+    ObservationRequest(RequestError),
+    /// Primary failure plus every topology-wide containment failure.
+    Cleanup {
+        /// Original operation failure, absent for an explicit stop failure.
+        primary: Option<Box<Self>>,
+        /// Every per-member cleanup failure in fixed member order.
+        failures: Vec<MemberCleanupFailure>,
+    },
+}
+
+impl fmt::Display for MysqlTopologyManagerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL topology manager failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MysqlTopologyManagerError {}
 
 /// One bounded lifecycle failure.
 #[derive(Debug)]

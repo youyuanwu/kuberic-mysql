@@ -27,7 +27,11 @@ pub struct TestRoot {
 impl TestRoot {
     pub fn new(label: &str) -> Self {
         let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let root = workspace.join("target").join(format!(
             "kms-{}-{serial}-{}",
             std::process::id(),
             &label[..label.len().min(8)]

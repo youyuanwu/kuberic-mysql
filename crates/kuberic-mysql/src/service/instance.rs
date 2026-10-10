@@ -17,6 +17,10 @@ use rustix::fs::{
 };
 
 use crate::core::GroupName;
+use crate::core::{
+    AttemptId, CredentialGeneration, EndpointBinding, MemberAddress, ProcessSessionId,
+    StorageBinding,
+};
 use crate::service::config::OwnedRoot;
 use crate::service::control::OwnedControlTarget;
 use crate::service::process::{
@@ -459,6 +463,83 @@ impl MysqlInstanceManager {
             self.config.member_index(),
             self.config.member().clone(),
         ))
+    }
+
+    pub(crate) fn topology_binding(
+        &mut self,
+        attempt: AttemptId,
+        observer_generation: CredentialGeneration,
+        recovery_generation: CredentialGeneration,
+    ) -> Result<MemberControlBinding, MysqlTopologyError> {
+        self.prepare_control_target()?;
+        let child = self
+            .child
+            .as_ref()
+            .expect("running state retains the exact child");
+        let data = self
+            .data_root
+            .as_ref()
+            .expect("running state retains exact data ownership");
+        let scratch = self
+            .scratch_root
+            .as_ref()
+            .expect("running state retains exact scratch ownership");
+        let process_session = ProcessSessionId::new(format!(
+            "member-{}-pid-{}-scratch-{}-{}",
+            self.config.member_index().as_usize() + 1,
+            child.id(),
+            scratch.device(),
+            scratch.inode()
+        ))
+        .map_err(|_| MysqlTopologyError::OwnershipContextLoss)?;
+        let endpoint = EndpointBinding::new(format!(
+            "uds:{}:{}:{}",
+            scratch.device(),
+            scratch.inode(),
+            self.config.runtime().socket().display()
+        ))
+        .map_err(|_| MysqlTopologyError::OwnershipContextLoss)?;
+        let storage = StorageBinding::new(format!("data:{}:{}", data.device(), data.inode()))
+            .map_err(|_| MysqlTopologyError::OwnershipContextLoss)?;
+        let member_address = MemberAddress::new(self.config.member().sql_address().to_string())
+            .map_err(|_| MysqlTopologyError::OwnershipContextLoss)?;
+        Ok(MemberControlBinding::new(
+            attempt,
+            self.config.member_index(),
+            process_session,
+            endpoint,
+            storage,
+            member_address,
+            observer_generation,
+            recovery_generation,
+        ))
+    }
+
+    pub(crate) fn contain(&mut self) -> Result<(), MysqlInstanceError> {
+        match self.state {
+            MysqlInstanceState::Configured | MysqlInstanceState::Stopped => return Ok(()),
+            MysqlInstanceState::Running => return self.stop(),
+            MysqlInstanceState::Initialized | MysqlInstanceState::Faulted => {}
+        }
+        if self.child.is_none() && self.data_root.is_none() && self.scratch_root.is_none() {
+            self.state = MysqlInstanceState::Stopped;
+            return Ok(());
+        }
+        if let Some(child) = self.child.as_mut() {
+            terminate_and_reap(child, self.config.timeouts().shutdown())?;
+            self.child = None;
+            wait_for_absence(
+                self.config.runtime().socket(),
+                self.config.timeouts().socket_disappearance(),
+            )?;
+        }
+        self.revalidate_roots()?;
+        if let Some(scratch) = self.scratch_root.as_ref() {
+            remove_owned_root(scratch, LifecycleOperation::ScratchCleanup)?;
+            self.scratch_root = None;
+        }
+        self.state = MysqlInstanceState::Stopped;
+        Ok(())
     }
 
     fn cleanup_all_roots(&mut self) -> Result<(), MysqlInstanceError> {
