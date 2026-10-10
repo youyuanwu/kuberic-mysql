@@ -72,13 +72,22 @@ impl TestRoot {
         member_index: MysqlMemberIndex,
         timeouts: MysqlOperationTimeouts,
     ) -> MysqlInstanceConfig {
+        self.config_for_member_in_topology(topology(), member_index, timeouts)
+    }
+
+    pub fn config_for_member_in_topology(
+        &self,
+        topology: MysqlTopologyConfig,
+        member_index: MysqlMemberIndex,
+        timeouts: MysqlOperationTimeouts,
+    ) -> MysqlInstanceConfig {
         write_launcher(&self.launcher);
         MysqlInstanceConfig::new_topology_member(
             "/usr/bin/sleep",
             &self.launcher,
             &self.data,
             &self.scratch,
-            topology(),
+            topology,
             member_index,
             timeouts,
         )

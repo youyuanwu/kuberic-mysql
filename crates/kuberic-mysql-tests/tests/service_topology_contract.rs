@@ -3,7 +3,7 @@ mod common;
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1774,9 +1774,15 @@ struct ScriptedMember {
 }
 
 impl ScriptedMember {
-    fn new(inner: MysqlInstanceManager, state: Arc<Mutex<ScriptState>>) -> Self {
-        let endpoint =
-            TcpListener::bind(inner.config().member().group_replication_address()).unwrap();
+    fn new(
+        inner: MysqlInstanceManager,
+        state: Arc<Mutex<ScriptState>>,
+        endpoint: TcpListener,
+    ) -> Self {
+        assert_eq!(
+            endpoint.local_addr().unwrap(),
+            inner.config().member().group_replication_address()
+        );
         Self {
             inner,
             state,
@@ -2169,15 +2175,27 @@ fn scripted_manager(
         TestRoot::new(&format!("{label}-two")),
         TestRoot::new(&format!("{label}-three")),
     ];
+    let (topology, endpoints) = reserve_scripted_topology();
     let state = Arc::new(Mutex::new(ScriptState::new(failure)));
-    let members = std::array::from_fn(|index| {
-        ScriptedMember::new(
-            MysqlInstanceManager::new(
-                roots[index].config_for_member(MysqlMemberIndex::all_for_test()[index]),
-            ),
-            Arc::clone(&state),
-        )
-    });
+    let members = roots
+        .each_ref()
+        .into_iter()
+        .zip(endpoints)
+        .enumerate()
+        .map(|(index, (root, endpoint))| {
+            ScriptedMember::new(
+                MysqlInstanceManager::new(root.config_for_member_in_topology(
+                    topology.clone(),
+                    MysqlMemberIndex::all_for_test()[index],
+                    timeouts(),
+                )),
+                Arc::clone(&state),
+                endpoint,
+            )
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("exactly three scripted members"));
     let attempt = attempt(&format!("script-{label}"), 5_000_000_000);
     let (observer, recovery) = credentials(&attempt);
     let clock = ScriptClock::new(1);
@@ -2195,6 +2213,55 @@ fn scripted_manager(
         attempt,
         clock,
     )
+}
+
+fn reserve_scripted_topology() -> (
+    kuberic_mysql::service::MysqlTopologyConfig,
+    [TcpListener; 3],
+) {
+    let listeners = (0..6)
+        .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+        .collect::<Vec<_>>();
+    let addresses = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .collect::<Vec<SocketAddr>>();
+    let sql_addresses: [SocketAddr; 3] = addresses[..3].try_into().unwrap();
+    let group_addresses: [SocketAddr; 3] = addresses[3..].try_into().unwrap();
+    let topology = kuberic_mysql::service::MysqlTopologyConfig::new([
+        kuberic_mysql::service::MysqlMemberConfig::new(
+            1,
+            sql_addresses[0],
+            group_addresses[0],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+        kuberic_mysql::service::MysqlMemberConfig::new(
+            2,
+            sql_addresses[1],
+            group_addresses[1],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+        kuberic_mysql::service::MysqlMemberConfig::new(
+            3,
+            sql_addresses[2],
+            group_addresses[2],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let endpoints = listeners
+        .into_iter()
+        .skip(3)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("exactly three Group Replication endpoints"));
+    (topology, endpoints)
 }
 
 async fn accept_bootstrap_public(
