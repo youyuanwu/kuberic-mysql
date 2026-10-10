@@ -296,8 +296,11 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
     ] {
         let evidence = RevocationEvidence {
             candidate,
+            binding: binding(),
             exact_member: "member-2".to_owned(),
             predecessor_process_session: "process-2".to_owned(),
+            predecessor_credential_generation: "credential-1".to_owned(),
+            replacement_credential_generation: "credential-2".to_owned(),
             opening_view: "1:3".to_owned(),
             successor_view: None,
             new_login: ProbeOutcome::Rejected,
@@ -316,8 +319,11 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
 
     let stop_rejoin = RevocationEvidence {
         candidate: RevocationCandidate::StopAndRejoin,
+        binding: binding(),
         exact_member: "member-2".to_owned(),
         predecessor_process_session: "process-2".to_owned(),
+        predecessor_credential_generation: "credential-1".to_owned(),
+        replacement_credential_generation: "credential-2".to_owned(),
         opening_view: "1:3".to_owned(),
         successor_view: Some("1:4".to_owned()),
         new_login: ProbeOutcome::Rejected,
@@ -333,12 +339,25 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
         RevocationVerdict::ExactProcessBarrier
     );
 
-    let invalidations: [fn(&mut RevocationEvidence); 4] = [
+    let invalidations: [fn(&mut RevocationEvidence); 10] = [
+        |evidence: &mut RevocationEvidence| evidence.binding.package = "other".to_owned(),
+        |evidence: &mut RevocationEvidence| evidence.binding.attempt.clear(),
+        |evidence: &mut RevocationEvidence| evidence.binding.group.clear(),
         |evidence: &mut RevocationEvidence| evidence.exact_member.clear(),
         |evidence: &mut RevocationEvidence| evidence.predecessor_process_session.clear(),
+        |evidence: &mut RevocationEvidence| {
+            evidence.replacement_credential_generation =
+                evidence.predecessor_credential_generation.clone();
+        },
         |evidence: &mut RevocationEvidence| evidence.successor_view = None,
         |evidence: &mut RevocationEvidence| {
             evidence.absence_observed_before_replacement = false;
+        },
+        |evidence: &mut RevocationEvidence| {
+            evidence.recovery_admission = ProbeOutcome::Accepted;
+        },
+        |evidence: &mut RevocationEvidence| {
+            evidence.established_participation = ProbeOutcome::Continued;
         },
     ];
     for invalidate in invalidations {
@@ -419,8 +438,11 @@ fn result_enums_keep_outcomes_and_diagnostics_distinct_and_secret_free() {
     assert_eq!(
         RevocationEvidence {
             candidate: RevocationCandidate::AccountLock,
+            binding: binding(),
             exact_member: "member-1".to_owned(),
             predecessor_process_session: "process-1".to_owned(),
+            predecessor_credential_generation: "credential-1".to_owned(),
+            replacement_credential_generation: "credential-2".to_owned(),
             opening_view: "1:3".to_owned(),
             successor_view: None,
             new_login: ProbeOutcome::Accepted,

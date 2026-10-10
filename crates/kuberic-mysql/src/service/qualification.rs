@@ -447,8 +447,11 @@ enum ProbeOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RevocationEvidence {
     candidate: RevocationCandidate,
+    binding: QualificationBinding,
     exact_member: String,
     predecessor_process_session: String,
+    predecessor_credential_generation: String,
+    replacement_credential_generation: String,
     opening_view: String,
     successor_view: Option<String>,
     new_login: ProbeOutcome,
@@ -470,7 +473,13 @@ enum RevocationVerdict {
 impl RevocationEvidence {
     fn verdict(&self) -> RevocationVerdict {
         let exact_binding = !self.exact_member.is_empty()
+            && self.binding.package == ORACLE_PACKAGE
+            && !self.binding.attempt.is_empty()
+            && !self.binding.group.is_empty()
             && !self.predecessor_process_session.is_empty()
+            && !self.predecessor_credential_generation.is_empty()
+            && !self.replacement_credential_generation.is_empty()
+            && self.predecessor_credential_generation != self.replacement_credential_generation
             && !self.opening_view.is_empty()
             && self
                 .successor_view
@@ -478,6 +487,8 @@ impl RevocationEvidence {
                 .is_some_and(|successor| successor != &self.opening_view);
         if self.candidate == RevocationCandidate::StopAndRejoin
             && exact_binding
+            && self.recovery_admission == ProbeOutcome::Rejected
+            && self.established_participation == ProbeOutcome::Absent
             && self.predecessor_absence == ProbeOutcome::Absent
             && self.absence_observed_before_replacement
             && self.replacement_admission == ProbeOutcome::Accepted
