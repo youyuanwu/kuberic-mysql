@@ -2,6 +2,8 @@
 
 use std::fs::{self, File};
 use std::os::unix::fs::FileTypeExt;
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -456,6 +458,25 @@ impl MysqlInstanceManager {
             self.state = MysqlInstanceState::Faulted;
             return Err(error);
         }
+        let abrupt_socket_identity = if kind == QualificationStopKind::Abrupt {
+            let metadata =
+                fs::symlink_metadata(self.config.runtime().socket()).map_err(|error| {
+                    self.state = MysqlInstanceState::Faulted;
+                    MysqlInstanceError::Io {
+                        operation: LifecycleOperation::Shutdown,
+                        kind: error.kind(),
+                    }
+                })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+                self.state = MysqlInstanceState::Faulted;
+                return Err(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::InspectionFailed,
+                ));
+            }
+            Some((metadata.dev(), metadata.ino()))
+        } else {
+            None
+        };
         let stop = match kind {
             QualificationStopKind::Graceful => {
                 terminate_and_reap(child, self.config.timeouts().shutdown())
@@ -474,6 +495,12 @@ impl MysqlInstanceManager {
                 Ok(metadata)
                     if !metadata.file_type().is_symlink() && metadata.file_type().is_socket() =>
                 {
+                    if abrupt_socket_identity != Some((metadata.dev(), metadata.ino())) {
+                        self.state = MysqlInstanceState::Faulted;
+                        return Err(MysqlInstanceError::Ownership(
+                            crate::service::OwnershipError::RootMismatch,
+                        ));
+                    }
                     fs::remove_file(self.config.runtime().socket()).map_err(|error| {
                         self.state = MysqlInstanceState::Faulted;
                         MysqlInstanceError::Io {

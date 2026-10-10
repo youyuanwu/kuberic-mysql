@@ -665,7 +665,35 @@ async fn qualify_post_ack_primary_crash_restart() {
     assert_eq!(report.binding.group, GROUP_UUID);
     assert_eq!(report.client_outcome, ClientOutcome::Acknowledged);
     assert!(!report.crashed_member.is_empty());
-    assert_ne!(report.opening_view, report.successor_view);
+    assert!(qualified_view_advanced(
+        &report.opening_view,
+        &report.successor_snapshot.view_id
+    ));
+    assert_eq!(report.kill_evidence.signal, 9);
+    assert!(report.kill_evidence.pid > 0);
+    assert!(report.kill_evidence.socket_identity.0 > 0);
+    assert!(
+        report
+            .pre_crash_snapshots
+            .iter()
+            .all(|snapshot| report.acknowledged_gtid.is_subset_of(&snapshot.executed))
+    );
+    assert_eq!(
+        report
+            .successor_snapshot
+            .members
+            .iter()
+            .filter(|member| member.role == "PRIMARY")
+            .count(),
+        1
+    );
+    assert!(
+        !report
+            .successor_snapshot
+            .members
+            .iter()
+            .any(|member| member.member_id == report.crashed_member)
+    );
     assert_eq!(report.restart_bindings.len(), 3);
     assert!(report.restart_bindings.iter().all(|(old, new)| old != new));
     assert!(
@@ -1281,6 +1309,21 @@ fn applier_barrier_requires_one_exact_transaction_gtid() {
         format!("{GROUP_UUID}:tag:9"),
     ] {
         assert!(validate_applying_gtid(&text, GROUP_UUID, 9).is_err());
+    }
+}
+
+#[test]
+fn qualified_successor_view_requires_same_fixed_part_and_strict_advance() {
+    assert!(qualified_view_advanced("42:7", "42:8"));
+    for (before, after) in [
+        ("42:7", "42:7"),
+        ("42:7", "42:6"),
+        ("42:7", "43:8"),
+        ("bad:7", "bad:8"),
+        ("42:bad", "42:8"),
+        ("42:7", "42:4294967296"),
+    ] {
+        assert!(!qualified_view_advanced(before, after));
     }
 }
 

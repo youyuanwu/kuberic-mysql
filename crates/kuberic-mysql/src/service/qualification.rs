@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -851,10 +853,31 @@ impl<'a> MysqlNativeQualification<'a> {
         member: MysqlMemberIndex,
         recovery: &crate::service::ControlCredential,
     ) -> Result<(), String> {
+        let guard = self
+            .ownership
+            .begin_rejoin(member)
+            .map_err(|failure| format!("rejoin admission failed: {:?}", failure.primary))?;
+        let result = guard.ownership.members[member.as_usize()]
+            .qualification_start_group_replication(recovery, &self.native_deadline)
+            .await;
+        match result {
+            Ok(()) => {
+                guard.complete();
+                Ok(())
+            }
+            Err(error) => Err(format!("Group Replication start failed: {error}")),
+        }
+    }
+
+    async fn probe_group_replication_start(
+        &mut self,
+        member: MysqlMemberIndex,
+        recovery: &crate::service::ControlCredential,
+    ) -> Result<(), String> {
         self.ownership.members[member.as_usize()]
             .qualification_start_group_replication(recovery, &self.native_deadline)
             .await
-            .map_err(|error| format!("Group Replication start failed: {error}"))
+            .map_err(|error| format!("Group Replication start probe failed: {error}"))
     }
 
     async fn qualify_peer_revocation(
@@ -977,7 +1000,7 @@ impl<'a> MysqlNativeQualification<'a> {
         }
         let new_login = self.probe_recovery_login(target, self.recovery).await;
         let old_recovery = match self
-            .start_group_replication_with(target, self.recovery)
+            .probe_group_replication_start(target, self.recovery)
             .await
         {
             Ok(()) => ProbeOutcome::Accepted,
@@ -1358,6 +1381,12 @@ impl<'a> MysqlNativeQualification<'a> {
         let crashed = current_primary_from(&acknowledged.snapshots)?;
         let crashed_identity = owned_identities[crashed.as_usize()].clone();
         let old_binding = self.member_binding(crashed)?;
+        let killed_pid = self.ownership.members[crashed.as_usize()]
+            .qualification_child_pid()
+            .ok_or_else(|| "primary had no retained child before crash".to_owned())?;
+        let socket_metadata = fs::symlink_metadata(self.member_socket(crashed))
+            .map_err(|error| format!("primary socket identity could not be captured: {error}"))?;
+        let socket_identity = (socket_metadata.dev(), socket_metadata.ino());
         let opening_view = acknowledged.view_id.clone();
         self.stop_member(crashed, QualificationStopKind::Abrupt)
             .map_err(|error| format!("abrupt primary termination failed: {error}"))?;
@@ -1455,8 +1484,14 @@ impl<'a> MysqlNativeQualification<'a> {
             binding,
             crashed_member: crashed_identity,
             acknowledged_gtid: exact_gtid,
+            pre_crash_snapshots: acknowledged.snapshots,
             opening_view,
-            successor_view: successor.view_id,
+            successor_snapshot: successor,
+            kill_evidence: AbruptKillEvidence {
+                pid: killed_pid,
+                socket_identity,
+                signal: 9,
+            },
             restart_bindings,
             final_snapshots,
             client_outcome: ClientOutcome::Acknowledged,
@@ -1501,7 +1536,14 @@ impl<'a> MysqlNativeQualification<'a> {
                         .members
                         .iter()
                         .all(|native| native.state == "ONLINE")
-                    && predecessor_view.is_none_or(|view| snapshot.view_id != view)
+                    && snapshot
+                        .members
+                        .iter()
+                        .filter(|native| native.role == "PRIMARY")
+                        .count()
+                        == 1
+                    && predecessor_view
+                        .is_none_or(|view| qualified_view_advanced(view, &snapshot.view_id))
                     && expected_primary.is_none_or(|identity| {
                         snapshot
                             .members
@@ -1580,6 +1622,23 @@ impl<'a> MysqlNativeQualification<'a> {
             .map_err(|error| format!("purged GTID was malformed: {error}"))?;
         Ok((purged, after))
     }
+}
+
+fn qualified_view_advanced(predecessor: &str, successor: &str) -> bool {
+    let Some((predecessor_fixed, predecessor_monotonic)) = predecessor.split_once(':') else {
+        return false;
+    };
+    let Some((successor_fixed, successor_monotonic)) = successor.split_once(':') else {
+        return false;
+    };
+    predecessor_fixed == successor_fixed
+        && predecessor_fixed.parse::<u64>().is_ok()
+        && successor_fixed.parse::<u64>().is_ok()
+        && predecessor_monotonic
+            .parse::<u32>()
+            .ok()
+            .zip(successor_monotonic.parse::<u32>().ok())
+            .is_some_and(|(before, after)| after > before)
 }
 
 fn validate_applying_gtid(
@@ -1794,11 +1853,20 @@ struct PrimaryCrashReport {
     binding: QualificationBinding,
     crashed_member: String,
     acknowledged_gtid: GtidSet,
+    pre_crash_snapshots: [NativeMemberSnapshot; 3],
     opening_view: String,
-    successor_view: String,
+    successor_snapshot: NativeMemberSnapshot,
+    kill_evidence: AbruptKillEvidence,
     restart_bindings: Vec<(String, String)>,
     final_snapshots: [NativeMemberSnapshot; 3],
     client_outcome: ClientOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AbruptKillEvidence {
+    pid: u32,
+    socket_identity: (u64, u64),
+    signal: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -2,6 +2,8 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -241,7 +243,37 @@ pub(super) fn qualification_kill_and_reap(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<(), MysqlInstanceError> {
-    kill_and_reap_bounded(child, timeout)
+    if child
+        .try_wait()
+        .map_err(|_| MysqlInstanceError::Ownership(OwnershipError::InspectionFailed))?
+        .is_some()
+    {
+        return Err(MysqlInstanceError::Ownership(OwnershipError::ChildExited));
+    }
+    child.kill().map_err(|error| MysqlInstanceError::Io {
+        operation: LifecycleOperation::Shutdown,
+        kind: error.kind(),
+    })?;
+    let deadline = checked_deadline(timeout, LifecycleOperation::Shutdown)?;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| MysqlInstanceError::Io {
+            operation: LifecycleOperation::Shutdown,
+            kind: error.kind(),
+        })? {
+            return if status.signal() == Some(9) {
+                Ok(())
+            } else {
+                Err(MysqlInstanceError::ChildFailure {
+                    operation: LifecycleOperation::Shutdown,
+                    code: status.code(),
+                })
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown));
+        }
+        sleep_until(deadline);
+    }
 }
 
 fn kill_and_reap_until(child: &mut Child, deadline: Instant) -> Result<(), MysqlInstanceError> {

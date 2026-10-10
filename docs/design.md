@@ -606,14 +606,18 @@ stronger than write-quorum application, but it is not a supported setting
 until the exact Oracle MySQL patch proves its commit, failure, and member-loss
 behavior in the repository gate.
 
-The qualification pins the complete durability tuple, including
+The native feasibility qualification pins the complete durability tuple, including
 `innodb_flush_log_at_trx_commit = 1`, `sync_binlog = 1`, binary-log retention,
 member-expulsion behavior, and the exact online native view required for an
-`All` completion. It injects commit timeout, member loss/expulsion during
-`AFTER`, primary crash immediately after acknowledgement, and restart of every
-participant. An acknowledged transaction must remain represented in the
-required public/native history boundary or automated publication and failover
-remain unavailable.
+`All` completion. On Oracle MySQL 8.4.11 it proves an ordinary acknowledged
+singleton GTID on all three members and proves that boundary survives abrupt
+primary termination, a coherent successor view, retained-data restart, and
+restart of every participant. It does **not** inject member loss during
+`AFTER`: the pinned server did not expose the required exact current-
+transaction applier/source-wait barrier, so disconnect ambiguity and
+member-loss-during-wait remain unproved. An acknowledged transaction must
+remain represented in the required public/native history boundary or
+automated publication and failover remain unavailable.
 
 The first serving profile keeps the active three-member set fixed. Bootstrap
 and build/join complete while client writes are closed, and planned
