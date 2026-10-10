@@ -627,6 +627,56 @@ async fn qualify_ambiguous_disconnect() {
     fixture.cleanup();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_secondary_loss_during_after() {
+    let mut fixture = LiveQualificationFixture::bootstrap().await;
+    let outcome = {
+        let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
+        qualification.qualify_secondary_loss_during_after().await
+    };
+    match outcome {
+        SecondaryLossQualification::Unproved {
+            reason,
+            fault_injected,
+        } => {
+            assert!(!fault_injected);
+            assert!(
+                reason.contains("applier GTID barrier was unavailable")
+                    || reason.contains("authoritative source AFTER wait")
+            );
+        }
+        outcome => panic!("unexpected secondary-loss result: {outcome:?}"),
+    }
+    fixture.cleanup();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_post_ack_primary_crash_restart() {
+    let mut fixture = LiveQualificationFixture::bootstrap().await;
+    let outcome = {
+        let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
+        qualification.qualify_post_ack_primary_crash_restart().await
+    };
+    let report = match outcome {
+        PrimaryCrashQualification::Qualified(report) => *report,
+        outcome => panic!("unexpected primary-crash result: {outcome:?}"),
+    };
+    assert_eq!(report.binding.package, ORACLE_PACKAGE);
+    assert_eq!(report.binding.group, GROUP_UUID);
+    assert_eq!(report.client_outcome, ClientOutcome::Acknowledged);
+    assert!(!report.crashed_member.is_empty());
+    assert_ne!(report.opening_view, report.successor_view);
+    assert_eq!(report.restart_bindings.len(), 3);
+    assert!(report.restart_bindings.iter().all(|(old, new)| old != new));
+    assert!(
+        report
+            .final_snapshots
+            .iter()
+            .all(|snapshot| report.acknowledged_gtid.is_subset_of(&snapshot.executed))
+    );
+    fixture.cleanup();
+}
+
 fn assert_view_same_or_advanced(before: &str, after: &str) {
     let (before_fixed, before_monotonic) = before.split_once(':').unwrap();
     let (after_fixed, after_monotonic) = after.split_once(':').unwrap();

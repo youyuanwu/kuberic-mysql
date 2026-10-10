@@ -1284,7 +1284,6 @@ impl<'a> MysqlNativeQualification<'a> {
                     expected_sequence,
                 );
             }
-
             if Instant::now() >= barrier_deadline {
                 return Err(
                     "authoritative applier GTID barrier was unavailable on Oracle 8.4.11"
@@ -1294,6 +1293,176 @@ impl<'a> MysqlNativeQualification<'a> {
             sleep(Duration::from_millis(25)).await;
         }
     }
+
+    async fn qualify_secondary_loss_during_after(&mut self) -> SecondaryLossQualification {
+        match self.qualify_ambiguous_disconnect().await {
+            QualificationTransactionOutcome::Unproved { reason } => {
+                SecondaryLossQualification::Unproved {
+                    reason,
+                    fault_injected: false,
+                }
+            }
+            QualificationTransactionOutcome::Unsupported { reason } => {
+                SecondaryLossQualification::Unsupported {
+                    reason,
+                    fault_injected: false,
+                }
+            }
+            QualificationTransactionOutcome::Qualified(_) => SecondaryLossQualification::Unproved {
+                reason: "applier identity alone did not prove an authoritative source AFTER wait"
+                    .to_owned(),
+                fault_injected: false,
+            },
+        }
+    }
+
+    async fn qualify_post_ack_primary_crash_restart(&mut self) -> PrimaryCrashQualification {
+        let deadline = tokio::time::Instant::from_std(self.ownership.work_cutoff);
+        match tokio::time::timeout_at(deadline, self.primary_crash_restart_inner()).await {
+            Ok(Ok(report)) => PrimaryCrashQualification::Qualified(Box::new(report)),
+            Ok(Err(reason)) => PrimaryCrashQualification::Unproved { reason },
+            Err(_) => PrimaryCrashQualification::Unproved {
+                reason: "primary crash scenario reached scenario work cutoff".to_owned(),
+            },
+        }
+    }
+
+    async fn primary_crash_restart_inner(&mut self) -> Result<PrimaryCrashReport, String> {
+        let profile = self.read_profile_evidence().await?;
+        let binding = profile.binding.clone();
+        profile
+            .qualify(&binding)
+            .map_err(|error| format!("profile evidence rejected: {error:?}"))?;
+        let owned_identities: [String; 3] = profile
+            .members
+            .iter()
+            .map(|member| member.server_uuid.clone())
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| "profile member cardinality changed".to_owned())?;
+        self.prepare_transaction_table().await?;
+        let acknowledged = self.commit_token("post-ack-primary-crash").await?;
+        let exact_gtid = GtidSet::from_str(&format!(
+            "{}:{}",
+            self.attempt.group_name().as_str(),
+            acknowledged.transaction_tail
+        ))
+        .map_err(|error| format!("acknowledged GTID construction failed: {error}"))?;
+        if acknowledged
+            .snapshots
+            .iter()
+            .any(|snapshot| !exact_gtid.is_subset_of(&snapshot.executed))
+        {
+            return Err("acknowledged GTID was not on all three members before crash".to_owned());
+        }
+        let crashed = current_primary_from(&acknowledged.snapshots)?;
+        let crashed_identity = owned_identities[crashed.as_usize()].clone();
+        let old_binding = self.member_binding(crashed)?;
+        let opening_view = acknowledged.view_id.clone();
+        self.stop_member(crashed, QualificationStopKind::Abrupt)
+            .map_err(|error| format!("abrupt primary termination failed: {error}"))?;
+        let expected_without = owned_identities
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != crashed.as_usize())
+            .map(|(_, identity)| identity.clone())
+            .collect::<HashSet<_>>();
+        let successor = self
+            .wait_exact_membership(
+                &expected_without,
+                &owned_identities,
+                None,
+                Some(&opening_view),
+            )
+            .await?;
+        if successor
+            .members
+            .iter()
+            .any(|member| member.member_id == crashed_identity)
+        {
+            return Err("crashed primary remained in successor membership".to_owned());
+        }
+
+        let new_binding = self
+            .restart_member(crashed)
+            .map_err(|error| format!("crashed primary restart failed: {error}"))?;
+        if old_binding.process_session() == new_binding.process_session() {
+            return Err("crashed primary reused its process session".to_owned());
+        }
+        self.start_group_replication(crashed).await?;
+        self.wait_exact_membership(
+            &owned_identities.iter().cloned().collect(),
+            &owned_identities,
+            None,
+            Some(&successor.view_id),
+        )
+        .await?;
+        let mut restart_bindings = vec![(
+            old_binding.process_session().as_str().to_owned(),
+            new_binding.process_session().as_str().to_owned(),
+        )];
+
+        for member in MysqlMemberIndex::all() {
+            if member == crashed {
+                continue;
+            }
+            if self.current_primary().await? == member {
+                self.transfer_primary(&owned_identities).await?;
+            }
+            let opening = self.snapshots().await?[0].view_id.clone();
+            self.stop_group_replication(member).await?;
+            let expected_without = owned_identities
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != member.as_usize())
+                .map(|(_, identity)| identity.clone())
+                .collect::<HashSet<_>>();
+            self.wait_exact_membership(&expected_without, &owned_identities, None, Some(&opening))
+                .await?;
+            let old = self.member_binding(member)?;
+            self.stop_member(member, QualificationStopKind::Graceful)
+                .map_err(|error| format!("participant stop failed: {error}"))?;
+            let new = self
+                .restart_member(member)
+                .map_err(|error| format!("participant restart failed: {error}"))?;
+            restart_bindings.push((
+                old.process_session().as_str().to_owned(),
+                new.process_session().as_str().to_owned(),
+            ));
+            self.start_group_replication(member).await?;
+            self.wait_exact_membership(
+                &owned_identities.iter().cloned().collect(),
+                &owned_identities,
+                None,
+                None,
+            )
+            .await?;
+        }
+
+        let final_profile = self.read_profile_evidence().await?;
+        let final_binding = final_profile.binding.clone();
+        final_profile
+            .qualify(&final_binding)
+            .map_err(|error| format!("post-restart profile evidence rejected: {error:?}"))?;
+        let final_snapshots = self.wait_common_tail(acknowledged.transaction_tail).await?;
+        if final_snapshots
+            .iter()
+            .any(|snapshot| !exact_gtid.is_subset_of(&snapshot.executed))
+        {
+            return Err("acknowledged GTID was lost after participant restarts".to_owned());
+        }
+        Ok(PrimaryCrashReport {
+            binding,
+            crashed_member: crashed_identity,
+            acknowledged_gtid: exact_gtid,
+            opening_view,
+            successor_view: successor.view_id,
+            restart_bindings,
+            final_snapshots,
+            client_outcome: ClientOutcome::Acknowledged,
+        })
+    }
+
     async fn wait_exact_membership(
         &self,
         expected: &HashSet<String>,
@@ -1605,6 +1774,36 @@ struct TransactionQualificationReport {
 enum QualificationTransactionOutcome {
     Qualified(Box<TransactionQualificationReport>),
     Unsupported { reason: String },
+    Unproved { reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecondaryLossQualification {
+    Unsupported {
+        reason: String,
+        fault_injected: bool,
+    },
+    Unproved {
+        reason: String,
+        fault_injected: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryCrashReport {
+    binding: QualificationBinding,
+    crashed_member: String,
+    acknowledged_gtid: GtidSet,
+    opening_view: String,
+    successor_view: String,
+    restart_bindings: Vec<(String, String)>,
+    final_snapshots: [NativeMemberSnapshot; 3],
+    client_outcome: ClientOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PrimaryCrashQualification {
+    Qualified(Box<PrimaryCrashReport>),
     Unproved { reason: String },
 }
 

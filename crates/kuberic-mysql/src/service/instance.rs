@@ -469,6 +469,35 @@ impl MysqlInstanceManager {
             return Err(error);
         }
         self.child = None;
+        if kind == QualificationStopKind::Abrupt {
+            match fs::symlink_metadata(self.config.runtime().socket()) {
+                Ok(metadata)
+                    if !metadata.file_type().is_symlink() && metadata.file_type().is_socket() =>
+                {
+                    fs::remove_file(self.config.runtime().socket()).map_err(|error| {
+                        self.state = MysqlInstanceState::Faulted;
+                        MysqlInstanceError::Io {
+                            operation: LifecycleOperation::SocketDisappearance,
+                            kind: error.kind(),
+                        }
+                    })?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    return Err(MysqlInstanceError::Ownership(
+                        crate::service::OwnershipError::InspectionFailed,
+                    ));
+                }
+                Err(error) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    return Err(MysqlInstanceError::Io {
+                        operation: LifecycleOperation::SocketDisappearance,
+                        kind: error.kind(),
+                    });
+                }
+            }
+        }
         if let Err(error) = wait_for_absence(
             self.config.runtime().socket(),
             self.config.timeouts().socket_disappearance(),
