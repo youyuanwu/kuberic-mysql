@@ -10,21 +10,33 @@
 //! live beneath a separate disposable scratch root. No application metadata
 //! file, journal, receipt database, state JSON, or adoption record is created.
 //!
-//! The manager does not publish client access, bootstrap Group Replication, or
-//! implement Kuberic callbacks. Observation is delegated unchanged to
-//! [`crate::adapter::MysqlObserver`] after checking that the request
-//! selects the currently owned private socket.
+//! The manager does not publish client access, compose a three-member topology,
+//! or implement Kuberic callbacks. Member-local setup and bounded
+//! bootstrap/join control use a separate root session over the currently owned
+//! private socket. Observation remains delegated unchanged to
+//! [`crate::adapter::MysqlObserver`].
 
 mod config;
+mod control;
 mod error;
 mod instance;
 mod process;
+mod topology;
 
 pub use config::{
     MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts,
     MysqlRuntimePaths, MysqlTopologyConfig,
 };
 pub use error::{
-    ConfigError, LifecycleOperation, MysqlInstanceError, OwnershipError, ProductError,
+    ConfigError, ControlStage, LifecycleOperation, MysqlInstanceError, MysqlTopologyError,
+    OwnershipError, ProductError, TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError,
+    TopologyNativeStateError, TopologyStateError,
 };
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
+pub use topology::{
+    AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect, ControlCredential,
+    ControlCredentialRole, ControlStep, CredentialError, JoinCapability, JoinEffect,
+    MemberControlBinding, NativeControlDeadline, NativeIdentityEnrollment, ObservedLocalBinding,
+    SourceGtidBoundary, TopologyAttempt, TopologyAuthority, TopologyInstant, TopologyObservation,
+    TopologyObservationStatus, TransitionCredit, TransitionEvaluation, ViewDiscovery,
+};

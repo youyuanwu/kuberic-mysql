@@ -118,6 +118,195 @@ pub enum OwnershipError {
     InspectionFailed,
 }
 
+/// One exact native-control step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlStage {
+    /// Final owned-socket validation.
+    SocketValidation,
+    /// Root connection over the owned Unix socket.
+    Connect,
+    /// Root authentication.
+    Authenticate,
+    /// Exact Oracle MySQL product validation.
+    ProductValidation,
+    /// Reading the current session binary-log switch.
+    ReadBinaryLogging,
+    /// Disabling session binary logging.
+    DisableBinaryLogging,
+    /// Creating the local observer account.
+    CreateObserver,
+    /// Granting observer access to Group Replication membership.
+    GrantObserverMembers,
+    /// Granting observer access to local Group Replication statistics.
+    GrantObserverStats,
+    /// Creating the local distributed-recovery account.
+    CreateRecovery,
+    /// Granting the exact distributed-recovery privileges.
+    GrantRecovery,
+    /// Restoring the original session binary-log switch.
+    RestoreBinaryLogging,
+    /// Proving the session binary-log switch was restored.
+    ProveBinaryLoggingRestored,
+    /// Reading the pre-effect native server identity.
+    EnrollIdentity,
+    /// Revalidating the enrolled server identity after a topology effect.
+    VerifyEnrolledIdentity,
+    /// Proving that no existing group state is present.
+    InspectExistingGroup,
+    /// Enabling designated bootstrap mode.
+    EnableBootstrap,
+    /// Starting Group Replication with in-memory recovery credentials.
+    StartGroupReplication,
+    /// Disabling designated bootstrap mode.
+    DisableBootstrap,
+    /// Proving that bootstrap mode is disabled.
+    ProveBootstrapDisabled,
+    /// Discovering the current native view identity.
+    DiscoverView,
+    /// Explicit connected-session teardown.
+    Disconnect,
+}
+
+/// Why a topology capability was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyAuthorityError {
+    /// The capability or evidence belongs to another topology attempt.
+    AttemptMismatch,
+    /// The supplied credential generation is not enrolled for this member.
+    CredentialGenerationMismatch,
+    /// Member-local setup did not use the same attempt principal.
+    PrincipalMismatch,
+    /// The selected bootstrap member is not the designated member.
+    WrongBootstrapMember,
+    /// Bootstrap authority was already issued.
+    BootstrapAlreadyUsed,
+    /// Another topology transition must complete before this operation.
+    TransitionInFlight,
+    /// The requested join target is not the next sequential member.
+    WrongJoinTarget,
+    /// The capability was consumed, revoked, or superseded.
+    StaleCapability,
+    /// No exact enrollment exists for the requested member.
+    MissingEnrollment,
+}
+
+/// Why the topology state cannot admit or accept an operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyStateError {
+    /// A supposedly fresh member already exposes native group state.
+    ExistingGroupState,
+    /// An enrollment duplicates another member's exact identity or binding.
+    DuplicateEnrollment,
+    /// A transition was requested from the wrong pure topology state.
+    InvalidTransition,
+    /// A post-effect view did not change from its accepted predecessor view.
+    UnchangedView,
+    /// The post-effect view omitted a required predecessor member.
+    RequiredMemberMissing,
+    /// The post-effect view contained an unapproved member.
+    UnexpectedMember,
+    /// The post-effect view did not contain the exact target member.
+    TargetMemberMissing,
+}
+
+/// Why typed native role or state evidence cannot complete a transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyNativeStateError {
+    /// Bootstrap did not report the designated member as primary.
+    BootstrapMemberNotPrimary,
+    /// A joining member did not report the secondary role.
+    JoiningMemberNotSecondary,
+    /// A previously accepted member changed role.
+    PredecessorRoleChanged,
+    /// A previously accepted member was no longer online.
+    PredecessorNotOnline,
+    /// The target reported `OFFLINE`.
+    Offline,
+    /// The target reported `ERROR`.
+    Error,
+    /// The target reported `UNREACHABLE`.
+    Unreachable,
+    /// The observation contained an unsupported native role.
+    UnsupportedRole,
+    /// The observation contained an unsupported native state.
+    UnsupportedState,
+}
+
+/// Why structured transaction history cannot complete a join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyGtidError {
+    /// A GTID source differed from the configured Group Replication UUID.
+    NonGroupSource,
+    /// The target did not contain the accepted pre-join source boundary.
+    SourceBoundaryNotContained,
+    /// The source boundary was not bound to the accepted predecessor evidence.
+    SourceBoundaryBindingMismatch,
+}
+
+/// Why proposed post-effect evidence cannot receive lifecycle credit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyEvidenceError {
+    /// Required post-effect evidence was not collected.
+    Missing,
+    /// Product identity differed from the qualified Oracle MySQL 8.4.11
+    /// profile.
+    ProductMismatch,
+    /// Exact retained ownership context was lost.
+    OwnershipContextLoss,
+    /// Evidence used another observation attempt or native view.
+    BindingMismatch,
+    /// The observed server/member identity drifted from pre-effect enrollment.
+    IdentityDrift,
+    /// The process, endpoint, or storage binding drifted from enrollment.
+    OwnershipDrift,
+    /// The configured Group Replication identity changed.
+    GroupMismatch,
+}
+
+/// Secret-free topology control or validation failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MysqlTopologyError {
+    /// The owned private UDS could not be reached.
+    ControlTransport(ControlStage),
+    /// Root authentication over the owned UDS failed.
+    ControlAuthentication(ControlStage),
+    /// The authenticated account lacked a required control permission.
+    ControlPermission(ControlStage),
+    /// The native client or server rejected the selected control operation.
+    ControlProtocol(ControlStage),
+    /// The connected server was not the qualified product.
+    ControlProductCompatibility,
+    /// Exact retained process/root/socket ownership was unavailable.
+    OwnershipContextLoss,
+    /// Capability or operation authority was invalid.
+    Authority(TopologyAuthorityError),
+    /// Pure topology state rejected the operation or evidence.
+    TopologyState(TopologyStateError),
+    /// Native role/state evidence rejected completion.
+    NativeState(TopologyNativeStateError),
+    /// The pre-established monotonic deadline was reached or exceeded.
+    Deadline(ControlStage),
+    /// Structured GTID evidence rejected completion.
+    Gtid(TopologyGtidError),
+    /// Post-effect evidence was missing, incompatible, or inconsistently bound.
+    Evidence(TopologyEvidenceError),
+    /// A primary control failure and its mandatory cleanup/proof both failed.
+    PairedControl {
+        /// Original control failure.
+        prior: Box<Self>,
+        /// Cleanup or restoration failure.
+        cleanup: Box<Self>,
+    },
+}
+
+impl fmt::Display for MysqlTopologyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL topology failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MysqlTopologyError {}
+
 /// One bounded lifecycle failure.
 #[derive(Debug)]
 pub enum MysqlInstanceError {

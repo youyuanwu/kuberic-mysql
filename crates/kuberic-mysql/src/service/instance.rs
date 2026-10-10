@@ -7,19 +7,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::adapter::{MysqlObserver, ObservationClock, ObservationReport, ObservationRequest};
+use crate::adapter::{
+    MysqlObserver, ObservationClock, ObservationReport, ObservationRequest, UnixSocketPath,
+};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
     AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, flock, fstat, open, openat,
     renameat_with, statat, unlinkat,
 };
 
+use crate::core::GroupName;
 use crate::service::config::OwnedRoot;
+use crate::service::control::OwnedControlTarget;
 use crate::service::process::{
     attest_child, launcher_command, terminate_and_reap, verify_product, wait_bounded,
     wait_for_absence,
 };
-use crate::service::{LifecycleOperation, MysqlInstanceConfig, MysqlInstanceError};
+use crate::service::{
+    AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect, ControlCredential,
+    JoinCapability, JoinEffect, LifecycleOperation, MemberControlBinding, MysqlInstanceConfig,
+    MysqlInstanceError, MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment,
+    TopologyStateError, ViewDiscovery,
+};
 
 const READY_POLL: Duration = Duration::from_millis(25);
 static CLEANUP_SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -295,6 +304,67 @@ impl MysqlInstanceManager {
         Ok(MysqlObserver::observe(request).await)
     }
 
+    /// Creates exact minimum observer and recovery accounts through the owned
+    /// private UDS, with account statements excluded from binary logging.
+    pub async fn provision_topology_accounts(
+        &mut self,
+        binding: MemberControlBinding,
+        observer: &ControlCredential,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<AccountProvisioningEvidence, MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::provision_accounts(target, binding, observer, recovery, deadline)
+            .await
+    }
+
+    /// Enrolls `@@server_uuid` before this member enters any topology effect.
+    pub async fn enroll_topology_identity(
+        &mut self,
+        binding: MemberControlBinding,
+        accounts: &AccountProvisioningEvidence,
+        deadline: &NativeControlDeadline,
+    ) -> Result<NativeIdentityEnrollment, MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::enroll_identity(target, binding, accounts, deadline).await
+    }
+
+    /// Enters the one designated bootstrap effect and proves bootstrap mode is
+    /// off before returning effect evidence.
+    pub async fn bootstrap_group_replication(
+        &mut self,
+        capability: BootstrapCapability,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<BootstrapEffect, MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::bootstrap(target, capability, recovery, deadline).await
+    }
+
+    /// Enters one non-bootstrap join with process-memory-only recovery
+    /// credentials.
+    pub async fn join_group_replication(
+        &mut self,
+        capability: JoinCapability,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<JoinEffect, MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::join(target, capability, recovery, deadline).await
+    }
+
+    /// Discovers a proposed post-effect view without replacing enrollment or
+    /// granting lifecycle credit.
+    pub async fn discover_topology_view(
+        &mut self,
+        enrollment: NativeIdentityEnrollment,
+        group_name: GroupName,
+        deadline: &NativeControlDeadline,
+    ) -> Result<ViewDiscovery, MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::discover_view(target, enrollment, group_name, deadline).await
+    }
+
     /// Attests, terminates, and reaps the exact retained child, proves socket
     /// disappearance, and removes only disposable scratch. Persistent data is
     /// retained.
@@ -358,6 +428,37 @@ impl MysqlInstanceManager {
                 .map_err(MysqlInstanceError::Ownership)?;
         }
         Ok(())
+    }
+
+    fn prepare_control_target(&mut self) -> Result<OwnedControlTarget, MysqlTopologyError> {
+        if self.state != MysqlInstanceState::Running {
+            return Err(MysqlTopologyError::TopologyState(
+                TopologyStateError::InvalidTransition,
+            ));
+        }
+        if self.revalidate_roots().is_err() {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(MysqlTopologyError::OwnershipContextLoss);
+        }
+        if attest_child(
+            self.child
+                .as_mut()
+                .expect("running state retains the exact child"),
+            &self.config,
+        )
+        .is_err()
+        {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(MysqlTopologyError::OwnershipContextLoss);
+        }
+        let socket = UnixSocketPath::new(self.config.runtime().socket()).map_err(|_| {
+            MysqlTopologyError::ControlTransport(crate::service::ControlStage::SocketValidation)
+        })?;
+        Ok(OwnedControlTarget::new(
+            socket,
+            self.config.member_index(),
+            self.config.member().clone(),
+        ))
     }
 
     fn cleanup_all_roots(&mut self) -> Result<(), MysqlInstanceError> {

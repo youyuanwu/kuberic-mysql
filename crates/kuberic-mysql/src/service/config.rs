@@ -16,7 +16,7 @@ const PID_FILE: &str = "mysqld.pid";
 const TOPOLOGY_MEMBER_COUNT: usize = 3;
 
 /// One exact position in the fixed three-member topology.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MysqlMemberIndex {
     /// The first configured member.
     First,
@@ -27,12 +27,18 @@ pub enum MysqlMemberIndex {
 }
 
 impl MysqlMemberIndex {
-    const fn as_usize(self) -> usize {
+    /// Returns the fixed zero-based topology position.
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
         match self {
             Self::First => 0,
             Self::Second => 1,
             Self::Third => 2,
         }
+    }
+
+    pub(crate) const fn all() -> [Self; 3] {
+        [Self::First, Self::Second, Self::Third]
     }
 }
 
@@ -484,6 +490,12 @@ impl MysqlInstanceConfig {
     #[must_use]
     pub fn member(&self) -> &MysqlMemberConfig {
         &self.topology.members[self.member_index.as_usize()]
+    }
+
+    /// This process generation's fixed topology position.
+    #[must_use]
+    pub const fn member_index(&self) -> MysqlMemberIndex {
+        self.member_index
     }
 
     /// Positive operation deadlines.
