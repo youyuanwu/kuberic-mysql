@@ -68,6 +68,26 @@ Cancelling bootstrap cannot detach a query future: bootstrap-off and proof are
 attempted after every enable attempt, while cancellation synchronously contains
 the exact owned topology before returning control.
 
+A test-only native feasibility gate pins GTID assignment blocks of 1,
+automatic view-change UUIDs, `AFTER` consistency, flush-at-commit and binlog
+sync of 1, 30-day binlog expiry, and a 5-second member-expulsion extension. It
+reads every effective value back on all members and qualifies one untagged
+group-source, contiguous-from-1 GTID history across primary transfer, graceful
+departure/rejoin, retained-data restart of every process, and binary-log
+purge. Full GTID sets remain authoritative; purged sets and opaque log
+inventory do not become public catch-up capability.
+
+The gate proves a normally acknowledged singleton GTID on all members and
+proves it survives abrupt primary SIGKILL, a coherent two-survivor view, and
+restart of every participant. Oracle 8.4.11 did not expose the exact blocked-
+transaction barrier required for safe disconnect or member-loss injection, so
+those cases remain unproved and no fault is injected. Account lock, password
+replacement, and recovery-privilege removal do not terminate established
+native participation; even after explicit Group Replication stop and password
+replacement, predecessor recovery credentials remain accepted by
+`START GROUP_REPLICATION`. Native peer-session revocation and serving cutover
+therefore remain ineligible.
+
 The original five-argument `MysqlInstanceConfig::new(mysqld, launcher,
 data_root, scratch_root, timeouts)` remains the single-instance constructor and
 retains its prior profile. Fixed-topology callers must use the explicit
@@ -90,7 +110,7 @@ Native `PRIMARY`, `read_only`, and `super_read_only` values are evidence only.
 They never open Kuberic read or write access and do not prove fencing. The
 delivered fresh three-member bootstrap/join slice is not the broader Stage 2
 lifecycle PoC: member-local public Replicator wiring, SF lifecycle ordering,
-qualified scalar progress, signed build/peer admission, proxy access
+public scalar progress, effective signed build/peer admission, proxy access
 reconciliation or publication, switchover, failover, Clone/reseed, replacement
 or destructive repair, restart continuation, TLS, cross-host operation,
 containers, Kubernetes, and production availability or security claims remain
@@ -161,6 +181,25 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
   --test service_group_replication_live_mysql_8_4_11 \
   -E 'test(=three_fresh_members_bootstrap_join_and_cleanup)'
+```
+
+The native feasibility gates can be selected independently:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql --lib \
+  -E 'test(=service::qualification::tests::qualify_profile_gtid_transitions)'
+
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql --lib \
+  -E 'test(/service::qualification::tests::qualify_peer_.*/)'
+
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql --lib \
+  -E 'test(=service::qualification::tests::qualify_normal_acknowledgement) \
+      | test(=service::qualification::tests::qualify_ambiguous_disconnect) \
+      | test(=service::qualification::tests::qualify_secondary_loss_during_after) \
+      | test(=service::qualification::tests::qualify_post_ack_primary_crash_restart)'
 ```
 
 The live tests launch only isolated project-local fixture children, require all

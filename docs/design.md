@@ -171,11 +171,29 @@ the public bootstrap future never detaches a query: an armed ownership guard
 synchronously contains all exact members before cancellation returns unless
 bootstrap-off proof has completed.
 
+The test-only native feasibility gate pins and reads back the proposed GTID,
+view-change, `AFTER`, flush/sync, retention, and expulsion settings on every
+member. It proves the one untagged group-source, contiguous-from-1 history
+shape across primary transfer, graceful departure/rejoin, retained-data
+restart of every process, and purge. It proves one acknowledged singleton GTID
+survives abrupt primary SIGKILL, an exact two-survivor successor view, and
+restart of every participant. Complete GTID sets remain the authority, and the
+runner is absent from the normal library API.
+
+The same gate returns negative feasibility results. Oracle 8.4.11 did not
+expose the exact current-transaction barrier needed before disconnect or
+secondary-loss injection, so neither fault is injected. Account lock, password
+replacement, and recovery-privilege removal leave established native
+participation intact. Explicit Group Replication stop proves predecessor
+process absence, but predecessor recovery credentials remain accepted after
+password replacement. No credential-bound peer-session revocation barrier or
+serving eligibility is established.
+
 The delivered slices make no claim for another MySQL patch or fork, Kuberic
 callbacks, access reconciliation or publication, routing, switchover, failover,
 fencing, Clone/reseed, replacement, destructive repair, restart continuation,
-TLS, cross-host operation, containers, Kubernetes, availability, durability,
-performance, or production security.
+TLS, cross-host operation, containers, Kubernetes, availability, general or
+production durability, performance, or production security.
 
 The broader host-local lifecycle target remains:
 
@@ -1313,9 +1331,11 @@ stage.
 
 Stages 0 and 1, the narrow Stage 2 observation slice, the single-process
 restart-stateless host, and the bounded fresh three-member bootstrap/join
-portion are delivered. Stage 2 public interface wiring, access reconciliation
-and publication, controlled switchover, and every later row remain a delivery
-contract, not a schedule or current feature list.
+portion are delivered. The native profile/GTID/peer/durability feasibility
+gate described above is also delivered, including its negative results. Stage
+2 public interface wiring, access reconciliation and publication, controlled
+switchover, and every later row remain a delivery contract, not a schedule or
+current feature list.
 
 ## Test Strategy
 
@@ -1323,8 +1343,8 @@ contract, not a schedule or current feature list.
 
 Repository development requires the exact installed Oracle MySQL package. The
 standard nextest workspace run starts isolated local fixtures and runs the
-delivered observer, single-process lifecycle, and fresh three-member
-bootstrap/join gates:
+delivered observer, single-process lifecycle, fresh three-member
+bootstrap/join, and native feasibility gates:
 
 ```bash
 cargo fmt --all -- --check
@@ -1376,6 +1396,18 @@ The delivered bounded topology matrix includes:
 - closed SQL TCP and MySQL X access, exact per-member process/UDS cleanup, and
   refusal to create a private MySQL application store.
 
+The delivered test-only native feasibility matrix additionally includes:
+
+- exact effective setting readback and the one-source contiguous GTID shape;
+- transactions around primary transfer, graceful leave/rejoin, retained-data
+  restart of each process, and purge;
+- normal `AFTER` acknowledgement and acknowledged-primary SIGKILL/restart;
+- fail-closed `Unproved` results, without fault injection, for ambiguous
+  disconnect and secondary loss during `AFTER`; and
+- isolated account lock, password replacement, privilege removal, and
+  stop/rejoin experiments that leave credential-bound session revocation
+  unproved.
+
 The remaining Stage 2 PoC matrix includes:
 
 - one member-local public interface bundle per replica, with no private managed
@@ -1426,6 +1458,7 @@ must define their exact inputs and pass conditions.
 | PoC observation | One pinned local `mysqld`, private UDS, fixture credential | Native identity/view/GTID evidence matches the exact process; permission denial, bad credentials, and wrong UDS/server identity remain distinct | Local adapter-to-MySQL observation works without TLS | No topology mutation or writable transition claim |
 | Single-process host | Exact Oracle MySQL 8.4.11, `aa-exec`, fresh distinct roots | One child is initialized, launched, attested, observed as fail-closed inactive membership, stopped, reaped, and its UDS proven absent; scratch is removed and data retained | One restart-stateless local process generation with private-UDS observation | No topology, callbacks, access publication, survivor adoption, or restart continuation |
 | Fresh topology bootstrap/join | Exactly three fresh owned instances, loopback Group Replication, retained in-memory attempt authority | One designated bootstrap and two sequential joins receive exact fresh identity/view/GTID credit; access stays closed; every process and scratch root is contained | Bounded fresh three-member bootstrap/join for the exact qualified local profile | No callbacks, access publication, switchover, failover, repair, survivor adoption, or restart continuation |
+| Native Stage 2 feasibility | The exact fresh topology plus the pinned setting tuple and test-only internal runner | Full GTID evidence stays one untagged group source and contiguous through the exercised transitions; normal acknowledgement and post-ack primary SIGKILL/restart pass; unsupported barriers and peer revocation return explicit negative results | The named Oracle 8.4.11 native profile and acknowledged-primary crash behavior are feasible inputs to later design | No public scalar progress, catch-up capability, credential-bound peer revocation, ambiguous disconnect, secondary-loss-during-`AFTER`, serving cutover, failover, or production durability claim |
 | PoC lifecycle and switchover | Three fresh owned instances, loopback Group Replication, SF-aligned public Kuberic values, one member-local Replicator and client proxy per host | Public conformance ordering passes; signed build/peer admission and qualified scalar progress bind exact sessions; bootstrap/join completes; source access closes and its process is stopped/reaped before target writes open; unexpected loss leaves writes closed | Controlled host-local public-only Kuberic lifecycle and one planned handoff | No specific-quorum optimization, arbitrary GTID-set progress, Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
 | Advanced repair and restart | Stage 3 implementation, generic durable effect records, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Resumable host-local repair for the exercised profile without an application-owned metadata store | No automated writable failover |
 | Advanced failover and fencing | Validated native commit invariant and independent fence provider | Only a candidate containing the required history publishes; old-primary survival, provider loss, quorum loss, and divergent histories remain fail-closed | Automated failover for the exact qualified environment | No portable infrastructure or Kubernetes claim |
@@ -1437,7 +1470,8 @@ Unless a later validated stage says otherwise, this design does not support:
 
 - production MySQL process ownership, writable transition, or Kuberic callback
   behavior beyond the delivered read-only observer, bounded fresh process
-  ownership, and closed-access three-member bootstrap/join;
+  ownership, closed-access three-member bootstrap/join, and test-only native
+  feasibility evidence;
 - production use or service-level objectives;
 - MySQL releases outside a pinned Oracle MySQL 8.4 LTS patch;
 - MariaDB, Percona Server, cloud-vendor forks, or unqualified managed services;
