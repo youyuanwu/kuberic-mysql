@@ -18,6 +18,14 @@ adapter and lifecycle component persist no private recovery metadata. Durable
 orchestration evidence belongs to Kuberic's generic controller and agent
 facilities, while native database facts remain in the MySQL data directory.
 
+The future production shape uses one member-local public SF-shaped Replicator
+per Kuberic replica. The delivered fixed three-process topology manager remains
+qualification infrastructure, not the production lifecycle owner. Activation
+also requires Kuberic's aligned public value types, a qualified
+`HistoryContext`-scoped GTID-to-LSN profile, signed build/peer authorization,
+and an application-owned client proxy; no private managed lifecycle or native
+receipt attachment is permitted.
+
 ## Status
 
 Stage 1 is delivered in the publish-disabled `kuberic-mysql` crate's `core`
@@ -81,10 +89,12 @@ variables alone do not grant or fence writes.
 Native `PRIMARY`, `read_only`, and `super_read_only` values are evidence only.
 They never open Kuberic read or write access and do not prove fencing. The
 delivered fresh three-member bootstrap/join slice is not the broader Stage 2
-lifecycle PoC: controller callbacks, access reconciliation or publication,
-routing, switchover, failover, Clone/reseed, replacement or destructive repair,
-restart continuation, TLS, cross-host operation, containers, Kubernetes, and
-production availability or security claims remain out of scope.
+lifecycle PoC: member-local public Replicator wiring, SF lifecycle ordering,
+qualified scalar progress, signed build/peer admission, proxy access
+reconciliation or publication, switchover, failover, Clone/reseed, replacement
+or destructive repair, restart continuation, TLS, cross-host operation,
+containers, Kubernetes, and production availability or security claims remain
+out of scope.
 
 The live gate qualifies the exact installed Oracle MySQL 8.4.11 package.
 Any other patch requires an explicit compatibility update.
