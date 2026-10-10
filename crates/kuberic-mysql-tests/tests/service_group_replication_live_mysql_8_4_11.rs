@@ -8,17 +8,15 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use kuberic_mysql::adapter::{ClockContext, ObservationClock};
 use kuberic_mysql::core::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, Epoch, GroupName,
-    GtidSet, ObservationInstant, ObservationSessionId, PartitionId, ReplicaId, ReplicaIncarnation,
-    ResourceId,
+    GtidSet, ObservationSessionId, PartitionId, ReplicaId, ReplicaIncarnation, ResourceId,
 };
 use kuberic_mysql::service::{
     ControlCredential, ControlCredentialRole, MysqlInstanceConfig, MysqlInstanceManager,
     MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts, MysqlTopologyConfig,
-    MysqlTopologyManager, MysqlTopologyState, NativeControlDeadline, TopologyAttempt,
-    TopologyInstant, TopologyObservationContext, TransitionCredit, TransitionEvaluation,
+    MysqlTopologyManager, MysqlTopologyState, TopologyAttempt, TopologyObservationContext,
+    TransitionCredit, TransitionEvaluation,
 };
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
@@ -31,28 +29,6 @@ use live_support::{
 
 const GROUP_UUID: &str = "d6f6f07e-37e1-4f7a-9105-73c13f634cb3";
 static NEXT_CONTEXT: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone)]
-struct LiveClock {
-    origin: Instant,
-}
-
-impl ObservationClock for LiveClock {
-    fn now(&self) -> ObservationInstant {
-        ObservationInstant::new(
-            u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
-        )
-    }
-
-    fn to_std_instant(
-        &self,
-        instant: ObservationInstant,
-    ) -> Result<Instant, kuberic_mysql::adapter::ClockError> {
-        self.origin
-            .checked_add(Duration::from_millis(instant.tick()))
-            .ok_or(kuberic_mysql::adapter::ClockError::UnrepresentableInstant)
-    }
-}
 
 #[tokio::test(flavor = "current_thread")]
 async fn three_fresh_members_bootstrap_join_and_cleanup() {
@@ -100,8 +76,7 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
         AttemptId::new(format!("gr-live-attempt-{}", std::process::id())).unwrap(),
         GroupName::new(GROUP_UUID).unwrap(),
         MysqlMemberIndex::First,
-        TopologyInstant::new(0),
-        TopologyInstant::new(10_000),
+        Duration::from_secs(300),
     )
     .unwrap();
     let observer_password = format!("KmsObserver{}A7", std::process::id());
@@ -147,11 +122,8 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     }
     assert_tcp_refuses(([127, 0, 0, 1], MYSQL_X_PORT).into()).unwrap();
 
-    let clock = LiveClock {
-        origin: Instant::now(),
-    };
     manager
-        .start_designated_member(&control_deadline(&attempt))
+        .start_designated_member()
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(manager.state(), MysqlTopologyState::BootstrapMemberEnrolled);
@@ -160,10 +132,10 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     assert!(!sockets[1].exists());
     assert!(!sockets[2].exists());
     manager
-        .bootstrap(TopologyInstant::new(10), &control_deadline(&attempt))
+        .bootstrap()
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let bootstrap_credit = await_accepted(&mut manager, &clock, "bootstrap", 20)
+    let bootstrap_credit = await_accepted(&mut manager, "bootstrap")
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(manager.state(), MysqlTopologyState::BootstrapAccepted);
@@ -179,7 +151,7 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     assert_tcp_refuses(([127, 0, 0, 1], MYSQL_X_PORT).into()).unwrap();
 
     manager
-        .start_second_member(&control_deadline(&attempt))
+        .start_second_member()
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(manager.state(), MysqlTopologyState::SecondMemberEnrolled);
@@ -190,15 +162,10 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     let second_source_boundary = query_gtids(&sockets[0]).await;
     assert_group_sources(&second_source_boundary);
     manager
-        .join_second_member(
-            TopologyInstant::new(30),
-            &control_deadline(&attempt),
-            observation_context("source-second"),
-            observation_clock(&clock),
-        )
+        .join_second_member(observation_context("source-second"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let second_credit = await_accepted(&mut manager, &clock, "second", 40)
+    let second_credit = await_accepted(&mut manager, "second")
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(manager.state(), MysqlTopologyState::SecondAccepted);
@@ -206,6 +173,10 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     assert_eq!(
         second_credit.members()[1].server_uuid().as_str(),
         second_identity
+    );
+    assert_exact_view_successor(
+        bootstrap_credit.view_id().as_str(),
+        second_credit.view_id().as_str(),
     );
     assert!(second_source_boundary.is_subset_of(second_credit.executed()));
     assert_group_sources(second_credit.executed());
@@ -219,7 +190,7 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     }
 
     manager
-        .start_third_member(&control_deadline(&attempt))
+        .start_third_member()
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(manager.state(), MysqlTopologyState::ThirdMemberEnrolled);
@@ -232,19 +203,18 @@ async fn three_fresh_members_bootstrap_join_and_cleanup() {
     let third_source_boundary = query_gtids(&sockets[1]).await;
     assert_group_sources(&third_source_boundary);
     manager
-        .join_third_member(
-            TopologyInstant::new(50),
-            &control_deadline(&attempt),
-            observation_context("source-third"),
-            observation_clock(&clock),
-        )
+        .join_third_member(observation_context("source-third"))
         .await
         .unwrap_or_else(|error| panic!("{error}"));
-    let final_credit = await_accepted(&mut manager, &clock, "third", 60)
+    let final_credit = await_accepted(&mut manager, "third")
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(manager.state(), MysqlTopologyState::Complete);
     assert_eq!(final_credit.members().len(), 3);
+    assert_exact_view_successor(
+        second_credit.view_id().as_str(),
+        final_credit.view_id().as_str(),
+    );
     assert!(third_source_boundary.is_subset_of(final_credit.executed()));
     assert_group_sources(final_credit.executed());
 
@@ -341,7 +311,7 @@ fn instance_config(
     timeouts: MysqlOperationTimeouts,
 ) -> MysqlInstanceConfig {
     let number = member_number(member);
-    MysqlInstanceConfig::new(
+    MysqlInstanceConfig::new_topology_member(
         MYSQLD,
         APPARMOR_EXEC,
         root.join(format!("member-{number}-data")),
@@ -361,14 +331,6 @@ fn member_number(member: MysqlMemberIndex) -> usize {
     }
 }
 
-fn control_deadline(attempt: &TopologyAttempt) -> NativeControlDeadline {
-    NativeControlDeadline::new(
-        attempt.id().clone(),
-        Instant::now() + Duration::from_secs(90),
-    )
-    .unwrap()
-}
-
 fn observation_context(label: &str) -> TopologyObservationContext {
     let serial = NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed);
     TopologyObservationContext::new(
@@ -384,32 +346,16 @@ fn observation_context(label: &str) -> TopologyObservationContext {
     )
 }
 
-fn observation_clock(clock: &LiveClock) -> ClockContext<LiveClock> {
-    let now = clock.now().tick();
-    let serial = NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed);
-    ClockContext::new(
-        clock.clone(),
-        ObservationInstant::new(now.saturating_add(10_000).saturating_add(serial)),
-    )
-    .unwrap()
-}
-
 async fn await_accepted(
     manager: &mut MysqlTopologyManager,
-    clock: &LiveClock,
     label: &str,
-    topology_tick: u64,
 ) -> Result<TransitionCredit, String> {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut poll = 0_u64;
     loop {
         poll = poll.saturating_add(1);
         let evaluation = manager
-            .observe_pending(
-                observation_context(&format!("{label}-{poll}")),
-                observation_clock(clock),
-                TopologyInstant::new(topology_tick.saturating_add(poll)),
-            )
+            .observe_pending(observation_context(&format!("{label}-{poll}")))
             .await
             .map_err(|error| error.to_string())?;
         match evaluation {
@@ -495,5 +441,27 @@ fn assert_group_sources(executed: &GtidSet) {
             .entries()
             .iter()
             .all(|entry| { entry.source().server_uuid().as_str() == GROUP_UUID })
+    );
+}
+
+fn assert_exact_view_successor(predecessor: &str, successor: &str) {
+    let (predecessor_fixed, predecessor_monotonic) = predecessor.split_once(':').unwrap();
+    let (successor_fixed, successor_monotonic) = successor.split_once(':').unwrap();
+    assert_eq!(
+        predecessor_fixed.parse::<u64>().unwrap().to_string(),
+        predecessor_fixed
+    );
+    assert_eq!(
+        successor_fixed.parse::<u64>().unwrap().to_string(),
+        successor_fixed
+    );
+    assert_eq!(predecessor_fixed, successor_fixed);
+    assert_eq!(
+        predecessor_monotonic
+            .parse::<u32>()
+            .unwrap()
+            .checked_add(1)
+            .unwrap(),
+        successor_monotonic.parse::<u32>().unwrap()
     );
 }

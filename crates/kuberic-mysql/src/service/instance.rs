@@ -313,7 +313,7 @@ impl MysqlInstanceManager {
 
     /// Creates exact minimum observer and recovery accounts through the owned
     /// private UDS, with account statements excluded from binary logging.
-    pub async fn provision_topology_accounts(
+    pub(crate) async fn provision_topology_accounts(
         &mut self,
         binding: MemberControlBinding,
         observer: &ControlCredential,
@@ -326,7 +326,7 @@ impl MysqlInstanceManager {
     }
 
     /// Enrolls `@@server_uuid` before this member enters any topology effect.
-    pub async fn enroll_topology_identity(
+    pub(crate) async fn enroll_topology_identity(
         &mut self,
         binding: MemberControlBinding,
         accounts: &AccountProvisioningEvidence,
@@ -338,19 +338,25 @@ impl MysqlInstanceManager {
 
     /// Enters the one designated bootstrap effect and proves bootstrap mode is
     /// off before returning effect evidence.
-    pub async fn bootstrap_group_replication(
+    pub(crate) async fn bootstrap_group_replication(
         &mut self,
         capability: BootstrapCapability,
         recovery: &ControlCredential,
         deadline: &NativeControlDeadline,
     ) -> Result<BootstrapEffect, MysqlTopologyError> {
         let target = self.prepare_control_target()?;
-        crate::service::control::bootstrap(target, capability, recovery, deadline).await
+        let mut containment = BootstrapCancellationContainment::new(self);
+        let result =
+            crate::service::control::bootstrap(target, capability, recovery, deadline).await;
+        if result.is_ok() {
+            containment.disarm();
+        }
+        result
     }
 
     /// Enters one non-bootstrap join with process-memory-only recovery
     /// credentials.
-    pub async fn join_group_replication(
+    pub(crate) async fn join_group_replication(
         &mut self,
         capability: JoinCapability,
         recovery: &ControlCredential,
@@ -362,7 +368,7 @@ impl MysqlInstanceManager {
 
     /// Discovers a proposed post-effect view without replacing enrollment or
     /// granting lifecycle credit.
-    pub async fn discover_topology_view(
+    pub(crate) async fn discover_topology_view(
         &mut self,
         enrollment: NativeIdentityEnrollment,
         group_name: GroupName,
@@ -438,6 +444,11 @@ impl MysqlInstanceManager {
     }
 
     fn prepare_control_target(&mut self) -> Result<OwnedControlTarget, MysqlTopologyError> {
+        if self.config.topology().is_none() {
+            return Err(MysqlTopologyError::TopologyState(
+                TopologyStateError::TopologyConfigurationRequired,
+            ));
+        }
         if self.state != MysqlInstanceState::Running {
             return Err(MysqlTopologyError::TopologyState(
                 TopologyStateError::InvalidTransition,
@@ -504,11 +515,13 @@ impl MysqlInstanceManager {
         .map_err(|_| MysqlTopologyError::OwnershipContextLoss)?;
         let storage = StorageBinding::new(format!("data:{}:{}", data.device(), data.inode()))
             .map_err(|_| MysqlTopologyError::OwnershipContextLoss)?;
-        let member_address = MemberAddress::new(self.config.member().sql_address().to_string())
+        let member = self.config.member();
+        let member_index = self.config.member_index();
+        let member_address = MemberAddress::new(member.sql_address().to_string())
             .map_err(|_| MysqlTopologyError::OwnershipContextLoss)?;
         Ok(MemberControlBinding::new(
             attempt,
-            self.config.member_index(),
+            member_index,
             process_session,
             endpoint,
             storage,
@@ -561,6 +574,32 @@ impl MysqlInstanceManager {
             self.scratch_root = None;
         }
         result
+    }
+}
+
+struct BootstrapCancellationContainment<'a> {
+    instance: &'a mut MysqlInstanceManager,
+    armed: bool,
+}
+
+impl<'a> BootstrapCancellationContainment<'a> {
+    fn new(instance: &'a mut MysqlInstanceManager) -> Self {
+        Self {
+            instance,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BootstrapCancellationContainment<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.instance.contain();
+        }
     }
 }
 
@@ -811,7 +850,7 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
         fs::create_dir(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
-        let config = MysqlInstanceConfig::new(
+        let config = MysqlInstanceConfig::new_topology_member(
             "/usr/bin/sleep",
             "/usr/bin/env",
             parent.join("data"),

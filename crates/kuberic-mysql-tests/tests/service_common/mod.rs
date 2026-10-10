@@ -48,11 +48,19 @@ impl TestRoot {
     }
 
     pub fn config(&self) -> MysqlInstanceConfig {
-        self.config_for_member_with_timeouts(MysqlMemberIndex::First, timeouts())
+        self.config_with_timeouts(timeouts())
     }
 
     pub fn config_with_timeouts(&self, timeouts: MysqlOperationTimeouts) -> MysqlInstanceConfig {
-        self.config_for_member_with_timeouts(MysqlMemberIndex::First, timeouts)
+        write_launcher(&self.launcher);
+        MysqlInstanceConfig::new(
+            "/usr/bin/sleep",
+            &self.launcher,
+            &self.data,
+            &self.scratch,
+            timeouts,
+        )
+        .unwrap()
     }
 
     pub fn config_for_member(&self, member_index: MysqlMemberIndex) -> MysqlInstanceConfig {
@@ -65,7 +73,7 @@ impl TestRoot {
         timeouts: MysqlOperationTimeouts,
     ) -> MysqlInstanceConfig {
         write_launcher(&self.launcher);
-        MysqlInstanceConfig::new(
+        MysqlInstanceConfig::new_topology_member(
             "/usr/bin/sleep",
             &self.launcher,
             &self.data,

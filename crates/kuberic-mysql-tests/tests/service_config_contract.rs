@@ -141,6 +141,25 @@ fn exact_three_member_render_is_unique_and_keeps_runtime_disposable() {
 }
 
 #[test]
+fn five_argument_constructor_preserves_the_single_instance_profile() {
+    let root = TestRoot::new("single-api");
+    let config = root.config();
+    let rendered = config.render_server_config();
+
+    assert!(config.topology().is_none());
+    assert!(rendered.contains("server-id=1\n"));
+    assert!(
+        rendered
+            .contains("loose-group-replication-group-name=cccccccc-cccc-cccc-cccc-cccccccccccc\n")
+    );
+    assert!(rendered.contains("loose-group-replication-local-address=127.0.0.1:33061\n"));
+    assert!(rendered.contains("loose-group-replication-group-seeds=127.0.0.1:33061\n"));
+    assert!(!rendered.contains("\nport="));
+    assert!(!rendered.contains("\nreport-host="));
+    assert!(!rendered.contains("\nreport-port="));
+}
+
+#[test]
 fn invalid_member_topology_values_are_rejected_precisely() {
     let seeds = [
         loopback_address(43061),
@@ -383,7 +402,7 @@ fn conflicting_three_member_topologies_are_rejected_precisely() {
 fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
     let root = TestRoot::new("paths");
     fs::create_dir(&root.data).unwrap();
-    let existing = MysqlInstanceConfig::new(
+    let existing = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         "/usr/bin/env",
         &root.data,
@@ -396,7 +415,7 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
     assert_eq!(existing, ConfigError::RootAlreadyExists);
     fs::remove_dir(&root.data).unwrap();
 
-    let overlap = MysqlInstanceConfig::new(
+    let overlap = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         "/usr/bin/env",
         &root.data,
@@ -410,7 +429,7 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
 
     let alias = root.root.join("alias");
     symlink("/usr/bin", &alias).unwrap();
-    let linked_binary = MysqlInstanceConfig::new(
+    let linked_binary = MysqlInstanceConfig::new_topology_member(
         alias.join("sleep"),
         "/usr/bin/env",
         &root.data,
@@ -422,7 +441,7 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
     .unwrap_err();
     assert_eq!(linked_binary, ConfigError::Symlink);
 
-    let lexical = MysqlInstanceConfig::new(
+    let lexical = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         "/usr/bin/env",
         root.root.join("missing").join("..").join("data"),
@@ -439,7 +458,7 @@ fn roots_must_be_fresh_distinct_normalized_and_non_symlinked() {
 fn overlapping_existing_parent_is_rejected_as_overlap() {
     let root = TestRoot::new("overlap");
     let nested = root.data.join("runtime");
-    let error = MysqlInstanceConfig::new(
+    let error = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         "/usr/bin/env",
         &root.data,
@@ -498,7 +517,7 @@ fn fresh_root_parent_must_be_private_and_owned_by_the_caller() {
     let public_parent = root.root.join("public");
     fs::create_dir(&public_parent).unwrap();
     fs::set_permissions(&public_parent, fs::Permissions::from_mode(0o777)).unwrap();
-    let public_error = MysqlInstanceConfig::new(
+    let public_error = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         "/usr/bin/env",
         public_parent.join("data"),
@@ -510,7 +529,7 @@ fn fresh_root_parent_must_be_private_and_owned_by_the_caller() {
     .unwrap_err();
     assert_eq!(public_error, ConfigError::InvalidRootParent);
 
-    let foreign_error = MysqlInstanceConfig::new(
+    let foreign_error = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         "/usr/bin/env",
         format!("/tmp/kms-foreign-data-{}", std::process::id()),
@@ -547,7 +566,7 @@ fn unsupported_product_identity_fails_and_releases_fresh_roots() {
     )
     .unwrap();
     fs::set_permissions(&root.launcher, fs::Permissions::from_mode(0o700)).unwrap();
-    let config = MysqlInstanceConfig::new(
+    let config = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         &root.launcher,
         &root.data,
@@ -588,7 +607,7 @@ fn ownership_race_faults_without_removing_an_unclaimed_root() {
 fn socket_path_must_fit_the_linux_unix_address() {
     let root = TestRoot::new("socket");
     let long = root.root.join("x".repeat(120));
-    let error = MysqlInstanceConfig::new(
+    let error = MysqlInstanceConfig::new_topology_member(
         "/usr/bin/sleep",
         "/usr/bin/env",
         &root.data,
@@ -605,7 +624,7 @@ fn socket_path_must_fit_the_linux_unix_address() {
 fn option_file_metacharacters_are_rejected_in_every_path() {
     let root = TestRoot::new("option");
     for suffix in ["hash#root", "back\\slash", "space root", "trailing "] {
-        let error = MysqlInstanceConfig::new(
+        let error = MysqlInstanceConfig::new_topology_member(
             "/usr/bin/sleep",
             "/usr/bin/env",
             root.root.join(suffix),

@@ -373,47 +373,57 @@ async fn bootstrap_with<C: ControlConnector>(
     let mut connection = connector.connect(&target, deadline).await?;
     let result = async {
         validate_product(&mut connection, deadline).await?;
-        execute(
+        let effect_deadline = reserve_cleanup_deadline(deadline, ControlStage::EnableBootstrap)?;
+        let enable = execute(
             &mut connection,
             "SET GLOBAL group_replication_bootstrap_group = ON",
-            deadline,
+            effect_deadline,
             ControlStage::EnableBootstrap,
         )
-        .await?;
-        let mut start = start_statement(recovery);
-        let primary = execute(
-            &mut connection,
-            start.as_str(),
-            deadline,
-            ControlStage::StartGroupReplication,
-        )
         .await;
-        start.clear();
-        let cleanup = execute(
+        let primary = match enable {
+            Ok(()) => {
+                let mut start = start_statement(recovery);
+                let result = execute(
+                    &mut connection,
+                    start.as_str(),
+                    effect_deadline,
+                    ControlStage::StartGroupReplication,
+                )
+                .await;
+                start.clear();
+                result
+            }
+            Err(error) => Err(error),
+        };
+        let disable = execute(
             &mut connection,
             "SET GLOBAL group_replication_bootstrap_group = OFF",
             deadline,
             ControlStage::DisableBootstrap,
         )
-        .await
-        .and_then(|()| {
-            if Instant::now() >= deadline {
-                Err(MysqlTopologyError::Deadline(
-                    ControlStage::ProveBootstrapDisabled,
-                ))
-            } else {
-                Ok(())
-            }
-        });
-        let cleanup = match cleanup {
-            Ok(()) => prove_bootstrap_off(&mut connection, deadline).await,
-            Err(error) => Err(error),
-        };
+        .await;
+        let proof = prove_bootstrap_off(&mut connection, deadline).await;
+        let cleanup = combine_primary_cleanup(disable, proof);
         combine_primary_cleanup(primary, cleanup)?;
         capability.record_effect(BootstrapEffect::required_steps().to_vec())
     }
     .await;
     disconnect(connection, result, deadline).await
+}
+
+fn reserve_cleanup_deadline(
+    deadline: Instant,
+    stage: ControlStage,
+) -> Result<Instant, MysqlTopologyError> {
+    let now = Instant::now();
+    let remaining = deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(MysqlTopologyError::Deadline(stage))?;
+    now.checked_add(remaining / 2)
+        .filter(|effect_deadline| *effect_deadline < deadline)
+        .ok_or(MysqlTopologyError::Deadline(stage))
 }
 
 pub(crate) async fn join(
@@ -1244,8 +1254,7 @@ mod tests {
             AttemptId::new("script-attempt").unwrap(),
             GroupName::new(GROUP_UUID).unwrap(),
             MysqlMemberIndex::First,
-            TopologyInstant::new(0),
-            TopologyInstant::new(100),
+            Duration::from_nanos(100),
         )
         .unwrap()
     }
@@ -1409,8 +1418,8 @@ mod tests {
             AttemptId::new("bootstrap-observation").unwrap(),
             ObservedLocalBinding::from_enrollment(&enrollments[0]),
             attempt.group_name().clone(),
-            ViewId::new("view-1").unwrap(),
-            ViewId::new("view-1").unwrap(),
+            ViewId::new("700:1").unwrap(),
+            ViewId::new("700:1").unwrap(),
             vec![NativeMember::new(
                 enrollments[0].member_id().clone(),
                 enrollments[0].binding().member_address().clone(),
@@ -1432,8 +1441,8 @@ mod tests {
             AttemptId::new("join-source-observation").unwrap(),
             ObservedLocalBinding::from_enrollment(&enrollments[0]),
             attempt.group_name().clone(),
-            ViewId::new("view-1").unwrap(),
-            ViewId::new("view-1").unwrap(),
+            ViewId::new("700:1").unwrap(),
+            ViewId::new("700:1").unwrap(),
             vec![NativeMember::new(
                 enrollments[0].member_id().clone(),
                 enrollments[0].binding().member_address().clone(),
@@ -1773,6 +1782,44 @@ mod tests {
         assert_closed(&authority, 0);
         connector.assert_complete(1, 1);
 
+        let socket = SocketFixture::new("bootstrap-ambiguous-enable");
+        let (authority, attempt, _enrollment, capability) = bootstrap_capability();
+        let (_, recovery) = test_credentials(&attempt);
+        let ambiguous = MysqlTopologyError::ControlTransport(ControlStage::EnableBootstrap);
+        let connector = ScriptConnector::new(
+            &socket.path,
+            vec![
+                product_query(MEMBER_UUIDS[0]),
+                failed_execute(
+                    ControlStage::EnableBootstrap,
+                    "SET GLOBAL group_replication_bootstrap_group = ON",
+                    ambiguous.clone(),
+                ),
+                execute_action(
+                    ControlStage::DisableBootstrap,
+                    "SET GLOBAL group_replication_bootstrap_group = OFF",
+                ),
+                query_action(
+                    ControlStage::ProveBootstrapDisabled,
+                    "SELECT @@GLOBAL.group_replication_bootstrap_group",
+                    ControlQueryResult::Unsigned8(0),
+                ),
+            ],
+        );
+        assert_eq!(
+            bootstrap_with(
+                &connector,
+                test_target(&socket, MysqlMemberIndex::First),
+                capability,
+                &recovery,
+                &test_deadline(&attempt),
+            )
+            .await,
+            Err(ambiguous)
+        );
+        assert_closed(&authority, 0);
+        connector.assert_complete(0, 1);
+
         let socket = SocketFixture::new("bootstrap-wrong-user");
         let (authority, attempt, _enrollment, capability) = bootstrap_capability();
         let wrong = ControlCredential::new(
@@ -1819,6 +1866,11 @@ mod tests {
                     ControlStage::DisableBootstrap,
                     "SET GLOBAL group_replication_bootstrap_group = OFF",
                     cleanup.clone(),
+                ),
+                query_action(
+                    ControlStage::ProveBootstrapDisabled,
+                    "SELECT @@GLOBAL.group_replication_bootstrap_group",
+                    ControlQueryResult::Unsigned8(0),
                 ),
             ],
         );

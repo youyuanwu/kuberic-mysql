@@ -24,6 +24,20 @@ credit remain in memory. Loss of manager ownership or topology-attempt context
 requires closed-access fixture reset even if surviving MySQL state appears
 healthy.
 
+The fresh-topology manager owns its monotonic clock and one absolute attempt
+deadline. Callers cannot replay, regress, or independently extend operation
+time with opaque ticks or per-call deadlines. Every control and observation
+deadline is derived beneath the attempt bound. Qualified XCom views are
+accepted only as the exact `<fixed u64>:<monotonic u32 + 1>` successor for a
+join, so foreign join/leave churn or member loss/rejoin cannot receive credit
+merely because final membership looks correct.
+
+Bootstrap cancellation remains restart-stateless but not uncontained. After
+any bootstrap-enable attempt, bootstrap-off and proof are attempted. If the
+public future is dropped while that asynchronous cleanup is incomplete, the
+retained ownership guard synchronously contains the exact topology before
+control returns; no query future is detached and no survivor is adopted.
+
 This design applies the ownership principle from the
 [PostgreSQL restart-stateless metadata proposal](https://github.com/youyuanwu/kuberic/blob/cfc27498ce1c67336d284e7b9c51813907e2efae/docs/features/postgres/stateless-metadata.md)
 to MySQL:

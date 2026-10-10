@@ -6,14 +6,15 @@ use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use common::{TestRoot, provide_socket};
+use common::{TestRoot, provide_socket, timeouts, topology};
 use kuberic_mysql::adapter::{
-    AdapterDiagnostic, ClockContext, ClockError, IdentityField, ObservationClock,
-    ObservationReport, ObservationRequest,
+    AdapterDiagnostic, ClockError, IdentityField, ObservationClock, ObservationReport,
+    ObservationRequest,
 };
 use kuberic_mysql::core::{
     AttemptId, AuthorityGeneration, BoundGtidSet, ConfigurationId, CredentialGeneration,
@@ -25,14 +26,15 @@ use kuberic_mysql::core::{
 };
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, BootstrapEffect, ControlCredential, ControlCredentialRole,
-    ControlStage, ControlStep, JoinEffect, MemberControlBinding, MysqlInstanceManager,
-    MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManager, MysqlTopologyManagerError,
-    MysqlTopologyMemberRuntime, MysqlTopologyState, NativeControlDeadline,
-    NativeIdentityEnrollment, ObservedLocalBinding, OwnershipError, SourceGtidBoundary,
-    TopologyAttempt, TopologyAuthority, TopologyAuthorityError, TopologyEvidenceError,
-    TopologyGtidError, TopologyInstant, TopologyNativeStateError, TopologyObservation,
-    TopologyObservationContext, TopologyObservationStatus, TopologyStateError, TransitionCredit,
-    TransitionEvaluation, ViewDiscovery,
+    ControlStage, ControlStep, JoinEffect, MemberControlBinding, MysqlInstanceConfig,
+    MysqlInstanceManager, MysqlMemberIndex, MysqlOwnedPathKind, MysqlTopologyError,
+    MysqlTopologyManager, MysqlTopologyManagerError, MysqlTopologyMemberRuntime,
+    MysqlTopologyState, NativeControlDeadline, NativeIdentityEnrollment, ObservedLocalBinding,
+    OwnershipError, SourceGtidBoundary, TopologyAttempt, TopologyAuthority, TopologyAuthorityError,
+    TopologyClock, TopologyEvidenceError, TopologyGtidError, TopologyInstant,
+    TopologyNativeStateError, TopologyObservation, TopologyObservationContext,
+    TopologyObservationStatus, TopologyStateError, TransitionCredit, TransitionEvaluation,
+    ViewDiscovery,
 };
 
 const GROUP_UUID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
@@ -41,6 +43,118 @@ const MEMBER_UUIDS: [&str; 3] = [
     "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
     "dddddddd-dddd-dddd-dddd-dddddddddddd",
 ];
+
+#[test]
+fn topology_manager_rejects_cross_member_paths_before_root_creation() {
+    for cross_kind in [false, true] {
+        let roots = [
+            TestRoot::new("paths-one"),
+            TestRoot::new("paths-two"),
+            TestRoot::new("paths-three"),
+        ];
+        let topology = topology();
+        for root in &roots {
+            let _ = root.config();
+        }
+        let first_data = roots[0].data.clone();
+        let first_scratch = roots[0].scratch.clone();
+        let second_data = if cross_kind {
+            first_scratch.clone()
+        } else {
+            first_data.clone()
+        };
+        let configs = [
+            MysqlInstanceConfig::new_topology_member(
+                "/usr/bin/sleep",
+                &roots[0].launcher,
+                &first_data,
+                &first_scratch,
+                topology.clone(),
+                MysqlMemberIndex::First,
+                timeouts(),
+            )
+            .unwrap(),
+            MysqlInstanceConfig::new_topology_member(
+                "/usr/bin/sleep",
+                &roots[1].launcher,
+                second_data,
+                &roots[1].scratch,
+                topology.clone(),
+                MysqlMemberIndex::Second,
+                timeouts(),
+            )
+            .unwrap(),
+            MysqlInstanceConfig::new_topology_member(
+                "/usr/bin/sleep",
+                &roots[2].launcher,
+                &roots[2].data,
+                &roots[2].scratch,
+                topology.clone(),
+                MysqlMemberIndex::Third,
+                timeouts(),
+            )
+            .unwrap(),
+        ];
+        let attempt = attempt("path-conflict", 5_000_000_000);
+        let (observer, recovery) = credentials(&attempt);
+        let result = MysqlTopologyManager::new(
+            configs.map(MysqlInstanceManager::new),
+            attempt,
+            observer,
+            recovery,
+        );
+        let error = match result {
+            Ok(_) => panic!("conflicting topology paths must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MysqlTopologyManagerError::PathConflict {
+                left_member: MysqlMemberIndex::First,
+                left_kind: MysqlOwnedPathKind::DataRoot | MysqlOwnedPathKind::ScratchRoot,
+                right_member: MysqlMemberIndex::Second,
+                right_kind: MysqlOwnedPathKind::DataRoot,
+            }
+        ));
+        for root in &roots {
+            assert!(!root.data.exists());
+            assert!(!root.scratch.exists());
+        }
+    }
+}
+
+#[test]
+fn topology_manager_requires_topology_specific_instance_construction() {
+    let roots = [
+        TestRoot::new("single-one"),
+        TestRoot::new("single-two"),
+        TestRoot::new("single-three"),
+    ];
+    let attempt = attempt("single-profile-rejected", 5_000_000_000);
+    let (observer, recovery) = credentials(&attempt);
+    let result = MysqlTopologyManager::new(
+        roots
+            .each_ref()
+            .map(|root| MysqlInstanceManager::new(root.config())),
+        attempt,
+        observer,
+        recovery,
+    );
+    let error = match result {
+        Ok(_) => panic!("single-instance profiles must not enter topology management"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        MysqlTopologyManagerError::Topology(MysqlTopologyError::TopologyState(
+            TopologyStateError::TopologyConfigurationRequired
+        ))
+    ));
+    for root in &roots {
+        assert!(!root.data.exists());
+        assert!(!root.scratch.exists());
+    }
+}
 
 #[test]
 fn manager_owns_exactly_three_existing_instances_and_cleans_initialized_layouts() {
@@ -54,7 +168,7 @@ fn manager_owns_exactly_three_existing_instances_and_cleans_initialized_layouts(
             roots[index].config_for_member(MysqlMemberIndex::all_for_test()[index]),
         )
     });
-    let topology_attempt = attempt("manager-layout-attempt", 100);
+    let topology_attempt = attempt("manager-layout-attempt", 5_000_000_000);
     let (observer, recovery) = credentials(&topology_attempt);
     let mut manager =
         MysqlTopologyManager::new(instances, topology_attempt, observer, recovery).unwrap();
@@ -112,7 +226,7 @@ fn manager_initialization_failure_contains_prior_members_without_starting_later_
         )
     });
     fs::set_permissions(&roots[1].launcher, fs::Permissions::from_mode(0o600)).unwrap();
-    let topology_attempt = attempt("manager-init-failure", 100);
+    let topology_attempt = attempt("manager-init-failure", 5_000_000_000);
     let (observer, recovery) = credentials(&topology_attempt);
     let mut manager =
         MysqlTopologyManager::new(instances, topology_attempt, observer, recovery).unwrap();
@@ -152,7 +266,7 @@ fn manager_stop_aggregates_every_member_cleanup_failure() {
             roots[index].config_for_member(MysqlMemberIndex::all_for_test()[index]),
         )
     });
-    let topology_attempt = attempt("manager-cleanup-failure", 100);
+    let topology_attempt = attempt("manager-cleanup-failure", 5_000_000_000);
     let (observer, recovery) = credentials(&topology_attempt);
     let mut manager =
         MysqlTopologyManager::new(instances, topology_attempt, observer, recovery).unwrap();
@@ -472,8 +586,8 @@ fn designated_bootstrap_is_single_use_and_bootstrap_off_is_required() {
         &attempt("topology-attempt", 100),
         &enrollments[0],
         "bootstrap-observation",
-        "view-1",
-        "view-1",
+        "700:1",
+        "700:1",
         vec![native(
             &enrollments[0],
             MemberRole::Primary,
@@ -552,8 +666,8 @@ fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
         &attempt("topology-attempt", 100),
         &enrollments[1],
         "join-two-observation",
-        "view-2",
-        "view-2",
+        "700:2",
+        "700:2",
         vec![
             native(&enrollments[0], MemberRole::Primary, MemberState::Online),
             native(
@@ -590,8 +704,8 @@ fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
         &attempt("topology-attempt", 100),
         &enrollments[1],
         online_attempt.as_str(),
-        "view-2",
-        "view-2",
+        "700:2",
+        "700:2",
         vec![
             native(&enrollments[0], MemberRole::Primary, MemberState::Online),
             native(&enrollments[1], MemberRole::Secondary, MemberState::Online),
@@ -622,8 +736,8 @@ fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
         &attempt("topology-attempt", 100),
         &enrollments[2],
         "join-three-observation",
-        "view-3",
-        "view-3",
+        "700:3",
+        "700:3",
         vec![
             native(&enrollments[0], MemberRole::Primary, MemberState::Online),
             native(&enrollments[1], MemberRole::Secondary, MemberState::Online),
@@ -641,6 +755,87 @@ fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
     assert_eq!(final_credit.members().len(), 3);
     assert_eq!(authority.final_credit(), Some(&final_credit));
     assert_closed_no_credit(&authority, 3);
+}
+
+#[test]
+fn join_requires_the_exact_qualified_xcom_successor_view() {
+    for (view, expected) in [
+        ("not-qualified", TopologyStateError::MalformedViewId),
+        ("0700:2", TopologyStateError::MalformedViewId),
+        ("700:4294967296", TopologyStateError::MalformedViewId),
+        ("701:2", TopologyStateError::ViewFixedPartChanged),
+        ("700:3", TopologyStateError::ViewSequenceNotSuccessor),
+        ("700:0", TopologyStateError::ViewSequenceNotSuccessor),
+        ("700:1", TopologyStateError::ViewSequenceNotSuccessor),
+    ] {
+        let (mut authority, enrollments, predecessor) = accepted_bootstrap();
+        let join = authority
+            .authorize_join(
+                MysqlMemberIndex::Second,
+                boundary(&predecessor, &enrollments[0]),
+                TopologyInstant::new(30),
+            )
+            .unwrap();
+        let effect = join
+            .record_effect(JoinEffect::required_steps().to_vec())
+            .unwrap()
+            .bind_observation_attempt(AttemptId::new("join-two-observation").unwrap());
+        let evidence = join_two_observation_with_view(&enrollments, "1-6", view);
+        assert_eq!(
+            authority.accept_join(&effect, &evidence, TopologyInstant::new(45)),
+            Err(MysqlTopologyError::TopologyState(expected)),
+            "{view}"
+        );
+        assert_closed_no_credit(&authority, 1);
+    }
+
+    let (mut authority, enrollments, predecessor) = accepted_bootstrap_with_view("700:4294967295");
+    let join = authority
+        .authorize_join(
+            MysqlMemberIndex::Second,
+            boundary(&predecessor, &enrollments[0]),
+            TopologyInstant::new(30),
+        )
+        .unwrap();
+    let effect = join
+        .record_effect(JoinEffect::required_steps().to_vec())
+        .unwrap()
+        .bind_observation_attempt(AttemptId::new("join-two-observation").unwrap());
+    let evidence = join_two_observation_with_view(&enrollments, "1-6", "700:4294967295");
+    assert_eq!(
+        authority.accept_join(&effect, &evidence, TopologyInstant::new(45)),
+        Err(MysqlTopologyError::TopologyState(
+            TopologyStateError::ViewSequenceOverflow
+        ))
+    );
+    assert_closed_no_credit(&authority, 1);
+}
+
+#[test]
+fn skipped_views_after_foreign_churn_or_member_rejoin_receive_no_credit() {
+    for scenario in ["foreign-join-leave", "member-loss-rejoin"] {
+        let (mut authority, enrollments, predecessor) = accepted_bootstrap();
+        let join = authority
+            .authorize_join(
+                MysqlMemberIndex::Second,
+                boundary(&predecessor, &enrollments[0]),
+                TopologyInstant::new(30),
+            )
+            .unwrap();
+        let effect = join
+            .record_effect(JoinEffect::required_steps().to_vec())
+            .unwrap()
+            .bind_observation_attempt(AttemptId::new("join-two-observation").unwrap());
+        let apparently_correct = join_two_observation_with_view(&enrollments, "1-6", "700:3");
+        assert_eq!(
+            authority.accept_join(&effect, &apparently_correct, TopologyInstant::new(45)),
+            Err(MysqlTopologyError::TopologyState(
+                TopologyStateError::ViewSequenceNotSuccessor
+            )),
+            "{scenario}"
+        );
+        assert_closed_no_credit(&authority, 1);
+    }
 }
 
 #[test]
@@ -722,8 +917,8 @@ fn non_group_gtid_sources_and_wrong_source_bindings_fail_before_join_effect() {
         &attempt("topology-attempt", 100),
         &enrollments[0],
         "bootstrap-observation",
-        "view-1",
-        "view-1",
+        "700:1",
+        "700:1",
         vec![native(
             &enrollments[0],
             MemberRole::Primary,
@@ -825,8 +1020,8 @@ fn fail_closed_collection_product_native_state_and_deadline_matrix() {
             &attempt("topology-attempt", 100),
             &enrollments[0],
             "bootstrap-observation",
-            "view-1",
-            "view-1",
+            "700:1",
+            "700:1",
             vec![native(
                 &enrollments[0],
                 MemberRole::Primary,
@@ -852,8 +1047,8 @@ fn fail_closed_collection_product_native_state_and_deadline_matrix() {
             &attempt("topology-attempt", 100),
             &enrollments[0],
             "bootstrap-observation",
-            "view-1",
-            "view-1",
+            "700:1",
+            "700:1",
             vec![native(&enrollments[0], MemberRole::Primary, state)],
             group_gtids("1"),
             TopologyObservationStatus::Complete,
@@ -877,8 +1072,8 @@ fn fail_closed_collection_product_native_state_and_deadline_matrix() {
         &attempt("topology-attempt", 100),
         &enrollments[0],
         "bootstrap-observation",
-        "view-1",
-        "view-1",
+        "700:1",
+        "700:1",
         vec![native(
             &enrollments[0],
             MemberRole::Primary,
@@ -901,8 +1096,8 @@ fn local_role_semantics_are_exact_and_recovery_never_grants_early_credit() {
         &attempt("topology-attempt", 100),
         &enrollments[0],
         "bootstrap-observation",
-        "view-1",
-        "view-1",
+        "700:1",
+        "700:1",
         vec![native(
             &enrollments[0],
             MemberRole::Secondary,
@@ -936,8 +1131,8 @@ fn local_role_semantics_are_exact_and_recovery_never_grants_early_credit() {
         &attempt("topology-attempt", 100),
         &enrollments[1],
         "join-two-observation",
-        "view-2",
-        "view-2",
+        "700:2",
+        "700:2",
         vec![
             native(&enrollments[0], MemberRole::Primary, MemberState::Online),
             native(&enrollments[1], MemberRole::Primary, MemberState::Online),
@@ -970,8 +1165,8 @@ fn local_role_semantics_are_exact_and_recovery_never_grants_early_credit() {
         &attempt("topology-attempt", 100),
         &enrollments[1],
         "join-two-observation",
-        "view-2",
-        "view-2",
+        "700:2",
+        "700:2",
         vec![
             native(&enrollments[0], MemberRole::Primary, MemberState::Offline),
             native(&enrollments[1], MemberRole::Secondary, MemberState::Online),
@@ -996,13 +1191,13 @@ fn discovery_retains_enrollment_and_cannot_replace_owned_bindings() {
     let discovery = ViewDiscovery::new(
         enrollment.clone(),
         attempt.group_name().clone(),
-        ViewId::new("view-proposal").unwrap(),
+        ViewId::new("700:9").unwrap(),
         ViewDiscovery::required_steps().to_vec(),
     )
     .unwrap();
     assert_eq!(discovery.enrollment(), &enrollment);
     assert_eq!(discovery.group_name(), attempt.group_name());
-    assert_eq!(discovery.view_id().as_str(), "view-proposal");
+    assert_eq!(discovery.view_id().as_str(), "700:9");
 }
 
 #[test]
@@ -1060,7 +1255,7 @@ fn negative_evidence(
     let mut local = ObservedLocalBinding::from_enrollment(target);
     let mut members = vec![native(target, MemberRole::Primary, MemberState::Online)];
     let mut observation_attempt = AttemptId::new("bootstrap-observation").unwrap();
-    let view_id = ViewId::new("view-1").unwrap();
+    let view_id = ViewId::new("700:1").unwrap();
     let mut binding_view_id = view_id.clone();
     match case {
         NegativeCase::WrongUuid => {
@@ -1113,7 +1308,7 @@ fn negative_evidence(
             );
         }
         NegativeCase::CrossView => {
-            binding_view_id = ViewId::new("other-view").unwrap();
+            binding_view_id = ViewId::new("701:1").unwrap();
         }
     }
     TopologyObservation::new(
@@ -1184,6 +1379,37 @@ fn accepted_bootstrap_with_history(
     (authority, enrollments, credit)
 }
 
+fn accepted_bootstrap_with_view(
+    view: &str,
+) -> (
+    TopologyAuthority,
+    [NativeIdentityEnrollment; 3],
+    TransitionCredit,
+) {
+    let (mut authority, enrollments, effect) = bootstrap_in_flight();
+    let evidence = observation(
+        &attempt("topology-attempt", 100),
+        &enrollments[0],
+        "bootstrap-observation",
+        view,
+        view,
+        vec![native(
+            &enrollments[0],
+            MemberRole::Primary,
+            MemberState::Online,
+        )],
+        group_gtids("1"),
+        TopologyObservationStatus::Complete,
+        TopologyInstant::new(20),
+    );
+    let credit = accepted(
+        authority
+            .accept_bootstrap(&effect, &evidence, TopologyInstant::new(21))
+            .unwrap(),
+    );
+    (authority, enrollments, credit)
+}
+
 fn bootstrap_observation(enrollments: &[NativeIdentityEnrollment; 3]) -> TopologyObservation {
     bootstrap_observation_with_history(enrollments, "1")
 }
@@ -1196,8 +1422,8 @@ fn bootstrap_observation_with_history(
         &attempt("topology-attempt", 100),
         &enrollments[0],
         "bootstrap-observation",
-        "view-1",
-        "view-1",
+        "700:1",
+        "700:1",
         vec![native(
             &enrollments[0],
             MemberRole::Primary,
@@ -1213,12 +1439,20 @@ fn join_two_observation(
     enrollments: &[NativeIdentityEnrollment; 3],
     history: &str,
 ) -> TopologyObservation {
+    join_two_observation_with_view(enrollments, history, "700:2")
+}
+
+fn join_two_observation_with_view(
+    enrollments: &[NativeIdentityEnrollment; 3],
+    history: &str,
+    view: &str,
+) -> TopologyObservation {
     observation(
         &attempt("topology-attempt", 100),
         &enrollments[1],
         "join-two-observation",
-        "view-2",
-        "view-2",
+        view,
+        view,
         vec![
             native(&enrollments[0], MemberRole::Primary, MemberState::Online),
             native(&enrollments[1], MemberRole::Secondary, MemberState::Online),
@@ -1234,8 +1468,7 @@ fn attempt(id: &str, deadline: u64) -> TopologyAttempt {
         AttemptId::new(id).unwrap(),
         GroupName::new(GROUP_UUID).unwrap(),
         MysqlMemberIndex::First,
-        TopologyInstant::new(0),
-        TopologyInstant::new(deadline),
+        Duration::from_nanos(deadline),
     )
     .unwrap()
 }
@@ -1450,6 +1683,8 @@ enum ScriptFailure {
     None,
     Initialize(MysqlMemberIndex),
     Bootstrap,
+    BootstrapPending,
+    DiscoveryPending,
     Join(MysqlMemberIndex),
     PostEffectObservation,
     SourceBinding,
@@ -1482,37 +1717,37 @@ impl ScriptState {
             plans: VecDeque::from([
                 ObservationPlan {
                     member: MysqlMemberIndex::First,
-                    view: "view-1",
+                    view: "700:1",
                     states: vec![MemberState::Online],
                     history: "1",
                 },
                 ObservationPlan {
                     member: MysqlMemberIndex::First,
-                    view: "view-1",
+                    view: "700:1",
                     states: vec![MemberState::Online],
                     history: "1-2",
                 },
                 ObservationPlan {
                     member: MysqlMemberIndex::Second,
-                    view: "view-2",
+                    view: "700:2",
                     states: vec![MemberState::Online, MemberState::Recovering],
                     history: "1-2",
                 },
                 ObservationPlan {
                     member: MysqlMemberIndex::Second,
-                    view: "view-2",
+                    view: "700:2",
                     states: vec![MemberState::Online, MemberState::Online],
                     history: "1-3",
                 },
                 ObservationPlan {
                     member: MysqlMemberIndex::Second,
-                    view: "view-2",
+                    view: "700:2",
                     states: vec![MemberState::Online, MemberState::Online],
                     history: "1-4",
                 },
                 ObservationPlan {
                     member: MysqlMemberIndex::Third,
-                    view: "view-3",
+                    view: "700:3",
                     states: vec![
                         MemberState::Online,
                         MemberState::Online,
@@ -1653,14 +1888,19 @@ impl MysqlTopologyMemberRuntime for ScriptedMember {
         _recovery: &ControlCredential,
         _deadline: &NativeControlDeadline,
     ) -> Result<BootstrapEffect, MysqlTopologyError> {
-        let mut state = self.state.lock().unwrap();
-        state.events.push("bootstrap".to_owned());
-        if state.failure == ScriptFailure::Bootstrap {
+        let failure = {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("bootstrap".to_owned());
+            state.failure
+        };
+        if failure == ScriptFailure::Bootstrap {
             return Err(MysqlTopologyError::ControlProtocol(
                 ControlStage::StartGroupReplication,
             ));
         }
-        drop(state);
+        if failure == ScriptFailure::BootstrapPending {
+            return std::future::pending().await;
+        }
         capability.record_effect(BootstrapEffect::required_steps().to_vec())
     }
 
@@ -1691,10 +1931,15 @@ impl MysqlTopologyMemberRuntime for ScriptedMember {
         group_name: GroupName,
         _deadline: &NativeControlDeadline,
     ) -> Result<ViewDiscovery, MysqlTopologyError> {
+        if self.state.lock().unwrap().failure == ScriptFailure::DiscoveryPending
+            && self.member() == MysqlMemberIndex::First
+        {
+            return std::future::pending().await;
+        }
         let view = match self.member() {
-            MysqlMemberIndex::First => "view-1",
-            MysqlMemberIndex::Second => "view-2",
-            MysqlMemberIndex::Third => "view-3",
+            MysqlMemberIndex::First => "700:1",
+            MysqlMemberIndex::Second => "700:2",
+            MysqlMemberIndex::Third => "700:3",
         };
         ViewDiscovery::new(
             enrollment,
@@ -1755,37 +2000,63 @@ impl MysqlTopologyMemberRuntime for ScriptedMember {
 
 #[derive(Clone)]
 struct ScriptClock {
-    now: ObservationInstant,
-    base: Instant,
+    now: Arc<AtomicU64>,
+    future_dated: Arc<AtomicBool>,
 }
 
 impl ScriptClock {
     fn new(now: u64) -> Self {
         Self {
-            now: ObservationInstant::new(now),
-            base: Instant::now(),
+            now: Arc::new(AtomicU64::new(now)),
+            future_dated: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn regress_to(&self, now: u64) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+
+    fn advance_to(&self, now: u64) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+
+    fn make_future_dated(&self) {
+        self.future_dated.store(true, Ordering::SeqCst);
     }
 }
 
-impl ObservationClock for ScriptClock {
+impl TopologyClock for ScriptClock {
     fn now(&self) -> ObservationInstant {
-        self.now
+        ObservationInstant::new(self.now.fetch_add(1, Ordering::SeqCst))
     }
 
     fn to_std_instant(&self, instant: ObservationInstant) -> Result<Instant, ClockError> {
-        let delta = instant
-            .tick()
-            .checked_sub(self.now.tick())
-            .ok_or(ClockError::UnrepresentableInstant)?;
-        self.base
-            .checked_add(Duration::from_secs(delta))
+        if self.future_dated.load(Ordering::SeqCst)
+            && instant.tick() <= self.now.load(Ordering::SeqCst)
+        {
+            return Instant::now()
+                .checked_add(Duration::from_secs(1))
+                .ok_or(ClockError::UnrepresentableInstant);
+        }
+        let current = self.now.load(Ordering::SeqCst);
+        let delta = instant.tick().saturating_sub(current);
+        Instant::now()
+            .checked_add(Duration::from_nanos(delta))
             .ok_or(ClockError::UnrepresentableInstant)
     }
-}
 
-fn observation_clock(now: u64, deadline: u64) -> ClockContext<ScriptClock> {
-    ClockContext::new(ScriptClock::new(now), ObservationInstant::new(deadline)).unwrap()
+    fn deadline_after(
+        &self,
+        now: ObservationInstant,
+        timeout: Duration,
+    ) -> Result<ObservationInstant, ClockError> {
+        let delta =
+            u64::try_from(timeout.as_nanos()).map_err(|_| ClockError::UnrepresentableInstant)?;
+        now.tick()
+            .checked_add(delta)
+            .map(ObservationInstant::new)
+            .ok_or(ClockError::UnrepresentableInstant)
+    }
 }
 
 fn observation_context(label: &str) -> TopologyObservationContext {
@@ -1800,14 +2071,6 @@ fn observation_context(label: &str) -> TopologyObservationContext {
         AuthorityGeneration::new("authority").unwrap(),
         format!("script-{label}"),
     )
-}
-
-fn control_deadline(attempt: &TopologyAttempt) -> NativeControlDeadline {
-    NativeControlDeadline::new(
-        attempt.id().clone(),
-        Instant::now() + Duration::from_secs(5),
-    )
-    .unwrap()
 }
 
 fn valid_report<C: ObservationClock>(
@@ -1899,6 +2162,7 @@ fn scripted_manager(
     [TestRoot; 3],
     Arc<Mutex<ScriptState>>,
     TopologyAttempt,
+    ScriptClock,
 ) {
     let roots = [
         TestRoot::new(&format!("{label}-one")),
@@ -1914,33 +2178,33 @@ fn scripted_manager(
             Arc::clone(&state),
         )
     });
-    let attempt = attempt(&format!("script-{label}"), 100);
+    let attempt = attempt(&format!("script-{label}"), 5_000_000_000);
     let (observer, recovery) = credentials(&attempt);
+    let clock = ScriptClock::new(1);
     (
-        MysqlTopologyManager::new(members, attempt.clone(), observer, recovery).unwrap(),
+        MysqlTopologyManager::new_with_clock(
+            members,
+            attempt.clone(),
+            observer,
+            recovery,
+            Arc::new(clock.clone()),
+        )
+        .unwrap(),
         roots,
         state,
         attempt,
+        clock,
     )
 }
 
 async fn accept_bootstrap_public(
     manager: &mut MysqlTopologyManager<ScriptedMember>,
-    attempt: &TopologyAttempt,
 ) -> Result<(), MysqlTopologyManagerError> {
     manager.initialize()?;
-    manager
-        .start_designated_member(&control_deadline(attempt))
-        .await?;
-    manager
-        .bootstrap(TopologyInstant::new(10), &control_deadline(attempt))
-        .await?;
+    manager.start_designated_member().await?;
+    manager.bootstrap().await?;
     let evaluation = manager
-        .observe_pending(
-            observation_context("bootstrap"),
-            observation_clock(100, 110),
-            TopologyInstant::new(20),
-        )
+        .observe_pending(observation_context("bootstrap"))
         .await?;
     assert!(matches!(evaluation, TransitionEvaluation::Accepted(_)));
     Ok(())
@@ -1948,33 +2212,17 @@ async fn accept_bootstrap_public(
 
 async fn accept_second_public(
     manager: &mut MysqlTopologyManager<ScriptedMember>,
-    attempt: &TopologyAttempt,
 ) -> Result<(), MysqlTopologyManagerError> {
+    manager.start_second_member().await?;
     manager
-        .start_second_member(&control_deadline(attempt))
-        .await?;
-    manager
-        .join_second_member(
-            TopologyInstant::new(30),
-            &control_deadline(attempt),
-            observation_context("source-second"),
-            observation_clock(120, 130),
-        )
+        .join_second_member(observation_context("source-second"))
         .await?;
     let pending = manager
-        .observe_pending(
-            observation_context("second-pending"),
-            observation_clock(140, 150),
-            TopologyInstant::new(40),
-        )
+        .observe_pending(observation_context("second-pending"))
         .await?;
     assert_eq!(pending, TransitionEvaluation::Pending);
     let accepted = manager
-        .observe_pending(
-            observation_context("second-online"),
-            observation_clock(151, 160),
-            TopologyInstant::new(41),
-        )
+        .observe_pending(observation_context("second-online"))
         .await?;
     assert!(matches!(accepted, TransitionEvaluation::Accepted(_)));
     Ok(())
@@ -1982,25 +2230,13 @@ async fn accept_second_public(
 
 async fn accept_third_public(
     manager: &mut MysqlTopologyManager<ScriptedMember>,
-    attempt: &TopologyAttempt,
 ) -> Result<(), MysqlTopologyManagerError> {
+    manager.start_third_member().await?;
     manager
-        .start_third_member(&control_deadline(attempt))
-        .await?;
-    manager
-        .join_third_member(
-            TopologyInstant::new(50),
-            &control_deadline(attempt),
-            observation_context("source-third"),
-            observation_clock(170, 180),
-        )
+        .join_third_member(observation_context("source-third"))
         .await?;
     let accepted = manager
-        .observe_pending(
-            observation_context("third-online"),
-            observation_clock(190, 200),
-            TopologyInstant::new(60),
-        )
+        .observe_pending(observation_context("third-online"))
         .await?;
     assert!(matches!(accepted, TransitionEvaluation::Accepted(_)));
     Ok(())
@@ -2022,7 +2258,7 @@ fn assert_script_cleanup(manager: &MysqlTopologyManager<ScriptedMember>, roots: 
 
 #[tokio::test]
 async fn public_manager_flow_uses_fresh_source_and_pending_observation_attempts() {
-    let (mut manager, roots, state, attempt) =
+    let (mut manager, roots, state, _attempt, _clock) =
         scripted_manager("public-happy", ScriptFailure::None);
     for member in manager.members() {
         TcpStream::connect(member.config().member().group_replication_address()).unwrap();
@@ -2030,11 +2266,9 @@ async fn public_manager_flow_uses_fresh_source_and_pending_observation_attempts(
     let foreign = roots[0].root.join("foreign-resource");
     fs::write(&foreign, "untouched").unwrap();
 
-    accept_bootstrap_public(&mut manager, &attempt)
-        .await
-        .unwrap();
-    accept_second_public(&mut manager, &attempt).await.unwrap();
-    accept_third_public(&mut manager, &attempt).await.unwrap();
+    accept_bootstrap_public(&mut manager).await.unwrap();
+    accept_second_public(&mut manager).await.unwrap();
+    accept_third_public(&mut manager).await.unwrap();
     assert_eq!(manager.state(), MysqlTopologyState::Complete);
     assert_eq!(
         manager
@@ -2058,7 +2292,7 @@ async fn public_manager_flow_uses_fresh_source_and_pending_observation_attempts(
     assert_eq!(state.boundary_attempts[0], state.attempts[1]);
     assert_eq!(state.boundary_attempts[1], state.attempts[4]);
     assert_ne!(state.attempts[2], state.attempts[3]);
-    assert!(state.deadlines[3] > state.deadlines[2]);
+    assert!(state.deadlines.windows(2).all(|pair| pair[0] == pair[1]));
     for (join, source) in [
         ("join:Second", "observe:First:"),
         ("join:Third", "observe:Second:"),
@@ -2097,7 +2331,7 @@ async fn public_manager_failures_invalidate_and_contain_every_allocated_endpoint
         ScriptFailure::SourceBinding,
         ScriptFailure::ContextLoss,
     ] {
-        let (mut manager, roots, _state, attempt) =
+        let (mut manager, roots, _state, _attempt, _clock) =
             scripted_manager(&format!("failure-{failure:?}"), failure);
         let foreign = roots[0].root.join("foreign-resource");
         fs::write(&foreign, "untouched").unwrap();
@@ -2105,9 +2339,9 @@ async fn public_manager_failures_invalidate_and_contain_every_allocated_endpoint
             TcpStream::connect(member.config().member().group_replication_address()).unwrap();
         }
         let result = async {
-            accept_bootstrap_public(&mut manager, &attempt).await?;
-            accept_second_public(&mut manager, &attempt).await?;
-            accept_third_public(&mut manager, &attempt).await
+            accept_bootstrap_public(&mut manager).await?;
+            accept_second_public(&mut manager).await?;
+            accept_third_public(&mut manager).await
         }
         .await;
         assert!(result.is_err(), "{failure:?}");
@@ -2130,12 +2364,9 @@ async fn public_manager_failures_invalidate_and_contain_every_allocated_endpoint
 
 #[tokio::test]
 async fn invalid_state_failure_invalidates_context_and_prevents_later_use() {
-    let (mut manager, roots, _state, attempt) =
+    let (mut manager, roots, _state, _attempt, _clock) =
         scripted_manager("invalid-state", ScriptFailure::None);
-    let error = manager
-        .start_designated_member(&control_deadline(&attempt))
-        .await
-        .unwrap_err();
+    let error = manager.start_designated_member().await.unwrap_err();
     assert!(matches!(
         error,
         MysqlTopologyManagerError::InvalidState {
@@ -2150,202 +2381,153 @@ async fn invalid_state_failure_invalidates_context_and_prevents_later_use() {
 }
 
 #[tokio::test]
-async fn pending_poll_reused_deadline_fails_closed_and_cannot_reuse_operation() {
-    let (mut manager, roots, state, attempt) =
-        scripted_manager("reused-deadline", ScriptFailure::None);
-    accept_bootstrap_public(&mut manager, &attempt)
-        .await
-        .unwrap();
+async fn cancelling_public_bootstrap_at_each_await_contains_the_exact_topology() {
+    for failure in [
+        ScriptFailure::BootstrapPending,
+        ScriptFailure::DiscoveryPending,
+    ] {
+        let (mut manager, roots, state, _attempt, _clock) =
+            scripted_manager(&format!("cancel-{failure:?}"), failure);
+        manager.initialize().unwrap();
+        manager.start_designated_member().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), manager.bootstrap())
+                .await
+                .is_err(),
+            "{failure:?}"
+        );
+        assert_eq!(manager.state(), MysqlTopologyState::Failed);
+        assert!(manager.accepted_topology().is_none());
+        assert!(!manager.read_access_open());
+        assert!(!manager.write_access_open());
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event == "bootstrap")
+        );
+        assert_script_cleanup(&manager, &roots);
+    }
+}
+
+#[tokio::test]
+async fn pending_polls_share_one_manager_deadline_with_fresh_attempts() {
+    let (mut manager, roots, state, _attempt, _clock) =
+        scripted_manager("manager-deadline", ScriptFailure::None);
+    accept_bootstrap_public(&mut manager).await.unwrap();
+    manager.start_second_member().await.unwrap();
     manager
-        .start_second_member(&control_deadline(&attempt))
-        .await
-        .unwrap();
-    manager
-        .join_second_member(
-            TopologyInstant::new(30),
-            &control_deadline(&attempt),
-            observation_context("source-reused-deadline"),
-            observation_clock(120, 130),
-        )
+        .join_second_member(observation_context("source-manager-deadline"))
         .await
         .unwrap();
     assert_eq!(
         manager
-            .observe_pending(
-                observation_context("pending-reused-deadline"),
-                observation_clock(140, 150),
-                TopologyInstant::new(40),
-            )
+            .observe_pending(observation_context("pending-manager-deadline"))
             .await
             .unwrap(),
         TransitionEvaluation::Pending
     );
-    let error = manager
-        .observe_pending(
-            observation_context("reused-deadline"),
-            observation_clock(141, 150),
-            TopologyInstant::new(41),
-        )
-        .await
-        .unwrap_err();
+    assert!(matches!(
+        manager
+            .observe_pending(observation_context("accepted-manager-deadline"))
+            .await
+            .unwrap(),
+        TransitionEvaluation::Accepted(_)
+    ));
+    let state = state.lock().unwrap();
+    assert_eq!(state.attempts.len(), 4);
+    assert_eq!(state.attempts.iter().collect::<HashSet<_>>().len(), 4);
+    assert!(state.deadlines.windows(2).all(|pair| pair[0] == pair[1]));
+    drop(state);
+    manager.stop().unwrap();
+    assert_script_cleanup(&manager, &roots);
+}
+
+#[tokio::test]
+async fn manager_clock_regression_fails_closed_before_control() {
+    let (mut manager, roots, state, _attempt, clock) =
+        scripted_manager("clock-regression", ScriptFailure::None);
+    accept_bootstrap_public(&mut manager).await.unwrap();
+    clock.regress_to(0);
+    let error = manager.start_second_member().await.unwrap_err();
     assert!(matches!(
         error,
         MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
-            TopologyEvidenceError::BindingMismatch
+            TopologyEvidenceError::ClockRegression
         ))
     ));
     assert_eq!(manager.state(), MysqlTopologyState::Failed);
-    assert!(manager.accepted_topology().is_none());
-    assert_eq!(state.lock().unwrap().attempts.len(), 3);
     assert!(
-        manager
-            .observe_pending(
-                observation_context("stale-operation"),
-                observation_clock(151, 160),
-                TopologyInstant::new(42),
-            )
-            .await
-            .is_err()
+        state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event != "start:Second")
     );
     assert_script_cleanup(&manager, &roots);
 }
 
 #[tokio::test]
-async fn pending_poll_smaller_deadline_fails_closed_without_observation_credit() {
-    let (mut manager, roots, state, attempt) =
-        scripted_manager("regressed-deadline", ScriptFailure::None);
-    accept_bootstrap_public(&mut manager, &attempt)
-        .await
-        .unwrap();
-    manager
-        .start_second_member(&control_deadline(&attempt))
-        .await
-        .unwrap();
-    manager
-        .join_second_member(
-            TopologyInstant::new(30),
-            &control_deadline(&attempt),
-            observation_context("source-regressed-deadline"),
-            observation_clock(120, 130),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        manager
-            .observe_pending(
-                observation_context("pending-regressed-deadline"),
-                observation_clock(140, 150),
-                TopologyInstant::new(40),
-            )
-            .await
-            .unwrap(),
-        TransitionEvaluation::Pending
-    );
-
-    let error = manager
-        .observe_pending(
-            observation_context("regressed-deadline"),
-            observation_clock(141, 149),
-            TopologyInstant::new(41),
-        )
-        .await
-        .unwrap_err();
-
+async fn future_dated_manager_clock_fails_closed_before_control() {
+    let (mut manager, roots, state, _attempt, clock) =
+        scripted_manager("future-clock", ScriptFailure::None);
+    accept_bootstrap_public(&mut manager).await.unwrap();
+    clock.make_future_dated();
+    let error = manager.start_second_member().await.unwrap_err();
     assert!(matches!(
         error,
         MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
-            TopologyEvidenceError::BindingMismatch
+            TopologyEvidenceError::FutureDatedClock
         ))
     ));
     assert_eq!(manager.state(), MysqlTopologyState::Failed);
-    assert!(manager.accepted_topology().is_none());
-    assert_eq!(state.lock().unwrap().attempts.len(), 3);
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event != "start:Second")
+    );
     assert_script_cleanup(&manager, &roots);
 }
 
 #[tokio::test]
-async fn pending_poll_deadline_a_b_a_reuse_fails_closed_without_observation_credit() {
-    let (mut manager, roots, state, attempt) =
-        scripted_manager("deadline-a-b-a", ScriptFailure::None);
-    accept_bootstrap_public(&mut manager, &attempt)
-        .await
-        .unwrap();
-    manager
-        .start_second_member(&control_deadline(&attempt))
-        .await
-        .unwrap();
-    manager
-        .join_second_member(
-            TopologyInstant::new(30),
-            &control_deadline(&attempt),
-            observation_context("source-deadline-a-b-a"),
-            observation_clock(120, 130),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        manager
-            .observe_pending(
-                observation_context("pending-deadline-a"),
-                observation_clock(140, 150),
-                TopologyInstant::new(40),
-            )
-            .await
-            .unwrap(),
-        TransitionEvaluation::Pending
-    );
-    state.lock().unwrap().plans.front_mut().unwrap().states[1] = MemberState::Recovering;
-    assert_eq!(
-        manager
-            .observe_pending(
-                observation_context("pending-deadline-b"),
-                observation_clock(141, 160),
-                TopologyInstant::new(41),
-            )
-            .await
-            .unwrap(),
-        TransitionEvaluation::Pending
-    );
-
-    let error = manager
-        .observe_pending(
-            observation_context("reused-deadline-a"),
-            observation_clock(142, 150),
-            TopologyInstant::new(42),
-        )
-        .await
-        .unwrap_err();
-
+async fn manager_attempt_deadline_expires_all_later_control() {
+    let (mut manager, roots, state, _attempt, clock) =
+        scripted_manager("attempt-expiry", ScriptFailure::None);
+    accept_bootstrap_public(&mut manager).await.unwrap();
+    clock.advance_to(6_000_000_000);
+    let error = manager.start_second_member().await.unwrap_err();
     assert!(matches!(
         error,
-        MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
-            TopologyEvidenceError::BindingMismatch
+        MysqlTopologyManagerError::Topology(MysqlTopologyError::Deadline(
+            ControlStage::ProductValidation
         ))
     ));
     assert_eq!(manager.state(), MysqlTopologyState::Failed);
-    assert!(manager.accepted_topology().is_none());
-    assert_eq!(state.lock().unwrap().attempts.len(), 4);
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event != "start:Second")
+    );
     assert_script_cleanup(&manager, &roots);
 }
 
 #[tokio::test]
 async fn fresh_source_observation_binding_failure_prevents_join_effect() {
-    let (mut manager, roots, state, attempt) =
+    let (mut manager, roots, state, _attempt, _clock) =
         scripted_manager("source-binding", ScriptFailure::SourceBinding);
-    accept_bootstrap_public(&mut manager, &attempt)
-        .await
-        .unwrap();
-    manager
-        .start_second_member(&control_deadline(&attempt))
-        .await
-        .unwrap();
+    accept_bootstrap_public(&mut manager).await.unwrap();
+    manager.start_second_member().await.unwrap();
     let error = manager
-        .join_second_member(
-            TopologyInstant::new(30),
-            &control_deadline(&attempt),
-            observation_context("wrong-source-binding"),
-            observation_clock(120, 130),
-        )
+        .join_second_member(observation_context("wrong-source-binding"))
         .await
         .unwrap_err();
     assert!(matches!(

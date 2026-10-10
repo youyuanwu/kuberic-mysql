@@ -6,12 +6,18 @@
 //! joins. Each transition is admitted from exact enrolled process, storage,
 //! endpoint, credential-generation, native-identity, view, and structured GTID
 //! evidence. `RECOVERING` remains pending; only exact `ONLINE` evidence grants
-//! lifecycle credit.
+//! lifecycle credit. Join credit additionally requires Oracle's qualified XCom
+//! view identity to be the exact `<fixed u64>:<predecessor u32 + 1>` successor.
+//! One manager-owned monotonic clock and absolute attempt deadline bound every
+//! control and observation operation.
 //!
 //! Process identity, capabilities, credentials, pending effects, and lifecycle
 //! state exist only in memory. Losing a manager means losing ownership context:
 //! callers must keep access closed and reset the fixture rather than discover,
 //! adopt, or continue surviving processes.
+//! Cancelling bootstrap synchronously contains the exact owned topology unless
+//! bootstrap-off plus its proof already completed; query futures are never
+//! detached.
 //!
 //! Persistent MySQL files live beneath the caller-selected data root. Generated
 //! configuration, logs, temporary files, PID state, and the private Unix socket
@@ -23,6 +29,8 @@
 //! continuation. Member-local setup and bounded bootstrap/join control use a
 //! separate root session over the currently owned private socket. Observation
 //! remains delegated unchanged to [`crate::adapter::MysqlObserver`].
+//! [`MysqlInstanceConfig::new`] retains the original single-instance profile;
+//! topology members require [`MysqlInstanceConfig::new_topology_member`].
 
 mod config;
 mod control;
@@ -33,7 +41,7 @@ mod topology;
 
 pub use config::{
     MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts,
-    MysqlRuntimePaths, MysqlTopologyConfig,
+    MysqlOwnedPathKind, MysqlRuntimePaths, MysqlTopologyConfig,
 };
 pub use error::{
     ConfigError, ControlStage, LifecycleOperation, MemberCleanupFailure, MysqlInstanceError,
@@ -47,7 +55,7 @@ pub use topology::{
     ControlCredential, ControlCredentialRole, ControlStep, CredentialError, JoinCapability,
     JoinEffect, MemberControlBinding, MysqlTopologyManager, MysqlTopologyMemberRuntime,
     MysqlTopologyState, NativeControlDeadline, NativeIdentityEnrollment, ObservedLocalBinding,
-    SourceGtidBoundary, TopologyAttempt, TopologyAuthority, TopologyInstant, TopologyObservation,
-    TopologyObservationContext, TopologyObservationStatus, TransitionCredit, TransitionEvaluation,
-    ViewDiscovery,
+    SourceGtidBoundary, SystemTopologyClock, TopologyAttempt, TopologyAuthority, TopologyClock,
+    TopologyInstant, TopologyObservation, TopologyObservationContext, TopologyObservationStatus,
+    TransitionCredit, TransitionEvaluation, ViewDiscovery,
 };

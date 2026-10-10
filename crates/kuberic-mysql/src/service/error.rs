@@ -4,7 +4,9 @@ use core::fmt;
 use std::io::ErrorKind;
 
 use crate::adapter::RequestError;
-use crate::service::{MysqlInstanceState, MysqlMemberIndex, MysqlTopologyState};
+use crate::service::{
+    MysqlInstanceState, MysqlMemberIndex, MysqlOwnedPathKind, MysqlTopologyState,
+};
 
 /// Configuration validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +198,8 @@ pub enum TopologyAuthorityError {
 /// Why the topology state cannot admit or accept an operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopologyStateError {
+    /// A topology operation received a single-instance configuration.
+    TopologyConfigurationRequired,
     /// A supposedly fresh member already exposes native group state.
     ExistingGroupState,
     /// A supposedly fresh member already exposes executed transaction history.
@@ -206,6 +210,14 @@ pub enum TopologyStateError {
     InvalidTransition,
     /// A post-effect view did not change from its accepted predecessor view.
     UnchangedView,
+    /// A qualified XCom view was not exactly `<u64>:<u32>`.
+    MalformedViewId,
+    /// A predecessor view's monotonic component had no successor.
+    ViewSequenceOverflow,
+    /// A post-view changed the fixed XCom view component.
+    ViewFixedPartChanged,
+    /// A post-view was not the predecessor monotonic component plus one.
+    ViewSequenceNotSuccessor,
     /// The post-effect view omitted a required predecessor member.
     RequiredMemberMissing,
     /// The post-effect view contained an unapproved member.
@@ -251,6 +263,12 @@ pub enum TopologyGtidError {
 /// Why proposed post-effect evidence cannot receive lifecycle credit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopologyEvidenceError {
+    /// The manager-owned monotonic clock moved backwards.
+    ClockRegression,
+    /// The manager-owned clock mapped its current tick into the future.
+    FutureDatedClock,
+    /// The manager-owned clock could not represent an instant or deadline.
+    UnrepresentableClock,
     /// Required post-effect evidence was not collected.
     Missing,
     /// Product identity differed from the qualified Oracle MySQL 8.4.11
@@ -340,6 +358,17 @@ impl MemberCleanupFailure {
 /// One public three-member manager failure.
 #[derive(Debug)]
 pub enum MysqlTopologyManagerError {
+    /// Two members configured equal or ancestor/descendant owned paths.
+    PathConflict {
+        /// First conflicting member.
+        left_member: MysqlMemberIndex,
+        /// First conflicting path category.
+        left_kind: MysqlOwnedPathKind,
+        /// Second conflicting member.
+        right_member: MysqlMemberIndex,
+        /// Second conflicting path category.
+        right_kind: MysqlOwnedPathKind,
+    },
     /// The requested manager transition was out of order.
     InvalidState {
         /// Required manager state.

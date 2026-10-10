@@ -117,7 +117,29 @@ third members join sequentially. Each accepted transition requires the exact
 enrolled process, storage, endpoint, server and member identities; the expected
 unchanged predecessors; no extra member; the required role and `ONLINE` state;
 one current view; and structured GTIDs containing the captured predecessor
-boundary. `RECOVERING` remains pending and grants no lifecycle credit.
+boundary. `RECOVERING` remains pending and grants no lifecycle credit. Oracle's
+qualified XCom `VIEW_ID` is treated as `<fixed u64>:<monotonic u32>`: bootstrap
+must produce a strictly parsed qualified ID, and each join must preserve the
+fixed part while advancing the monotonic part by exactly one. Malformed,
+overflowed, skipped, regressed, changed-fixed-part, and apparently-correct
+post-churn views receive no credit.
+
+The original five-argument `MysqlInstanceConfig::new` remains the
+single-instance profile. Topology members use the explicit
+`new_topology_member` constructor with `MysqlTopologyConfig` and
+`MysqlMemberIndex`; the topology manager rejects any single-instance profile.
+Before initialization it compares every member's data root, scratch root, and
+derived configuration, UDS, PID, log, temporary, secure-file, binary-log, and
+relay-log path. Equality or destructive ancestor/descendant overlap is a
+configuration failure and no root is created.
+
+One manager-owned process-monotonic clock establishes one absolute topology
+attempt deadline. Default construction uses the real monotonic clock and
+deterministic contracts inject a test clock. Public topology operations derive
+their current time, native-control deadline, and observation deadline
+internally. Clock regression, future-dated mapping, and completion at or after
+the attempt deadline fail closed; control and observation cannot outlive the
+attempt.
 
 Account setup and topology mutation use a separate root session over each
 currently owned UDS. Account statements run with session binary logging
@@ -134,6 +156,12 @@ absence, removes disposable scratch, and retains persistent data roots for
 diagnosis until the enclosing fixture removes them. The live gate proves the
 fresh three-member flow, closed client endpoints, exact identities, bootstrap
 off, GTID-source restrictions, and cleanup against the pinned package.
+After any bootstrap-enable attempt, the service attempts bootstrap-off and an
+explicit proof even when enable or start returns an ambiguous transport or
+timeout failure, preserving primary and cleanup failures together. Cancelling
+the public bootstrap future never detaches a query: an armed ownership guard
+synchronously contains all exact members before cancellation returns unless
+bootstrap-off proof has completed.
 
 The delivered slices make no claim for another MySQL patch or fork, Kuberic
 callbacks, access reconciliation or publication, routing, switchover, failover,

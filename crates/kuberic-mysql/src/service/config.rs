@@ -15,6 +15,40 @@ const SOCKET_FILE: &str = "mysql.sock";
 const PID_FILE: &str = "mysqld.pid";
 const TOPOLOGY_MEMBER_COUNT: usize = 3;
 
+/// One owned or generated path whose overlap could make topology cleanup
+/// destructive across member boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MysqlOwnedPathKind {
+    /// Persistent MySQL data root.
+    DataRoot,
+    /// Disposable runtime root.
+    ScratchRoot,
+    /// Generated option file.
+    Config,
+    /// Private administration socket.
+    Socket,
+    /// Retained-child PID file.
+    Pid,
+    /// Server error log.
+    ErrorLog,
+    /// Server standard-output log.
+    StdoutLog,
+    /// Initialization standard-output log.
+    InitializationStdoutLog,
+    /// Initialization standard-error log.
+    InitializationStderrLog,
+    /// Product-version inspection log.
+    VersionLog,
+    /// Temporary-file directory.
+    Temporary,
+    /// Secure-file directory.
+    SecureFiles,
+    /// Binary-log prefix.
+    BinaryLog,
+    /// Relay-log prefix.
+    RelayLog,
+}
+
 /// One exact position in the fixed three-member topology.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MysqlMemberIndex {
@@ -340,8 +374,8 @@ pub struct MysqlInstanceConfig {
     launcher_identity: FileIdentity,
     data_root: PathBuf,
     runtime: MysqlRuntimePaths,
-    topology: MysqlTopologyConfig,
-    member_index: MysqlMemberIndex,
+    topology: Option<MysqlTopologyConfig>,
+    member_index: Option<MysqlMemberIndex>,
     timeouts: MysqlOperationTimeouts,
 }
 
@@ -410,15 +444,54 @@ pub(crate) struct LayoutCreationError {
 }
 
 impl MysqlInstanceConfig {
-    /// Validates exact executable paths, one member of an exact topology, and
-    /// two distinct, absent fresh roots.
+    /// Validates the original single-instance profile with exact executable
+    /// paths and two distinct, absent fresh roots.
     pub fn new(
+        mysqld: impl Into<PathBuf>,
+        launcher: impl Into<PathBuf>,
+        data_root: impl Into<PathBuf>,
+        scratch_root: impl Into<PathBuf>,
+        timeouts: MysqlOperationTimeouts,
+    ) -> Result<Self, ConfigError> {
+        Self::new_inner(
+            mysqld,
+            launcher,
+            data_root,
+            scratch_root,
+            None,
+            None,
+            timeouts,
+        )
+    }
+
+    /// Validates one exact member of a fixed three-member topology.
+    pub fn new_topology_member(
         mysqld: impl Into<PathBuf>,
         launcher: impl Into<PathBuf>,
         data_root: impl Into<PathBuf>,
         scratch_root: impl Into<PathBuf>,
         topology: MysqlTopologyConfig,
         member_index: MysqlMemberIndex,
+        timeouts: MysqlOperationTimeouts,
+    ) -> Result<Self, ConfigError> {
+        Self::new_inner(
+            mysqld,
+            launcher,
+            data_root,
+            scratch_root,
+            Some(topology),
+            Some(member_index),
+            timeouts,
+        )
+    }
+
+    fn new_inner(
+        mysqld: impl Into<PathBuf>,
+        launcher: impl Into<PathBuf>,
+        data_root: impl Into<PathBuf>,
+        scratch_root: impl Into<PathBuf>,
+        topology: Option<MysqlTopologyConfig>,
+        member_index: Option<MysqlMemberIndex>,
         timeouts: MysqlOperationTimeouts,
     ) -> Result<Self, ConfigError> {
         if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
@@ -482,20 +555,25 @@ impl MysqlInstanceConfig {
 
     /// Validated fixed topology shared by this process generation.
     #[must_use]
-    pub const fn topology(&self) -> &MysqlTopologyConfig {
-        &self.topology
+    pub const fn topology(&self) -> Option<&MysqlTopologyConfig> {
+        self.topology.as_ref()
     }
 
     /// This process generation's exact topology member.
     #[must_use]
     pub fn member(&self) -> &MysqlMemberConfig {
-        &self.topology.members[self.member_index.as_usize()]
+        match (&self.topology, self.member_index) {
+            (Some(topology), Some(member_index)) => &topology.members[member_index.as_usize()],
+            (None, None) => panic!("single-instance configuration has no topology member"),
+            _ => unreachable!("configuration profile is constructed atomically"),
+        }
     }
 
     /// This process generation's fixed topology position.
     #[must_use]
-    pub const fn member_index(&self) -> MysqlMemberIndex {
+    pub fn member_index(&self) -> MysqlMemberIndex {
         self.member_index
+            .expect("single-instance configuration has no topology position")
     }
 
     /// Positive operation deadlines.
@@ -504,11 +582,67 @@ impl MysqlInstanceConfig {
         self.timeouts
     }
 
+    pub(crate) fn owned_paths(&self) -> Vec<(MysqlOwnedPathKind, &Path)> {
+        vec![
+            (MysqlOwnedPathKind::DataRoot, &self.data_root),
+            (MysqlOwnedPathKind::ScratchRoot, &self.runtime.scratch_root),
+            (MysqlOwnedPathKind::Config, &self.runtime.config),
+            (MysqlOwnedPathKind::Socket, &self.runtime.socket),
+            (MysqlOwnedPathKind::Pid, &self.runtime.pid),
+            (MysqlOwnedPathKind::ErrorLog, &self.runtime.error_log),
+            (MysqlOwnedPathKind::StdoutLog, &self.runtime.stdout_log),
+            (
+                MysqlOwnedPathKind::InitializationStdoutLog,
+                &self.runtime.init_stdout_log,
+            ),
+            (
+                MysqlOwnedPathKind::InitializationStderrLog,
+                &self.runtime.init_stderr_log,
+            ),
+            (MysqlOwnedPathKind::VersionLog, &self.runtime.version_log),
+            (MysqlOwnedPathKind::Temporary, &self.runtime.temporary),
+            (MysqlOwnedPathKind::SecureFiles, &self.runtime.secure_files),
+            (MysqlOwnedPathKind::BinaryLog, &self.runtime.binary_log),
+            (MysqlOwnedPathKind::RelayLog, &self.runtime.relay_log),
+        ]
+    }
+
     /// Renders the deterministic exact-target server configuration.
     #[must_use]
     pub fn render_server_config(&self) -> String {
-        let member = self.member();
-        let seeds = member.group_seeds.map(|seed| seed.to_string()).join(",");
+        let (member_profile, group_profile) = self.topology().map_or_else(
+            || {
+                (
+                    "server-id=1\n".to_owned(),
+                    "loose-group-replication-group-name=cccccccc-cccc-cccc-cccc-cccccccccccc\n\
+                     loose-group-replication-local-address=127.0.0.1:33061\n\
+                     loose-group-replication-group-seeds=127.0.0.1:33061\n"
+                        .to_owned(),
+                )
+            },
+            |_| {
+                let member = self.member();
+                let seeds = member.group_seeds.map(|seed| seed.to_string()).join(",");
+                (
+                    format!(
+                        "port={}\n\
+                         report-host={}\n\
+                         report-port={}\n\
+                         server-id={}\n",
+                        member.sql_address.port(),
+                        member.sql_address.ip(),
+                        member.sql_address.port(),
+                        member.server_id,
+                    ),
+                    format!(
+                        "loose-group-replication-group-name={}\n\
+                         loose-group-replication-local-address={}\n\
+                         loose-group-replication-group-seeds={}\n",
+                        member.group_uuid, member.group_replication_address, seeds,
+                    ),
+                )
+            },
+        );
         format!(
             "[mysqld]\n\
              datadir={}\n\
@@ -521,19 +655,14 @@ impl MysqlInstanceConfig {
              relay-log={}\n\
              skip-networking=ON\n\
              mysqlx=OFF\n\
-             port={}\n\
-             report-host={}\n\
-             report-port={}\n\
-             server-id={}\n\
+             {}\
              binlog-format=ROW\n\
              binlog-checksum=NONE\n\
              relay-log-recovery=ON\n\
              gtid-mode=ON\n\
              enforce-gtid-consistency=ON\n\
              plugin-load-add=group_replication.so\n\
-             loose-group-replication-group-name={}\n\
-             loose-group-replication-local-address={}\n\
-             loose-group-replication-group-seeds={}\n\
+             {}\
              loose-group-replication-single-primary-mode=ON\n\
              loose-group-replication-enforce-update-everywhere-checks=OFF\n\
              loose-group-replication-start-on-boot=OFF\n\
@@ -546,13 +675,8 @@ impl MysqlInstanceConfig {
             display(&self.runtime.secure_files),
             display(&self.runtime.binary_log),
             display(&self.runtime.relay_log),
-            member.sql_address.port(),
-            member.sql_address.ip(),
-            member.sql_address.port(),
-            member.server_id,
-            member.group_uuid,
-            member.group_replication_address,
-            seeds,
+            member_profile,
+            group_profile,
         )
     }
 

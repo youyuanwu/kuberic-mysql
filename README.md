@@ -45,11 +45,28 @@ topology manager initializes all three, starts and enrolls one designated
 bootstrap member, accepts one fresh one-member view, then starts and joins the
 remaining members sequentially. Each join requires an exact fresh view and a
 structured GTID boundary captured from the accepted predecessor. All ordinary
-client access remains closed. The service keeps persistent MySQL data separate
+client access remains closed. Qualified Oracle XCom view IDs are parsed as
+`<fixed u64>:<monotonic u32>` and a join receives credit only for the same
+fixed part and exactly the predecessor monotonic value plus one. Skipped,
+regressed, malformed, overflowed, or changed-fixed-part views fail closed.
+The manager owns one monotonic clock and one absolute attempt deadline; callers
+do not supply operation ticks or per-call control/observation deadlines.
+The service keeps persistent MySQL data separate
 from disposable runtime files, retains and attests exact children in memory,
 and contains all owned members on failure or stop. It writes no application
 metadata store and has no restart, reattachment, or survivor-adoption path;
 loss of in-memory ownership or attempt context requires fixture reset.
+Cancelling bootstrap cannot detach a query future: bootstrap-off and proof are
+attempted after every enable attempt, while cancellation synchronously contains
+the exact owned topology before returning control.
+
+The original five-argument `MysqlInstanceConfig::new(mysqld, launcher,
+data_root, scratch_root, timeouts)` remains the single-instance constructor and
+retains its prior profile. Fixed-topology callers must use the explicit
+`MysqlInstanceConfig::new_topology_member(..., topology, member_index,
+timeouts)` path; topology management rejects single-instance profiles before
+creating any root. It also rejects duplicate or cross-member overlapping data,
+scratch, socket, PID, configuration, log, and runtime paths before mutation.
 
 The second and only other workspace package, `kuberic-mysql-tests`, owns the
 integration contracts, protocol simulators, fixtures, shared test

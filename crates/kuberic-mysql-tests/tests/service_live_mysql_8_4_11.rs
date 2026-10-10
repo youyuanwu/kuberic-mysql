@@ -15,13 +15,10 @@ use kuberic_mysql::core::{
     ObservationOutcome, ObservationProvenance, ObservationSessionId, PartitionId, ProcessSessionId,
     ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
 };
-use kuberic_mysql::service::{
-    MysqlInstanceConfig, MysqlInstanceManager, MysqlMemberIndex, MysqlOperationTimeouts,
-};
+use kuberic_mysql::service::{MysqlInstanceConfig, MysqlInstanceManager, MysqlOperationTimeouts};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
 
-use common::topology;
 use live_support::{FixtureRoot, preflight_oracle_mysql_8_4_11};
 
 #[derive(Clone)]
@@ -67,8 +64,6 @@ async fn one_fresh_owned_instance_lifecycle() {
         "/usr/bin/aa-exec",
         &data,
         &scratch,
-        topology(),
-        MysqlMemberIndex::First,
         timeouts,
     )
     .unwrap();
