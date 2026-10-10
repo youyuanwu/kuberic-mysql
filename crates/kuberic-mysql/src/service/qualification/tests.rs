@@ -577,6 +577,56 @@ async fn qualify_peer_stop_rejoin() {
     assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
 }
 
+async fn run_normal_transaction_live() -> TransactionQualificationReport {
+    let mut fixture = LiveQualificationFixture::bootstrap().await;
+    let outcome = {
+        let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
+        qualification.qualify_normal_acknowledgement().await
+    };
+    let report = match outcome {
+        QualificationTransactionOutcome::Qualified(report) => *report,
+        outcome => panic!("transaction qualification did not complete: {outcome:?}"),
+    };
+    fixture.cleanup();
+    report
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_normal_acknowledgement() {
+    let report = run_normal_transaction_live().await;
+    assert_eq!(report.binding.package, ORACLE_PACKAGE);
+    assert_eq!(report.binding.group, GROUP_UUID);
+    assert_eq!(
+        report.outcome.verdict(),
+        TransactionVerdict::AcknowledgedDurable
+    );
+    assert_eq!(report.after_tail, report.before_tail + 1);
+    assert_eq!(report.opening_view, report.closing_view);
+    assert!(report.applier_barrier.is_none());
+    assert!(
+        report
+            .snapshots
+            .iter()
+            .all(|snapshot| report.exact_gtid.is_subset_of(&snapshot.executed))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualify_ambiguous_disconnect() {
+    let mut fixture = LiveQualificationFixture::bootstrap().await;
+    let outcome = {
+        let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
+        qualification.qualify_ambiguous_disconnect().await
+    };
+    match outcome {
+        QualificationTransactionOutcome::Unproved { reason } => {
+            assert!(reason.contains("applier GTID barrier was unavailable"));
+        }
+        outcome => panic!("unexpected ambiguous qualification result: {outcome:?}"),
+    }
+    fixture.cleanup();
+}
+
 fn assert_view_same_or_advanced(before: &str, after: &str) {
     let (before_fixed, before_monotonic) = before.split_once(':').unwrap();
     let (after_fixed, after_monotonic) = after.split_once(':').unwrap();
@@ -1163,6 +1213,24 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
             stop_rejoin.verdict(&expected),
             RevocationVerdict::ExactProcessBarrier
         );
+    }
+}
+
+#[test]
+fn applier_barrier_requires_one_exact_transaction_gtid() {
+    let expected = format!("{GROUP_UUID}:9");
+    assert_eq!(
+        validate_applying_gtid(&expected, GROUP_UUID, 9).unwrap(),
+        GtidSet::from_str(&expected).unwrap()
+    );
+    for text in [
+        "not-a-gtid".to_owned(),
+        format!("{GROUP_UUID}:8"),
+        format!("{GROUP_UUID}:9-10"),
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:9".to_owned(),
+        format!("{GROUP_UUID}:tag:9"),
+    ] {
+        assert!(validate_applying_gtid(&text, GROUP_UUID, 9).is_err());
     }
 }
 

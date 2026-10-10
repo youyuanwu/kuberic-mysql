@@ -1060,6 +1060,215 @@ impl<'a> MysqlNativeQualification<'a> {
         }
     }
 
+    async fn qualify_normal_acknowledgement(&mut self) -> QualificationTransactionOutcome {
+        self.run_transaction_scenario(false).await
+    }
+
+    async fn qualify_ambiguous_disconnect(&mut self) -> QualificationTransactionOutcome {
+        self.run_transaction_scenario(true).await
+    }
+
+    async fn run_transaction_scenario(
+        &mut self,
+        disconnect_after_barrier: bool,
+    ) -> QualificationTransactionOutcome {
+        let deadline = tokio::time::Instant::from_std(self.ownership.work_cutoff);
+        match tokio::time::timeout_at(
+            deadline,
+            self.run_transaction_scenario_inner(disconnect_after_barrier),
+        )
+        .await
+        {
+            Ok(Ok(report)) => QualificationTransactionOutcome::Qualified(Box::new(report)),
+            Ok(Err(reason)) if reason.contains("unsupported") => {
+                QualificationTransactionOutcome::Unsupported { reason }
+            }
+            Ok(Err(reason)) => QualificationTransactionOutcome::Unproved { reason },
+            Err(_) => QualificationTransactionOutcome::Unproved {
+                reason: "transaction scenario reached scenario work cutoff".to_owned(),
+            },
+        }
+    }
+
+    async fn run_transaction_scenario_inner(
+        &mut self,
+        disconnect_after_barrier: bool,
+    ) -> Result<TransactionQualificationReport, String> {
+        let profile = self.read_profile_evidence().await?;
+        let expected_profile = profile.binding.clone();
+        profile
+            .qualify(&expected_profile)
+            .map_err(|error| format!("profile evidence rejected: {error:?}"))?;
+        self.prepare_transaction_table().await?;
+
+        if !disconnect_after_barrier {
+            let checkpoint = self.commit_token("normal-acknowledgement").await?;
+            let exact_gtid = GtidSet::from_str(&format!(
+                "{}:{}",
+                self.attempt.group_name().as_str(),
+                checkpoint.transaction_tail
+            ))
+            .map_err(|error| format!("normal GTID construction failed: {error}"))?;
+            return Ok(TransactionQualificationReport {
+                binding: expected_profile,
+                outcome: TransactionOutcomeEvidence {
+                    client: ClientOutcome::Acknowledged,
+                    exact_gtid_bound: true,
+                    inclusion: InclusionEvidence::PresentOnEveryRequiredMember,
+                },
+                exact_gtid,
+                opening_view: checkpoint.view_id.clone(),
+                closing_view: checkpoint.view_id,
+                before_tail: checkpoint.before_tail,
+                after_tail: checkpoint.transaction_tail,
+                snapshots: checkpoint.snapshots,
+                applier_barrier: None,
+            });
+        }
+
+        let baseline = self.commit_token("ambiguous-lock-row").await?;
+        let primary = self.current_primary().await?;
+        let secondary = MysqlMemberIndex::all()
+            .into_iter()
+            .find(|member| *member != primary)
+            .unwrap();
+        let lock_token = baseline.label.clone();
+        let mut lock_connection = self.root_connection(secondary).await?;
+        lock_connection
+            .query_drop("SET GLOBAL super_read_only = OFF")
+            .await
+            .map_err(|_| "secondary super-read-only release failed".to_owned())?;
+        lock_connection
+            .query_drop("SET GLOBAL read_only = OFF")
+            .await
+            .map_err(|_| "secondary read-only release failed".to_owned())?;
+        lock_connection
+            .query_drop("START TRANSACTION")
+            .await
+            .map_err(|_| "secondary lock transaction failed".to_owned())?;
+        lock_connection
+            .exec_drop(
+                "SELECT token_value FROM kuberic_native_qualification.tokens \
+                         WHERE token_name = ? FOR UPDATE",
+                (lock_token.clone(),),
+            )
+            .await
+            .map_err(|_| "secondary row lock failed".to_owned())?;
+
+        let mut workload = self.root_connection(primary).await?;
+        let effective = workload
+            .query_first::<String, _>(
+                "SELECT CAST(@@SESSION.group_replication_consistency AS CHAR)",
+            )
+            .await
+            .map_err(|_| "workload consistency readback failed".to_owned())?
+            .ok_or_else(|| "workload consistency readback returned no row".to_owned())?;
+        if effective != "AFTER" {
+            return Err(format!("workload session consistency was {effective}"));
+        }
+        let update_token = lock_token.clone();
+        let update = tokio::spawn(async move {
+            let result = workload
+                .exec_drop(
+                    "UPDATE kuberic_native_qualification.tokens \
+                             SET token_value = token_value + 1 WHERE token_name = ?",
+                    (update_token,),
+                )
+                .await;
+            (workload, result)
+        });
+
+        let applying_gtid = match self
+            .wait_exact_applier_gtid(secondary, baseline.transaction_tail + 1)
+            .await
+        {
+            Ok(gtid) => gtid,
+            Err(error) => {
+                update.abort();
+                let _ = update.await;
+                restore_secondary_lock(&mut lock_connection).await?;
+                return Err(error);
+            }
+        };
+        if update.is_finished() {
+            return Err("client completed before the applier barrier".to_owned());
+        }
+        update.abort();
+        let _ = update.await;
+        restore_secondary_lock(&mut lock_connection).await?;
+
+        let after = self.wait_common_tail(baseline.transaction_tail + 1).await?;
+        let after_tail = compatible_common_tail(&after, self.attempt.group_name().as_str())?;
+        if after_tail != baseline.transaction_tail + 1 {
+            return Err("ambiguous transaction produced an unexpected GTID delta".to_owned());
+        }
+        let closing_view = after[0].view_id.clone();
+        if closing_view != baseline.view_id {
+            return Err("ambiguous transaction crossed a native view change".to_owned());
+        }
+        Ok(TransactionQualificationReport {
+            binding: expected_profile,
+            outcome: TransactionOutcomeEvidence {
+                client: ClientOutcome::DisconnectedAfterDispatch,
+                exact_gtid_bound: true,
+                inclusion: InclusionEvidence::PresentOnEveryRequiredMember,
+            },
+            exact_gtid: applying_gtid.clone(),
+            opening_view: baseline.view_id,
+            closing_view,
+            before_tail: baseline.transaction_tail,
+            after_tail,
+            snapshots: after,
+            applier_barrier: Some(ApplierBarrierEvidence {
+                member: profile.members[secondary.as_usize()].server_uuid.clone(),
+                process_session: self
+                    .member_binding(secondary)?
+                    .process_session()
+                    .as_str()
+                    .to_owned(),
+                applying_gtid,
+            }),
+        })
+    }
+
+    async fn wait_exact_applier_gtid(
+        &self,
+        member: MysqlMemberIndex,
+        expected_sequence: u64,
+    ) -> Result<GtidSet, String> {
+        let barrier_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.ownership
+                .require_work_budget()
+                .map_err(|()| "applier barrier reached scenario cutoff".to_owned())?;
+            let mut connection = self.root_connection(member).await?;
+            let applying = connection
+                .query_first::<String, _>(
+                    "SELECT APPLYING_TRANSACTION \
+                             FROM performance_schema.replication_applier_status_by_worker \
+                             WHERE CHANNEL_NAME = 'group_replication_applier' \
+                             AND APPLYING_TRANSACTION IS NOT NULL \
+                             AND APPLYING_TRANSACTION <> '' LIMIT 1",
+                )
+                .await;
+            let _ = connection.disconnect().await;
+            if let Ok(Some(text)) = applying {
+                return validate_applying_gtid(
+                    &text,
+                    self.attempt.group_name().as_str(),
+                    expected_sequence,
+                );
+            }
+
+            if Instant::now() >= barrier_deadline {
+                return Err(
+                    "authoritative applier GTID barrier was unavailable on Oracle 8.4.11"
+                        .to_owned(),
+                );
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
     async fn wait_exact_membership(
         &self,
         expected: &HashSet<String>,
@@ -1179,6 +1388,28 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 }
 
+fn validate_applying_gtid(
+    text: &str,
+    group_uuid: &str,
+    expected_sequence: u64,
+) -> Result<GtidSet, String> {
+    let gtid =
+        GtidSet::from_str(text).map_err(|error| format!("applying GTID was malformed: {error}"))?;
+    if matches!(
+        classify_gtid_profile(&gtid, group_uuid),
+        GtidProfileCompatibility::DoesNotBeginAtOne
+            | GtidProfileCompatibility::CompatibleContiguous { .. }
+    ) && gtid.entries().len() == 1
+        && gtid.entries()[0].intervals().len() == 1
+        && gtid.entries()[0].intervals()[0].start() == expected_sequence
+        && gtid.entries()[0].intervals()[0].end() == expected_sequence
+    {
+        Ok(gtid)
+    } else {
+        Err(format!("unexpected applying GTID: {text}"))
+    }
+}
+
 fn decode_binary_log_inventory(rows: &[mysql_async::Row]) -> Result<Vec<String>, String> {
     rows.iter()
         .map(|row| {
@@ -1192,6 +1423,21 @@ fn decode_binary_log_inventory(rows: &[mysql_async::Row]) -> Result<Vec<String>,
                 .ok_or_else(|| "binary-log name was malformed".to_owned())
         })
         .collect()
+}
+
+async fn restore_secondary_lock(connection: &mut Conn) -> Result<(), String> {
+    connection
+        .query_drop("ROLLBACK")
+        .await
+        .map_err(|_| "secondary lock rollback failed".to_owned())?;
+    connection
+        .query_drop("SET GLOBAL read_only = ON")
+        .await
+        .map_err(|_| "secondary read-only restoration failed".to_owned())?;
+    connection
+        .query_drop("SET GLOBAL super_read_only = ON")
+        .await
+        .map_err(|_| "secondary super-read-only restoration failed".to_owned())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1261,6 +1507,33 @@ enum QualificationPeerOutcome {
         candidate: RevocationCandidate,
         reason: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApplierBarrierEvidence {
+    member: String,
+    process_session: String,
+    applying_gtid: GtidSet,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TransactionQualificationReport {
+    binding: QualificationBinding,
+    outcome: TransactionOutcomeEvidence,
+    exact_gtid: GtidSet,
+    opening_view: String,
+    closing_view: String,
+    before_tail: u64,
+    after_tail: u64,
+    snapshots: [NativeMemberSnapshot; 3],
+    applier_barrier: Option<ApplierBarrierEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QualificationTransactionOutcome {
+    Qualified(Box<TransactionQualificationReport>),
+    Unsupported { reason: String },
+    Unproved { reason: String },
 }
 
 async fn root_connection(socket: &Path) -> Result<Conn, String> {
