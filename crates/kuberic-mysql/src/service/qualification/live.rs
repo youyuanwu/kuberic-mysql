@@ -40,7 +40,10 @@ impl LiveQualificationFixture {
     pub(super) async fn bootstrap() -> Self {
         preflight();
         let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from("/tmp").join(format!("kmql-{}-{serial}", std::process::id()));
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("kmql-{}-{serial}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
 

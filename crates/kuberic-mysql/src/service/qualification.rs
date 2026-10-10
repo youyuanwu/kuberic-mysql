@@ -1411,6 +1411,23 @@ impl<'a> MysqlNativeQualification<'a> {
         {
             return Err("crashed primary remained in successor membership".to_owned());
         }
+        let mut successor_histories = Vec::new();
+        for member in MysqlMemberIndex::all() {
+            if member == crashed {
+                continue;
+            }
+            let snapshot = read_snapshot(self.member_socket(member)).await?;
+            if snapshot.view_id != successor.view_id
+                || snapshot.members != successor.members
+                || !exact_gtid.is_subset_of(&snapshot.executed)
+            {
+                return Err(format!(
+                    "successor member {} lacked coherent acknowledged history",
+                    member.as_usize() + 1
+                ));
+            }
+            successor_histories.push(snapshot.executed);
+        }
 
         let new_binding = self
             .restart_member(crashed)
@@ -1487,6 +1504,7 @@ impl<'a> MysqlNativeQualification<'a> {
             pre_crash_snapshots: acknowledged.snapshots,
             opening_view,
             successor_snapshot: successor,
+            successor_histories,
             kill_evidence: AbruptKillEvidence {
                 pid: killed_pid,
                 socket_identity,
@@ -1631,13 +1649,17 @@ fn qualified_view_advanced(predecessor: &str, successor: &str) -> bool {
     let Some((successor_fixed, successor_monotonic)) = successor.split_once(':') else {
         return false;
     };
+    let fixed = predecessor_fixed.parse::<u64>().ok();
+    let successor_fixed_value = successor_fixed.parse::<u64>().ok();
+    let before = predecessor_monotonic.parse::<u32>().ok();
+    let after = successor_monotonic.parse::<u32>().ok();
     predecessor_fixed == successor_fixed
-        && predecessor_fixed.parse::<u64>().is_ok()
-        && successor_fixed.parse::<u64>().is_ok()
-        && predecessor_monotonic
-            .parse::<u32>()
-            .ok()
-            .zip(successor_monotonic.parse::<u32>().ok())
+        && fixed.is_some_and(|value| value.to_string() == predecessor_fixed)
+        && successor_fixed_value.is_some_and(|value| value.to_string() == successor_fixed)
+        && before.is_some_and(|value| value.to_string() == predecessor_monotonic)
+        && after.is_some_and(|value| value.to_string() == successor_monotonic)
+        && before
+            .zip(after)
             .is_some_and(|(before, after)| after > before)
 }
 
@@ -1856,6 +1878,7 @@ struct PrimaryCrashReport {
     pre_crash_snapshots: [NativeMemberSnapshot; 3],
     opening_view: String,
     successor_snapshot: NativeMemberSnapshot,
+    successor_histories: Vec<GtidSet>,
     kill_evidence: AbruptKillEvidence,
     restart_bindings: Vec<(String, String)>,
     final_snapshots: [NativeMemberSnapshot; 3],

@@ -694,6 +694,13 @@ async fn qualify_post_ack_primary_crash_restart() {
             .iter()
             .any(|member| member.member_id == report.crashed_member)
     );
+    assert_eq!(report.successor_histories.len(), 2);
+    assert!(
+        report
+            .successor_histories
+            .iter()
+            .all(|history| report.acknowledged_gtid.is_subset_of(history))
+    );
     assert_eq!(report.restart_bindings.len(), 3);
     assert!(report.restart_bindings.iter().all(|(old, new)| old != new));
     assert!(
@@ -1322,6 +1329,9 @@ fn qualified_successor_view_requires_same_fixed_part_and_strict_advance() {
         ("bad:7", "bad:8"),
         ("42:bad", "42:8"),
         ("42:7", "42:4294967296"),
+        ("01:7", "01:8"),
+        ("42:07", "42:8"),
+        ("42:7", "42:08"),
     ] {
         assert!(!qualified_view_advanced(before, after));
     }
