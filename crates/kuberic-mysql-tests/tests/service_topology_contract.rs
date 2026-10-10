@@ -2151,7 +2151,7 @@ async fn invalid_state_failure_invalidates_context_and_prevents_later_use() {
 
 #[tokio::test]
 async fn pending_poll_reused_deadline_fails_closed_and_cannot_reuse_operation() {
-    let (mut manager, roots, _state, attempt) =
+    let (mut manager, roots, state, attempt) =
         scripted_manager("reused-deadline", ScriptFailure::None);
     accept_bootstrap_public(&mut manager, &attempt)
         .await
@@ -2195,6 +2195,8 @@ async fn pending_poll_reused_deadline_fails_closed_and_cannot_reuse_operation() 
         ))
     ));
     assert_eq!(manager.state(), MysqlTopologyState::Failed);
+    assert!(manager.accepted_topology().is_none());
+    assert_eq!(state.lock().unwrap().attempts.len(), 3);
     assert!(
         manager
             .observe_pending(
@@ -2205,6 +2207,124 @@ async fn pending_poll_reused_deadline_fails_closed_and_cannot_reuse_operation() 
             .await
             .is_err()
     );
+    assert_script_cleanup(&manager, &roots);
+}
+
+#[tokio::test]
+async fn pending_poll_smaller_deadline_fails_closed_without_observation_credit() {
+    let (mut manager, roots, state, attempt) =
+        scripted_manager("regressed-deadline", ScriptFailure::None);
+    accept_bootstrap_public(&mut manager, &attempt)
+        .await
+        .unwrap();
+    manager
+        .start_second_member(&control_deadline(&attempt))
+        .await
+        .unwrap();
+    manager
+        .join_second_member(
+            TopologyInstant::new(30),
+            &control_deadline(&attempt),
+            observation_context("source-regressed-deadline"),
+            observation_clock(120, 130),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .observe_pending(
+                observation_context("pending-regressed-deadline"),
+                observation_clock(140, 150),
+                TopologyInstant::new(40),
+            )
+            .await
+            .unwrap(),
+        TransitionEvaluation::Pending
+    );
+
+    let error = manager
+        .observe_pending(
+            observation_context("regressed-deadline"),
+            observation_clock(141, 149),
+            TopologyInstant::new(41),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
+            TopologyEvidenceError::BindingMismatch
+        ))
+    ));
+    assert_eq!(manager.state(), MysqlTopologyState::Failed);
+    assert!(manager.accepted_topology().is_none());
+    assert_eq!(state.lock().unwrap().attempts.len(), 3);
+    assert_script_cleanup(&manager, &roots);
+}
+
+#[tokio::test]
+async fn pending_poll_deadline_a_b_a_reuse_fails_closed_without_observation_credit() {
+    let (mut manager, roots, state, attempt) =
+        scripted_manager("deadline-a-b-a", ScriptFailure::None);
+    accept_bootstrap_public(&mut manager, &attempt)
+        .await
+        .unwrap();
+    manager
+        .start_second_member(&control_deadline(&attempt))
+        .await
+        .unwrap();
+    manager
+        .join_second_member(
+            TopologyInstant::new(30),
+            &control_deadline(&attempt),
+            observation_context("source-deadline-a-b-a"),
+            observation_clock(120, 130),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .observe_pending(
+                observation_context("pending-deadline-a"),
+                observation_clock(140, 150),
+                TopologyInstant::new(40),
+            )
+            .await
+            .unwrap(),
+        TransitionEvaluation::Pending
+    );
+    state.lock().unwrap().plans.front_mut().unwrap().states[1] = MemberState::Recovering;
+    assert_eq!(
+        manager
+            .observe_pending(
+                observation_context("pending-deadline-b"),
+                observation_clock(141, 160),
+                TopologyInstant::new(41),
+            )
+            .await
+            .unwrap(),
+        TransitionEvaluation::Pending
+    );
+
+    let error = manager
+        .observe_pending(
+            observation_context("reused-deadline-a"),
+            observation_clock(142, 150),
+            TopologyInstant::new(42),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
+            TopologyEvidenceError::BindingMismatch
+        ))
+    ));
+    assert_eq!(manager.state(), MysqlTopologyState::Failed);
+    assert!(manager.accepted_topology().is_none());
+    assert_eq!(state.lock().unwrap().attempts.len(), 4);
     assert_script_cleanup(&manager, &roots);
 }
 

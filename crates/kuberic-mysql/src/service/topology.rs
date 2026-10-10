@@ -1469,7 +1469,7 @@ impl PendingEffect {
         if last_observation
             .as_ref()
             .is_some_and(|(prior_attempt, prior_deadline)| {
-                prior_attempt == &attempt || deadline == *prior_deadline
+                prior_attempt == &attempt || deadline <= *prior_deadline
             })
         {
             return Err(MysqlTopologyManagerError::Topology(
