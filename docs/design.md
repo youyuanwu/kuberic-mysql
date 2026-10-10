@@ -171,23 +171,30 @@ the public bootstrap future never detaches a query: an armed ownership guard
 synchronously contains all exact members before cancellation returns unless
 bootstrap-off proof has completed.
 
-The test-only native feasibility gate pins and reads back the proposed GTID,
-view-change, `AFTER`, flush/sync, retention, and expulsion settings on every
-member. It proves the one untagged group-source, contiguous-from-1 history
-shape across primary transfer, graceful departure/rejoin, retained-data
-restart of every process, and purge. It proves one acknowledged singleton GTID
-survives abrupt primary SIGKILL, an exact two-survivor successor view, and
-restart of every participant. Complete GTID sets remain the authority, and the
-runner is absent from the normal library API.
+The test-only native feasibility gate pins and reads back all nine effective
+values on every member: `gtid_mode = ON`,
+`enforce_gtid_consistency = ON`,
+`group_replication_gtid_assignment_block_size = 1`,
+`group_replication_view_change_uuid = AUTOMATIC`, global and workload-session
+`group_replication_consistency = AFTER`,
+`innodb_flush_log_at_trx_commit = 1`, `sync_binlog = 1`,
+`binlog_expire_logs_seconds = 2592000`, and
+`group_replication_member_expel_timeout = 5`. It proves the one untagged
+group-source, contiguous-from-1 history shape across primary transfer,
+graceful departure/rejoin, retained-data restart of every process, and purge.
+It proves one acknowledged singleton GTID survives abrupt primary SIGKILL, an
+exact two-survivor successor view, and restart of every participant. Complete
+GTID sets remain the authority, and the runner is absent from the normal
+library API.
 
 The same gate returns negative feasibility results. Oracle 8.4.11 did not
 expose the exact current-transaction barrier needed before disconnect or
 secondary-loss injection, so neither fault is injected. Account lock, password
 replacement, and recovery-privilege removal leave established native
 participation intact. Explicit Group Replication stop proves predecessor
-process absence, but predecessor recovery credentials remain accepted after
-password replacement. No credential-bound peer-session revocation barrier or
-serving eligibility is established.
+membership absence from the exact successor view, but predecessor recovery
+credentials remain accepted after password replacement. No credential-bound
+peer-session revocation barrier or serving eligibility is established.
 
 The delivered slices make no claim for another MySQL patch or fork, Kuberic
 callbacks, access reconciliation or publication, routing, switchover, failover,
