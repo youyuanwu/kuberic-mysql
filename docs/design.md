@@ -27,6 +27,14 @@ and lifecycle component own no private durable recovery store. Durable
 operation records are application-neutral Kuberic controller or generic-agent
 records, not a MySQL-specific metadata file or database.
 
+It also targets Kuberic's SF-aligned public-only contract in the sibling
+repository's `service-fabric-api-semantics.md`,
+`service-fabric-alignment.md`, and `stateless-default-replicator.md`. The
+delivered fixed three-member manager is a native qualification boundary, not
+the future production runtime shape. Production integration requires one
+member-local public Replicator per replica and no private managed lifecycle,
+observation, access, or receipt attachment.
+
 Words such as **must** and **requires** below remain requirements for stages
 whose delivery gates have not passed; they do not imply that broader lifecycle
 integration behavior exists today.
@@ -197,8 +205,8 @@ portions and does not claim a production lifecycle.
 
 The first executable **server-integration** milestone is the Stage 2 PoC. Its
 purpose is to prove that Kuberic can own three local `mysqld` processes, observe
-Group Replication and GTID state, drive the custom-replicator callbacks, and
-complete a controlled primary handoff.
+Group Replication and GTID state, drive one member-local public SF-shaped
+Replicator per replica, and complete a controlled primary handoff.
 
 The PoC includes:
 
@@ -208,7 +216,10 @@ The PoC includes:
 - loopback TCP for Group Replication and distributed recovery;
 - a single-primary group created from fresh fixture-owned data roots;
 - exact process, storage, `server_uuid`, member, view, and GTID binding;
-- Kuberic role/configuration callbacks with client access initially closed;
+- public role, epoch, configuration, catch-up, build, and close operations with
+  client access initially closed;
+- one application-owned MySQL-compatible client proxy per replica while the
+  raw native listener remains private;
 - one controlled switchover while every member and the source runtime remain
   reachable; and
 - exact source process stop/reap verification before target write publication.
@@ -244,9 +255,10 @@ This document uses three labels:
   delivery and test gates pass.
 
 MySQL-native details named here must be checked against the exact pinned 8.4
-release during implementation. Where the current Kuberic callback model cannot
-carry required evidence safely, this design says so rather than treating a
-planned API as present.
+release during implementation. The SF-aligned Kuberic values and sequencing
+remain roadmap dependencies until implemented; this design does not treat
+planned capabilities, signed authorization, or public value shapes as already
+available.
 
 ## Authority and Ownership
 
@@ -257,7 +269,7 @@ Safety depends on keeping five independent kinds of authority distinct.
 | Desired topology and lifecycle | Kuberic controller | Configuration intent, replica identities, role intent, operation ordering, and retry policy | Exact configuration/epoch and callback context |
 | Durable effects | Generic Kuberic agent and runtime lifecycle host | Process/storage ownership, generic operation records, callback fencing, cancellation, access reconciliation, and restart reconstruction | Exact process session, generic operation record, and effect receipt |
 | Native facts and replication transport | MySQL engine / Group Replication | Authoritative group membership, native role/state, GTID and recovery facts, replication transport, and execution of accepted native operations | Native state exposed by the pinned MySQL profile |
-| Native integration and proof | MySQL adapter | Authorized SQL/native mutation requests, coherent observation collection and interpretation, typed evidence production, and submission through private runtime protocols | Exact request context plus fresh native observation bundle or operation receipt |
+| Native integration and proof | MySQL adapter and public Replicator | Authorized SQL/native mutation, coherent observation collection, and interpretation sufficient to complete or reject an exact public operation | Exact public call completion or typed public error under the current runtime operation fence |
 | Independent containment | Infrastructure fence provider, after the PoC | Terminating or isolating the exact old process or host independently of that `mysqld` and its service runtime | Durable, verifiable, exact-incarnation fence receipt |
 
 Kuberic authority is not Group Replication membership. A member may be
@@ -289,19 +301,20 @@ The runtime lifecycle host:
 - validates authority immediately before and after every external effect;
 - rejects completion from an old configuration, epoch, incarnation, process
   session, native view, credential generation, or operation attempt;
-- reconciles Kuberic read/write status with native evidence; and
-- reconstructs effects and access from generic durable state plus fresh MySQL
-  observation after restart.
+- owns public operation ordering, cancellation, durable completion, service
+  address retention, and Kuberic read/write status; and
+- reconstructs effects and access by replaying public calls whose MySQL
+  implementation performs fresh native observation after restart.
 
 The MySQL adapter:
 
-- provides the custom stateful-service and replication interfaces;
+- provides the custom stateful-service and public replication interfaces;
 - maintains typed MySQL identity, GTID, Group Replication, recovery, and
   observation evidence inside the application boundary;
-- requests PoC bootstrap, join, and topology operations only under an exact
-  runtime authorization; later stages add clone, repair, and recovery
-  operations. It interprets fresh engine facts and submits typed evidence
-  without opening or interpreting the generic agent store; and
+- performs bootstrap, join, catch-up, topology, and later repair operations
+  only as work required by one exact public callback. It interprets fresh
+  engine facts and returns public success or a typed public failure without
+  opening or interpreting the generic agent store; and
 - never grants client access from MySQL role alone.
 
 The external fence provider is a post-PoC boundary outside both the managed
@@ -312,28 +325,46 @@ process is unreachable. A process-local boolean, Kubernetes readiness result,
 object deletion request, in-memory role, or database variable is not a
 production fence receipt.
 
-### Custom-authority admission
+### SF-style public operation admission
 
-The existing Kuberic custom-replicator boundary invokes the stateful
-current/joint configuration callback before candidate host authority is
-durably persisted. The proposed MySQL integration must preserve the following
-ordering:
+The target Kuberic runtime follows the Service Fabric V1 ordering and evidence
+model. MySQL is hosted through only the public `Replicator` and
+`PrimaryReplicator` interfaces. Successful completion of an exact public call
+is the runtime-visible evidence for that operation; the runtime does not fetch
+a second private MySQL receipt or native snapshot to strengthen the result.
 
-1. Close Kuberic read and write projections and revoke effective client access.
-2. Bind an admission attempt to the candidate configuration, epoch, exact
-   replica/process sessions, and the currently observed native view.
-3. Invoke the stateful native admission callback.
-4. Revalidate the callback result and persist candidate host authority only if
-   the attempt is still current.
-5. Reobserve native state and publish access later, under a separate explicit
-   authorization.
+The runtime persists operation intent before invoking MySQL and owns the exact
+task, cancellation, supersession, durable revision, process session, and final
+access publication. MySQL owns the native work required to make the public
+postcondition true. Primary-only configuration callbacks never run before the
+Replicator has successfully entered primary role.
 
-The callback is not a dry run. There is no atomic transaction spanning native
-MySQL effects and the runtime authority store, and no automatic rollback.
-Therefore, a failed, dropped, stale, or crash-interrupted callback that entered
-native code must abort or contain its exact host session. Restart recovery must
-reobserve native effects before retrying or accepting authority. Group
-membership created by a partial callback is not committed Kuberic authority.
+The ordered promotion path is:
+
+1. Close Kuberic read and write status and revoke effective client access.
+2. Persist the exact role/epoch operation intent.
+3. Complete `Replicator::change_role(..., Primary)`.
+4. Complete the explicit epoch barrier when the transition requires one.
+5. Complete the application replica's primary role change and retain its
+   returned service address.
+6. Complete `PrimaryReplicator::on_data_loss` when the controller authorized
+   possible data loss.
+7. Install the exact current/previous public replica-set configuration.
+8. Complete the required catch-up wait.
+9. Revalidate the durable operation and grant access separately.
+
+A secondary that remains secondary across a newer epoch still receives
+`update_epoch`. That call must invalidate predecessor work and peer admission;
+an unchanged native role is not an epoch barrier.
+
+There is no atomic transaction spanning a native MySQL mutation and the agent
+store. Every public operation therefore has an explicit replay disposition.
+Role, epoch, settings, and exact configuration replay must converge. Ambiguous
+builds retire their source/target sessions and restart with a new build
+authorization. Ambiguous data-loss mutation uses the declared
+`ReplaceOnAmbiguity` policy and retires the affected storage incarnation.
+Close, abort, removal, and containment must be idempotent. Late completion may
+not publish state for a superseding operation.
 
 ## Identity and Host-Local Ownership
 
@@ -423,78 +454,175 @@ identity and prove the old incarnation is contained.
 
 ## Runtime Integration
 
-### Existing interface mapping
+### SF-aligned public interface mapping
 
-The proposed service uses the existing custom-replication shape:
+The proposed service is one member-local custom Replicator per Kuberic replica.
+The delivered three-process `MysqlTopologyManager` remains a native
+qualification fixture and a source of reusable validation/control primitives;
+it is not the production runtime owner of three replicas.
 
 | Kuberic surface | Proposed MySQL responsibility |
 |---|---|
-| `StatefulServiceReplica.open` | Validate resource/partition identity, load generic agent authority, open the per-incarnation process host, retain the partition, select the factory, create one coherent custom interface bundle, and return that bundle's control `Replicator` |
-| `ReplicatorFactory.create_replicator` | Construct the coherent `ReplicatorInterfaces` bundle with the control replicator and optional primary interface; omit state/operation-copy interfaces because MySQL owns native transport and state transfer |
-| `change_role` | Reconcile desired role with fresh native evidence; return no client address until independent access reconciliation grants it |
-| `close` / `abort` | Close access first, cancel exact attempts, and stop/reap or quarantine the owned process according to the generic operation record |
-| `Replicator.open` | Return the exact application-owned Group Replication address only after identity and transport configuration validation |
-| `change_role` / `update_epoch` | Record new authority, revoke stale work, and schedule native reconciliation without treating the callback as promotion proof |
-| `current_progress` | Return only the compatibility marker described below; submit GTID/view/recovery proof through the typed private runtime protocol |
-| `catch_up_capability` | Return only a conservative compatibility marker; never claim recoverability without retained-history and donor proof |
-| `PrimaryReplicator` current/joint configuration | Perform the stateful, access-closed native admission contract and validate exact member descriptions |
-| catch-up quorum | Freeze and verify a native boundary under exact sessions; do not use scalar callback values as sole proof |
-| build / removal | In the PoC, support only fresh bootstrap/join and reject destructive repair explicitly. Later stages add generic clone/reseed/removal effects with typed native receipts. |
-| data-loss handling | Evaluate exact authority, view, quorum, GTID compatibility, and fence evidence; reject unsupported stages explicitly |
+| `StatefulServiceReplica.open` | Validate resource/partition/storage identity, create one member-local process host and `MysqlReplicator`, select its factory, create one coherent public interface bundle, and return that bundle's control `Replicator` |
+| `ReplicatorFactory.create_replicator` | Return the same control/primary object with immutable capabilities and settings; omit `StateReplicator` and `StateProvider` because MySQL owns replication, recovery, and application bytes |
+| application `change_role` | Converge the application role and return the role-specific MySQL proxy service address; address retention/publication remains runtime-owned and access status remains separate |
+| application `close` / `abort` | Close the service proxy first, cancel and drain exact work, then stop/reap or quarantine the owned process; abort is synchronous containment |
+| `Replicator.open` | Bind the application-owned replication/control endpoint and return its published address only after exact process/native identity validation; failed open leaves no listener |
+| `Replicator::change_role` | Establish the native role postcondition under the supplied epoch while access remains closed; initial primary may perform the one authorized bootstrap without requiring a prior primary configuration callback |
+| `Replicator::update_epoch` | Fence predecessor callbacks, build sessions, peer authorization, and native traffic before accepting newer-epoch work, including same-role secondary transitions |
+| `Replicator::close` | Cancel and drain Replicator-owned role/configuration/catch-up/build work, stop its replication/control endpoint and native peer sessions, and leave no descendant task or listener |
+| `Replicator::abort` | Synchronously fence new work, invalidate peer/build authorization, stop the replication/control endpoint, and contain owned native work as far as possible |
+| `current_progress` | Return only the qualified role-correct scalar projection described below; never return a configuration generation or transaction count as progress |
+| `catch_up_capability` | Return the earliest exactly retained scalar boundary only when the qualified history projection and donor/binlog proof exist; otherwise return `INVALID_LSN` or a typed rebuild-required error |
+| current/joint configuration | Accept only remote active secondaries, exact process sessions, `must_catchup`, signed peer authorization, and meaningful or invalid public progress; exclude the local primary and every idle/build target |
+| catch-up quorum | Capture an internal structured GTID boundary and complete only when the requested public predicate is true for the exact installed configuration; initially support the conservative `All` mode |
+| `build_replica` | From the primary, contact the exact idle target through the application-owned control endpoint, present its signed one-attempt build authorization, and complete only after copy/recovery plus retained replication reach the internal build boundary |
+| `remove_replica` | Cancel and drain the exact build before convergently releasing source-side sessions/resources for the retired idle target; configured removal occurs through configuration exclusion first |
+| `on_data_loss` | Run only under typed controller authorization, revalidate structured GTID history internally, and use `ReplaceOnAmbiguity`; unsupported or incompatible history returns rebuild-required and keeps access closed |
 
-The custom bundle does not need Kuberic operation/copy replication when MySQL
-owns transport and state transfer. That does not remove Kuberic lifecycle
-authority or the requirement to implement the control and primary callbacks
-accurately.
+The custom bundle uses no private managed lifecycle, observation, access, or
+receipt capability. MySQL may keep structured observations and operation
+state in memory, but runtime correctness depends only on exact public call
+completion plus agent-owned identity, configuration, history context, signed
+authorization, and access ordering.
 
-### Data-loss callback
+Graceful teardown first revokes access and cancels/drains exact outstanding
+operations, then closes the Replicator, then closes the application
+replica/proxy and stops or quarantines `mysqld`. A failed Replicator close is
+contained through Replicator abort before application close continues.
+Ungraceful teardown invokes Replicator abort before application abort, and both
+abort paths are synchronous.
+
+### Data-loss callback and replay disposition
 
 The data-loss callback is not permission to discard transactions or force a
-view. It accepts only an exact authority/configuration context and a coherent
-observation bundle. Its result records:
+view. The public bundle declares the `ReplaceOnAmbiguity` data-loss replay
+disposition. A retained callback result is not reinvoked. If process failure
+makes the result ambiguous, the authorized replica/storage incarnation is
+retired and recovery selects or builds another incarnation.
 
-- the exact candidate and old-primary incarnations;
-- native view and member set;
-- GTID histories compared and the required frozen boundary;
-- quorum and retained-history conclusions;
-- exact old-primary fence receipt;
-- decision and support-stage capability; and
-- observation and decision deadlines.
+Before controlled data-loss recovery is enabled, `on_data_loss` returns an
+explicit unsupported or rebuild-required error. Once enabled, it may complete
+only after one coherent native observation proves the exact candidate,
+accepted history context, GTID compatibility, quorum assumptions, and required
+old-primary fencing. `Ok(false)` means no local correction was made; it does
+not prove history compatibility. `Ok(true)` requires a fresh progress query
+and invalidates incompatible peer/build evidence before access.
 
-Before the controlled failover stage is enabled, the callback returns an
-explicit unsupported result. Once enabled, it may acknowledge only the
-already-defined failover contract in this document. A stale completion cannot
-earn data-loss, build, role, or access credit.
+### Public value and authorization dependencies
 
-### Additive runtime capabilities
+The SF-aligned Kuberic design keeps the protected public method sets but adds
+immutable value semantics around them:
 
-The current public progress fields are scalar `i64` values. They cannot encode
-a GTID set, view identity, multi-member observation, or fence receipt. A safe
-full integration may require the following additive, compatibility-preserving
-capabilities. They are not prerequisites for the PoC, which keeps structured
-evidence only in attempt-local memory and uses conservative callback results.
-Loss of that memory forces fixture reset; it does not trigger reconstruction or
-continuation:
+- `ReplicatorCapabilities`, initially including catch-up-specific-quorum
+  support and the data-loss replay disposition;
+- `HistoryContext`, which scopes scalar progress comparison to one resource,
+  protocol generation, opaque history identity, and data-loss number;
+- `must_catchup` on an active remote replica description;
+- `INVALID_LSN = -1` for unknown target or Replicator-owned progress;
+- signed `BuildAuthorization` for one exact source/target/build attempt; and
+- signed `PeerSessionAuthorization` for one exact active primary-secondary
+  process-session pair and current/previous configuration.
 
-1. **Structured application progress** carrying typed lineage/history,
-   configuration/view, recovery, and retained-history evidence.
-2. **Coherent observation receipts** binding all samples to exact sessions,
-   native view, deadlines, query provenance, and privilege generation.
-3. **External fence receipts** with provider verification, exact subject,
-   input signature, validity, and revocation semantics.
-4. **Resumable operation status** with exact operation identity, stages,
-   native/provider receipts, cancellation, and recovered-completion outcomes.
+These target values are roadmap dependencies until their Kuberic
+implementation lands. MySQL must not bind production code to the current
+pre-alignment value shapes or recreate missing fields through a private
+runtime channel.
 
-Until such APIs exist, safety-relevant evidence is either reobserved from
-MySQL, supplied by current generic Kuberic authority, or retained only for the
-current in-memory PoC attempt. No MySQL-specific durable fallback is permitted.
-The scalar `current_progress`/`catch_up_capability` compatibility values may
-carry only a runtime-assigned Kuberic configuration/admission generation. They
-must never be derived from serialized GTIDs, transaction counts, view text,
-hash ordering, or member count, and must never be the sole build, catch-up,
-election, promotion, or access proof. A stage that requires durable structured
-evidence before the generic APIs exist must return explicit unsupported rather
-than persist private state or fabricate progress.
+Two MySQL-specific compatibility gates must pass before public-only activation.
+
+#### Scalar GTID projection
+
+The public progress methods return `i64`, while MySQL history is a structured
+GTID set. A scalar projection is eligible only for the exact qualified profile:
+
+1. every accepted GTID has the configured Group Replication UUID as its source;
+2. no transaction tag is present;
+3. the normalized executed history is empty or one interval beginning at
+   sequence `1`;
+4. no foreign, disjoint, or unexplained history is hidden by the projection;
+   a same-lineage purged prefix remains part of `gtid_executed` and does not
+   invalidate applied progress; and
+5. the sequence fits the qualified signed 64-bit boundary.
+
+For an eligible non-empty history, the interval tail is the public LSN; empty
+history is `0`. Any other set is public-progress-incompatible and returns
+`INVALID_LSN` or rebuild-required. The controller compares this LSN only
+within the same `HistoryContext`. Internally, every native safety decision
+continues to use complete GTID-set containment/equality; the scalar never
+replaces the set or authorizes access by itself.
+
+The projection remains role-sensitive. A primary reports only the highest
+eligible tail proven committed under the exact installed public configuration
+and qualified native commit profile, never a merely local executed tail. An
+idle or active secondary reports its highest contiguous eligible tail durably
+applied locally. A recovering or unassigned replacement may report qualified
+election progress while access remains closed, but that value is not serving
+readiness.
+
+This shape is not assumed from ordinary Group Replication defaults. The serving
+configuration must pin and qualify GTID allocation and view-change behavior,
+including `group_replication_gtid_assignment_block_size = 1` and an explicit
+`group_replication_view_change_uuid` policy compatible with the one-source
+profile. Live gates cover transactions before and after primary transfer,
+member departure/restart, every accepted view change, and binlog purge. Any
+valid native transition that creates a gap or second source disables the
+scalar profile and therefore serving cutover.
+
+`catch_up_capability` is separate from applied progress. It requires exact
+proof of the first incrementally recoverable transaction from the qualified
+retained set, derived from `gtid_executed`, `gtid_purged`, and the pinned
+binary-log inventory/retention profile. Unknown purging, donor substitution,
+foreign/disjoint purged history, or non-projectable retained history returns
+`INVALID_LSN` or rebuild-required.
+
+#### Native peer-session authorization
+
+Signed Kuberic peer authorization must become an executable native fence.
+Group Replication's XCom traffic does not directly consume a Kuberic signed
+token, and rotating distributed-recovery credentials does not terminate
+existing group communication. Before activation, one qualified design must
+prove that `update_epoch`, withdrawal, close, and replacement invalidate every
+predecessor primary/session:
+
+- an application-owned authenticated control/transport endpoint may validate
+  the signed authorization and mediate native join/session establishment; or
+- an exact Group Replication stop/rejoin or communication-stack credential
+  transition may provide the barrier, if live qualification proves old
+  sessions cannot continue.
+
+If neither design proves process-session and epoch fencing, MySQL remains
+ineligible for serving cutover even when native membership appears healthy.
+
+#### Initial quorum and commit profile
+
+The first public-only profile advertises
+`catch_up_specific_quorum = false`. Kuberic therefore uses `All` for ordinary
+full catch-up and for both planned-swap waits. The MySQL profile must also pin
+and live-qualify transaction acknowledgement semantics strong enough that a
+successful client commit cannot outrun the public progress/catch-up contract.
+`group_replication_consistency = AFTER` is the initial candidate because it is
+stronger than write-quorum application, but it is not a supported setting
+until the exact Oracle MySQL patch proves its commit, failure, and member-loss
+behavior in the repository gate.
+
+The qualification pins the complete durability tuple, including
+`innodb_flush_log_at_trx_commit = 1`, `sync_binlog = 1`, binary-log retention,
+member-expulsion behavior, and the exact online native view required for an
+`All` completion. It injects commit timeout, member loss/expulsion during
+`AFTER`, primary crash immediately after acknowledgement, and restart of every
+participant. An acknowledged transaction must remain represented in the
+required public/native history boundary or automated publication and failover
+remain unavailable.
+
+The first serving profile keeps the active three-member set fixed. Bootstrap
+and build/join complete while client writes are closed, and planned
+switchover changes the primary without changing membership. Serving-time
+scale-up, configured-member removal, or a PC/CC transition whose old and new
+member sets differ remains unsupported until live qualification proves how the
+native Group Replication view transition satisfies both public configuration
+commit obligations. A single current native view must not be assumed to prove
+independent previous/current quorum completion.
 
 ## Native Progress and Observation
 
@@ -574,58 +702,36 @@ stale, or incoherent evidence.
 
 ## Bootstrap, Clone, Reseed, and Replacement
 
-All workflows use a durable operation identity:
+All workflows use a durable public-operation identity:
 
 ```text
 (operation_kind, resource, authority, target_incarnation, source_or_donor,
- native_view, attempt, canonical_input_signature)
+ history_context, attempt, canonical_public_input)
 ```
 
-Each generic operation record contains authorization, current stage,
-non-secret inputs, exact process/storage/native bindings, external effects
-entered, native/provider observations, completion receipt, cancellation, and
-last reconciliation time. Retries with the same canonical identity are
-idempotent. A changed authority, target, donor, or input creates a new attempt;
-the old result is rejected. An unrelated view or process-session change does
-the same. A workflow may, however, pre-authorize a specific native view or
-process-session transition that is an expected effect of that operation. Such
-a transition uses the durable handoff rules below; it never makes an old
-observation or callback valid in the new context.
+Each generic operation record contains only agent-owned facts: immutable
+public inputs, exact replica/process/storage identity, signed authorization,
+destructive approval, cancellation/retirement state, and terminal public-call
+completion. It does not contain native pre/post views, structured GTID sets,
+recovery cursors, donor sessions, or a MySQL handoff receipt.
 
-### Durable workflow stages and expected handoffs
+MySQL observes those native facts inside the exact public call. It returns
+success only when the native postcondition is true. If a restart loses
+process-local native context, Kuberic follows the operation's public replay
+disposition rather than reconstructing a private workflow stage.
 
-The generic operation record separates a logical operation from the fresh
-observation or process session used to reconcile each stage. Every stage
-transition persists its input binding and evidence before the next external
-effect. Expected native changes are accepted only through an explicit
-pre-state/post-state handoff:
+| Workflow | Public operation and durable agent fact | Ambiguity/restart action |
+|---|---|---|
+| Initial bootstrap | Exact primary-role operation for fresh storage plus its retained public completion | Replay converges only when fresh observation proves the same group/bootstrap result; otherwise remain closed and replace/reset |
+| Join / distributed recovery | One signed `build_replica` input and terminal public build completion | Retire source/target sessions and reissue with a new build ID, target generation, and signature |
+| Clone / reseed | Agent-owned destructive approval followed by a new empty target incarnation and public build | Never continue a lost copy cursor; inspect ownership only to contain/clean up, then build a new incarnation |
+| Replacement | Old-incarnation retirement plus allocation and public build completion for a new storage/process incarnation | Keep the old incarnation fenced; never transfer its progress, peer authorization, or completion |
+| Cleanup | Exact process/storage containment and idempotent resource-absence completion | Revalidate each agent-recorded resource and remove only the still-owned identity |
 
-1. The pre-state record names the exact operation, authority, incarnation,
-   process session, native view, expected effect, and allowed post-state shape.
-2. After the effect, the old bundle is closed and cannot prove the new state.
-3. A fresh reconciliation session observes the post-state independently.
-4. The runtime verifies that the post-state is a permitted consequence of the
-   recorded effect and that authority, target, donor, and canonical inputs did
-   not change.
-5. The generic agent persists a handoff receipt containing both bindings, then
-   advances the stage. Delayed callbacks from the pre-state remain stale.
-
-The runtime never merges fields across the pre- and post-state views. The
-handoff receipt proves continuity of the authorized operation; the fresh
-post-state bundle proves current native eligibility.
-
-| Workflow | Durable stages | Expected handoff | Completion receipt | Restart action |
-|---|---|---|---|---|
-| Join / distributed recovery | `Authorized` → `JoinEntered` → `MemberObserved` → `Recovering` → `BoundaryApplied` → `Complete` | `JoinEntered` pre-authorizes a view transition that adds the exact target. `MemberObserved` requires a fresh accepted view containing that target and allowed predecessor members. | Target identity, pre/post views, recovery completion, required and executed GTID boundaries, authority, and attempt | Reobserve membership and recovery. Recover a reached stage, reissue only an idempotent join under the same binding, or fail closed. |
-| Clone | `Authorized` → `TargetFenced` → `DonorValidated` → `CloneEntered` → `TargetRestarted` → `IdentityRebound` → `Joined` → `BoundaryApplied` → `Complete` | `CloneEntered` pre-authorizes one target restart. `IdentityRebound` creates a fresh process session and verifies the same owned root, expected clone result, target incarnation, and permitted native identity before join reconciliation. | Donor/target, clone result, old/new process sessions, storage/native binding, join view, required and executed GTIDs, authority, and attempt | Query clone/provider and process state before replay. Recover a completed clone or restart, then continue from a fresh binding; never credit the old session. |
-| Reseed / rebuild | `Authorized` → `TargetFenced` → `OwnedRootCleared` → `Provisioning` → `TargetRestarted` → `IdentityRebound` → `Joined` → `BoundaryApplied` → `Complete` | The authorization fixes the replacement storage/native expectations and permits only the recorded clear, restart, and join transitions. | Destructive approval, fence, old/new storage and process bindings, donor, views, resulting identity/history, authority, and attempt | Revalidate the fence and ownership marker, discover whether clear/provision/restart completed, and continue only from proven exact state. |
-| Replacement | `Authorized` → `OldIncarnationFenced` → `NewIdentityAllocated` → `Provisioned` → `Joined` → `Complete` | The operation fixes both old and new incarnations. The new identity is not a mutation of the old binding and receives fresh process, storage, native, and view evidence. | Old fence/removal evidence plus the new incarnation's allocation, native identity, accepted view/history, authority, and attempt | Keep the old incarnation fenced; reconcile the new incarnation independently. Never transfer old progress or receipts. |
-| Cleanup | `Authorized` → `TargetContained` → `OwnershipRevalidated` → `ResourcesRemoved` → `Complete` | No identity or view transition grants broader deletion rights. Each removed resource must match the authorization recorded before removal. | Exact removed resources, pre-removal ownership/process/native evidence, containment receipt, post-removal absence, authority, and attempt | Reobserve every operation-recorded resource. Record already-absent exact resources, continue exact idempotent removal, or stop on foreign/reused state. |
-
-An expected handoff is narrow. A join view that drops an unapproved member, a
-clone restart into an unexplained `server_uuid`, a second restart, a different
-donor, or any authority change is unrelated drift and creates a new operation
-attempt or a fail-closed recovery decision.
+A native transition that drops an unapproved member, produces an unexplained
+`server_uuid`, changes donor or process session, or reveals incompatible GTID
+history causes the current public call to fail. It does not create a durable
+native handoff record or broaden the operation's authority.
 
 ### Initial bootstrap
 
@@ -635,15 +741,17 @@ Bootstrap is permitted only for a new resource with no accepted native history.
    addresses, ports, credentials, and generic operation records.
 2. Initialize each data root under its exact ownership marker.
 3. Start only the designated first member under closed client access.
-4. Authorize the MySQL group-bootstrap action for that exact member and attempt.
-   The bootstrap flag/action must be transient and removed immediately after a
-   coherent native group is observed.
-5. Join each remaining member one at a time using distributed recovery or the
-   selected provisioning path.
-6. Reobserve all exact members in one accepted view, verify identities and
-   history, persist the bootstrap receipt, and keep writes closed.
-7. Publish access only through the independent access reconciler after Kuberic
-   authority and native eligibility converge.
+4. Invoke the designated member's exact public primary-role operation. Its
+   MySQL implementation may enable bootstrap only for this fresh input, must
+   disable it immediately, and returns success only after a coherent native
+   one-member group is observed.
+5. Invoke one signed public `build_replica` operation for each remaining idle
+   member. Each build owns its distributed-recovery and internal GTID boundary.
+6. Install the exact public three-member configuration and complete the
+   conservative `All` catch-up wait while writes remain closed.
+7. Persist only those exact public completions. Publish access later through
+   the independent runtime decision after authority and all required public
+   postconditions converge.
 
 No second member may independently bootstrap the same group. Discovery of an
 existing unknown group, data, `server_uuid`, or membership is a foreign-state
@@ -651,10 +759,11 @@ error, not a reason to adopt it automatically.
 
 ### Join and distributed recovery
 
-A join attempt binds target, donor/source set, expected group, native view, and
-credentials. The target remains client-fenced. Completion requires the exact
-target to appear with the expected native identity in a coherent accepted view,
-reach the required online/recovery-complete state, and execute the required
+A join is one signed public `build_replica` attempt bound to the target,
+source, `HistoryContext`, process/storage sessions, build ID, and endpoint. The
+target remains client-fenced. Inside that call, MySQL requires the exact target
+to appear with the expected native identity in a coherent accepted view, reach
+the required online/recovery-complete state, and execute the internal required
 GTID boundary. Reachability, process readiness, or membership alone is not
 completion.
 
@@ -681,9 +790,9 @@ Clone is destructive to the target and requires:
 
 Completion is not the clone command returning. The target must restart or
 reconcile as required, present the expected storage/native binding, join the
-intended group, complete recovery, and apply the frozen GTID boundary. The
-generic agent then persists a receipt binding donor, target, authority, view,
-attempt, and resulting history.
+intended group, complete recovery, and apply the internal build boundary. The
+generic agent persists only the new incarnation/process/storage allocation,
+signed build input, and terminal public `build_replica` completion.
 
 ### Reseed or rebuild
 
@@ -704,46 +813,70 @@ or foreign resources.
 
 ### Ambiguous restart after an external effect
 
-Restart may occur after an effect succeeds but before its completion receipt is
-durable. Every workflow therefore has a **reobserve before reissue** branch:
+Restart may occur after a public call mutates MySQL but before its completion is
+durable. Recovery follows the declared public replay contract:
 
-1. Reconstruct the exact pending attempt and authority from the generic agent
-   operation record.
-2. Keep client access closed.
-3. Query the native server or provider for exact target, donor, view, input
-   signature, and result evidence.
-4. If completion is proven, persist a recovered receipt without replaying the
-   effect.
-5. If non-completion is proven and the effect is idempotent under the same
-   inputs, reissue it.
-6. If completion, identity, authority, or safety cannot be proven, fail closed
-   and require a new explicitly authorized recovery action.
+1. Keep client access closed and revalidate the exact durable operation,
+   authority, process/storage incarnation, and canonical public input.
+2. Exact role, epoch, settings, configuration, close, and removal calls may be
+   replayed only when their implementation converges from fresh native
+   observation.
+3. Catch-up waits are re-evaluated for the exact retained configuration and
+   mode.
+4. Ambiguous builds retire their source/target sessions and restart with a new
+   build ID and signed authorization.
+5. Ambiguous `ReplaceOnAmbiguity` data-loss work retires the affected
+   incarnation without reinvoking the callback.
+6. Destructive provisioning and cleanup use only agent-owned storage/process
+   authorization and idempotent containment; they never infer database
+   completion from partial files.
 
-This rule applies to bootstrap, join, clone, reseed, topology mutation, fencing,
-process termination, and cleanup.
+If the public replay contract cannot establish a safe next action, the
+operation fails closed and requires replacement, fixture reset, or explicit
+operator recovery. The agent does not recover success by reading a private
+native receipt.
 
 ## Client Access and Fencing
 
 ### Access is a reconciled effect
 
-The effective read and write service addresses are derived from both:
+The runtime derives effective read and write publication from:
 
 1. Kuberic partition read/write access status for the current access
-   generation; and
-2. a fresh, coherent native observation proving the exact incarnation is
-   eligible for that access.
+   generation;
+2. exact completion of the required public role, epoch, configuration,
+   catch-up, build, and data-loss operations; and
+3. runtime-owned process/session, endpoint, revision, and containment fences.
 
 Role is necessary but not sufficient. A native `PRIMARY` with closed Kuberic
 write status publishes no writable endpoint. A Kuberic primary intent with a
-member still recovering, stale, divergent, outside the accepted view, or
-unfenced relative to an old primary also publishes no writable endpoint.
+missing public completion or an unfenced old primary also publishes no
+writable endpoint.
 
 Access transitions are generic Kuberic effects. Closure is acknowledged only
 after existing publication is withdrawn, ordinary and administrative client
 paths are contained as required, relevant sessions are drained or terminated,
-and the exact result is reobserved. Opening is acknowledged only after fresh
-authority, identity, native eligibility, fence, and routing evidence is
-validated immediately before publication.
+and the exact proxy generation is closed. Opening is acknowledged only after
+the runtime revalidates current authority, exact public completions, identity,
+process/session fences, source containment, and endpoint ownership immediately
+before publication. It does not request a second private MySQL observation or
+access receipt.
+
+The production service address must not expose the raw `mysqld` listener
+directly. The application role change returns an application-owned
+MySQL-compatible proxy endpoint. The proxy checks the current Kuberic access
+generation before dispatching every MySQL command, keeps the native SQL
+listener private, and owns all externally reachable client sessions.
+Revocation atomically rejects new command dispatch, closes the listener,
+settles or terminates in-flight commands according to the fixed policy, closes
+idle and transaction-holding sessions, and proves zero commands/sessions for
+the revoked generation before closure completes. Only then may MySQL freeze a
+source GTID boundary. An ambiguous disconnect/commit outcome leaves the
+boundary and target access uncredited.
+
+`read_only` and `super_read_only` remain a second native barrier. The proxy,
+native variables, endpoint withdrawal, and exact process containment are
+independent checks; no one check substitutes for the others.
 
 ### Why MySQL read-only variables are not a fence
 
@@ -833,21 +966,33 @@ be exact and verifiable.
 
 ### PoC controlled handoff
 
-The PoC implements only a reachable-source handoff:
+The PoC implements only a reachable-source handoff through the SF public
+sequence. The initial MySQL capability advertises no catch-up-specific quorum,
+so both waits use `All`:
 
-1. Bind the exact source, target, configuration, native view, and operation
-   attempt while all three members are healthy.
-2. Close source write access and withdraw its client endpoint.
-3. Freeze the source executed GTID set after client sessions are drained.
-4. Wait until the exact target has executed that boundary.
-5. Invoke the pinned single-primary Group Replication transfer while source and
-   target are still reachable.
-6. Collect a fresh coherent view proving the target is native primary and the
-   histories remain compatible.
-7. Stop and reap the exact old-source `mysqld`; verify its process session and
+1. Install the current/previous configuration with the target marked
+   `must_catchup`.
+2. Complete the first `All` catch-up wait while source writes remain granted.
+3. Revoke source write status, close its proxy endpoint, and drain or terminate
+   existing client sessions.
+4. Freeze the coherent source executed-GTID set after closure.
+5. Apply the swap epoch barrier and refreshed configuration.
+6. Complete the second `All` wait at the final frozen boundary.
+7. Demote the old Replicator and promote the target Replicator; the target role
+   operation performs the pinned single-primary Group Replication transfer.
+8. Complete the corresponding application role changes and collect a fresh
+   coherent native view proving the requested primary and compatible history.
+9. Stop and reap the exact old-source `mysqld`; verify its process session and
    UDS are gone.
-8. Revalidate Kuberic target authority and the fresh native view, then publish
-   the target write endpoint.
+10. Re-evaluate the exact public catch-up/progress postcondition. Inside that
+    call, MySQL observes the containment-induced successor view and requires
+    that only the stopped source is absent, the intended target remains
+    primary, the other secondary remains online, quorum remains available, and
+    both survivors contain the frozen boundary. The public three-member
+    configuration remains unchanged; this is member unavailability, not a
+    PC/CC membership transition.
+11. Revalidate target authority, retained public completion, and source
+    containment, then grant target write status and publish the proxy endpoint.
 
 Failure at any step leaves writes closed. Restart during this sequence is not
 resumed automatically in the PoC; the exact fixture is reset. The old source
@@ -862,33 +1007,36 @@ callback that survives an authority change.
 The **source-close attempt** runs under configuration `C_source`, which
 authorizes the old primary:
 
-1. **Authorize source closure** for exact source/target incarnations, native
-   pre-view, operation ID, and attempt.
+1. **Authorize source closure** for exact source/target incarnations,
+   operation ID, `HistoryContext`, and public swap attempt.
 2. **Close source write access**, withdraw the writable endpoint, stop new
    client writes, and drain or terminate relevant sessions.
-3. **Freeze a boundary** from a coherent post-drain source observation. Record
-   the executed GTID set and native pre-view and prove no later client
-   transaction was accepted.
+3. **Freeze a boundary** from a coherent post-drain source observation. MySQL
+   retains the complete GTID set in the live operation and returns the
+   qualified public LSN; the agent records only `HistoryContext`, LSN, source
+   closure, and exact public operation identity. Prove no later client command
+   was accepted.
 4. **Drain/apply** until the exact target has executed the frozen boundary and
    remains compatible in the accepted lineage. Equality is not inferred from a
    scalar count.
 5. **Contain the source** with an independently verified exact-incarnation
    client-write fence.
-6. **Complete source handoff** by persisting a receipt that binds
-   `C_source`, source/target identities, frozen GTID boundary, native pre-view,
-   source access closure, fence dependency, and the target-authorizing
-   configuration proposed next.
+6. **Complete source handoff** by persisting an agent-owned record that binds
+   `C_source`, source/target identities, the qualified
+   `HistoryContext`/LSN boundary, source access closure, fence dependency, and
+   the target-authorizing configuration proposed next. It contains no native
+   view or structured GTID receipt.
 
 The controller may then admit configuration `C_target`, which explicitly
 authorizes the target's desired primary role. This is a new exact authority
-attempt. Admission consumes and revalidates the source-handoff receipt, starts
-with target access closed, and follows the non-atomic custom-authority contract.
-No callback or receipt from `C_source` is credited directly under `C_target`.
+attempt. Admission consumes and revalidates the source-handoff record, starts
+with target access closed, and follows the SF public operation sequence. No
+public completion from `C_source` is credited directly under `C_target`.
 
 The **target-open attempt** runs under committed `C_target`:
 
-1. **Authorize native transfer** for the exact target, current pre-view, source
-   fence generation, frozen boundary, and allowed post-state shape.
+1. **Authorize target role** for the exact target, source fence generation,
+   qualified public boundary, and current public configuration/epoch.
 2. **Transfer native primary role** using the pinned, validated single-primary
    Group Replication operation.
 3. **Close the pre-view bundle** and collect a fresh post-transfer bundle. A
@@ -896,21 +1044,24 @@ The **target-open attempt** runs under committed `C_target`:
    primary, the exact source and allowed members have the recorded
    disposition, lineage remains compatible, and no unrelated membership or
    identity change occurred.
-4. **Persist the native handoff receipt** with pre/post views, exact authority,
-   identities, boundary, transfer attempt, and fresh target recovery/role
-   evidence.
+4. **Complete the exact public target role operation** only after MySQL has
+   internally validated the pre/post views, identities, boundary, transfer
+   attempt, and fresh target recovery/role evidence. The agent persists the
+   exact public completion, not the private native observation.
 5. **Publish target writes** only after revalidating committed `C_target`, the
-   source fence dependency, frozen GTID boundary, target eligibility, and all
-   handoff receipts. Read publication is reconciled separately.
+   source fence dependency, qualified public boundary, target public
+   completions, and source containment. Read publication is reconciled
+   separately.
 
 If Group Replication chooses or reports a different primary, the operation
 stops with writes closed. An unrecorded authority, process-session, credential,
 member-identity, native-view, or attempt change invalidates the relevant
-attempt. The explicitly recorded `C_source` → `C_target` and native pre-view →
-post-view transitions are accepted only through their handoff receipts.
-Failure after source closure leaves writes closed. Restart reconstructs the two
-attempts independently and runs ambiguous-effect reconciliation; it never
-infers completion from desired role.
+attempt. The explicitly recorded `C_source` → `C_target` transition is accepted only
+through its agent-owned public operation records. Native pre-view → post-view
+validation remains inside the target role call. Failure after source closure
+leaves writes closed. Restart reconstructs the two attempts independently and
+uses their public replay dispositions; it never infers completion from desired
+role.
 
 ## Unplanned Failover and Quorum Recovery
 
@@ -1034,38 +1185,43 @@ PoC never resumes the operation.
 The resumable reconstruction contract below belongs to Stage 3 and later.
 
 Runtime or host restart creates fresh process and observation sessions. The
-replacement receives no access credit until effective client-path closure is
-verified; a surviving `mysqld` is potentially serving until then.
-Reconstruction joins four durable evidence sets:
+replacement starts unassigned and access-closed. It receives no predecessor
+role, PC/CC configuration, peer authorization, or access credit merely because
+the storage and `server_uuid` are retained.
 
-- current Kuberic authority, configuration, role intent, and access generation;
-- generic identity, storage, process, allocation, and operation records;
-- fresh MySQL identity, Group Replication, GTID, recovery, and access-control
-  observations; and
-- still-verifiable external fence and routing receipts.
+The ordered replacement-session protocol is:
 
-The reconciler:
-
-1. validates repository resource identity and loads generic operation records
-   without applying their desired access;
-2. discovers only agent-recorded process/storage candidates and rejects
-   foreign state;
-3. verifies effective client-path closure, then assigns fresh process sessions
-   or safely contains unadoptable survivors;
-4. reobserves pending external effects before reissuing them;
-5. rejects old callback completions and scalar progress snapshots;
-6. reconciles native membership and topology with committed Kuberic authority;
-7. revalidates fence, credential, trust, and routing generations; and
-8. performs a new access decision from fresh evidence.
+1. Validate resource, storage, process, and application identity without
+   applying desired access.
+2. Verify effective client-path closure and retire the predecessor process
+   session; safely contain any survivor that cannot be reattached under the
+   qualified ownership policy.
+3. Open the member-local Replicator unassigned and report that process-session
+   renewal is required, including only qualified election progress under the
+   retained `HistoryContext`.
+4. Have the controller admit a newer configuration epoch bound to the new
+   process session and issue fresh signed peer authorizations.
+5. Close affected peer ingress and complete the newer `update_epoch` barrier on
+   every surviving secondary before predecessor traffic can be accepted.
+6. Replay the replacement role under the newer epoch. A replacement primary
+   completes Replicator role, explicit epoch work, and application role in the
+   normal order.
+7. Install fresh PC/CC configuration and establish peers only from its new
+   signed authorizations.
+8. Re-evaluate required catch-up, build, or authorized data-loss work through
+   public calls; MySQL performs fresh native validation internally.
+9. Revalidate external fence, routing, durable revision, public completion, and
+   the new process session before granting access.
 
 A persisted “granted” access value remains desired state, not effective state.
 No endpoint is restored merely because it existed before the restart.
 
-If restart lands between native configuration admission and Kuberic authority
-persistence, the host contains the entered session, compares the exact native
-effect with the candidate generic operation record, and either records a proven
-recovered effect under still-current authority or requires a new admission. It
-never promotes partial membership to durable authority implicitly.
+If restart lands after a native effect but before public completion is
+persisted, recovery follows the operation-specific replay disposition.
+Convergent public calls may be replayed after fresh native observation;
+ambiguous builds receive new sessions/authorization; ambiguous data-loss work
+retires the incarnation. Partial native membership is never promoted to
+durable authority implicitly.
 
 ## Security Boundaries
 
@@ -1145,7 +1301,7 @@ stage.
 |---|---|---|---|---|
 | 0. Design | No prior stage. Deliver this design and concise README with current/future claims separated. | Spec, plan, cross-artifact, implementation, and final reviews pass with no unresolved safety finding. | Intended contract is documented. | No executable MySQL support. |
 | 1. Server-free core | Stage 0 passed. Add typed identities, GTID relations, views, observation decoding, and minimal fail-closed state machines without a server dependency. | Deterministic tests pass for malformed, stale, partial, divergent, and stale-authority cases. | Core identity/history decisions do not flatten GTIDs or accept stale work. | No process, SQL, topology mutation, TLS, or recovery automation. |
-| 2. Host-local Kuberic PoC | Stage 1 passed; an exact MySQL patch and local metadata surface are pinned. Add UDS observation, three owned local processes, fresh bootstrap/join, custom Kuberic interfaces, access reconciliation, and controlled switchover. | The fixture proves exact identity/view/GTID observation, process cleanup, Kuberic callback wiring, source stop/reap, and delayed target write publication. | Kuberic can manage a fresh three-member development group and perform one controlled local handoff. | No TLS, Clone/reseed, automated failover, independent fence provider, crash-resumable mutation, cross-host, or Kubernetes claim. |
+| 2. Host-local Kuberic PoC | Stage 1 passed; the SF-aligned Kuberic public values and operation sequencing are available; an exact MySQL patch and local metadata surface are pinned. Add one member-local public Replicator per replica, signed build/peer admission, qualified scalar GTID projection, an application-owned client proxy, fresh bootstrap/join, access reconciliation, and controlled switchover. | The fixture proves public role-before-configuration ordering, same-role epoch fencing, exact identity/view/GTID observation, signed build admission, `All`/`All` swap catch-up, proxy access closure, process cleanup, source stop/reap, and delayed target write publication. | Kuberic can manage a fresh three-member development group through only public SF-shaped interfaces and perform one controlled local handoff. | No specific-quorum optimization, general non-projectable GTID history, TLS, Clone/reseed, automated failover, independent fence provider, crash-resumable mutation, cross-host, or Kubernetes claim. |
 | 3. Resumable lifecycle and repair | Stage 2 passed. Add generic durable effect records, ambiguous-effect recovery, Clone/reseed, replacement, cleanup recovery, and destructive approvals. | Restart and fault gates prove effects are recovered, retried only when idempotent, or left safely closed. | Host-local lifecycle survives interrupted provisioning and replacement without a MySQL-specific metadata store. | No automated writable failover or production security claim. |
 | 4. Automated failover and independent fencing | Stage 3 passed; the pinned native commit invariant and an independent fence provider are validated. Add lossless-boundary derivation, continuing fence dependencies, unplanned failover, and quorum recovery. | Old-primary survival, direct-client, provider-loss, divergent-history, and quorum-loss gates pass with no premature write publication. | Controlled automated failover for the exact validated environment. | No portable cross-host or Kubernetes claim. |
 | 5. Secure cross-host qualification | Stage 4 passed. Add separate principals, secure secret handling, native TLS or an explicitly qualified equivalent network profile, real fault domains, and a production-candidate fence backend. | Cross-host network, trust rotation, host loss, storage, direct-client, and fence-lifetime gates pass. | Only the named cross-host security and infrastructure profile that passed. | No generic CNI, mesh, cloud, or cross-region assumption. |
@@ -1153,8 +1309,8 @@ stage.
 
 Stages 0 and 1, the narrow Stage 2 observation slice, the single-process
 restart-stateless host, and the bounded fresh three-member bootstrap/join
-portion are delivered. Stage 2 callback wiring, access reconciliation and
-publication, controlled switchover, and every later row remain a delivery
+portion are delivered. Stage 2 public interface wiring, access reconciliation
+and publication, controlled switchover, and every later row remain a delivery
 contract, not a schedule or current feature list.
 
 ## Test Strategy
@@ -1179,10 +1335,10 @@ observation outcome/freshness/coherence behavior, and stale authority/session
 completion. Later server-free stages must additionally cover:
 
 - purged-history recovery capability without treating it as executed history;
-- authority callback success/failure around the non-atomic persistence window;
+- public operation success/failure around the non-atomic persistence window;
 - effect-completed/receipt-not-persisted restart reconciliation;
-- expected join view transition with a fresh post-view bundle and durable
-  pre-view/post-view handoff;
+- expected join view transition validated inside public build completion,
+  without a durable pre-view/post-view receipt;
 - clone restart with a fresh process session, exact identity rebinding, and
   rejection of completion from the old session;
 - rejection of unrelated member/view drift, unexplained native identity
@@ -1218,8 +1374,17 @@ The delivered bounded topology matrix includes:
 
 The remaining Stage 2 PoC matrix includes:
 
-- switchover with source drain, frozen GTID boundary, containment, and delayed
-  publication;
+- one member-local public interface bundle per replica, with no private managed
+  lifecycle, observation, access, or receipt capability;
+- role-before-primary-configuration and same-role-secondary epoch ordering;
+- exact `HistoryContext`-scoped scalar projection for the qualified single
+  Group Replication UUID/contiguous-interval profile, with every other GTID
+  shape rejected;
+- signed build authorization, active peer-session authorization, invalid idle
+  target progress, and build cancellation/drain before removal;
+- Replicator-owned endpoint lifetime and proxy-owned client endpoint lifetime;
+- planned switchover with `must_catchup`, `All`/`All` waits, source drain,
+  frozen GTID boundary, containment, and delayed publication;
 - source process stop/reap and UDS disappearance before target writes open;
 - refusal to publish writes after unexpected source loss, quorum loss,
   conflicting/stale views, divergent histories, or ambiguous mutation; and
@@ -1257,7 +1422,7 @@ must define their exact inputs and pass conditions.
 | PoC observation | One pinned local `mysqld`, private UDS, fixture credential | Native identity/view/GTID evidence matches the exact process; permission denial, bad credentials, and wrong UDS/server identity remain distinct | Local adapter-to-MySQL observation works without TLS | No topology mutation or writable transition claim |
 | Single-process host | Exact Oracle MySQL 8.4.11, `aa-exec`, fresh distinct roots | One child is initialized, launched, attested, observed as fail-closed inactive membership, stopped, reaped, and its UDS proven absent; scratch is removed and data retained | One restart-stateless local process generation with private-UDS observation | No topology, callbacks, access publication, survivor adoption, or restart continuation |
 | Fresh topology bootstrap/join | Exactly three fresh owned instances, loopback Group Replication, retained in-memory attempt authority | One designated bootstrap and two sequential joins receive exact fresh identity/view/GTID credit; access stays closed; every process and scratch root is contained | Bounded fresh three-member bootstrap/join for the exact qualified local profile | No callbacks, access publication, switchover, failover, repair, survivor adoption, or restart continuation |
-| PoC lifecycle and switchover | Three fresh owned instances, loopback Group Replication, Kuberic hosts | Bootstrap/join completes; callbacks retain exact identities; source access closes and its process is stopped/reaped before target writes open; unexpected loss leaves writes closed | Controlled host-local Kuberic lifecycle and one planned handoff | No Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
+| PoC lifecycle and switchover | Three fresh owned instances, loopback Group Replication, SF-aligned public Kuberic values, one member-local Replicator and client proxy per host | Public conformance ordering passes; signed build/peer admission and qualified scalar progress bind exact sessions; bootstrap/join completes; source access closes and its process is stopped/reaped before target writes open; unexpected loss leaves writes closed | Controlled host-local public-only Kuberic lifecycle and one planned handoff | No specific-quorum optimization, arbitrary GTID-set progress, Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
 | Advanced repair and restart | Stage 3 implementation, generic durable effect records, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Resumable host-local repair for the exercised profile without an application-owned metadata store | No automated writable failover |
 | Advanced failover and fencing | Validated native commit invariant and independent fence provider | Only a candidate containing the required history publishes; old-primary survival, provider loss, quorum loss, and divergent histories remain fail-closed | Automated failover for the exact qualified environment | No portable infrastructure or Kubernetes claim |
 | Secure cross-host and Kubernetes | Named network, TLS or qualified equivalent, separate principals, storage, routing, and fence integration | The environment-specific lifecycle, partition, trust-rotation, direct-client, restart, and replacement matrix passes | Only the exact named deployment matrix | No generic CNI, mesh, cloud, or Kubernetes portability |
@@ -1308,22 +1473,24 @@ repositories:
 - application-owned custom replication with Kuberic-owned lifecycle
   choreography;
 - independent read/write partition status rather than role-derived access;
-- native completion evidence in addition to public scalar progress;
+- complete native validation behind narrow public completion and qualified
+  `HistoryContext`-scoped scalar progress;
 - generic effect records, stale-result rejection, restart reobservation, and
   conservative access reconstruction;
 - independently verifiable fencing before new write publication; and
 - deterministic core contracts retained alongside mandatory live repository
   gates.
 
-The existing callback and custom-authority behavior is evidenced in:
+The SF-aligned public contract and transition plan are evidenced in:
 
-- `../kuberic/kuberic-runtime/src/application.rs:23-28,67-76`;
-- `../kuberic/kuberic-runtime/src/replicator/mod.rs:42-70,160-201,608-665`;
-- `../kuberic/docs/features/kuberic/replicator-boundary.md:74-181`; and
-- `../kuberic/kuberic-runtime/README.md:30-260`.
+- `../kuberic/docs/features/kuberic/service-fabric-api-semantics.md`;
+- `../kuberic/docs/features/kuberic/service-fabric-alignment.md`;
+- `../kuberic/docs/features/kuberic/stateless-default-replicator.md`;
+- `../kuberic/docs/features/kuberic/replicator-boundary.md`; and
+- `../kuberic/kuberic-runtime/src/replicator/mod.rs`.
 
 These paths were researched at local Kuberic commit
-`301d7f364744aea4dd2513dcc8179d3588fd7dd7`.
+`356e96f33efbfccc8761f28c2bd97e1214a7540e`.
 
 ### Database-specific mechanisms not copied
 
