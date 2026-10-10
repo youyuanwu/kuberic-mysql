@@ -38,6 +38,16 @@ fn complete_evidence() -> NativeProfileEvidence {
     }
 }
 
+fn revocation_expectation(member: &str, process: &str) -> RevocationExpectation {
+    RevocationExpectation {
+        binding: binding(),
+        exact_member: member.to_owned(),
+        predecessor_process_session: process.to_owned(),
+        predecessor_credential_generation: "credential-1".to_owned(),
+        replacement_credential_generation: "credential-2".to_owned(),
+    }
+}
+
 #[test]
 fn exact_profile_matrix_and_binding_qualify_all_three_members() {
     assert_eq!(NATIVE_PROFILE.len(), 9);
@@ -312,7 +322,7 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
             credential_bound_session_identity: false,
         };
         assert_eq!(
-            evidence.verdict(),
+            evidence.verdict(&revocation_expectation("member-2", "process-2")),
             RevocationVerdict::SessionIdentityUnproved
         );
     }
@@ -335,7 +345,7 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
         credential_bound_session_identity: false,
     };
     assert_eq!(
-        stop_rejoin.verdict(),
+        stop_rejoin.verdict(&revocation_expectation("member-2", "process-2")),
         RevocationVerdict::ExactProcessBarrier
     );
 
@@ -363,7 +373,36 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
     for invalidate in invalidations {
         let mut evidence = stop_rejoin.clone();
         invalidate(&mut evidence);
-        assert_ne!(evidence.verdict(), RevocationVerdict::ExactProcessBarrier);
+        assert_ne!(
+            evidence.verdict(&revocation_expectation("member-2", "process-2")),
+            RevocationVerdict::ExactProcessBarrier
+        );
+    }
+
+    let expectation_mutations: [fn(&mut RevocationExpectation); 7] = [
+        |expected: &mut RevocationExpectation| expected.binding.attempt = "attempt-2".to_owned(),
+        |expected: &mut RevocationExpectation| expected.binding.group = "other-group".to_owned(),
+        |expected: &mut RevocationExpectation| {
+            expected.binding.opening_view = "1:2".to_owned();
+        },
+        |expected: &mut RevocationExpectation| expected.exact_member = "member-3".to_owned(),
+        |expected: &mut RevocationExpectation| {
+            expected.predecessor_process_session = "process-3".to_owned();
+        },
+        |expected: &mut RevocationExpectation| {
+            expected.predecessor_credential_generation = "credential-old".to_owned();
+        },
+        |expected: &mut RevocationExpectation| {
+            expected.replacement_credential_generation = "credential-new".to_owned();
+        },
+    ];
+    for mutate in expectation_mutations {
+        let mut expected = revocation_expectation("member-2", "process-2");
+        mutate(&mut expected);
+        assert_ne!(
+            stop_rejoin.verdict(&expected),
+            RevocationVerdict::ExactProcessBarrier
+        );
     }
 }
 
@@ -453,7 +492,7 @@ fn result_enums_keep_outcomes_and_diagnostics_distinct_and_secret_free() {
             replacement_admission: ProbeOutcome::Unproved,
             credential_bound_session_identity: true,
         }
-        .verdict(),
+        .verdict(&revocation_expectation("member-1", "process-1")),
         RevocationVerdict::Insufficient
     );
 

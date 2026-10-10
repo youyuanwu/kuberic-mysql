@@ -463,6 +463,15 @@ struct RevocationEvidence {
     credential_bound_session_identity: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RevocationExpectation {
+    binding: QualificationBinding,
+    exact_member: String,
+    predecessor_process_session: String,
+    predecessor_credential_generation: String,
+    replacement_credential_generation: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RevocationVerdict {
     ExactProcessBarrier,
@@ -471,16 +480,15 @@ enum RevocationVerdict {
 }
 
 impl RevocationEvidence {
-    fn verdict(&self) -> RevocationVerdict {
-        let exact_binding = !self.exact_member.is_empty()
+    fn verdict(&self, expected: &RevocationExpectation) -> RevocationVerdict {
+        let exact_binding = self.binding == expected.binding
             && self.binding.package == ORACLE_PACKAGE
-            && !self.binding.attempt.is_empty()
-            && !self.binding.group.is_empty()
-            && !self.predecessor_process_session.is_empty()
-            && !self.predecessor_credential_generation.is_empty()
-            && !self.replacement_credential_generation.is_empty()
+            && self.opening_view == self.binding.opening_view
+            && self.exact_member == expected.exact_member
+            && self.predecessor_process_session == expected.predecessor_process_session
+            && self.predecessor_credential_generation == expected.predecessor_credential_generation
+            && self.replacement_credential_generation == expected.replacement_credential_generation
             && self.predecessor_credential_generation != self.replacement_credential_generation
-            && !self.opening_view.is_empty()
             && self
                 .successor_view
                 .as_ref()
