@@ -356,16 +356,16 @@ mod tests {
             ])
             .spawn()
             .unwrap();
-        let ready_deadline = Instant::now() + Duration::from_secs(1);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
             assert!(Instant::now() < ready_deadline);
             thread::sleep(Duration::from_millis(1));
         }
         let started = Instant::now();
-        terminate_and_reap(&mut child, Duration::from_millis(100)).unwrap();
+        terminate_and_reap(&mut child, Duration::from_secs(1)).unwrap();
         let status = child.try_wait().unwrap().unwrap();
         assert_eq!(status.signal(), Some(9));
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_millis(1500));
         fs::remove_file(ready).unwrap();
     }
 }

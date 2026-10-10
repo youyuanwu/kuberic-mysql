@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -8,9 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use kuberic_mysql::service::{MysqlInstanceConfig, MysqlOperationTimeouts};
+use kuberic_mysql::service::{
+    MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts,
+    MysqlTopologyConfig,
+};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+pub const GROUP_UUID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 
 pub struct TestRoot {
     pub root: PathBuf,
@@ -22,7 +27,11 @@ pub struct TestRoot {
 impl TestRoot {
     pub fn new(label: &str) -> Self {
         let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let root = workspace.join("target").join(format!(
             "kms-{}-{serial}-{}",
             std::process::id(),
             &label[..label.len().min(8)]
@@ -53,6 +62,37 @@ impl TestRoot {
         )
         .unwrap()
     }
+
+    pub fn config_for_member(&self, member_index: MysqlMemberIndex) -> MysqlInstanceConfig {
+        self.config_for_member_with_timeouts(member_index, timeouts())
+    }
+
+    pub fn config_for_member_with_timeouts(
+        &self,
+        member_index: MysqlMemberIndex,
+        timeouts: MysqlOperationTimeouts,
+    ) -> MysqlInstanceConfig {
+        self.config_for_member_in_topology(topology(), member_index, timeouts)
+    }
+
+    pub fn config_for_member_in_topology(
+        &self,
+        topology: MysqlTopologyConfig,
+        member_index: MysqlMemberIndex,
+        timeouts: MysqlOperationTimeouts,
+    ) -> MysqlInstanceConfig {
+        write_launcher(&self.launcher);
+        MysqlInstanceConfig::new_topology_member(
+            "/usr/bin/sleep",
+            &self.launcher,
+            &self.data,
+            &self.scratch,
+            topology,
+            member_index,
+            timeouts,
+        )
+        .unwrap()
+    }
 }
 
 impl Drop for TestRoot {
@@ -70,6 +110,33 @@ pub fn timeouts() -> MysqlOperationTimeouts {
         Duration::from_secs(2),
     )
     .unwrap()
+}
+
+pub fn topology() -> MysqlTopologyConfig {
+    MysqlTopologyConfig::new(member_configs()).unwrap()
+}
+
+pub fn member_configs() -> [MysqlMemberConfig; 3] {
+    let sql_addresses = [
+        loopback_address(33061),
+        loopback_address(33062),
+        loopback_address(33063),
+    ];
+    let group_addresses = [
+        loopback_address(43061),
+        loopback_address(43062),
+        loopback_address(43063),
+    ];
+    let seeds = [group_addresses[2], group_addresses[0], group_addresses[1]];
+    [
+        MysqlMemberConfig::new(1, sql_addresses[0], group_addresses[0], GROUP_UUID, seeds).unwrap(),
+        MysqlMemberConfig::new(2, sql_addresses[1], group_addresses[1], GROUP_UUID, seeds).unwrap(),
+        MysqlMemberConfig::new(3, sql_addresses[2], group_addresses[2], GROUP_UUID, seeds).unwrap(),
+    ]
+}
+
+pub fn loopback_address(port: u16) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
 }
 
 fn write_launcher(path: &Path) {

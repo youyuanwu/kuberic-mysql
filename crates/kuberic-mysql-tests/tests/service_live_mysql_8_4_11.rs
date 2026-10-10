@@ -1,6 +1,8 @@
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+#[path = "service_common/mod.rs"]
+mod common;
+#[path = "service_live_support/mod.rs"]
+mod live_support;
+
 use std::time::{Duration, Instant};
 
 use kuberic_mysql::adapter::{
@@ -16,6 +18,8 @@ use kuberic_mysql::core::{
 use kuberic_mysql::service::{MysqlInstanceConfig, MysqlInstanceManager, MysqlOperationTimeouts};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
+
+use live_support::{FixtureRoot, preflight_oracle_mysql_8_4_11};
 
 #[derive(Clone)]
 struct SystemClock {
@@ -41,12 +45,12 @@ impl ObservationClock for SystemClock {
 
 #[tokio::test(flavor = "current_thread")]
 async fn one_fresh_owned_instance_lifecycle() {
-    let root = live_root();
+    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+    let mut fixture =
+        FixtureRoot::new("service-single-live").unwrap_or_else(|error| panic!("{error}"));
+    let root = fixture.path().to_path_buf();
     let data = root.join("data");
     let scratch = root.join("scratch");
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir(&root).unwrap();
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
 
     let timeouts = MysqlOperationTimeouts::new(
         Duration::from_secs(90),
@@ -94,7 +98,7 @@ async fn one_fresh_owned_instance_lifecycle() {
     assert!(!socket.exists());
     assert!(data.is_dir());
     assert!(!scratch.exists());
-    fs::remove_dir_all(&root).unwrap();
+    fixture.remove().unwrap_or_else(|error| panic!("{error}"));
 
     assert!(
         matches!(report.outcome(), ObservationOutcome::Absent(_)),
@@ -122,10 +126,6 @@ async fn connect_root(socket: &std::path::Path) -> Conn {
         .socket(Some(socket.to_str().unwrap().to_owned()))
         .user(Some("root".to_owned()));
     Conn::new(options).await.unwrap()
-}
-
-fn live_root() -> PathBuf {
-    std::env::temp_dir().join(format!("kms-live-{}", std::process::id()))
 }
 
 fn binding(server_uuid: &str, group_name: &str) -> ExactBinding {
