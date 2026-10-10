@@ -1562,11 +1562,14 @@ impl AbortWorkloadOnDrop {
     }
 
     async fn join(&mut self) -> Result<(Conn, Result<(), mysql_async::Error>), String> {
-        self.handle
-            .take()
+        let result = self
+            .handle
+            .as_mut()
             .expect("workload task is retained until joined")
             .await
-            .map_err(|_| "workload task was cancelled unexpectedly".to_owned())
+            .map_err(|_| "workload task was cancelled unexpectedly".to_owned());
+        self.handle.take();
+        result
     }
 
     async fn abort_and_join(&mut self) {
