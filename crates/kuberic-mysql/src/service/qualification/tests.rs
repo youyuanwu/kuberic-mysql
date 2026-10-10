@@ -318,7 +318,7 @@ fn qualification_ownership_stops_restarts_and_rebinds_phase() {
     let mut members = std::array::from_fn(|_| ScriptedOwnedMember::default());
     {
         let mut ownership =
-            QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(121))
+            QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(151))
                 .unwrap();
         ownership
             .stop(MysqlMemberIndex::Second, QualificationStopKind::Graceful)
@@ -733,7 +733,7 @@ fn qualification_ownership_contains_on_failure_and_cancelled_rejoin() {
     {
         let mut ownership = QualificationOwnership::new(
             &mut failed_members,
-            Instant::now() + Duration::from_secs(121),
+            Instant::now() + Duration::from_secs(151),
         )
         .unwrap();
         assert!(
@@ -756,7 +756,7 @@ fn qualification_ownership_contains_on_failure_and_cancelled_rejoin() {
     {
         let mut ownership = QualificationOwnership::new(
             &mut restart_members,
-            Instant::now() + Duration::from_secs(121),
+            Instant::now() + Duration::from_secs(151),
         )
         .unwrap();
         ownership
@@ -777,7 +777,7 @@ fn qualification_ownership_contains_on_failure_and_cancelled_rejoin() {
     {
         let mut ownership = QualificationOwnership::new(
             &mut cancelled_members,
-            Instant::now() + Duration::from_secs(121),
+            Instant::now() + Duration::from_secs(151),
         )
         .unwrap();
         drop(ownership.begin_rejoin(MysqlMemberIndex::Third).unwrap());
@@ -802,7 +802,7 @@ fn qualification_ownership_completes_rejoin_and_reserves_cleanup_budget() {
 
     {
         let mut ownership =
-            QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(121))
+            QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(151))
                 .unwrap();
         assert!(ownership.restart(MysqlMemberIndex::First).is_err());
         assert_eq!(
@@ -815,7 +815,7 @@ fn qualification_ownership_completes_rejoin_and_reserves_cleanup_budget() {
     {
         let mut ownership = QualificationOwnership::new(
             &mut rejoin_members,
-            Instant::now() + Duration::from_secs(121),
+            Instant::now() + Duration::from_secs(151),
         )
         .unwrap();
         ownership
@@ -880,7 +880,7 @@ fn qualification_rebinding_failure_contains_and_propagates_cleanup_overrun() {
     members[0].contain_delay = Duration::from_millis(5);
     let mut ownership = QualificationOwnership::with_deadlines(
         &mut members,
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(31),
         Instant::now() + Duration::from_millis(1),
     );
     ownership
@@ -909,7 +909,7 @@ fn invalid_or_late_rejoin_contains_immediately() {
     let mut invalid_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
     let mut ownership = QualificationOwnership::with_deadlines(
         &mut invalid_members,
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(21),
         Instant::now() + Duration::from_secs(2),
     );
     ownership
