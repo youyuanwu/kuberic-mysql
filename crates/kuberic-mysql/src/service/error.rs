@@ -153,6 +153,8 @@ pub enum ControlStage {
     VerifyEnrolledIdentity,
     /// Proving that no existing group state is present.
     InspectExistingGroup,
+    /// Proving that no executed transaction history is present.
+    InspectExistingHistory,
     /// Enabling designated bootstrap mode.
     EnableBootstrap,
     /// Starting Group Replication with in-memory recovery credentials.
@@ -195,6 +197,8 @@ pub enum TopologyAuthorityError {
 pub enum TopologyStateError {
     /// A supposedly fresh member already exposes native group state.
     ExistingGroupState,
+    /// A supposedly fresh member already exposes executed transaction history.
+    ExistingTransactionHistory,
     /// An enrollment duplicates another member's exact identity or binding.
     DuplicateEnrollment,
     /// A transition was requested from the wrong pure topology state.

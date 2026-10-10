@@ -286,6 +286,8 @@ pub enum ControlStep {
     ProveBinaryLoggingRestored,
     /// Prove no existing Group Replication identity is active or retained.
     ProveFreshGroupState,
+    /// Prove no executed transaction history exists.
+    ProveFreshExecutedHistory,
     /// Read and freeze `@@server_uuid`.
     EnrollServerIdentity,
     /// Set bootstrap mode on.
@@ -339,6 +341,7 @@ impl ControlStep {
                 "SELECT COUNT(*) FROM performance_schema.replication_group_members \
                  WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID <> ''",
             ),
+            Self::ProveFreshExecutedHistory => Some("SELECT @@GLOBAL.gtid_executed"),
             Self::EnrollServerIdentity | Self::VerifyEnrolledIdentity => {
                 Some("SELECT @@GLOBAL.server_uuid")
             }
@@ -370,9 +373,10 @@ const ACCOUNT_STEPS: [ControlStep; 10] = [
     ControlStep::RestoreBinaryLogging,
     ControlStep::ProveBinaryLoggingRestored,
 ];
-const ENROLLMENT_STEPS: [ControlStep; 3] = [
+const ENROLLMENT_STEPS: [ControlStep; 4] = [
     ControlStep::ValidateProduct,
     ControlStep::ProveFreshGroupState,
+    ControlStep::ProveFreshExecutedHistory,
     ControlStep::EnrollServerIdentity,
 ];
 const BOOTSTRAP_STEPS: [ControlStep; 5] = [
@@ -557,6 +561,7 @@ impl NativeIdentityEnrollment {
         server_uuid: ServerUuid,
         accounts: &AccountProvisioningEvidence,
         fresh_group_state: bool,
+        executed: GtidSet,
         steps: Vec<ControlStep>,
     ) -> Result<Self, MysqlTopologyError> {
         if accounts.binding != binding {
@@ -567,6 +572,11 @@ impl NativeIdentityEnrollment {
         if !fresh_group_state {
             return Err(MysqlTopologyError::TopologyState(
                 TopologyStateError::ExistingGroupState,
+            ));
+        }
+        if !executed.entries().is_empty() {
+            return Err(MysqlTopologyError::TopologyState(
+                TopologyStateError::ExistingTransactionHistory,
             ));
         }
         if steps != ENROLLMENT_STEPS {
@@ -602,6 +612,10 @@ impl NativeIdentityEnrollment {
     #[must_use]
     pub const fn member_id(&self) -> &MemberId {
         &self.member_id
+    }
+
+    pub(crate) fn recovery_username(&self) -> &str {
+        &self.recovery_username
     }
 }
 
@@ -680,24 +694,6 @@ pub struct SourceGtidBoundary {
 }
 
 impl SourceGtidBoundary {
-    /// Creates a source-bound pre-join GTID boundary.
-    #[must_use]
-    pub const fn new(
-        attempt: AttemptId,
-        source: NativeIdentityEnrollment,
-        observation_attempt: AttemptId,
-        view_id: ViewId,
-        executed: GtidSet,
-    ) -> Self {
-        Self {
-            attempt,
-            source,
-            observation_attempt,
-            view_id,
-            executed,
-        }
-    }
-
     /// Captured executed set.
     #[must_use]
     pub const fn executed(&self) -> &GtidSet {
@@ -944,6 +940,7 @@ pub struct TransitionCredit {
     observation_attempt: AttemptId,
     view_id: ViewId,
     members: Vec<NativeIdentityEnrollment>,
+    executed: GtidSet,
 }
 
 impl TransitionCredit {
@@ -963,6 +960,25 @@ impl TransitionCredit {
     #[must_use]
     pub fn members(&self) -> &[NativeIdentityEnrollment] {
         &self.members
+    }
+
+    /// Constructs the join boundary from this exact accepted observation.
+    pub fn source_gtid_boundary(
+        &self,
+        source: &NativeIdentityEnrollment,
+    ) -> Result<SourceGtidBoundary, MysqlTopologyError> {
+        if !self.members.contains(source) {
+            return Err(MysqlTopologyError::Gtid(
+                TopologyGtidError::SourceBoundaryBindingMismatch,
+            ));
+        }
+        Ok(SourceGtidBoundary {
+            attempt: self.attempt.clone(),
+            source: source.clone(),
+            observation_attempt: self.observation_attempt.clone(),
+            view_id: self.view_id.clone(),
+            executed: self.executed.clone(),
+        })
     }
 }
 
@@ -1278,6 +1294,7 @@ fn validate_boundary(
         || predecessor.attempt != attempt.id
         || boundary.observation_attempt != predecessor.observation_attempt
         || boundary.view_id != predecessor.view_id
+        || boundary.executed != predecessor.executed
         || !predecessor.members.contains(&boundary.source)
     {
         return Err(MysqlTopologyError::Gtid(
@@ -1398,6 +1415,7 @@ fn validate_transition(
         observation_attempt: evidence.observation_attempt.clone(),
         view_id: evidence.view_id.clone(),
         members: expected,
+        executed: evidence.executed.clone(),
     }))
 }
 

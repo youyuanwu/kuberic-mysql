@@ -89,6 +89,15 @@ fn control_contract_uses_exact_minimum_accounts_and_restores_binary_logging() {
         ]
     );
     assert_eq!(
+        NativeIdentityEnrollment::required_steps(),
+        [
+            ControlStep::ValidateProduct,
+            ControlStep::ProveFreshGroupState,
+            ControlStep::ProveFreshExecutedHistory,
+            ControlStep::EnrollServerIdentity,
+        ]
+    );
+    assert_eq!(
         JoinEffect::required_steps(),
         [
             ControlStep::ValidateProduct,
@@ -195,6 +204,7 @@ fn account_provisioning_is_attempt_and_generation_bound_on_every_member() {
         ServerUuid::new(MEMBER_UUIDS[1]).unwrap(),
         &second_accounts,
         true,
+        GtidSet::empty(),
         NativeIdentityEnrollment::required_steps().to_vec(),
     )
     .unwrap();
@@ -235,6 +245,7 @@ fn enrollment_rejects_existing_group_state_and_requires_complete_setup_trace() {
             ServerUuid::new(MEMBER_UUIDS[0]).unwrap(),
             &accounts,
             false,
+            GtidSet::empty(),
             NativeIdentityEnrollment::required_steps().to_vec(),
         ),
         Err(MysqlTopologyError::TopologyState(
@@ -243,10 +254,24 @@ fn enrollment_rejects_existing_group_state_and_requires_complete_setup_trace() {
     );
     assert_eq!(
         NativeIdentityEnrollment::new(
+            binding.clone(),
+            ServerUuid::new(MEMBER_UUIDS[0]).unwrap(),
+            &accounts,
+            true,
+            group_gtids("1"),
+            NativeIdentityEnrollment::required_steps().to_vec(),
+        ),
+        Err(MysqlTopologyError::TopologyState(
+            TopologyStateError::ExistingTransactionHistory
+        ))
+    );
+    assert_eq!(
+        NativeIdentityEnrollment::new(
             binding,
             ServerUuid::new(MEMBER_UUIDS[0]).unwrap(),
             &accounts,
             true,
+            GtidSet::empty(),
             vec![ControlStep::EnrollServerIdentity],
         ),
         Err(MysqlTopologyError::TopologyState(
@@ -348,7 +373,7 @@ fn non_designated_bootstrap_and_unenrolled_members_execute_no_effect() {
 #[test]
 fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
     let (mut authority, enrollments, bootstrap_credit) = accepted_bootstrap();
-    let source_boundary = boundary(&bootstrap_credit, &enrollments[0], group_gtids("1-5"));
+    let source_boundary = boundary(&bootstrap_credit, &enrollments[0]);
     let join = authority
         .authorize_join(
             MysqlMemberIndex::Second,
@@ -388,7 +413,7 @@ fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
     assert!(matches!(
         authority.authorize_join(
             MysqlMemberIndex::Third,
-            boundary(&bootstrap_credit, &enrollments[0], group_gtids("1-5")),
+            boundary(&bootstrap_credit, &enrollments[0]),
             TopologyInstant::new(42),
         ),
         Err(MysqlTopologyError::Authority(
@@ -420,7 +445,7 @@ fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
     let third = authority
         .authorize_join(
             MysqlMemberIndex::Third,
-            boundary(&second_credit, &enrollments[0], group_gtids("1-6")),
+            boundary(&second_credit, &enrollments[0]),
             TopologyInstant::new(50),
         )
         .unwrap();
@@ -456,11 +481,11 @@ fn sequential_joins_treat_recovering_as_pending_and_online_as_credit() {
 #[test]
 fn join_requires_equal_or_superset_group_only_history() {
     for target_history in ["1-5", "1-6"] {
-        let (mut authority, enrollments, predecessor) = accepted_bootstrap();
+        let (mut authority, enrollments, predecessor) = accepted_bootstrap_with_history("1-5");
         let join = authority
             .authorize_join(
                 MysqlMemberIndex::Second,
-                boundary(&predecessor, &enrollments[0], group_gtids("1-5")),
+                boundary(&predecessor, &enrollments[0]),
                 TopologyInstant::new(30),
             )
             .unwrap();
@@ -478,11 +503,11 @@ fn join_requires_equal_or_superset_group_only_history() {
         assert_closed_no_credit(&authority, 2);
     }
 
-    let (mut authority, enrollments, predecessor) = accepted_bootstrap();
+    let (mut authority, enrollments, predecessor) = accepted_bootstrap_with_history("1-5");
     let join = authority
         .authorize_join(
             MysqlMemberIndex::Second,
-            boundary(&predecessor, &enrollments[0], group_gtids("1-5")),
+            boundary(&predecessor, &enrollments[0]),
             TopologyInstant::new(30),
         )
         .unwrap();
@@ -501,57 +526,57 @@ fn join_requires_equal_or_superset_group_only_history() {
 }
 
 #[test]
-fn non_group_gtid_sources_and_wrong_source_bindings_fail_before_join_effect() {
-    let (mut authority, enrollments, predecessor) = accepted_bootstrap();
-    let foreign = GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1").unwrap();
-    let mut effects = 0;
-    if authority
+fn understated_source_boundary_cannot_admit_under_recovered_target() {
+    let (mut authority, enrollments, predecessor) = accepted_bootstrap_with_history("1-100");
+    let join = authority
         .authorize_join(
             MysqlMemberIndex::Second,
-            boundary(&predecessor, &enrollments[0], foreign),
+            boundary(&predecessor, &enrollments[0]),
             TopologyInstant::new(30),
         )
-        .is_ok()
-    {
-        effects += 1;
-    }
-    assert_eq!(effects, 0);
-    assert_closed_no_credit(&authority, 1);
-
-    let (mut authority, enrollments, predecessor) = accepted_bootstrap();
-    let wrong_view = SourceGtidBoundary::new(
-        predecessor.members()[0].binding().attempt().clone(),
-        enrollments[0].clone(),
-        predecessor.observation_attempt().clone(),
-        ViewId::new("foreign-view").unwrap(),
-        group_gtids("1"),
-    );
+        .unwrap();
+    let effect = join
+        .record_effect(JoinEffect::required_steps().to_vec())
+        .unwrap()
+        .bind_observation_attempt(AttemptId::new("join-two-observation").unwrap());
+    let under_recovered = join_two_observation(&enrollments, "1-99");
     assert_eq!(
-        authority.authorize_join(
-            MysqlMemberIndex::Second,
-            wrong_view,
-            TopologyInstant::new(30),
-        ),
+        authority.accept_join(&effect, &under_recovered, TopologyInstant::new(45)),
         Err(MysqlTopologyError::Gtid(
-            TopologyGtidError::SourceBoundaryBindingMismatch
+            TopologyGtidError::SourceBoundaryNotContained
         ))
     );
     assert_closed_no_credit(&authority, 1);
+}
 
-    let (mut authority, enrollments, predecessor) = accepted_bootstrap();
-    let wrong_source = SourceGtidBoundary::new(
-        predecessor.members()[0].binding().attempt().clone(),
-        enrollments[2].clone(),
-        predecessor.observation_attempt().clone(),
-        predecessor.view_id().clone(),
-        group_gtids("1"),
+#[test]
+fn non_group_gtid_sources_and_wrong_source_bindings_fail_before_join_effect() {
+    let (mut authority, enrollments, effect) = bootstrap_in_flight();
+    let foreign = GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1").unwrap();
+    let evidence = observation(
+        &attempt("topology-attempt", 100),
+        &enrollments[0],
+        "bootstrap-observation",
+        "view-1",
+        "view-1",
+        vec![native(
+            &enrollments[0],
+            MemberRole::Primary,
+            MemberState::Online,
+        )],
+        foreign,
+        TopologyObservationStatus::Complete,
+        TopologyInstant::new(20),
     );
     assert_eq!(
-        authority.authorize_join(
-            MysqlMemberIndex::Second,
-            wrong_source,
-            TopologyInstant::new(30),
-        ),
+        authority.accept_bootstrap(&effect, &evidence, TopologyInstant::new(21)),
+        Err(MysqlTopologyError::Gtid(TopologyGtidError::NonGroupSource))
+    );
+    assert_closed_no_credit(&authority, 0);
+
+    let (authority, enrollments, predecessor) = accepted_bootstrap();
+    assert_eq!(
+        predecessor.source_gtid_boundary(&enrollments[2]),
         Err(MysqlTopologyError::Gtid(
             TopologyGtidError::SourceBoundaryBindingMismatch
         ))
@@ -566,7 +591,7 @@ fn wrong_join_order_is_rejected_without_dependent_effect() {
     if authority
         .authorize_join(
             MysqlMemberIndex::Third,
-            boundary(&predecessor, &enrollments[0], group_gtids("1")),
+            boundary(&predecessor, &enrollments[0]),
             TopologyInstant::new(30),
         )
         .is_ok()
@@ -591,29 +616,12 @@ fn fail_closed_identity_ownership_membership_and_binding_matrix() {
         let (mut authority, enrollments, effect) = bootstrap_in_flight();
         let mut evidence = bootstrap_observation(&enrollments);
         evidence = negative_evidence(case, &enrollments, evidence);
-        assert!(
-            authority
-                .accept_bootstrap(&effect, &evidence, TopologyInstant::new(21))
-                .is_err(),
+        let error = reject_bootstrap_without_dependent_effect(&mut authority, &effect, &evidence);
+        assert_ne!(
+            error,
+            MysqlTopologyError::TopologyState(TopologyStateError::InvalidTransition),
             "{case:?}"
         );
-        assert_closed_no_credit(&authority, 0);
-        assert!(matches!(
-            authority.authorize_join(
-                MysqlMemberIndex::Second,
-                SourceGtidBoundary::new(
-                    AttemptId::new("topology-attempt").unwrap(),
-                    enrollments[0].clone(),
-                    AttemptId::new("bootstrap-observation").unwrap(),
-                    ViewId::new("view-1").unwrap(),
-                    group_gtids("1"),
-                ),
-                TopologyInstant::new(22),
-            ),
-            Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::InvalidTransition
-            ))
-        ));
     }
 }
 
@@ -659,10 +667,9 @@ fn fail_closed_collection_product_native_state_and_deadline_matrix() {
             TopologyInstant::new(20),
         );
         assert_eq!(
-            authority.accept_bootstrap(&effect, &evidence, TopologyInstant::new(21)),
-            Err(expected)
+            reject_bootstrap_without_dependent_effect(&mut authority, &effect, &evidence),
+            expected
         );
-        assert_closed_no_credit(&authority, 0);
     }
 
     for state in [
@@ -684,16 +691,15 @@ fn fail_closed_collection_product_native_state_and_deadline_matrix() {
         );
         assert!(
             matches!(
-                authority.accept_bootstrap(&effect, &evidence, TopologyInstant::new(21)),
-                Err(MysqlTopologyError::NativeState(
+                reject_bootstrap_without_dependent_effect(&mut authority, &effect, &evidence),
+                MysqlTopologyError::NativeState(
                     TopologyNativeStateError::Offline
                         | TopologyNativeStateError::Error
                         | TopologyNativeStateError::Unreachable
-                ))
+                )
             ),
             "{state:?}"
         );
-        assert_closed_no_credit(&authority, 0);
     }
 
     let (mut authority, enrollments, effect) = bootstrap_in_flight();
@@ -713,10 +719,9 @@ fn fail_closed_collection_product_native_state_and_deadline_matrix() {
         TopologyInstant::new(100),
     );
     assert_eq!(
-        authority.accept_bootstrap(&effect, &expired, TopologyInstant::new(99)),
-        Err(MysqlTopologyError::Deadline(ControlStage::DiscoverView))
+        reject_bootstrap_without_dependent_effect(&mut authority, &effect, &expired),
+        MysqlTopologyError::Deadline(ControlStage::DiscoverView)
     );
-    assert_closed_no_credit(&authority, 0);
 }
 
 #[test]
@@ -749,7 +754,7 @@ fn local_role_semantics_are_exact_and_recovery_never_grants_early_credit() {
     let join = authority
         .authorize_join(
             MysqlMemberIndex::Second,
-            boundary(&predecessor, &enrollments[0], group_gtids("1")),
+            boundary(&predecessor, &enrollments[0]),
             TopologyInstant::new(30),
         )
         .unwrap();
@@ -783,7 +788,7 @@ fn local_role_semantics_are_exact_and_recovery_never_grants_early_credit() {
     let join = authority
         .authorize_join(
             MysqlMemberIndex::Second,
-            boundary(&predecessor, &enrollments[0], group_gtids("1")),
+            boundary(&predecessor, &enrollments[0]),
             TopologyInstant::new(30),
         )
         .unwrap();
@@ -989,8 +994,18 @@ fn accepted_bootstrap() -> (
     [NativeIdentityEnrollment; 3],
     TransitionCredit,
 ) {
+    accepted_bootstrap_with_history("1")
+}
+
+fn accepted_bootstrap_with_history(
+    history: &str,
+) -> (
+    TopologyAuthority,
+    [NativeIdentityEnrollment; 3],
+    TransitionCredit,
+) {
     let (mut authority, enrollments, effect) = bootstrap_in_flight();
-    let evidence = bootstrap_observation(&enrollments);
+    let evidence = bootstrap_observation_with_history(&enrollments, history);
     let credit = accepted(
         authority
             .accept_bootstrap(&effect, &evidence, TopologyInstant::new(21))
@@ -1000,6 +1015,13 @@ fn accepted_bootstrap() -> (
 }
 
 fn bootstrap_observation(enrollments: &[NativeIdentityEnrollment; 3]) -> TopologyObservation {
+    bootstrap_observation_with_history(enrollments, "1")
+}
+
+fn bootstrap_observation_with_history(
+    enrollments: &[NativeIdentityEnrollment; 3],
+    history: &str,
+) -> TopologyObservation {
     observation(
         &attempt("topology-attempt", 100),
         &enrollments[0],
@@ -1011,7 +1033,7 @@ fn bootstrap_observation(enrollments: &[NativeIdentityEnrollment; 3]) -> Topolog
             MemberRole::Primary,
             MemberState::Online,
         )],
-        group_gtids("1"),
+        group_gtids(history),
         TopologyObservationStatus::Complete,
         TopologyInstant::new(20),
     )
@@ -1101,6 +1123,7 @@ fn enrollment(attempt: &TopologyAttempt, member: MysqlMemberIndex) -> NativeIden
         ServerUuid::new(MEMBER_UUIDS[member.as_usize()]).unwrap(),
         &accounts(attempt, member),
         true,
+        GtidSet::empty(),
         NativeIdentityEnrollment::required_steps().to_vec(),
     )
     .unwrap()
@@ -1144,18 +1167,8 @@ fn native(
     )
 }
 
-fn boundary(
-    credit: &TransitionCredit,
-    source: &NativeIdentityEnrollment,
-    executed: GtidSet,
-) -> SourceGtidBoundary {
-    SourceGtidBoundary::new(
-        source.binding().attempt().clone(),
-        source.clone(),
-        credit.observation_attempt().clone(),
-        credit.view_id().clone(),
-        executed,
-    )
+fn boundary(credit: &TransitionCredit, source: &NativeIdentityEnrollment) -> SourceGtidBoundary {
+    credit.source_gtid_boundary(source).unwrap()
 }
 
 fn group_gtids(intervals: &str) -> GtidSet {
@@ -1167,6 +1180,31 @@ fn accepted(evaluation: TransitionEvaluation) -> TransitionCredit {
         TransitionEvaluation::Accepted(credit) => credit,
         TransitionEvaluation::Pending => panic!("expected accepted transition"),
     }
+}
+
+fn reject_bootstrap_without_dependent_effect(
+    authority: &mut TopologyAuthority,
+    effect: &BootstrapEffect,
+    evidence: &TopologyObservation,
+) -> MysqlTopologyError {
+    let error = authority
+        .accept_bootstrap(effect, evidence, TopologyInstant::new(21))
+        .unwrap_err();
+    let (_, enrollments, accepted_credit) = accepted_bootstrap();
+    let mut dependent_effects = 0;
+    if authority
+        .authorize_join(
+            MysqlMemberIndex::Second,
+            boundary(&accepted_credit, &enrollments[0]),
+            TopologyInstant::new(22),
+        )
+        .is_ok()
+    {
+        dependent_effects += 1;
+    }
+    assert_eq!(dependent_effects, 0);
+    assert_closed_no_credit(authority, 0);
+    error
 }
 
 fn assert_closed_no_credit(authority: &TopologyAuthority, expected_credits: u8) {
