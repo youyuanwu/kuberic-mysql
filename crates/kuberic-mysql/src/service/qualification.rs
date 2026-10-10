@@ -740,11 +740,15 @@ impl<'a> MysqlNativeQualification<'a> {
                 "transaction advanced GTID tail from {before_tail} to {tail}"
             ));
         }
+        if after[0].view_id != before[0].view_id {
+            return Err("transaction crossed a native view change".to_owned());
+        }
         let binary_logs = self.binary_log_inventory(primary).await?;
         Ok(GtidCheckpoint {
             label: label.to_owned(),
             before_tail,
             transaction_tail: tail,
+            opening_view: before[0].view_id.clone(),
             view_id: after[0].view_id.clone(),
             members: after[0]
                 .members
@@ -1117,7 +1121,7 @@ impl<'a> MysqlNativeQualification<'a> {
                     inclusion: InclusionEvidence::PresentOnEveryRequiredMember,
                 },
                 exact_gtid,
-                opening_view: checkpoint.view_id.clone(),
+                opening_view: checkpoint.opening_view,
                 closing_view: checkpoint.view_id,
                 before_tail: checkpoint.before_tail,
                 after_tail: checkpoint.transaction_tail,
@@ -1177,6 +1181,7 @@ impl<'a> MysqlNativeQualification<'a> {
                 .await;
             (workload, result)
         });
+        let mut update = AbortWorkloadOnDrop::new(update);
 
         let applying_gtid = match self
             .wait_exact_applier_gtid(secondary, baseline.transaction_tail + 1)
@@ -1184,17 +1189,21 @@ impl<'a> MysqlNativeQualification<'a> {
         {
             Ok(gtid) => gtid,
             Err(error) => {
-                update.abort();
-                let _ = update.await;
                 restore_secondary_lock(&mut lock_connection).await?;
+                let (connection, result) = update.join().await?;
+                let _ = connection.disconnect().await;
+                result
+                    .map_err(|_| "calibration transaction failed after lock release".to_owned())?;
                 return Err(error);
             }
         };
         if update.is_finished() {
+            restore_secondary_lock(&mut lock_connection).await?;
+            let (connection, _) = update.join().await?;
+            let _ = connection.disconnect().await;
             return Err("client completed before the applier barrier".to_owned());
         }
-        update.abort();
-        let _ = update.await;
+        update.abort_and_join().await;
         restore_secondary_lock(&mut lock_connection).await?;
 
         let after = self.wait_common_tail(baseline.transaction_tail + 1).await?;
@@ -1206,6 +1215,7 @@ impl<'a> MysqlNativeQualification<'a> {
         if closing_view != baseline.view_id {
             return Err("ambiguous transaction crossed a native view change".to_owned());
         }
+        let opening_view = baseline.view_id.clone();
         Ok(TransactionQualificationReport {
             binding: expected_profile,
             outcome: TransactionOutcomeEvidence {
@@ -1214,7 +1224,7 @@ impl<'a> MysqlNativeQualification<'a> {
                 inclusion: InclusionEvidence::PresentOnEveryRequiredMember,
             },
             exact_gtid: applying_gtid.clone(),
-            opening_view: baseline.view_id,
+            opening_view: opening_view.clone(),
             closing_view,
             before_tail: baseline.transaction_tail,
             after_tail,
@@ -1226,6 +1236,12 @@ impl<'a> MysqlNativeQualification<'a> {
                     .process_session()
                     .as_str()
                     .to_owned(),
+                source_process_session: self
+                    .member_binding(primary)?
+                    .process_session()
+                    .as_str()
+                    .to_owned(),
+                opening_view,
                 applying_gtid,
             }),
         })
@@ -1241,18 +1257,27 @@ impl<'a> MysqlNativeQualification<'a> {
             self.ownership
                 .require_work_budget()
                 .map_err(|()| "applier barrier reached scenario cutoff".to_owned())?;
-            let mut connection = self.root_connection(member).await?;
-            let applying = connection
-                .query_first::<String, _>(
-                    "SELECT APPLYING_TRANSACTION \
+            let applying =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(barrier_deadline), async {
+                    let mut connection = self.root_connection(member).await?;
+                    let applying = connection
+                        .query_first::<String, _>(
+                            "SELECT APPLYING_TRANSACTION \
                              FROM performance_schema.replication_applier_status_by_worker \
                              WHERE CHANNEL_NAME = 'group_replication_applier' \
                              AND APPLYING_TRANSACTION IS NOT NULL \
                              AND APPLYING_TRANSACTION <> '' LIMIT 1",
-                )
-                .await;
-            let _ = connection.disconnect().await;
-            if let Ok(Some(text)) = applying {
+                        )
+                        .await
+                        .map_err(|_| "applier barrier query failed".to_owned())?;
+                    let _ = connection.disconnect().await;
+                    Ok::<_, String>(applying)
+                })
+                .await
+                .map_err(|_| {
+                    "authoritative applier GTID barrier was unavailable on Oracle 8.4.11".to_owned()
+                })??;
+            if let Some(text) = applying {
                 return validate_applying_gtid(
                     &text,
                     self.attempt.group_name().as_str(),
@@ -1463,6 +1488,7 @@ struct GtidCheckpoint {
     label: String,
     before_tail: u64,
     transaction_tail: u64,
+    opening_view: String,
     view_id: String,
     members: HashSet<String>,
     snapshots: [NativeMemberSnapshot; 3],
@@ -1513,7 +1539,50 @@ enum QualificationPeerOutcome {
 struct ApplierBarrierEvidence {
     member: String,
     process_session: String,
+    source_process_session: String,
+    opening_view: String,
     applying_gtid: GtidSet,
+}
+
+struct AbortWorkloadOnDrop {
+    handle: Option<tokio::task::JoinHandle<(Conn, Result<(), mysql_async::Error>)>>,
+}
+
+impl AbortWorkloadOnDrop {
+    fn new(handle: tokio::task::JoinHandle<(Conn, Result<(), mysql_async::Error>)>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    async fn join(&mut self) -> Result<(Conn, Result<(), mysql_async::Error>), String> {
+        self.handle
+            .take()
+            .expect("workload task is retained until joined")
+            .await
+            .map_err(|_| "workload task was cancelled unexpectedly".to_owned())
+    }
+
+    async fn abort_and_join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AbortWorkloadOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
