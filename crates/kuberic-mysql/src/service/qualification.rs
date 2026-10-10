@@ -13,7 +13,7 @@ use crate::service::topology::QualificationManagerParts;
 use crate::service::{
     ControlCredential, ControlStage, MemberCleanupFailure, MemberControlBinding,
     MysqlInstanceError, MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError,
-    MysqlTopologyManager, MysqlTopologyManagerError, NativeControlDeadline,
+    MysqlTopologyManager, MysqlTopologyManagerError, NativeControlDeadline, TransitionCredit,
 };
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
@@ -258,6 +258,7 @@ struct MysqlNativeQualification<'a> {
     observer: &'a crate::service::ControlCredential,
     recovery: &'a crate::service::ControlCredential,
     native_deadline: NativeControlDeadline,
+    admitted_credit: TransitionCredit,
 }
 
 #[allow(dead_code)]
@@ -269,6 +270,7 @@ impl<'a> MysqlNativeQualification<'a> {
             observer,
             recovery,
             runtime_deadline,
+            admitted_credit,
         } = manager.enter_native_qualification()?;
         let work_cutoff = match qualification_work_cutoff(runtime_deadline) {
             Ok(work_cutoff) => work_cutoff,
@@ -302,6 +304,7 @@ impl<'a> MysqlNativeQualification<'a> {
             observer,
             recovery,
             native_deadline,
+            admitted_credit,
         })
     }
 
@@ -390,25 +393,36 @@ impl<'a> MysqlNativeQualification<'a> {
         self.ownership.phase(member)
     }
 
+    fn finalize(mut self) -> Result<(), String> {
+        let cleanup = self.ownership.contain();
+        if cleanup.failures.is_empty() && !cleanup.deadline_overrun {
+            Ok(())
+        } else {
+            Err(format!(
+                "qualification cleanup failed: {} member failures, deadline_overrun={}",
+                cleanup.failures.len(),
+                cleanup.deadline_overrun
+            ))
+        }
+    }
+
     async fn qualify_profile_gtid_transitions(&mut self) -> QualificationLiveOutcome {
         let deadline = tokio::time::Instant::from_std(self.ownership.work_cutoff);
         match tokio::time::timeout_at(deadline, self.qualify_profile_gtid_transitions_inner()).await
         {
             Ok(Ok(report)) => QualificationLiveOutcome::Qualified(Box::new(report)),
-            Ok(Err(reason))
-                if reason.contains("unsupported")
-                    || reason.contains("function failed")
-                    || reason.contains("returned no row") =>
-            {
-                QualificationLiveOutcome::Unsupported {
-                    stage: QualificationStage::GtidCheckpoint,
-                    reason,
-                }
+            Ok(Err(QualificationFailure::Unsupported { stage, reason })) => {
+                QualificationLiveOutcome::Unsupported { stage, reason }
             }
-            Ok(Err(reason)) => QualificationLiveOutcome::Unproved {
-                stage: QualificationStage::GtidCheckpoint,
-                reason,
-            },
+            Ok(Err(QualificationFailure::MalformedOrAbsent { stage, reason })) => {
+                QualificationLiveOutcome::MalformedOrAbsent { stage, reason }
+            }
+            Ok(Err(QualificationFailure::Incompatible { stage, reason })) => {
+                QualificationLiveOutcome::Incompatible { stage, reason }
+            }
+            Ok(Err(QualificationFailure::OperationallyUnproved { stage, reason })) => {
+                QualificationLiveOutcome::Unproved { stage, reason }
+            }
             Err(_) => QualificationLiveOutcome::Unproved {
                 stage: QualificationStage::Cleanup,
                 reason: "profile/GTID qualification reached scenario work cutoff".to_owned(),
@@ -418,7 +432,7 @@ impl<'a> MysqlNativeQualification<'a> {
 
     async fn qualify_profile_gtid_transitions_inner(
         &mut self,
-    ) -> Result<ProfileGtidQualificationReport, String> {
+    ) -> Result<ProfileGtidQualificationReport, QualificationFailure> {
         let profile = self.read_profile_evidence().await?;
         let owned_identities: [String; 3] = profile
             .members
@@ -430,7 +444,7 @@ impl<'a> MysqlNativeQualification<'a> {
         let expected = profile.binding.clone();
         let qualified_profile = profile
             .qualify(&expected)
-            .map_err(|error| format!("profile evidence rejected: {error:?}"))?;
+            .map_err(QualificationFailure::from_profile_error)?;
 
         self.prepare_transaction_table().await?;
         let mut checkpoints = Vec::new();
@@ -500,7 +514,9 @@ impl<'a> MysqlNativeQualification<'a> {
                 .restart_member(member)
                 .map_err(|error| format!("retained restart failed: {error}"))?;
             if old.process_session() == new.process_session() {
-                return Err("retained restart reused a process session".to_owned());
+                return Err("retained restart reused a process session"
+                    .to_owned()
+                    .into());
             }
             restart_bindings.push((
                 old.process_session().as_str().to_owned(),
@@ -535,24 +551,31 @@ impl<'a> MysqlNativeQualification<'a> {
                     .executed
                     .is_subset_of(&pair[1].snapshots[member.as_usize()].executed)
                 {
-                    return Err(format!(
-                        "checkpoint {} lost predecessor history at member {}",
-                        pair[1].label,
-                        member.as_usize() + 1
-                    ));
+                    return Err(QualificationFailure::Incompatible {
+                        stage: QualificationStage::GtidCheckpoint,
+                        reason: format!(
+                            "checkpoint {} lost predecessor history at member {}",
+                            pair[1].label,
+                            member.as_usize() + 1
+                        ),
+                    });
                 }
             }
         }
         for snapshot in &final_snapshots {
             if !purged.is_subset_of(&snapshot.executed) {
-                return Err("purged history was outside executed history".to_owned());
+                return Err(QualificationFailure::Incompatible {
+                    stage: QualificationStage::RetainedHistory,
+                    reason: "purged history was outside executed history".to_owned(),
+                });
             }
             match classify_gtid_profile(&snapshot.executed, self.attempt.group_name().as_str()) {
                 GtidProfileCompatibility::CompatibleContiguous { .. } => {}
                 compatibility => {
-                    return Err(format!(
-                        "final GTID history was incompatible: {compatibility:?}"
-                    ));
+                    return Err(QualificationFailure::Incompatible {
+                        stage: QualificationStage::GtidCheckpoint,
+                        reason: format!("final GTID history was incompatible: {compatibility:?}"),
+                    });
                 }
             }
         }
@@ -587,6 +610,25 @@ impl<'a> MysqlNativeQualification<'a> {
         let mut members = Vec::new();
         for member in MysqlMemberIndex::all() {
             let binding = self.member_binding(member)?;
+            let admitted = self
+                .admitted_credit
+                .members()
+                .iter()
+                .find(|enrollment| enrollment.binding().member() == member)
+                .ok_or_else(|| "admitted topology lacked an expected member".to_owned())?;
+            if snapshots[member.as_usize()].server_uuid != admitted.server_uuid().as_str()
+                || binding.attempt() != admitted.binding().attempt()
+                || binding.endpoint() != admitted.binding().endpoint()
+                || binding.storage() != admitted.binding().storage()
+                || binding.member_address() != admitted.binding().member_address()
+                || binding.observer_generation() != admitted.binding().observer_generation()
+                || binding.recovery_generation() != admitted.binding().recovery_generation()
+            {
+                return Err(format!(
+                    "member {} drifted from admitted native/storage binding",
+                    member.as_usize() + 1
+                ));
+            }
             let mut connection = self.root_connection(member).await?;
             let mut settings = Vec::new();
             for spec in NATIVE_PROFILE {
@@ -639,6 +681,14 @@ impl<'a> MysqlNativeQualification<'a> {
                 settings,
             });
         }
+        let closing = self.snapshots().await?;
+        if closing.iter().zip(snapshots.iter()).any(|(after, before)| {
+            after.server_uuid != before.server_uuid
+                || after.view_id != before.view_id
+                || after.members != before.members
+        }) {
+            return Err("profile evidence changed across its settings bracket".to_owned());
+        }
         Ok(NativeProfileEvidence {
             binding: QualificationBinding {
                 package: ORACLE_PACKAGE.to_owned(),
@@ -671,17 +721,22 @@ impl<'a> MysqlNativeQualification<'a> {
             .socket()
     }
 
-    async fn snapshots(&self) -> Result<[NativeMemberSnapshot; 3], String> {
+    async fn snapshots(&mut self) -> Result<[NativeMemberSnapshot; 3], String> {
         let mut snapshots = Vec::new();
         for member in MysqlMemberIndex::all() {
-            snapshots.push(read_snapshot(self.member_socket(member)).await?);
+            let process_session = self
+                .member_binding(member)?
+                .process_session()
+                .as_str()
+                .to_owned();
+            snapshots.push(read_snapshot(self.member_socket(member), process_session).await?);
         }
         snapshots
             .try_into()
             .map_err(|_| "snapshot cardinality changed".to_owned())
     }
 
-    async fn prepare_transaction_table(&self) -> Result<(), String> {
+    async fn prepare_transaction_table(&mut self) -> Result<(), String> {
         let primary = self.current_primary().await?;
         let mut connection = self.root_connection(primary).await?;
         connection
@@ -701,7 +756,7 @@ impl<'a> MysqlNativeQualification<'a> {
             .map_err(|_| "transaction setup disconnect failed".to_owned())
     }
 
-    async fn commit_token(&self, label: &str) -> Result<GtidCheckpoint, String> {
+    async fn commit_token(&mut self, label: &str) -> Result<GtidCheckpoint, String> {
         self.ownership
             .require_work_budget()
             .map_err(|()| "scenario work cutoff reached".to_owned())?;
@@ -727,7 +782,7 @@ impl<'a> MysqlNativeQualification<'a> {
             .exec_drop(
                 "INSERT INTO kuberic_native_qualification.tokens(token_name, token_value) \
                  VALUES (?, ?)",
-                (token, serial),
+                (token.clone(), serial),
             )
             .await
             .map_err(|_| "qualification transaction failed".to_owned())?;
@@ -748,6 +803,8 @@ impl<'a> MysqlNativeQualification<'a> {
         let binary_logs = self.binary_log_inventory(primary).await?;
         Ok(GtidCheckpoint {
             label: label.to_owned(),
+            token,
+            token_value: serial,
             before_tail,
             transaction_tail: tail,
             opening_view: before[0].view_id.clone(),
@@ -777,7 +834,7 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 
     async fn wait_common_tail(
-        &self,
+        &mut self,
         minimum_tail: u64,
     ) -> Result<[NativeMemberSnapshot; 3], String> {
         loop {
@@ -785,21 +842,23 @@ impl<'a> MysqlNativeQualification<'a> {
                 .require_work_budget()
                 .map_err(|()| "GTID wait reached scenario cutoff".to_owned())?;
             let snapshots = self.snapshots().await?;
-            if require_coherent_full_view(&snapshots).is_ok()
-                && compatible_common_tail(&snapshots, self.attempt.group_name().as_str())
-                    .is_ok_and(|tail| tail >= minimum_tail)
-            {
-                return Ok(snapshots);
+            if require_coherent_full_view(&snapshots).is_ok() {
+                match compatible_common_tail(&snapshots, self.attempt.group_name().as_str()) {
+                    Ok(tail) if tail >= minimum_tail => return Ok(snapshots),
+                    Ok(_) => {}
+                    Err(reason) if reason.contains("incompatible") => return Err(reason),
+                    Err(_) => {}
+                }
             }
             sleep(Duration::from_millis(50)).await;
         }
     }
 
-    async fn current_primary(&self) -> Result<MysqlMemberIndex, String> {
+    async fn current_primary(&mut self) -> Result<MysqlMemberIndex, String> {
         current_primary_from(&self.snapshots().await?)
     }
 
-    async fn transfer_primary(&self, owned_identities: &[String; 3]) -> Result<(), String> {
+    async fn transfer_primary(&mut self, owned_identities: &[String; 3]) -> Result<(), String> {
         let snapshots = self.snapshots().await?;
         require_coherent_full_view(&snapshots)?;
         let current = current_primary_from(&snapshots)?;
@@ -1051,7 +1110,8 @@ impl<'a> MysqlNativeQualification<'a> {
             opening_view,
             successor_view: Some(successor.view_id),
             new_login,
-            recovery_admission: old_recovery,
+            start_command: old_recovery,
+            recovery_authentication: ProbeOutcome::Unproved,
             established_participation: if candidate == RevocationCandidate::StopAndRejoin {
                 ProbeOutcome::Absent
             } else {
@@ -1159,7 +1219,7 @@ impl<'a> MysqlNativeQualification<'a> {
             .into_iter()
             .find(|member| *member != primary)
             .unwrap();
-        let lock_token = baseline.label.clone();
+        let lock_token = baseline.token.clone();
         let mut lock_connection = self.root_connection(secondary).await?;
         lock_connection
             .query_drop("SET GLOBAL super_read_only = OFF")
@@ -1173,14 +1233,18 @@ impl<'a> MysqlNativeQualification<'a> {
             .query_drop("START TRANSACTION")
             .await
             .map_err(|_| "secondary lock transaction failed".to_owned())?;
-        lock_connection
-            .exec_drop(
+        let locked_value = lock_connection
+            .exec_first::<u64, _, _>(
                 "SELECT token_value FROM kuberic_native_qualification.tokens \
                          WHERE token_name = ? FOR UPDATE",
                 (lock_token.clone(),),
             )
             .await
-            .map_err(|_| "secondary row lock failed".to_owned())?;
+            .map_err(|_| "secondary row lock failed".to_owned())?
+            .ok_or_else(|| "secondary row lock found no exact token".to_owned())?;
+        if locked_value != baseline.token_value {
+            return Err("secondary row lock found an unexpected token value".to_owned());
+        }
 
         let mut workload = self.root_connection(primary).await?;
         let effective = workload
@@ -1226,7 +1290,10 @@ impl<'a> MysqlNativeQualification<'a> {
             let _ = connection.disconnect().await;
             return Err("client completed before the applier barrier".to_owned());
         }
-        update.abort_and_join().await;
+        if !update.abort_and_join().await {
+            restore_secondary_lock(&mut lock_connection).await?;
+            return Err("workload completed before cancellation could prove disconnect".to_owned());
+        }
         restore_secondary_lock(&mut lock_connection).await?;
 
         let after = self.wait_common_tail(baseline.transaction_tail + 1).await?;
@@ -1318,24 +1385,27 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 
     async fn qualify_secondary_loss_during_after(&mut self) -> SecondaryLossQualification {
-        match self.qualify_ambiguous_disconnect().await {
-            QualificationTransactionOutcome::Unproved { reason } => {
-                SecondaryLossQualification::Unproved {
+        let profile = match self.read_profile_evidence().await {
+            Ok(profile) => profile,
+            Err(reason) => {
+                return SecondaryLossQualification::Unproved {
                     reason,
                     fault_injected: false,
-                }
+                };
             }
-            QualificationTransactionOutcome::Unsupported { reason } => {
-                SecondaryLossQualification::Unsupported {
-                    reason,
-                    fault_injected: false,
-                }
-            }
-            QualificationTransactionOutcome::Qualified(_) => SecondaryLossQualification::Unproved {
-                reason: "applier identity alone did not prove an authoritative source AFTER wait"
-                    .to_owned(),
+        };
+        let expected = profile.binding.clone();
+        if let Err(error) = profile.qualify(&expected) {
+            return SecondaryLossQualification::Unproved {
+                reason: format!("source-wait profile admission failed: {error:?}"),
                 fault_injected: false,
-            },
+            };
+        }
+        SecondaryLossQualification::Unproved {
+            reason:
+                "no authoritative current-transaction source AFTER wait surface was established"
+                    .to_owned(),
+            fault_injected: false,
         }
     }
 
@@ -1416,7 +1486,12 @@ impl<'a> MysqlNativeQualification<'a> {
             if member == crashed {
                 continue;
             }
-            let snapshot = read_snapshot(self.member_socket(member)).await?;
+            let process_session = self
+                .member_binding(member)?
+                .process_session()
+                .as_str()
+                .to_owned();
+            let snapshot = read_snapshot(self.member_socket(member), process_session).await?;
             if snapshot.view_id != successor.view_id
                 || snapshot.members != successor.members
                 || !exact_gtid.is_subset_of(&snapshot.executed)
@@ -1517,7 +1592,7 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 
     async fn wait_exact_membership(
-        &self,
+        &mut self,
         expected: &HashSet<String>,
         owned_identities: &[String; 3],
         expected_primary: Option<&str>,
@@ -1529,7 +1604,15 @@ impl<'a> MysqlNativeQualification<'a> {
                 .map_err(|()| "membership wait reached scenario cutoff".to_owned())?;
             let mut accepted = Vec::new();
             for member in MysqlMemberIndex::all() {
-                let Ok(snapshot) = read_snapshot(self.member_socket(member)).await else {
+                let Ok(binding) = self.member_binding(member) else {
+                    continue;
+                };
+                let Ok(snapshot) = read_snapshot(
+                    self.member_socket(member),
+                    binding.process_session().as_str().to_owned(),
+                )
+                .await
+                else {
                     continue;
                 };
                 let member_ids = snapshot
@@ -1584,7 +1667,7 @@ impl<'a> MysqlNativeQualification<'a> {
         }
     }
 
-    async fn rotate_and_purge_binary_logs(&self) -> Result<(GtidSet, Vec<String>), String> {
+    async fn rotate_and_purge_binary_logs(&mut self) -> Result<(GtidSet, Vec<String>), String> {
         let primary = self.current_primary().await?;
         let mut connection = self.root_connection(primary).await?;
         connection
@@ -1660,7 +1743,7 @@ fn qualified_view_advanced(predecessor: &str, successor: &str) -> bool {
         && after.is_some_and(|value| value.to_string() == successor_monotonic)
         && before
             .zip(after)
-            .is_some_and(|(before, after)| after > before)
+            .is_some_and(|(before, after)| before.checked_add(1) == Some(after))
 }
 
 fn validate_applying_gtid(
@@ -1727,6 +1810,7 @@ struct NativeMemberRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeMemberSnapshot {
     server_uuid: String,
+    process_session: String,
     view_id: String,
     members: Vec<NativeMemberRow>,
     executed: GtidSet,
@@ -1736,6 +1820,8 @@ struct NativeMemberSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GtidCheckpoint {
     label: String,
+    token: String,
+    token_value: u64,
     before_tail: u64,
     transaction_tail: u64,
     opening_view: String,
@@ -1763,10 +1849,92 @@ enum QualificationLiveOutcome {
         stage: QualificationStage,
         reason: String,
     },
+    MalformedOrAbsent {
+        stage: QualificationStage,
+        reason: String,
+    },
+    Incompatible {
+        stage: QualificationStage,
+        reason: String,
+    },
     Unproved {
         stage: QualificationStage,
         reason: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QualificationFailure {
+    Unsupported {
+        stage: QualificationStage,
+        reason: String,
+    },
+    MalformedOrAbsent {
+        stage: QualificationStage,
+        reason: String,
+    },
+    Incompatible {
+        stage: QualificationStage,
+        reason: String,
+    },
+    OperationallyUnproved {
+        stage: QualificationStage,
+        reason: String,
+    },
+}
+
+impl QualificationFailure {
+    fn from_profile_error(error: ProfileEvidenceError) -> Self {
+        match error {
+            ProfileEvidenceError::Missing { .. }
+            | ProfileEvidenceError::Malformed { .. }
+            | ProfileEvidenceError::WrongMemberCount => Self::MalformedOrAbsent {
+                stage: QualificationStage::ProfileReadback,
+                reason: format!("profile evidence was malformed or absent: {error:?}"),
+            },
+            ProfileEvidenceError::Unsupported { .. } => Self::Unsupported {
+                stage: QualificationStage::ProfileReadback,
+                reason: format!("profile surface was unsupported: {error:?}"),
+            },
+            ProfileEvidenceError::ProfileMatrixMismatch
+            | ProfileEvidenceError::BindingMismatch
+            | ProfileEvidenceError::DuplicateMember
+            | ProfileEvidenceError::Mismatch { .. }
+            | ProfileEvidenceError::UnexpectedSetting { .. } => Self::Incompatible {
+                stage: QualificationStage::ProfileReadback,
+                reason: format!("profile evidence was incompatible: {error:?}"),
+            },
+        }
+    }
+}
+
+impl From<String> for QualificationFailure {
+    fn from(reason: String) -> Self {
+        if reason.contains("incompatible")
+            || reason.contains("lost predecessor history")
+            || reason.contains("unexpected GTID delta")
+        {
+            Self::Incompatible {
+                stage: QualificationStage::GtidCheckpoint,
+                reason,
+            }
+        } else if reason.contains("malformed") || reason.contains("returned no row") {
+            Self::MalformedOrAbsent {
+                stage: QualificationStage::GtidCheckpoint,
+                reason,
+            }
+        } else if reason.contains("unsupported") || reason.contains("function failed") {
+            Self::Unsupported {
+                stage: QualificationStage::GtidCheckpoint,
+                reason,
+            }
+        } else {
+            Self::OperationallyUnproved {
+                stage: QualificationStage::GtidCheckpoint,
+                reason,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1822,11 +1990,12 @@ impl AbortWorkloadOnDrop {
         result
     }
 
-    async fn abort_and_join(&mut self) {
+    async fn abort_and_join(&mut self) -> bool {
         if let Some(handle) = self.handle.take() {
             handle.abort();
-            let _ = handle.await;
+            return handle.await.is_err_and(|error| error.is_cancelled());
         }
+        false
     }
 }
 
@@ -1860,10 +2029,6 @@ enum QualificationTransactionOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SecondaryLossQualification {
-    Unsupported {
-        reason: String,
-        fault_injected: bool,
-    },
     Unproved {
         reason: String,
         fault_injected: bool,
@@ -1911,7 +2076,10 @@ async fn root_connection(socket: &Path) -> Result<Conn, String> {
         .map_err(|_| "root UDS connection failed".to_owned())
 }
 
-async fn read_snapshot(socket: &Path) -> Result<NativeMemberSnapshot, String> {
+async fn read_snapshot(
+    socket: &Path,
+    process_session: String,
+) -> Result<NativeMemberSnapshot, String> {
     let mut connection = root_connection(socket).await?;
     let server_uuid = connection
         .query_first::<String, _>("SELECT @@GLOBAL.server_uuid")
@@ -1956,12 +2124,52 @@ async fn read_snapshot(socket: &Path) -> Result<NativeMemberSnapshot, String> {
         .await
         .map_err(|_| "purged GTID query failed".to_owned())?
         .ok_or_else(|| "purged GTID query returned no row".to_owned())?;
+    let closing_server_uuid = connection
+        .query_first::<String, _>("SELECT @@GLOBAL.server_uuid")
+        .await
+        .map_err(|_| "closing server UUID query failed".to_owned())?
+        .ok_or_else(|| "closing server UUID query returned no row".to_owned())?;
+    let closing_view_id = connection
+        .query_first::<String, _>(
+            "SELECT VIEW_ID FROM performance_schema.replication_group_member_stats \
+             WHERE MEMBER_ID = @@GLOBAL.server_uuid",
+        )
+        .await
+        .map_err(|_| "closing view query failed".to_owned())?
+        .ok_or_else(|| "closing view query returned no local row".to_owned())?;
+    let closing_members = connection
+        .query_map(
+            "SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_ROLE, MEMBER_STATE \
+             FROM performance_schema.replication_group_members ORDER BY MEMBER_ID",
+            |(member_id, member_host, member_port, role, state): (
+                String,
+                String,
+                u16,
+                String,
+                String,
+            )| NativeMemberRow {
+                member_id,
+                member_host,
+                member_port,
+                role,
+                state,
+            },
+        )
+        .await
+        .map_err(|_| "closing membership query failed".to_owned())?;
+    if closing_server_uuid != server_uuid
+        || closing_view_id != view_id
+        || closing_members != members
+    {
+        return Err("native snapshot changed across its history bracket".to_owned());
+    }
     connection
         .disconnect()
         .await
         .map_err(|_| "snapshot disconnect failed".to_owned())?;
     Ok(NativeMemberSnapshot {
         server_uuid,
+        process_session,
         view_id,
         members,
         executed: GtidSet::from_str(&executed)
@@ -2472,7 +2680,8 @@ struct RevocationEvidence {
     opening_view: String,
     successor_view: Option<String>,
     new_login: ProbeOutcome,
-    recovery_admission: ProbeOutcome,
+    start_command: ProbeOutcome,
+    recovery_authentication: ProbeOutcome,
     established_participation: ProbeOutcome,
     predecessor_absence: ProbeOutcome,
     absence_observed_before_replacement: bool,
@@ -2512,7 +2721,7 @@ impl RevocationEvidence {
                 .is_some_and(|successor| successor != &self.opening_view);
         if self.candidate == RevocationCandidate::StopAndRejoin
             && exact_binding
-            && self.recovery_admission == ProbeOutcome::Rejected
+            && self.recovery_authentication == ProbeOutcome::Rejected
             && self.established_participation == ProbeOutcome::Absent
             && self.predecessor_absence == ProbeOutcome::Absent
             && self.absence_observed_before_replacement

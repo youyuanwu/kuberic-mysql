@@ -1909,6 +1909,7 @@ pub(super) struct QualificationManagerParts<'a, M: MysqlTopologyMemberRuntime> {
     pub(super) observer: &'a ControlCredential,
     pub(super) recovery: &'a ControlCredential,
     pub(super) runtime_deadline: Instant,
+    pub(super) admitted_credit: TransitionCredit,
 }
 
 impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
@@ -2067,6 +2068,15 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
                 actual: self.state,
             });
         }
+        let admitted_credit = self
+            .accepted
+            .as_ref()
+            .ok_or(MysqlTopologyManagerError::InvalidState {
+                expected: MysqlTopologyState::Complete,
+                actual: self.state,
+            })?
+            .credit
+            .clone();
         self.pending_effect = None;
         self.pending_discovery = None;
         self.accepted = None;
@@ -2079,17 +2089,13 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
             observer: &self.observer,
             recovery: &self.recovery,
             runtime_deadline: self.runtime_deadline,
+            admitted_credit,
         })
     }
 
     #[cfg(test)]
-    pub(super) fn mark_complete_for_qualification_contract(&mut self) {
-        self.state = MysqlTopologyState::Complete;
-    }
-
-    #[cfg(test)]
-    pub(super) fn qualification_authority_is_invalidated(&self) -> bool {
-        matches!(self.authority.state, AuthorityState::Invalidated)
+    pub(super) const fn qualification_runtime_deadline(&self) -> Instant {
+        self.runtime_deadline
     }
 
     /// Initializes all three fresh members before any member is started.

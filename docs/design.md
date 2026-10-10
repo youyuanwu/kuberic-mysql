@@ -187,14 +187,19 @@ exact two-survivor successor view, and restart of every participant. Complete
 GTID sets remain the authority, and the runner is absent from the normal
 library API.
 
-The same gate returns negative feasibility results. Oracle 8.4.11 did not
-expose the exact current-transaction barrier needed before disconnect or
-secondary-loss injection, so neither fault is injected. Account lock, password
+The same gate proves an exact blocked-applier GTID and an ambiguous client
+disconnect whose transaction is subsequently present on every member. It
+returns a negative feasibility result for secondary loss: no authoritative
+current-source-`AFTER` wait surface was established, so no member fault is
+injected. Account lock, password
 replacement, and recovery-privilege removal leave established native
 participation intact. Explicit Group Replication stop proves predecessor
 membership absence from the exact successor view, but predecessor recovery
-credentials remain accepted after password replacement. No credential-bound
-peer-session revocation barrier or serving eligibility is established.
+`START GROUP_REPLICATION` still completes after password replacement. The
+caught-up target does not require observable donor authentication, so
+predecessor recovery-credential acceptance remains unproved. No
+credential-bound peer-session revocation barrier or serving eligibility is
+established.
 
 The delivered slices make no claim for another MySQL patch or fork, Kuberic
 callbacks, access reconciliation or publication, routing, switchover, failover,
@@ -637,10 +642,11 @@ member-expulsion behavior, and the exact online native view required for an
 `All` completion. On Oracle MySQL 8.4.11 it proves an ordinary acknowledged
 singleton GTID on all three members and proves that boundary survives abrupt
 primary termination, a coherent successor view, retained-data restart, and
-restart of every participant. It does **not** inject member loss during
-`AFTER`: the pinned server did not expose the required exact current-
-transaction applier/source-wait barrier, so disconnect ambiguity and
-member-loss-during-wait remain unproved. An acknowledged transaction must
+restart of every participant. A blocked-applier experiment binds the exact
+transaction GTID before disconnect and later proves that ambiguous transaction
+on every member. It does **not** inject member loss during `AFTER`: the gate
+did not establish an authoritative current-source-wait surface, so
+member-loss-during-wait remains unproved. An acknowledged transaction must
 remain represented in the required public/native history boundary or
 automated publication and failover remain unavailable.
 
@@ -1409,8 +1415,9 @@ The delivered test-only native feasibility matrix additionally includes:
 - transactions around primary transfer, graceful leave/rejoin, retained-data
   restart of each process, and purge;
 - normal `AFTER` acknowledgement and acknowledged-primary SIGKILL/restart;
-- fail-closed `Unproved` results, without fault injection, for ambiguous
-  disconnect and secondary loss during `AFTER`; and
+- exact blocked-applier/ambiguous-disconnect inclusion plus a fail-closed
+  `Unproved` result, without member fault injection, for secondary loss during
+  `AFTER`; and
 - isolated account lock, password replacement, privilege removal, and
   stop/rejoin experiments that leave credential-bound session revocation
   unproved.
@@ -1465,7 +1472,7 @@ must define their exact inputs and pass conditions.
 | PoC observation | One pinned local `mysqld`, private UDS, fixture credential | Native identity/view/GTID evidence matches the exact process; permission denial, bad credentials, and wrong UDS/server identity remain distinct | Local adapter-to-MySQL observation works without TLS | No topology mutation or writable transition claim |
 | Single-process host | Exact Oracle MySQL 8.4.11, `aa-exec`, fresh distinct roots | One child is initialized, launched, attested, observed as fail-closed inactive membership, stopped, reaped, and its UDS proven absent; scratch is removed and data retained | One restart-stateless local process generation with private-UDS observation | No topology, callbacks, access publication, survivor adoption, or restart continuation |
 | Fresh topology bootstrap/join | Exactly three fresh owned instances, loopback Group Replication, retained in-memory attempt authority | One designated bootstrap and two sequential joins receive exact fresh identity/view/GTID credit; access stays closed; every process and scratch root is contained | Bounded fresh three-member bootstrap/join for the exact qualified local profile | No callbacks, access publication, switchover, failover, repair, survivor adoption, or restart continuation |
-| Native Stage 2 feasibility | The exact fresh topology plus the pinned setting tuple and test-only internal runner | Full GTID evidence stays one untagged group source and contiguous through the exercised transitions; normal acknowledgement and post-ack primary SIGKILL/restart pass; unsupported barriers and peer revocation return explicit negative results | The named Oracle 8.4.11 native profile and acknowledged-primary crash behavior are feasible inputs to later design | No public scalar progress, catch-up capability, credential-bound peer revocation, ambiguous disconnect, secondary-loss-during-`AFTER`, serving cutover, failover, or production durability claim |
+| Native Stage 2 feasibility | The exact fresh topology plus the pinned setting tuple and test-only internal runner | Full GTID evidence stays one untagged group source and contiguous through the exercised transitions; normal acknowledgement, exact ambiguous-disconnect inclusion, and post-ack primary SIGKILL/restart pass; source-wait and peer revocation gaps return explicit negative results | The named Oracle 8.4.11 native profile, ambiguous transaction inclusion, and acknowledged-primary crash behavior are feasible inputs to later design | No public scalar progress, catch-up capability, credential-bound peer revocation, secondary-loss-during-`AFTER`, serving cutover, failover, or production durability claim |
 | PoC lifecycle and switchover | Three fresh owned instances, loopback Group Replication, SF-aligned public Kuberic values, one member-local Replicator and client proxy per host | Public conformance ordering passes; signed build/peer admission and qualified scalar progress bind exact sessions; bootstrap/join completes; source access closes and its process is stopped/reaped before target writes open; unexpected loss leaves writes closed | Controlled host-local public-only Kuberic lifecycle and one planned handoff | No specific-quorum optimization, arbitrary GTID-set progress, Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
 | Advanced repair and restart | Stage 3 implementation, generic durable effect records, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Resumable host-local repair for the exercised profile without an application-owned metadata store | No automated writable failover |
 | Advanced failover and fencing | Validated native commit invariant and independent fence provider | Only a candidate containing the required history publishes; old-primary survival, provider loss, quorum loss, and divergent histories remain fail-closed | Automated failover for the exact qualified environment | No portable infrastructure or Kubernetes claim |

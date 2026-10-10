@@ -358,24 +358,6 @@ fn qualification_entry_rejects_precompletion_without_mutation() {
 }
 
 #[test]
-fn qualification_entry_invalidates_authority_and_drop_contains_members() {
-    let (mut manager, root) = configured_manager();
-    manager.mark_complete_for_qualification_contract();
-    {
-        let qualification = MysqlNativeQualification::enter(&mut manager).unwrap();
-        assert_eq!(
-            qualification.phase(MysqlMemberIndex::First),
-            QualificationMemberPhase::Running
-        );
-    }
-    assert_eq!(manager.state(), MysqlTopologyState::Failed);
-    assert!(manager.qualification_authority_is_invalidated());
-    manager.stop().unwrap();
-    assert_eq!(manager.state(), MysqlTopologyState::Stopped);
-    fs::remove_dir(root).unwrap();
-}
-
-#[test]
 fn retained_restart_rejects_foreign_endpoints_and_changes_process_session() {
     for foreign_pid in [true, false] {
         let (mut instance, root) = fake_instance(if foreign_pid { "pid" } else { "socket" });
@@ -453,10 +435,12 @@ async fn qualify_profile_gtid_transitions() {
     );
     let report = {
         let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
-        match qualification.qualify_profile_gtid_transitions().await {
+        let report = match qualification.qualify_profile_gtid_transitions().await {
             QualificationLiveOutcome::Qualified(report) => report,
             outcome => panic!("native qualification did not pass: {outcome:?}"),
-        }
+        };
+        qualification.finalize().unwrap();
+        report
     };
     assert_eq!(report.qualified_profile.member_process_sessions.len(), 3);
     assert_eq!(report.checkpoints.len(), 12);
@@ -504,7 +488,9 @@ async fn run_peer_live(candidate: RevocationCandidate) -> (RevocationEvidence, R
     let mut fixture = LiveQualificationFixture::bootstrap().await;
     let outcome = {
         let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
-        qualification.qualify_peer_revocation(candidate).await
+        let outcome = qualification.qualify_peer_revocation(candidate).await;
+        qualification.finalize().unwrap();
+        outcome
     };
     let result = match outcome {
         QualificationPeerOutcome::Qualified { evidence, verdict } => (*evidence, verdict),
@@ -536,7 +522,8 @@ async fn qualify_peer_account_lock() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::AccountLock).await;
     assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
-    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.start_command, ProbeOutcome::Accepted);
+    assert_eq!(evidence.recovery_authentication, ProbeOutcome::Unproved);
     assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
     assert!(!evidence.absence_observed_before_replacement);
     assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
@@ -547,7 +534,8 @@ async fn qualify_peer_credential_replacement() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::CredentialReplacement).await;
     assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
-    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.start_command, ProbeOutcome::Accepted);
+    assert_eq!(evidence.recovery_authentication, ProbeOutcome::Unproved);
     assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
     assert!(!evidence.absence_observed_before_replacement);
     assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
@@ -558,7 +546,8 @@ async fn qualify_peer_privilege_removal() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::PrivilegeRemoval).await;
     assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Accepted);
-    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.start_command, ProbeOutcome::Accepted);
+    assert_eq!(evidence.recovery_authentication, ProbeOutcome::Unproved);
     assert_eq!(evidence.established_participation, ProbeOutcome::Continued);
     assert!(!evidence.absence_observed_before_replacement);
     assert_eq!(verdict, RevocationVerdict::SessionIdentityUnproved);
@@ -569,7 +558,8 @@ async fn qualify_peer_stop_rejoin() {
     let (evidence, verdict) = run_peer_live(RevocationCandidate::StopAndRejoin).await;
     assert_peer_binding(&evidence);
     assert_eq!(evidence.new_login, ProbeOutcome::Rejected);
-    assert_eq!(evidence.recovery_admission, ProbeOutcome::Accepted);
+    assert_eq!(evidence.start_command, ProbeOutcome::Accepted);
+    assert_eq!(evidence.recovery_authentication, ProbeOutcome::Unproved);
     assert_eq!(evidence.established_participation, ProbeOutcome::Absent);
     assert_eq!(evidence.predecessor_absence, ProbeOutcome::Absent);
     assert!(evidence.absence_observed_before_replacement);
@@ -581,7 +571,9 @@ async fn run_normal_transaction_live() -> TransactionQualificationReport {
     let mut fixture = LiveQualificationFixture::bootstrap().await;
     let outcome = {
         let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
-        qualification.qualify_normal_acknowledgement().await
+        let outcome = qualification.qualify_normal_acknowledgement().await;
+        qualification.finalize().unwrap();
+        outcome
     };
     let report = match outcome {
         QualificationTransactionOutcome::Qualified(report) => *report,
@@ -616,14 +608,25 @@ async fn qualify_ambiguous_disconnect() {
     let mut fixture = LiveQualificationFixture::bootstrap().await;
     let outcome = {
         let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
-        qualification.qualify_ambiguous_disconnect().await
+        let outcome = qualification.qualify_ambiguous_disconnect().await;
+        qualification.finalize().unwrap();
+        outcome
     };
-    match outcome {
-        QualificationTransactionOutcome::Unproved { reason } => {
-            assert!(reason.contains("applier GTID barrier was unavailable"));
-        }
+    let report = match outcome {
+        QualificationTransactionOutcome::Qualified(report) => *report,
         outcome => panic!("unexpected ambiguous qualification result: {outcome:?}"),
-    }
+    };
+    assert_eq!(
+        report.outcome.verdict(),
+        TransactionVerdict::AmbiguousIncluded
+    );
+    assert_eq!(report.after_tail, report.before_tail + 1);
+    assert_eq!(report.opening_view, report.closing_view);
+    let barrier = report.applier_barrier.expect("exact applier barrier");
+    assert_eq!(barrier.opening_view, report.opening_view);
+    assert!(!barrier.source_process_session.is_empty());
+    assert!(!barrier.process_session.is_empty());
+    assert_eq!(barrier.applying_gtid, report.exact_gtid);
     fixture.cleanup();
 }
 
@@ -632,21 +635,16 @@ async fn qualify_secondary_loss_during_after() {
     let mut fixture = LiveQualificationFixture::bootstrap().await;
     let outcome = {
         let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
-        qualification.qualify_secondary_loss_during_after().await
+        let outcome = qualification.qualify_secondary_loss_during_after().await;
+        qualification.finalize().unwrap();
+        outcome
     };
-    match outcome {
-        SecondaryLossQualification::Unproved {
-            reason,
-            fault_injected,
-        } => {
-            assert!(!fault_injected);
-            assert!(
-                reason.contains("applier GTID barrier was unavailable")
-                    || reason.contains("authoritative source AFTER wait")
-            );
-        }
-        outcome => panic!("unexpected secondary-loss result: {outcome:?}"),
-    }
+    let SecondaryLossQualification::Unproved {
+        reason,
+        fault_injected,
+    } = outcome;
+    assert!(!fault_injected);
+    assert!(reason.contains("authoritative current-transaction source AFTER wait"));
     fixture.cleanup();
 }
 
@@ -655,7 +653,9 @@ async fn qualify_post_ack_primary_crash_restart() {
     let mut fixture = LiveQualificationFixture::bootstrap().await;
     let outcome = {
         let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
-        qualification.qualify_post_ack_primary_crash_restart().await
+        let outcome = qualification.qualify_post_ack_primary_crash_restart().await;
+        qualification.finalize().unwrap();
+        outcome
     };
     let report = match outcome {
         PrimaryCrashQualification::Qualified(report) => *report,
@@ -1209,7 +1209,8 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
             opening_view: "1:3".to_owned(),
             successor_view: None,
             new_login: ProbeOutcome::Rejected,
-            recovery_admission: ProbeOutcome::Rejected,
+            start_command: ProbeOutcome::Rejected,
+            recovery_authentication: ProbeOutcome::Unproved,
             established_participation: ProbeOutcome::Continued,
             predecessor_absence: ProbeOutcome::Unproved,
             absence_observed_before_replacement: false,
@@ -1232,7 +1233,8 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
         opening_view: "1:3".to_owned(),
         successor_view: Some("1:4".to_owned()),
         new_login: ProbeOutcome::Rejected,
-        recovery_admission: ProbeOutcome::Rejected,
+        start_command: ProbeOutcome::Rejected,
+        recovery_authentication: ProbeOutcome::Rejected,
         established_participation: ProbeOutcome::Absent,
         predecessor_absence: ProbeOutcome::Absent,
         absence_observed_before_replacement: true,
@@ -1259,7 +1261,7 @@ fn revocation_never_confuses_login_denial_with_a_session_barrier() {
             evidence.absence_observed_before_replacement = false;
         },
         |evidence: &mut RevocationEvidence| {
-            evidence.recovery_admission = ProbeOutcome::Accepted;
+            evidence.recovery_authentication = ProbeOutcome::Accepted;
         },
         |evidence: &mut RevocationEvidence| {
             evidence.established_participation = ProbeOutcome::Continued;
@@ -1325,6 +1327,7 @@ fn qualified_successor_view_requires_same_fixed_part_and_strict_advance() {
     for (before, after) in [
         ("42:7", "42:7"),
         ("42:7", "42:6"),
+        ("42:7", "42:9"),
         ("42:7", "43:8"),
         ("bad:7", "bad:8"),
         ("42:bad", "42:8"),
@@ -1335,6 +1338,31 @@ fn qualified_successor_view_requires_same_fixed_part_and_strict_advance() {
     ] {
         assert!(!qualified_view_advanced(before, after));
     }
+}
+
+#[test]
+fn typed_profile_failures_preserve_incompatible_malformed_and_unsupported_classes() {
+    assert!(matches!(
+        QualificationFailure::from_profile_error(ProfileEvidenceError::Mismatch {
+            member: "member-1".to_owned(),
+            variable: "sync_binlog".to_owned(),
+        }),
+        QualificationFailure::Incompatible { .. }
+    ));
+    assert!(matches!(
+        QualificationFailure::from_profile_error(ProfileEvidenceError::Missing {
+            member: "member-1".to_owned(),
+            variable: "sync_binlog".to_owned(),
+        }),
+        QualificationFailure::MalformedOrAbsent { .. }
+    ));
+    assert!(matches!(
+        QualificationFailure::from_profile_error(ProfileEvidenceError::Unsupported {
+            member: "member-1".to_owned(),
+            variable: "sync_binlog".to_owned(),
+        }),
+        QualificationFailure::Unsupported { .. }
+    ));
 }
 
 #[test]
@@ -1416,7 +1444,8 @@ fn result_enums_keep_outcomes_and_diagnostics_distinct_and_secret_free() {
             opening_view: "1:3".to_owned(),
             successor_view: None,
             new_login: ProbeOutcome::Accepted,
-            recovery_admission: ProbeOutcome::Accepted,
+            start_command: ProbeOutcome::Accepted,
+            recovery_authentication: ProbeOutcome::Unproved,
             established_participation: ProbeOutcome::Continued,
             predecessor_absence: ProbeOutcome::Unproved,
             absence_observed_before_replacement: false,

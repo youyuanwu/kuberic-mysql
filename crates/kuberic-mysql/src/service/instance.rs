@@ -458,6 +458,27 @@ impl MysqlInstanceManager {
             self.state = MysqlInstanceState::Faulted;
             return Err(error);
         }
+        let child_id = child.id();
+        let pid_metadata = fs::symlink_metadata(self.config.runtime().pid()).map_err(|error| {
+            self.state = MysqlInstanceState::Faulted;
+            MysqlInstanceError::Io {
+                operation: LifecycleOperation::Shutdown,
+                kind: error.kind(),
+            }
+        })?;
+        if pid_metadata.file_type().is_symlink()
+            || !pid_metadata.file_type().is_file()
+            || fs::read_to_string(self.config.runtime().pid())
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                != Some(child_id)
+        {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InvalidPidFile,
+            ));
+        }
+        let pid_identity = (pid_metadata.dev(), pid_metadata.ino());
         let abrupt_socket_identity = if kind == QualificationStopKind::Abrupt {
             let metadata =
                 fs::symlink_metadata(self.config.runtime().socket()).map_err(|error| {
@@ -532,9 +553,31 @@ impl MysqlInstanceManager {
             self.state = MysqlInstanceState::Faulted;
             return Err(error);
         }
-        match fs::remove_file(self.config.runtime().pid()) {
-            Ok(()) => {}
+        match fs::symlink_metadata(self.config.runtime().pid()) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && metadata.file_type().is_file()
+                    && (metadata.dev(), metadata.ino()) == pid_identity
+                    && fs::read_to_string(self.config.runtime().pid())
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok())
+                        == Some(child_id) =>
+            {
+                fs::remove_file(self.config.runtime().pid()).map_err(|error| {
+                    self.state = MysqlInstanceState::Faulted;
+                    MysqlInstanceError::Io {
+                        operation: LifecycleOperation::Shutdown,
+                        kind: error.kind(),
+                    }
+                })?;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                self.state = MysqlInstanceState::Faulted;
+                return Err(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::InvalidPidFile,
+                ));
+            }
             Err(error) => {
                 self.state = MysqlInstanceState::Faulted;
                 return Err(MysqlInstanceError::Io {

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +33,54 @@ pub(super) struct LiveQualificationFixture {
     pub(super) identities: [String; 3],
     data_roots: [PathBuf; 3],
     scratch_roots: [PathBuf; 3],
-    root: PathBuf,
+    root: FixtureRoot,
+    cleaned: bool,
+    deadline: Instant,
+}
+
+struct FixtureRoot {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    remove_on_drop: bool,
+}
+
+impl FixtureRoot {
+    fn create(path: PathBuf) -> Self {
+        assert!(!path.exists(), "qualification fixture root already exists");
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            remove_on_drop: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn remove(&mut self) {
+        let metadata = fs::symlink_metadata(&self.path).unwrap();
+        assert_eq!((metadata.dev(), metadata.ino()), (self.device, self.inode));
+        assert!(!metadata.file_type().is_symlink() && metadata.is_dir());
+        fs::remove_dir_all(&self.path).unwrap();
+        self.remove_on_drop = false;
+    }
+
+    fn retain(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for FixtureRoot {
+    fn drop(&mut self) {
+        if self.remove_on_drop && self.path.exists() {
+            self.remove();
+        }
+    }
 }
 
 impl LiveQualificationFixture {
@@ -44,8 +91,7 @@ impl LiveQualificationFixture {
             .unwrap()
             .join("target")
             .join(format!("kmql-{}-{serial}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let root = FixtureRoot::create(root);
 
         let (reservations, sql_addresses, group_addresses) = reserve_ports();
         let topology = topology(sql_addresses, group_addresses);
@@ -61,8 +107,8 @@ impl LiveQualificationFixture {
             MysqlInstanceConfig::new_topology_member(
                 MYSQLD,
                 APPARMOR_EXEC,
-                root.join(format!("m{number}d")),
-                root.join(format!("m{number}s")),
+                root.path().join(format!("m{number}d")),
+                root.path().join(format!("m{number}s")),
                 topology.clone(),
                 member,
                 timeouts,
@@ -110,6 +156,7 @@ impl LiveQualificationFixture {
             recovery,
         )
         .unwrap();
+        let deadline = manager.qualification_runtime_deadline();
         drop(reservations);
         manager.initialize().unwrap();
         manager.start_designated_member().await.unwrap();
@@ -140,11 +187,17 @@ impl LiveQualificationFixture {
             data_roots,
             scratch_roots,
             root,
+            cleaned: false,
+            deadline,
         }
     }
 
     pub(super) fn cleanup(mut self) {
-        self.manager.stop().unwrap();
+        if self.sockets.iter().any(|socket| socket.exists())
+            || self.scratch_roots.iter().any(|root| root.exists())
+        {
+            self.manager.stop().unwrap();
+        }
         for index in 0..3 {
             assert!(!self.sockets[index].exists());
             assert!(self.data_roots[index].is_dir());
@@ -161,14 +214,25 @@ impl LiveQualificationFixture {
         }
         let mysql_x = SocketAddr::from(([127, 0, 0, 1], 33_060));
         assert!(std::net::TcpStream::connect_timeout(&mysql_x, Duration::from_millis(50)).is_err());
-        fs::remove_dir_all(&self.root).unwrap();
+        self.root.remove();
+        assert!(
+            Instant::now() <= self.deadline,
+            "qualification fixture cleanup exceeded its attempt deadline"
+        );
+        self.cleaned = true;
     }
 }
 
 impl Drop for LiveQualificationFixture {
     fn drop(&mut self) {
-        let _ = self.manager.stop();
-        let _ = fs::remove_dir_all(&self.root);
+        if self.cleaned {
+            return;
+        }
+        if self.manager.stop().is_ok() {
+            self.root.remove();
+        } else {
+            self.root.retain();
+        }
     }
 }
 

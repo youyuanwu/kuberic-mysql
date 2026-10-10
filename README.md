@@ -84,14 +84,18 @@ inventory do not become public catch-up capability.
 
 The gate proves a normally acknowledged singleton GTID on all members and
 proves it survives abrupt primary SIGKILL, a coherent two-survivor view, and
-restart of every participant. Oracle 8.4.11 did not expose the exact blocked-
-transaction barrier required for safe disconnect or member-loss injection, so
-those cases remain unproved and no fault is injected. Account lock, password
+restart of every participant. A deliberately blocked secondary applier exposed
+the exact transaction GTID; dropping the client before response produced an
+ambiguous client outcome whose GTID was then proved on all members. The gate
+did not establish an authoritative current-source-`AFTER` wait surface, so
+secondary loss during that wait remains unproved and no member fault is
+injected. Account lock, password
 replacement, and recovery-privilege removal do not terminate established
 native participation; even after explicit Group Replication stop and password
-replacement, predecessor recovery credentials remain accepted by
-`START GROUP_REPLICATION`. Native peer-session revocation and serving cutover
-therefore remain ineligible.
+replacement, the native `START GROUP_REPLICATION` command still completes.
+Because the caught-up target does not prove donor authentication, predecessor
+recovery-credential acceptance remains unproved. Native peer-session
+revocation and serving cutover therefore remain ineligible.
 
 The original five-argument `MysqlInstanceConfig::new(mysqld, launcher,
 data_root, scratch_root, timeouts)` remains the single-instance constructor and
