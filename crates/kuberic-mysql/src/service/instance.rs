@@ -515,7 +515,9 @@ impl MysqlInstanceManager {
         ))
     }
 
-    pub(crate) fn contain(&mut self) -> Result<(), MysqlInstanceError> {
+    /// Contains any exact process generation owned by this manager and removes
+    /// disposable scratch even when startup or topology control failed.
+    pub fn contain(&mut self) -> Result<(), MysqlInstanceError> {
         match self.state {
             MysqlInstanceState::Configured | MysqlInstanceState::Stopped => return Ok(()),
             MysqlInstanceState::Running => return self.stop(),

@@ -39,9 +39,9 @@ pub use instance::{MysqlInstanceManager, MysqlInstanceState};
 pub use topology::{
     AcceptedMysqlTopology, AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect,
     ControlCredential, ControlCredentialRole, ControlStep, CredentialError, JoinCapability,
-    JoinEffect, MemberControlBinding, MysqlTopologyManager, MysqlTopologyState,
-    NativeControlDeadline, NativeIdentityEnrollment, ObservedLocalBinding, SourceGtidBoundary,
-    TopologyAttempt, TopologyAuthority, TopologyInstant, TopologyObservation,
+    JoinEffect, MemberControlBinding, MysqlTopologyManager, MysqlTopologyMemberRuntime,
+    MysqlTopologyState, NativeControlDeadline, NativeIdentityEnrollment, ObservedLocalBinding,
+    SourceGtidBoundary, TopologyAttempt, TopologyAuthority, TopologyInstant, TopologyObservation,
     TopologyObservationContext, TopologyObservationStatus, TransitionCredit, TransitionEvaluation,
     ViewDiscovery,
 };

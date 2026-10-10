@@ -1427,7 +1427,30 @@ mod tests {
             TransitionEvaluation::Accepted(credit) => credit,
             TransitionEvaluation::Pending => panic!("bootstrap should be accepted"),
         };
-        let boundary = credit.source_gtid_boundary(&enrollments[0]).unwrap();
+        let source_evidence = TopologyObservation::new(
+            TopologyObservationStatus::Complete,
+            AttemptId::new("join-source-observation").unwrap(),
+            ObservedLocalBinding::from_enrollment(&enrollments[0]),
+            attempt.group_name().clone(),
+            ViewId::new("view-1").unwrap(),
+            ViewId::new("view-1").unwrap(),
+            vec![NativeMember::new(
+                enrollments[0].member_id().clone(),
+                enrollments[0].binding().member_address().clone(),
+                MemberRole::Primary,
+                MemberState::Online,
+            )],
+            GtidSet::from_str(&format!("{GROUP_UUID}:1-2")).unwrap(),
+            TopologyInstant::new(25),
+        );
+        let boundary = credit
+            .source_gtid_boundary(
+                &attempt,
+                &enrollments[0],
+                &source_evidence,
+                TopologyInstant::new(26),
+            )
+            .unwrap();
         let capability = authority
             .authorize_join(MysqlMemberIndex::Second, boundary, TopologyInstant::new(30))
             .unwrap();

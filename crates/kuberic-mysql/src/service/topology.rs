@@ -5,20 +5,21 @@ use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use crate::adapter::{
-    AdapterDiagnostic, ClockContext, ObservationClock, ObservationRequest, ObserverCredentials,
-    RequestError, UnixSocketPath,
+    AdapterDiagnostic, ClockContext, ObservationClock, ObservationReport, ObservationRequest,
+    ObserverCredentials, RequestError, UnixSocketPath,
 };
 use crate::core::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding, Epoch,
     ExactBinding, ExactBindingParts, GroupName, GtidSet, MemberAddress, MemberId, MemberRole,
-    MemberState, NativeField, NativeMember, ObservationOutcome, ObservationProvenance,
-    ObservationSessionId, PartitionId, ProcessSessionId, ReplicaId, ReplicaIncarnation, ResourceId,
-    ServerUuid, StorageBinding, UnsupportedReason, ViewId,
+    MemberState, NativeField, NativeMember, ObservationInstant, ObservationOutcome,
+    ObservationProvenance, ObservationSessionId, PartitionId, ProcessSessionId, ReplicaId,
+    ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, UnsupportedReason, ViewId,
 };
 use crate::service::{
-    ControlStage, MemberCleanupFailure, MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError,
-    MysqlTopologyManagerError, TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError,
-    TopologyNativeStateError, TopologyStateError,
+    ControlStage, MemberCleanupFailure, MysqlInstanceConfig, MysqlInstanceError,
+    MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManagerError,
+    TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError, TopologyNativeStateError,
+    TopologyStateError,
 };
 
 /// One caller-controlled monotonic tick used by topology contracts.
@@ -690,6 +691,12 @@ impl BootstrapEffect {
         self.observation_attempt = Some(attempt);
         self
     }
+
+    /// Rebinds the same authorized bootstrap operation to a new observation
+    /// attempt. This is required after a prior observation reported pending.
+    pub fn rebind_observation_attempt(&mut self, attempt: AttemptId) {
+        self.observation_attempt = Some(attempt);
+    }
 }
 
 /// Source transaction boundary captured from the accepted predecessor view.
@@ -697,6 +704,7 @@ impl BootstrapEffect {
 pub struct SourceGtidBoundary {
     attempt: AttemptId,
     source: NativeIdentityEnrollment,
+    predecessor_observation_attempt: AttemptId,
     observation_attempt: AttemptId,
     view_id: ViewId,
     executed: GtidSet,
@@ -707,6 +715,12 @@ impl SourceGtidBoundary {
     #[must_use]
     pub const fn executed(&self) -> &GtidSet {
         &self.executed
+    }
+
+    /// Fresh observer attempt that captured this source boundary.
+    #[must_use]
+    pub const fn observation_attempt(&self) -> &AttemptId {
+        &self.observation_attempt
     }
 }
 
@@ -721,6 +735,12 @@ pub struct JoinCapability {
 }
 
 impl JoinCapability {
+    /// Fresh source boundary authorized for this exact join.
+    #[must_use]
+    pub const fn boundary(&self) -> &SourceGtidBoundary {
+        &self.boundary
+    }
+
     /// Records the exact non-bootstrap join trace.
     pub fn record_effect(self, steps: Vec<ControlStep>) -> Result<JoinEffect, MysqlTopologyError> {
         if steps != JOIN_STEPS {
@@ -764,6 +784,12 @@ impl JoinEffect {
     pub fn bind_observation_attempt(mut self, attempt: AttemptId) -> Self {
         self.observation_attempt = Some(attempt);
         self
+    }
+
+    /// Rebinds the same authorized join operation to a new observation
+    /// attempt. This is required after a prior observation reported pending.
+    pub fn rebind_observation_attempt(&mut self, attempt: AttemptId) {
+        self.observation_attempt = Some(attempt);
     }
 }
 
@@ -971,22 +997,38 @@ impl TransitionCredit {
         &self.members
     }
 
-    /// Constructs the join boundary from this exact accepted observation.
+    /// Executed history accepted for this view.
+    #[must_use]
+    pub const fn executed(&self) -> &GtidSet {
+        &self.executed
+    }
+
+    /// Constructs a join boundary only from a distinct, fresh observation of
+    /// one exact member in this accepted predecessor view.
     pub fn source_gtid_boundary(
         &self,
+        topology_attempt: &TopologyAttempt,
         source: &NativeIdentityEnrollment,
+        evidence: &TopologyObservation,
+        now: TopologyInstant,
     ) -> Result<SourceGtidBoundary, MysqlTopologyError> {
-        if !self.members.contains(source) {
+        topology_attempt.check_deadline(now, ControlStage::DiscoverView)?;
+        if self.attempt != *topology_attempt.id()
+            || !self.members.contains(source)
+            || evidence.observation_attempt == self.observation_attempt
+        {
             return Err(MysqlTopologyError::Gtid(
                 TopologyGtidError::SourceBoundaryBindingMismatch,
             ));
         }
+        validate_source_observation(topology_attempt, self, source, evidence)?;
         Ok(SourceGtidBoundary {
             attempt: self.attempt.clone(),
             source: source.clone(),
-            observation_attempt: self.observation_attempt.clone(),
+            predecessor_observation_attempt: self.observation_attempt.clone(),
+            observation_attempt: evidence.observation_attempt.clone(),
             view_id: self.view_id.clone(),
-            executed: self.executed.clone(),
+            executed: evidence.executed.clone(),
         })
     }
 }
@@ -1280,6 +1322,7 @@ impl TopologyAuthority {
 
     pub(crate) fn invalidate(&mut self) {
         self.state = AuthorityState::Invalidated;
+        self.enrollments.fill(None);
     }
 
     fn take_nonce(&mut self) -> u64 {
@@ -1391,14 +1434,232 @@ impl AcceptedMysqlTopology {
 
 #[derive(Debug)]
 enum PendingEffect {
-    Bootstrap(Box<BootstrapEffect>),
-    Join(Box<JoinEffect>),
+    Bootstrap {
+        effect: Box<BootstrapEffect>,
+        last_observation: Option<(AttemptId, ObservationInstant)>,
+    },
+    Join {
+        effect: Box<JoinEffect>,
+        last_observation: Option<(AttemptId, ObservationInstant)>,
+    },
+}
+
+impl PendingEffect {
+    fn bind_fresh_observation(
+        &mut self,
+        attempt: AttemptId,
+        deadline: ObservationInstant,
+    ) -> Result<(), MysqlTopologyManagerError> {
+        let last_observation = match self {
+            Self::Bootstrap {
+                effect,
+                last_observation,
+            } => {
+                effect.rebind_observation_attempt(attempt.clone());
+                last_observation
+            }
+            Self::Join {
+                effect,
+                last_observation,
+            } => {
+                effect.rebind_observation_attempt(attempt.clone());
+                last_observation
+            }
+        };
+        if last_observation
+            .as_ref()
+            .is_some_and(|(prior_attempt, prior_deadline)| {
+                prior_attempt == &attempt || deadline == *prior_deadline
+            })
+        {
+            return Err(MysqlTopologyManagerError::Topology(
+                MysqlTopologyError::Evidence(TopologyEvidenceError::BindingMismatch),
+            ));
+        }
+        *last_observation = Some((attempt, deadline));
+        Ok(())
+    }
+}
+
+/// One member dependency used by [`MysqlTopologyManager`].
+///
+/// Production uses [`MysqlInstanceManager`]. Deterministic tests may supply a
+/// scripted implementation while exercising the same public manager methods.
+#[allow(async_fn_in_trait)]
+pub trait MysqlTopologyMemberRuntime {
+    /// Immutable validated member configuration.
+    fn config(&self) -> &MysqlInstanceConfig;
+
+    /// Initializes one fresh member generation.
+    fn initialize(&mut self) -> Result<(), MysqlInstanceError>;
+
+    /// Starts and attests one exact member process.
+    fn start(&mut self) -> Result<(), MysqlInstanceError>;
+
+    /// Freezes the exact process, endpoint, storage, and address binding.
+    fn topology_binding(
+        &mut self,
+        attempt: AttemptId,
+        observer_generation: CredentialGeneration,
+        recovery_generation: CredentialGeneration,
+    ) -> Result<MemberControlBinding, MysqlTopologyError>;
+
+    /// Provisions the exact topology accounts.
+    async fn provision_topology_accounts(
+        &mut self,
+        binding: MemberControlBinding,
+        observer: &ControlCredential,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<AccountProvisioningEvidence, MysqlTopologyError>;
+
+    /// Enrolls the exact pre-effect native identity.
+    async fn enroll_topology_identity(
+        &mut self,
+        binding: MemberControlBinding,
+        accounts: &AccountProvisioningEvidence,
+        deadline: &NativeControlDeadline,
+    ) -> Result<NativeIdentityEnrollment, MysqlTopologyError>;
+
+    /// Executes the designated bootstrap effect.
+    async fn bootstrap_group_replication(
+        &mut self,
+        capability: BootstrapCapability,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<BootstrapEffect, MysqlTopologyError>;
+
+    /// Executes one non-bootstrap join effect.
+    async fn join_group_replication(
+        &mut self,
+        capability: JoinCapability,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<JoinEffect, MysqlTopologyError>;
+
+    /// Discovers the proposed post-effect view.
+    async fn discover_topology_view(
+        &mut self,
+        enrollment: NativeIdentityEnrollment,
+        group_name: GroupName,
+        deadline: &NativeControlDeadline,
+    ) -> Result<ViewDiscovery, MysqlTopologyError>;
+
+    /// Performs one exact read-only observer attempt.
+    async fn observe<C: ObservationClock>(
+        &mut self,
+        request: ObservationRequest<C>,
+    ) -> Result<ObservationReport, MysqlInstanceError>;
+
+    /// Contains the exact owned process and disposable resources.
+    fn contain(&mut self) -> Result<(), MysqlInstanceError>;
+}
+
+impl MysqlTopologyMemberRuntime for MysqlInstanceManager {
+    fn config(&self) -> &MysqlInstanceConfig {
+        MysqlInstanceManager::config(self)
+    }
+
+    fn initialize(&mut self) -> Result<(), MysqlInstanceError> {
+        MysqlInstanceManager::initialize(self)
+    }
+
+    fn start(&mut self) -> Result<(), MysqlInstanceError> {
+        MysqlInstanceManager::start(self)
+    }
+
+    fn topology_binding(
+        &mut self,
+        attempt: AttemptId,
+        observer_generation: CredentialGeneration,
+        recovery_generation: CredentialGeneration,
+    ) -> Result<MemberControlBinding, MysqlTopologyError> {
+        MysqlInstanceManager::topology_binding(
+            self,
+            attempt,
+            observer_generation,
+            recovery_generation,
+        )
+    }
+
+    async fn provision_topology_accounts(
+        &mut self,
+        binding: MemberControlBinding,
+        observer: &ControlCredential,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<AccountProvisioningEvidence, MysqlTopologyError> {
+        MysqlInstanceManager::provision_topology_accounts(
+            self, binding, observer, recovery, deadline,
+        )
+        .await
+    }
+
+    async fn enroll_topology_identity(
+        &mut self,
+        binding: MemberControlBinding,
+        accounts: &AccountProvisioningEvidence,
+        deadline: &NativeControlDeadline,
+    ) -> Result<NativeIdentityEnrollment, MysqlTopologyError> {
+        MysqlInstanceManager::enroll_topology_identity(self, binding, accounts, deadline).await
+    }
+
+    async fn bootstrap_group_replication(
+        &mut self,
+        capability: BootstrapCapability,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<BootstrapEffect, MysqlTopologyError> {
+        MysqlInstanceManager::bootstrap_group_replication(self, capability, recovery, deadline)
+            .await
+    }
+
+    async fn join_group_replication(
+        &mut self,
+        capability: JoinCapability,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<JoinEffect, MysqlTopologyError> {
+        MysqlInstanceManager::join_group_replication(self, capability, recovery, deadline).await
+    }
+
+    async fn discover_topology_view(
+        &mut self,
+        enrollment: NativeIdentityEnrollment,
+        group_name: GroupName,
+        deadline: &NativeControlDeadline,
+    ) -> Result<ViewDiscovery, MysqlTopologyError> {
+        MysqlInstanceManager::discover_topology_view(self, enrollment, group_name, deadline).await
+    }
+
+    async fn observe<C: ObservationClock>(
+        &mut self,
+        request: ObservationRequest<C>,
+    ) -> Result<ObservationReport, MysqlInstanceError> {
+        MysqlInstanceManager::observe(self, request).await
+    }
+
+    fn contain(&mut self) -> Result<(), MysqlInstanceError> {
+        MysqlInstanceManager::contain(self)
+    }
+}
+
+fn contain_members<M: MysqlTopologyMemberRuntime>(
+    instances: &mut [M; 3],
+) -> Vec<MemberCleanupFailure> {
+    let mut failures = Vec::new();
+    for member in MysqlMemberIndex::all() {
+        if let Err(error) = instances[member.as_usize()].contain() {
+            failures.push(MemberCleanupFailure::new(member, error));
+        }
+    }
+    failures
 }
 
 /// Owns exactly three fresh instance generations and their in-memory topology
 /// attempt. It has no adoption, resume, publication, or durable store surface.
-pub struct MysqlTopologyManager {
-    instances: [MysqlInstanceManager; 3],
+pub struct MysqlTopologyManager<M: MysqlTopologyMemberRuntime = MysqlInstanceManager> {
+    instances: [M; 3],
     authority: TopologyAuthority,
     state: MysqlTopologyState,
     observer: ControlCredential,
@@ -1410,32 +1671,46 @@ pub struct MysqlTopologyManager {
     observation_serial: u64,
 }
 
-impl MysqlTopologyManager {
+impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
     /// Creates one fixed manager from exactly three existing instance managers.
     pub fn new(
-        instances: [MysqlInstanceManager; 3],
+        mut instances: [M; 3],
         attempt: TopologyAttempt,
         observer: ControlCredential,
         recovery: ControlCredential,
     ) -> Result<Self, MysqlTopologyManagerError> {
-        if observer.attempt() != attempt.id()
+        let validation_error = if observer.attempt() != attempt.id()
             || recovery.attempt() != attempt.id()
             || observer.role() != ControlCredentialRole::Observer
             || recovery.role() != ControlCredentialRole::Recovery
         {
-            return Err(MysqlTopologyManagerError::Topology(
+            Some(MysqlTopologyManagerError::Topology(
                 MysqlTopologyError::Authority(TopologyAuthorityError::AttemptMismatch),
-            ));
-        }
-        let topology = instances[0].config().topology();
-        if instances.iter().enumerate().any(|(index, instance)| {
-            instance.config().member_index().as_usize() != index
-                || instance.config().topology() != topology
-                || instance.config().member().group_uuid() != attempt.group_name().as_str()
-        }) {
-            return Err(MysqlTopologyManagerError::Topology(
-                MysqlTopologyError::TopologyState(TopologyStateError::InvalidTransition),
-            ));
+            ))
+        } else {
+            let topology = instances[0].config().topology();
+            instances
+                .iter()
+                .enumerate()
+                .any(|(index, instance)| {
+                    instance.config().member_index().as_usize() != index
+                        || instance.config().topology() != topology
+                        || instance.config().member().group_uuid() != attempt.group_name().as_str()
+                })
+                .then_some(MysqlTopologyManagerError::Topology(
+                    MysqlTopologyError::TopologyState(TopologyStateError::InvalidTransition),
+                ))
+        };
+        if let Some(primary) = validation_error {
+            let failures = contain_members(&mut instances);
+            return if failures.is_empty() {
+                Err(primary)
+            } else {
+                Err(MysqlTopologyManagerError::Cleanup {
+                    primary: Some(Box::new(primary)),
+                    failures,
+                })
+            };
         }
         Ok(Self {
             instances,
@@ -1459,7 +1734,7 @@ impl MysqlTopologyManager {
 
     /// Exact owned member managers in fixed topology order.
     #[must_use]
-    pub const fn members(&self) -> &[MysqlInstanceManager; 3] {
+    pub const fn members(&self) -> &[M; 3] {
         &self.instances
     }
 
@@ -1483,7 +1758,7 @@ impl MysqlTopologyManager {
 
     /// Initializes all three fresh members before any member is started.
     pub fn initialize(&mut self) -> Result<(), MysqlTopologyManagerError> {
-        self.require_state(MysqlTopologyState::Configured)?;
+        self.require_state_or_fail(MysqlTopologyState::Configured)?;
         for member in MysqlMemberIndex::all() {
             if let Err(error) = self.instances[member.as_usize()].initialize() {
                 return Err(self.fail(MysqlTopologyManagerError::Instance { member, error }));
@@ -1498,7 +1773,7 @@ impl MysqlTopologyManager {
         &mut self,
         deadline: &NativeControlDeadline,
     ) -> Result<(), MysqlTopologyManagerError> {
-        self.require_state(MysqlTopologyState::Initialized)?;
+        self.require_state_or_fail(MysqlTopologyState::Initialized)?;
         let member = self.authority.attempt.designated_bootstrap();
         self.start_and_enroll(member, deadline).await?;
         self.state = MysqlTopologyState::BootstrapMemberEnrolled;
@@ -1511,7 +1786,7 @@ impl MysqlTopologyManager {
         now: TopologyInstant,
         deadline: &NativeControlDeadline,
     ) -> Result<(), MysqlTopologyManagerError> {
-        self.require_state(MysqlTopologyState::BootstrapMemberEnrolled)?;
+        self.require_state_or_fail(MysqlTopologyState::BootstrapMemberEnrolled)?;
         let member = self.authority.attempt.designated_bootstrap();
         let result = async {
             let capability = self
@@ -1531,9 +1806,11 @@ impl MysqlTopologyManager {
                 )
                 .await
                 .map_err(MysqlTopologyManagerError::Topology)?;
-            let effect = effect.bind_observation_attempt(self.next_observation_attempt()?);
             self.install_pending(
-                PendingEffect::Bootstrap(Box::new(effect)),
+                PendingEffect::Bootstrap {
+                    effect: Box::new(effect),
+                    last_observation: None,
+                },
                 discovery,
                 MysqlTopologyState::BootstrapObservationPending,
             );
@@ -1551,7 +1828,7 @@ impl MysqlTopologyManager {
         &mut self,
         deadline: &NativeControlDeadline,
     ) -> Result<(), MysqlTopologyManagerError> {
-        self.require_state(MysqlTopologyState::BootstrapAccepted)?;
+        self.require_state_or_fail(MysqlTopologyState::BootstrapAccepted)?;
         let member = self.join_order()[0];
         self.start_and_enroll(member, deadline).await?;
         self.state = MysqlTopologyState::SecondMemberEnrolled;
@@ -1559,14 +1836,22 @@ impl MysqlTopologyManager {
     }
 
     /// Enters the second member's join from the exact accepted bootstrap credit.
-    pub async fn join_second_member(
+    pub async fn join_second_member<C: ObservationClock>(
         &mut self,
         now: TopologyInstant,
         deadline: &NativeControlDeadline,
+        source_context: TopologyObservationContext,
+        source_clock: ClockContext<C>,
     ) -> Result<(), MysqlTopologyManagerError> {
-        self.require_state(MysqlTopologyState::SecondMemberEnrolled)?;
-        self.join_member(self.join_order()[0], now, deadline)
-            .await?;
+        self.require_state_or_fail(MysqlTopologyState::SecondMemberEnrolled)?;
+        self.join_member(
+            self.join_order()[0],
+            now,
+            deadline,
+            source_context,
+            source_clock,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1575,7 +1860,7 @@ impl MysqlTopologyManager {
         &mut self,
         deadline: &NativeControlDeadline,
     ) -> Result<(), MysqlTopologyManagerError> {
-        self.require_state(MysqlTopologyState::SecondAccepted)?;
+        self.require_state_or_fail(MysqlTopologyState::SecondAccepted)?;
         let member = self.join_order()[1];
         self.start_and_enroll(member, deadline).await?;
         self.state = MysqlTopologyState::ThirdMemberEnrolled;
@@ -1583,14 +1868,22 @@ impl MysqlTopologyManager {
     }
 
     /// Enters the third member's join from the exact accepted second credit.
-    pub async fn join_third_member(
+    pub async fn join_third_member<C: ObservationClock>(
         &mut self,
         now: TopologyInstant,
         deadline: &NativeControlDeadline,
+        source_context: TopologyObservationContext,
+        source_clock: ClockContext<C>,
     ) -> Result<(), MysqlTopologyManagerError> {
-        self.require_state(MysqlTopologyState::ThirdMemberEnrolled)?;
-        self.join_member(self.join_order()[1], now, deadline)
-            .await?;
+        self.require_state_or_fail(MysqlTopologyState::ThirdMemberEnrolled)?;
+        self.join_member(
+            self.join_order()[1],
+            now,
+            deadline,
+            source_context,
+            source_clock,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1608,12 +1901,27 @@ impl MysqlTopologyManager {
                 | MysqlTopologyState::SecondObservationPending
                 | MysqlTopologyState::ThirdObservationPending
         ) {
-            return Err(MysqlTopologyManagerError::InvalidState {
+            let error = MysqlTopologyManagerError::InvalidState {
                 expected: MysqlTopologyState::BootstrapObservationPending,
                 actual: self.state,
-            });
+            };
+            return Err(self.fail(error));
         }
-        let result = self.observe_pending_inner(context, clock, now).await;
+        let observation_attempt = match self.next_observation_attempt() {
+            Ok(attempt) => attempt,
+            Err(error) => return Err(self.fail(error)),
+        };
+        if let Err(error) = self
+            .pending_effect
+            .as_mut()
+            .expect("pending state retains one effect")
+            .bind_fresh_observation(observation_attempt.clone(), clock.deadline())
+        {
+            return Err(self.fail(error));
+        }
+        let result = self
+            .observe_pending_inner(context, clock, now, observation_attempt)
+            .await;
         let evidence = match result {
             Ok(evidence) => evidence,
             Err(error) => return Err(self.fail(error)),
@@ -1624,9 +1932,7 @@ impl MysqlTopologyManager {
     /// Contains every exact member and reports every cleanup failure.
     pub fn stop(&mut self) -> Result<(), MysqlTopologyManagerError> {
         let failures = self.contain_all();
-        self.authority.invalidate();
-        self.pending_effect = None;
-        self.pending_discovery = None;
+        self.invalidate_context();
         if failures.is_empty() {
             self.state = MysqlTopologyState::Stopped;
             Ok(())
@@ -1675,11 +1981,13 @@ impl MysqlTopologyManager {
         result.map_err(|error| self.fail(error))
     }
 
-    async fn join_member(
+    async fn join_member<C: ObservationClock>(
         &mut self,
         member: MysqlMemberIndex,
         now: TopologyInstant,
         deadline: &NativeControlDeadline,
+        source_context: TopologyObservationContext,
+        source_clock: ClockContext<C>,
     ) -> Result<(), MysqlTopologyManagerError> {
         let result = async {
             let predecessor = self
@@ -1689,15 +1997,24 @@ impl MysqlTopologyManager {
                     MysqlTopologyError::TopologyState(TopologyStateError::InvalidTransition),
                 ))?
                 .clone();
-            let source =
-                predecessor
-                    .members()
-                    .last()
-                    .ok_or(MysqlTopologyManagerError::Topology(
-                        MysqlTopologyError::Evidence(TopologyEvidenceError::Missing),
-                    ))?;
+            let source = predecessor.members().last().cloned().ok_or(
+                MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
+                    TopologyEvidenceError::Missing,
+                )),
+            )?;
+            let source_attempt = self.next_observation_attempt()?;
+            let source_evidence = self
+                .observe_enrollment(
+                    source_context,
+                    source_clock,
+                    now,
+                    source_attempt,
+                    &source,
+                    predecessor.view_id(),
+                )
+                .await?;
             let boundary = predecessor
-                .source_gtid_boundary(source)
+                .source_gtid_boundary(&self.authority.attempt, &source, &source_evidence, now)
                 .map_err(MysqlTopologyManagerError::Topology)?;
             let capability = self
                 .authority
@@ -1716,14 +2033,16 @@ impl MysqlTopologyManager {
                 )
                 .await
                 .map_err(MysqlTopologyManagerError::Topology)?;
-            let effect = effect.bind_observation_attempt(self.next_observation_attempt()?);
             let pending_state = if member == self.join_order()[0] {
                 MysqlTopologyState::SecondObservationPending
             } else {
                 MysqlTopologyState::ThirdObservationPending
             };
             self.install_pending(
-                PendingEffect::Join(Box::new(effect)),
+                PendingEffect::Join {
+                    effect: Box::new(effect),
+                    last_observation: None,
+                },
                 discovery,
                 pending_state,
             );
@@ -1738,6 +2057,7 @@ impl MysqlTopologyManager {
         context: TopologyObservationContext,
         clock: ClockContext<C>,
         now: TopologyInstant,
+        observation_attempt: AttemptId,
     ) -> Result<TopologyObservation, MysqlTopologyManagerError> {
         let discovery =
             self.pending_discovery
@@ -1745,22 +2065,38 @@ impl MysqlTopologyManager {
                 .ok_or(MysqlTopologyManagerError::Topology(
                     MysqlTopologyError::Evidence(TopologyEvidenceError::Missing),
                 ))?;
-        let observation_attempt = match self.pending_effect.as_ref() {
-            Some(PendingEffect::Bootstrap(effect)) => effect
-                .observation_attempt
-                .as_ref()
-                .expect("manager binds bootstrap observation before pending"),
-            Some(PendingEffect::Join(effect)) => effect
-                .observation_attempt
-                .as_ref()
-                .expect("manager binds join observation before pending"),
-            None => {
-                return Err(MysqlTopologyManagerError::Topology(
-                    MysqlTopologyError::Evidence(TopologyEvidenceError::Missing),
-                ));
+        let enrollment = discovery.enrollment().clone();
+        let group_name = discovery.group_name().clone();
+        let view_id = discovery.view_id().clone();
+        self.observe_enrollment(
+            context,
+            clock,
+            now,
+            observation_attempt,
+            &enrollment,
+            &view_id,
+        )
+        .await
+        .and_then(|observation| {
+            if observation.group_name != group_name {
+                Err(MysqlTopologyManagerError::Topology(
+                    MysqlTopologyError::Evidence(TopologyEvidenceError::GroupMismatch),
+                ))
+            } else {
+                Ok(observation)
             }
-        };
-        let enrollment = discovery.enrollment();
+        })
+    }
+
+    async fn observe_enrollment<C: ObservationClock>(
+        &mut self,
+        context: TopologyObservationContext,
+        clock: ClockContext<C>,
+        now: TopologyInstant,
+        observation_attempt: AttemptId,
+        enrollment: &NativeIdentityEnrollment,
+        binding_view_id: &ViewId,
+    ) -> Result<TopologyObservation, MysqlTopologyManagerError> {
         let binding = ExactBinding::new(ExactBindingParts {
             resource: context.resource,
             partition: context.partition,
@@ -1772,15 +2108,16 @@ impl MysqlTopologyManager {
             endpoint: enrollment.binding().endpoint().clone(),
             storage: enrollment.binding().storage().clone(),
             server_uuid: enrollment.server_uuid().clone(),
-            group_name: discovery.group_name().clone(),
+            group_name: self.authority.attempt.group_name().clone(),
             member_id: enrollment.member_id().clone(),
             member_address: enrollment.binding().member_address().clone(),
             configuration: context.configuration,
             epoch: context.epoch,
             authority_generation: context.authority_generation,
-            view_id: discovery.view_id().clone(),
+            view_id: binding_view_id.clone(),
             credential_generation: enrollment.binding().observer_generation().clone(),
         });
+        let expected_binding = binding.clone();
         let provenance = ObservationProvenance::new(context.origin, observation_attempt.clone())
             .map_err(|_| {
                 MysqlTopologyManagerError::ObservationRequest(RequestError::AttemptMismatch)
@@ -1809,9 +2146,11 @@ impl MysqlTopologyManager {
         topology_observation(
             report.outcome(),
             report.diagnostic(),
-            observation_attempt.clone(),
+            &expected_binding,
+            observation_attempt,
             enrollment,
-            discovery,
+            self.authority.attempt.group_name(),
+            binding_view_id,
             now,
         )
         .map_err(MysqlTopologyManagerError::Topology)
@@ -1827,11 +2166,11 @@ impl MysqlTopologyManager {
             .as_ref()
             .expect("pending effect retained until evaluation")
         {
-            PendingEffect::Bootstrap(effect) => self
+            PendingEffect::Bootstrap { effect, .. } => self
                 .authority
                 .accept_bootstrap(effect, evidence, now)
                 .map_err(MysqlTopologyManagerError::Topology),
-            PendingEffect::Join(effect) => self
+            PendingEffect::Join { effect, .. } => self
                 .authority
                 .accept_join(effect, evidence, now)
                 .map_err(MysqlTopologyManagerError::Topology),
@@ -1902,7 +2241,12 @@ impl MysqlTopologyManager {
     }
 
     fn next_observation_attempt(&mut self) -> Result<AttemptId, MysqlTopologyManagerError> {
-        self.observation_serial = self.observation_serial.saturating_add(1);
+        self.observation_serial =
+            self.observation_serial
+                .checked_add(1)
+                .ok_or(MysqlTopologyManagerError::Topology(
+                    MysqlTopologyError::Evidence(TopologyEvidenceError::BindingMismatch),
+                ))?;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.authority.attempt.id().hash(&mut hasher);
         AttemptId::new(format!(
@@ -1938,11 +2282,18 @@ impl MysqlTopologyManager {
         }
     }
 
+    fn require_state_or_fail(
+        &mut self,
+        expected: MysqlTopologyState,
+    ) -> Result<(), MysqlTopologyManagerError> {
+        match self.require_state(expected) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.fail(error)),
+        }
+    }
+
     fn fail(&mut self, primary: MysqlTopologyManagerError) -> MysqlTopologyManagerError {
-        self.authority.invalidate();
-        self.pending_effect = None;
-        self.pending_discovery = None;
-        self.accepted = None;
+        self.invalidate_context();
         self.state = MysqlTopologyState::Failed;
         let failures = self.contain_all();
         if failures.is_empty() {
@@ -1956,33 +2307,61 @@ impl MysqlTopologyManager {
     }
 
     fn contain_all(&mut self) -> Vec<MemberCleanupFailure> {
-        let mut failures = Vec::new();
-        for member in MysqlMemberIndex::all() {
-            if let Err(error) = self.instances[member.as_usize()].contain() {
-                failures.push(MemberCleanupFailure::new(member, error));
-            }
-        }
-        failures
+        contain_members(&mut self.instances)
     }
-}
 
-impl Drop for MysqlTopologyManager {
-    fn drop(&mut self) {
+    fn invalidate_context(&mut self) {
         self.authority.invalidate();
         self.pending_effect = None;
         self.pending_discovery = None;
+        self.accepted = None;
+        self.enrollments.fill(None);
+        self.observer.clear();
+        self.recovery.clear();
+    }
+}
+
+impl<M: MysqlTopologyMemberRuntime> Drop for MysqlTopologyManager<M> {
+    fn drop(&mut self) {
+        self.invalidate_context();
         let _ = self.contain_all();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn topology_observation(
     outcome: &ObservationOutcome,
     diagnostic: &AdapterDiagnostic,
+    expected_binding: &ExactBinding,
     observation_attempt: AttemptId,
     enrollment: &NativeIdentityEnrollment,
-    discovery: &ViewDiscovery,
+    group_name: &GroupName,
+    binding_view_id: &ViewId,
     decision: TopologyInstant,
 ) -> Result<TopologyObservation, MysqlTopologyError> {
+    let actual_binding = outcome.metadata().binding();
+    if actual_binding != expected_binding
+        || outcome.metadata().provenance().attempt() != &observation_attempt
+    {
+        let actual = actual_binding.parts();
+        let expected = expected_binding.parts();
+        let error = if actual.server_uuid != expected.server_uuid
+            || actual.member_id != expected.member_id
+            || actual.member_address != expected.member_address
+        {
+            TopologyEvidenceError::IdentityDrift
+        } else if actual.process_session != expected.process_session
+            || actual.endpoint != expected.endpoint
+            || actual.storage != expected.storage
+        {
+            TopologyEvidenceError::OwnershipDrift
+        } else if actual.group_name != expected.group_name {
+            TopologyEvidenceError::GroupMismatch
+        } else {
+            TopologyEvidenceError::BindingMismatch
+        };
+        return Err(MysqlTopologyError::Evidence(error));
+    }
     if let AdapterDiagnostic::UnexpectedIdentity { field } = diagnostic {
         let error = match field {
             crate::adapter::IdentityField::GroupName => TopologyEvidenceError::GroupMismatch,
@@ -2008,7 +2387,7 @@ fn topology_observation(
         _ => TopologyObservationStatus::Missing,
     };
     let (view_id, members, executed) = outcome.valid().map_or_else(
-        || (discovery.view_id().clone(), Vec::new(), GtidSet::empty()),
+        || (binding_view_id.clone(), Vec::new(), GtidSet::empty()),
         |valid| {
             (
                 valid.view().id().clone(),
@@ -2021,8 +2400,8 @@ fn topology_observation(
         status,
         observation_attempt,
         ObservedLocalBinding::from_enrollment(enrollment),
-        discovery.group_name().clone(),
-        discovery.view_id().clone(),
+        group_name.clone(),
+        binding_view_id.clone(),
         view_id,
         members,
         executed,
@@ -2052,6 +2431,55 @@ fn validate_credential(
     Ok(())
 }
 
+fn validate_source_observation(
+    attempt: &TopologyAttempt,
+    predecessor: &TransitionCredit,
+    source: &NativeIdentityEnrollment,
+    evidence: &TopologyObservation,
+) -> Result<(), MysqlTopologyError> {
+    if evidence.decision >= attempt.deadline {
+        return Err(MysqlTopologyError::Deadline(ControlStage::DiscoverView));
+    }
+    if evidence.status != TopologyObservationStatus::Complete {
+        return Err(match evidence.status {
+            TopologyObservationStatus::Missing => {
+                MysqlTopologyError::Evidence(TopologyEvidenceError::Missing)
+            }
+            TopologyObservationStatus::ProductMismatch => {
+                MysqlTopologyError::Evidence(TopologyEvidenceError::ProductMismatch)
+            }
+            TopologyObservationStatus::OwnershipContextLoss => {
+                MysqlTopologyError::Evidence(TopologyEvidenceError::OwnershipContextLoss)
+            }
+            TopologyObservationStatus::UnsupportedRole => {
+                MysqlTopologyError::NativeState(TopologyNativeStateError::UnsupportedRole)
+            }
+            TopologyObservationStatus::UnsupportedState => {
+                MysqlTopologyError::NativeState(TopologyNativeStateError::UnsupportedState)
+            }
+            TopologyObservationStatus::Complete => unreachable!(),
+        });
+    }
+    if evidence.local.attempt != attempt.id
+        || evidence.group_name != attempt.group_name
+        || evidence.binding_view_id != predecessor.view_id
+        || evidence.view_id != predecessor.view_id
+    {
+        return Err(MysqlTopologyError::Gtid(
+            TopologyGtidError::SourceBoundaryBindingMismatch,
+        ));
+    }
+    validate_local_binding(source, &evidence.local)?;
+    validate_accepted_members(attempt, &predecessor.members, &evidence.members)?;
+    validate_group_sources(attempt, &evidence.executed)?;
+    if !predecessor.executed.is_subset_of(&evidence.executed) {
+        return Err(MysqlTopologyError::Gtid(
+            TopologyGtidError::SourceBoundaryNotContained,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_boundary(
     attempt: &TopologyAttempt,
     predecessor: &TransitionCredit,
@@ -2059,9 +2487,9 @@ fn validate_boundary(
 ) -> Result<(), MysqlTopologyError> {
     if boundary.attempt != attempt.id
         || predecessor.attempt != attempt.id
-        || boundary.observation_attempt != predecessor.observation_attempt
+        || boundary.predecessor_observation_attempt != predecessor.observation_attempt
+        || boundary.observation_attempt == predecessor.observation_attempt
         || boundary.view_id != predecessor.view_id
-        || boundary.executed != predecessor.executed
         || !predecessor.members.contains(&boundary.source)
     {
         return Err(MysqlTopologyError::Gtid(
@@ -2069,6 +2497,47 @@ fn validate_boundary(
         ));
     }
     validate_group_sources(attempt, &boundary.executed)
+}
+
+fn validate_accepted_members(
+    attempt: &TopologyAttempt,
+    expected: &[NativeIdentityEnrollment],
+    actual: &[NativeMember],
+) -> Result<(), MysqlTopologyError> {
+    for enrollment in expected {
+        let member = actual
+            .iter()
+            .find(|member| member.id() == enrollment.member_id())
+            .ok_or(MysqlTopologyError::TopologyState(
+                TopologyStateError::RequiredMemberMissing,
+            ))?;
+        if member.address() != enrollment.binding().member_address() {
+            return Err(MysqlTopologyError::Evidence(
+                TopologyEvidenceError::IdentityDrift,
+            ));
+        }
+        let expected_role = if enrollment.binding().member == attempt.designated_bootstrap {
+            MemberRole::Primary
+        } else {
+            MemberRole::Secondary
+        };
+        if member.role() != expected_role {
+            return Err(MysqlTopologyError::NativeState(
+                TopologyNativeStateError::PredecessorRoleChanged,
+            ));
+        }
+        if member.state() != MemberState::Online {
+            return Err(MysqlTopologyError::NativeState(
+                TopologyNativeStateError::PredecessorNotOnline,
+            ));
+        }
+    }
+    if actual.len() != expected.len() {
+        return Err(MysqlTopologyError::TopologyState(
+            TopologyStateError::UnexpectedMember,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_transition(
@@ -2285,531 +2754,25 @@ fn next_target(attempt: &TopologyAttempt, accepted_members: usize) -> Option<Mys
 #[cfg(test)]
 mod manager_tests {
     use std::fs;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
     use std::path::Path;
-    use std::path::PathBuf;
-    use std::str::FromStr;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::service::{
-        MysqlInstanceConfig, MysqlMemberConfig, MysqlOperationTimeouts, MysqlTopologyConfig,
-    };
+    use crate::service::{MysqlMemberConfig, MysqlOperationTimeouts, MysqlTopologyConfig};
 
-    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
-    const GROUP: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
-    const UUIDS: [&str; 3] = [
-        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-        "dddddddd-dddd-dddd-dddd-dddddddddddd",
-    ];
-
-    #[test]
-    fn manager_scripted_happy_path_requires_each_accepted_transition() {
-        let (mut manager, root) = manager("happy");
-        let attempt = manager.authority.attempt.clone();
-        let enrollments = std::array::from_fn(|index| {
-            enrollment(
-                &attempt,
-                MysqlMemberIndex::all()[index],
-                &manager.observer,
-                &manager.recovery,
-            )
-        });
-        manager.state = MysqlTopologyState::Initialized;
-        manager
-            .record_enrollment(MysqlMemberIndex::First, enrollments[0].clone())
-            .unwrap();
-        manager.state = MysqlTopologyState::BootstrapMemberEnrolled;
-
-        let capability = manager
-            .authority
-            .authorize_bootstrap(MysqlMemberIndex::First, TopologyInstant::new(10))
-            .unwrap();
-        let observation_attempt = manager.next_observation_attempt().unwrap();
-        let effect = capability
-            .record_effect(BootstrapEffect::required_steps().to_vec())
-            .unwrap()
-            .bind_observation_attempt(observation_attempt.clone());
-        let discovery = discovery(&attempt, &enrollments[0], "view-1");
-        manager.install_pending(
-            PendingEffect::Bootstrap(Box::new(effect)),
-            discovery,
-            MysqlTopologyState::BootstrapObservationPending,
-        );
-        let first = observation(
-            &attempt,
-            &enrollments[0],
-            observation_attempt,
-            "view-1",
-            vec![native(
-                &enrollments[0],
-                MemberRole::Primary,
-                MemberState::Online,
-            )],
-            gtids("1"),
-            TopologyInstant::new(20),
-        );
-        assert!(matches!(
-            manager
-                .accept_pending_evidence(&first, TopologyInstant::new(21))
-                .unwrap(),
-            TransitionEvaluation::Accepted(_)
-        ));
-        assert_eq!(manager.state(), MysqlTopologyState::BootstrapAccepted);
-
-        manager
-            .record_enrollment(MysqlMemberIndex::Second, enrollments[1].clone())
-            .unwrap();
-        manager.state = MysqlTopologyState::SecondMemberEnrolled;
-        scripted_join(
-            &mut manager,
-            &attempt,
-            &enrollments,
-            MysqlMemberIndex::Second,
-            "view-2",
-            "1-2",
-            TopologyInstant::new(30),
-        );
-        assert_eq!(manager.state(), MysqlTopologyState::SecondAccepted);
-
-        manager
-            .record_enrollment(MysqlMemberIndex::Third, enrollments[2].clone())
-            .unwrap();
-        manager.state = MysqlTopologyState::ThirdMemberEnrolled;
-        scripted_join(
-            &mut manager,
-            &attempt,
-            &enrollments,
-            MysqlMemberIndex::Third,
-            "view-3",
-            "1-3",
-            TopologyInstant::new(50),
-        );
-        assert_eq!(manager.state(), MysqlTopologyState::Complete);
-        let accepted = manager.accepted_topology().unwrap();
-        assert_eq!(accepted.credit().members().len(), 3);
-        assert!(!accepted.read_access_open());
-        assert!(!accepted.write_access_open());
-        assert_eq!(manager.authority.lifecycle_credits(), 3);
-        drop(manager);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn manager_rejects_changed_native_identity_and_invalidates_progress() {
-        let (mut manager, root) = manager("identity");
-        let attempt = manager.authority.attempt.clone();
-        let enrollment = enrollment(
-            &attempt,
-            MysqlMemberIndex::First,
-            &manager.observer,
-            &manager.recovery,
-        );
-        manager
-            .record_enrollment(MysqlMemberIndex::First, enrollment.clone())
-            .unwrap();
-        let capability = manager
-            .authority
-            .authorize_bootstrap(MysqlMemberIndex::First, TopologyInstant::new(10))
-            .unwrap();
-        let observation_attempt = manager.next_observation_attempt().unwrap();
-        let effect = capability
-            .record_effect(BootstrapEffect::required_steps().to_vec())
-            .unwrap()
-            .bind_observation_attempt(observation_attempt.clone());
-        manager.install_pending(
-            PendingEffect::Bootstrap(Box::new(effect)),
-            discovery(&attempt, &enrollment, "view-1"),
-            MysqlTopologyState::BootstrapObservationPending,
-        );
-        let wrong_local = ObservedLocalBinding::new(
-            attempt.id().clone(),
-            MysqlMemberIndex::First,
-            enrollment.binding().process_session().clone(),
-            enrollment.binding().endpoint().clone(),
-            enrollment.binding().storage().clone(),
-            ServerUuid::new(UUIDS[1]).unwrap(),
-            MemberId::new(UUIDS[1]).unwrap(),
-            enrollment.binding().member_address().clone(),
-            enrollment.binding().observer_generation().clone(),
-        );
-        let evidence = TopologyObservation::new(
-            TopologyObservationStatus::Complete,
-            observation_attempt,
-            wrong_local,
-            attempt.group_name().clone(),
-            ViewId::new("view-1").unwrap(),
-            ViewId::new("view-1").unwrap(),
-            vec![native(
-                &enrollment,
-                MemberRole::Primary,
-                MemberState::Online,
-            )],
-            gtids("1"),
-            TopologyInstant::new(20),
-        );
-        assert!(matches!(
-            manager.accept_pending_evidence(&evidence, TopologyInstant::new(21)),
-            Err(MysqlTopologyManagerError::Topology(
-                MysqlTopologyError::Evidence(TopologyEvidenceError::IdentityDrift)
-            ))
-        ));
-        assert_eq!(manager.state(), MysqlTopologyState::Failed);
-        assert!(manager.pending_effect.is_none());
-        assert!(manager.accepted_topology().is_none());
-        assert!(!manager.read_access_open());
-        assert!(!manager.write_access_open());
-        drop(manager);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn boundary_rejects_wrong_predecessor_attempt_process_storage_view_and_observation() {
-        for case in [
-            "predecessor",
-            "attempt",
-            "process",
-            "storage",
-            "view",
-            "observation",
-        ] {
-            let (mut manager, root, enrollments) = accepted_bootstrap_manager(case);
-            let predecessor = manager.authority.current_credit().unwrap().clone();
-            let mut boundary = predecessor.source_gtid_boundary(&enrollments[0]).unwrap();
-            match case {
-                "predecessor" => {
-                    boundary.source.server_uuid = ServerUuid::new(UUIDS[1]).unwrap();
-                    boundary.source.member_id = MemberId::new(UUIDS[1]).unwrap();
-                }
-                "attempt" => {
-                    boundary.attempt = AttemptId::new("wrong-attempt").unwrap();
-                }
-                "process" => {
-                    boundary.source.binding.process_session =
-                        ProcessSessionId::new("wrong-process").unwrap();
-                }
-                "storage" => {
-                    boundary.source.binding.storage = StorageBinding::new("wrong-storage").unwrap();
-                }
-                "view" => {
-                    boundary.view_id = ViewId::new("wrong-view").unwrap();
-                }
-                "observation" => {
-                    boundary.observation_attempt =
-                        AttemptId::new("wrong-observation-attempt").unwrap();
-                }
-                _ => unreachable!(),
-            }
-            assert_eq!(
-                manager.authority.authorize_join(
-                    MysqlMemberIndex::Second,
-                    boundary,
-                    TopologyInstant::new(30),
-                ),
-                Err(MysqlTopologyError::Gtid(
-                    TopologyGtidError::SourceBoundaryBindingMismatch
-                )),
-                "{case}"
-            );
-            assert_eq!(manager.authority.lifecycle_credits(), 1, "{case}");
-            assert!(!manager.read_access_open());
-            assert!(!manager.write_access_open());
-            drop(manager);
-            fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
-    fn failed_runs_after_each_effect_stage_contain_every_owned_member() {
-        for (label, started, state) in [
-            ("after-bootstrap", 1, MysqlTopologyState::BootstrapAccepted),
-            ("after-second", 2, MysqlTopologyState::SecondAccepted),
-            ("after-third", 3, MysqlTopologyState::Complete),
-        ] {
-            let (mut manager, root) = manager(label);
-            manager.initialize().unwrap();
-            let foreign = root.join("foreign-resource");
-            fs::write(&foreign, "untouched").unwrap();
-            let mut sockets = Vec::new();
-            let mut pids = Vec::new();
-            for index in 0..started {
-                let instance = &mut manager.instances[index];
-                let socket = provide_socket(
-                    instance.config().runtime().pid().to_owned(),
-                    instance.config().runtime().socket().to_owned(),
-                );
-                instance.start().unwrap();
-                pids.push(
-                    fs::read_to_string(instance.config().runtime().pid())
-                        .unwrap()
-                        .trim()
-                        .parse::<u32>()
-                        .unwrap(),
-                );
-                sockets.push(socket);
-            }
-            manager.state = state;
-            let error = manager.fail(MysqlTopologyManagerError::Topology(
-                MysqlTopologyError::Evidence(TopologyEvidenceError::Missing),
-            ));
-            assert!(matches!(
-                error,
-                MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
-                    TopologyEvidenceError::Missing
-                ))
-            ));
-            for socket in sockets {
-                socket.join().unwrap();
-            }
-            assert_eq!(manager.state(), MysqlTopologyState::Failed);
-            for pid in pids {
-                assert!(!Path::new(&format!("/proc/{pid}")).exists());
-            }
-            for instance in manager.members() {
-                assert!(instance.config().data_root().is_dir());
-                assert!(!instance.config().runtime().scratch_root().exists());
-                assert!(!instance.config().runtime().socket().exists());
-                assert!(
-                    TcpStream::connect_timeout(
-                        &instance.config().member().group_replication_address(),
-                        Duration::from_millis(50),
-                    )
-                    .is_err()
-                );
-            }
-            assert_eq!(fs::read_to_string(&foreign).unwrap(), "untouched");
-            drop(manager);
-            fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
-    fn primary_failure_retains_every_member_cleanup_failure() {
-        let (mut manager, root) = manager("aggregate");
-        manager.initialize().unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
-        let error = manager.fail(MysqlTopologyManagerError::Topology(
-            MysqlTopologyError::Evidence(TopologyEvidenceError::Missing),
-        ));
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let MysqlTopologyManagerError::Cleanup { primary, failures } = error else {
-            panic!("expected primary plus cleanup aggregate");
-        };
-        assert!(matches!(
-            primary.as_deref(),
-            Some(MysqlTopologyManagerError::Topology(
-                MysqlTopologyError::Evidence(TopologyEvidenceError::Missing)
-            ))
-        ));
-        assert_eq!(failures.len(), 3);
-        assert_eq!(
-            failures
-                .iter()
-                .map(MemberCleanupFailure::member)
-                .collect::<Vec<_>>(),
-            MysqlMemberIndex::all()
-        );
-        drop(manager);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn manager_drop_contains_context_without_adoption_or_resume() {
-        let (mut manager, root) = manager("drop");
-        manager.initialize().unwrap();
-        let socket = provide_socket(
-            manager.instances[0].config().runtime().pid().to_owned(),
-            manager.instances[0].config().runtime().socket().to_owned(),
-        );
-        manager.instances[0].start().unwrap();
-        let pid = fs::read_to_string(manager.instances[0].config().runtime().pid())
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
-        let layouts = manager.instances.each_ref().map(|instance| {
-            (
-                instance.config().data_root().to_owned(),
-                instance.config().runtime().scratch_root().to_owned(),
-                instance.config().member().group_replication_address(),
-            )
-        });
-
-        drop(manager);
-        socket.join().unwrap();
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
-        for (data, scratch, endpoint) in layouts {
-            assert!(data.is_dir());
-            assert!(!scratch.exists());
-            assert!(TcpStream::connect_timeout(&endpoint, Duration::from_millis(50)).is_err());
-        }
-        let inventory = filesystem_inventory(&root);
-        for forbidden in [
-            "journal", "receipt", "cursor", "adoption", "metadata", "store",
-        ] {
-            assert!(
-                inventory.iter().all(|entry| !entry.contains(forbidden)),
-                "{inventory:?}"
-            );
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    fn scripted_join(
-        manager: &mut MysqlTopologyManager,
-        attempt: &TopologyAttempt,
-        enrollments: &[NativeIdentityEnrollment; 3],
-        target: MysqlMemberIndex,
-        view: &str,
-        history: &str,
-        now: TopologyInstant,
-    ) {
-        let predecessor = manager.authority.current_credit().unwrap().clone();
-        let source = predecessor.members().last().unwrap();
-        let boundary = predecessor.source_gtid_boundary(source).unwrap();
-        let capability = manager
-            .authority
-            .authorize_join(target, boundary, now)
-            .unwrap();
-        let observation_attempt = manager.next_observation_attempt().unwrap();
-        let effect = capability
-            .record_effect(JoinEffect::required_steps().to_vec())
-            .unwrap()
-            .bind_observation_attempt(observation_attempt.clone());
-        manager.install_pending(
-            PendingEffect::Join(Box::new(effect)),
-            discovery(attempt, &enrollments[target.as_usize()], view),
-            if target == MysqlMemberIndex::Second {
-                MysqlTopologyState::SecondObservationPending
-            } else {
-                MysqlTopologyState::ThirdObservationPending
-            },
-        );
-        let members = enrollments[..=target.as_usize()]
-            .iter()
-            .enumerate()
-            .map(|(index, enrollment)| {
-                native(
-                    enrollment,
-                    if index == 0 {
-                        MemberRole::Primary
-                    } else {
-                        MemberRole::Secondary
-                    },
-                    MemberState::Online,
-                )
-            })
-            .collect();
-        let evidence = observation(
-            attempt,
-            &enrollments[target.as_usize()],
-            observation_attempt,
-            view,
-            members,
-            gtids(history),
-            TopologyInstant::new(now.tick() + 5),
-        );
-        assert!(matches!(
-            manager
-                .accept_pending_evidence(&evidence, TopologyInstant::new(now.tick() + 6))
-                .unwrap(),
-            TransitionEvaluation::Accepted(_)
-        ));
-    }
-
-    fn accepted_bootstrap_manager(
-        label: &str,
-    ) -> (MysqlTopologyManager, PathBuf, [NativeIdentityEnrollment; 3]) {
-        let (mut manager, root) = manager(label);
-        let attempt = manager.authority.attempt.clone();
-        let enrollments = std::array::from_fn(|index| {
-            enrollment(
-                &attempt,
-                MysqlMemberIndex::all()[index],
-                &manager.observer,
-                &manager.recovery,
-            )
-        });
-        manager
-            .record_enrollment(MysqlMemberIndex::First, enrollments[0].clone())
-            .unwrap();
-        let capability = manager
-            .authority
-            .authorize_bootstrap(MysqlMemberIndex::First, TopologyInstant::new(10))
-            .unwrap();
-        let observation_attempt = manager.next_observation_attempt().unwrap();
-        let effect = capability
-            .record_effect(BootstrapEffect::required_steps().to_vec())
-            .unwrap()
-            .bind_observation_attempt(observation_attempt.clone());
-        manager.install_pending(
-            PendingEffect::Bootstrap(Box::new(effect)),
-            discovery(&attempt, &enrollments[0], "view-1"),
-            MysqlTopologyState::BootstrapObservationPending,
-        );
-        let evidence = observation(
-            &attempt,
-            &enrollments[0],
-            observation_attempt,
-            "view-1",
-            vec![native(
-                &enrollments[0],
-                MemberRole::Primary,
-                MemberState::Online,
-            )],
-            gtids("1"),
-            TopologyInstant::new(20),
-        );
-        manager
-            .accept_pending_evidence(&evidence, TopologyInstant::new(21))
-            .unwrap();
-        manager
-            .record_enrollment(MysqlMemberIndex::Second, enrollments[1].clone())
-            .unwrap();
-        (manager, root, enrollments)
-    }
-
-    fn manager(label: &str) -> (MysqlTopologyManager, PathBuf) {
-        let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap();
-        let root = workspace
-            .join("target")
-            .join(format!("p3m-{}-{serial}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let launcher = root.join("launcher");
-        fs::write(
-            &launcher,
-            r#"#!/bin/sh
-while [ "$1" != "--" ]; do shift; done
-shift
-mysqld="$1"
-shift
-if [ "$1" = "--version" ]; then
-  echo "$mysqld  Ver 8.4.11 for Linux on x86_64 (MySQL Community Server - GPL)"
-  exit 0
-fi
-case "$*" in
-  *--initialize-insecure*) exit 0 ;;
-esac
-config=${1#--defaults-file=}
-pid_file=$(sed -n 's/^pid-file=//p' "$config")
-echo $$ > "$pid_file"
-exec "$mysqld" 60
-"#,
-        )
+    #[tokio::test]
+    async fn invalid_public_transition_invalidates_manager_context() {
+        let group = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let sql = [33161, 33162, 33163].map(address);
+        let replication = [43161, 43162, 43163].map(address);
+        let topology = MysqlTopologyConfig::new([
+            MysqlMemberConfig::new(1, sql[0], replication[0], group, replication).unwrap(),
+            MysqlMemberConfig::new(2, sql[1], replication[1], group, replication).unwrap(),
+            MysqlMemberConfig::new(3, sql[2], replication[2], group, replication).unwrap(),
+        ])
         .unwrap();
-        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
-        let topology = MysqlTopologyConfig::new(member_configs()).unwrap();
         let timeouts = MysqlOperationTimeouts::new(
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -2817,24 +2780,33 @@ exec "$mysqld" 60
             Duration::from_secs(1),
         )
         .unwrap();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let root = workspace
+            .join("target")
+            .join(format!("manager-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let instances = std::array::from_fn(|index| {
-            let member = MysqlMemberIndex::all()[index];
             MysqlInstanceManager::new(
                 MysqlInstanceConfig::new(
                     "/usr/bin/sleep",
-                    &launcher,
+                    "/usr/bin/sleep",
                     root.join(format!("data-{index}")),
                     root.join(format!("scratch-{index}")),
                     topology.clone(),
-                    member,
+                    MysqlMemberIndex::all()[index],
                     timeouts,
                 )
                 .unwrap(),
             )
         });
         let attempt = TopologyAttempt::new(
-            AttemptId::new(format!("manager-{label}")).unwrap(),
-            GroupName::new(GROUP).unwrap(),
+            AttemptId::new("public-invalid-state").unwrap(),
+            GroupName::new(group).unwrap(),
             MysqlMemberIndex::First,
             TopologyInstant::new(0),
             TopologyInstant::new(100),
@@ -2856,146 +2828,29 @@ exec "$mysqld" 60
             "recovery-secret",
         )
         .unwrap();
-        (
-            MysqlTopologyManager::new(instances, attempt, observer, recovery).unwrap(),
-            root,
+        let deadline = NativeControlDeadline::new(
+            attempt.id().clone(),
+            Instant::now() + Duration::from_secs(1),
         )
-    }
+        .unwrap();
+        let mut manager =
+            MysqlTopologyManager::new(instances, attempt, observer, recovery).unwrap();
 
-    fn member_configs() -> [MysqlMemberConfig; 3] {
-        let sql = [33061, 33062, 33063].map(address);
-        let group = [43061, 43062, 43063].map(address);
-        [
-            MysqlMemberConfig::new(1, sql[0], group[0], GROUP, group).unwrap(),
-            MysqlMemberConfig::new(2, sql[1], group[1], GROUP, group).unwrap(),
-            MysqlMemberConfig::new(3, sql[2], group[2], GROUP, group).unwrap(),
-        ]
+        assert!(matches!(
+            manager.start_designated_member(&deadline).await,
+            Err(MysqlTopologyManagerError::InvalidState {
+                expected: MysqlTopologyState::Initialized,
+                actual: MysqlTopologyState::Configured,
+            })
+        ));
+        assert_eq!(manager.state(), MysqlTopologyState::Failed);
+        assert!(manager.initialize().is_err());
+        assert_eq!(manager.state(), MysqlTopologyState::Failed);
+        drop(manager);
+        fs::remove_dir(root).unwrap();
     }
 
     fn address(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
-    }
-
-    fn enrollment(
-        attempt: &TopologyAttempt,
-        member: MysqlMemberIndex,
-        observer: &ControlCredential,
-        recovery: &ControlCredential,
-    ) -> NativeIdentityEnrollment {
-        let binding = MemberControlBinding::new(
-            attempt.id().clone(),
-            member,
-            ProcessSessionId::new(format!("process-{}", member.as_usize())).unwrap(),
-            EndpointBinding::new(format!("endpoint-{}", member.as_usize())).unwrap(),
-            StorageBinding::new(format!("storage-{}", member.as_usize())).unwrap(),
-            MemberAddress::new(format!("127.0.0.1:{}", 33061 + member.as_usize())).unwrap(),
-            observer.generation().clone(),
-            recovery.generation().clone(),
-        );
-        let accounts = AccountProvisioningEvidence::new(
-            binding.clone(),
-            observer,
-            recovery,
-            AccountProvisioningEvidence::required_steps().to_vec(),
-        )
-        .unwrap();
-        NativeIdentityEnrollment::new(
-            binding,
-            ServerUuid::new(UUIDS[member.as_usize()]).unwrap(),
-            &accounts,
-            true,
-            GtidSet::empty(),
-            NativeIdentityEnrollment::required_steps().to_vec(),
-        )
-        .unwrap()
-    }
-
-    fn discovery(
-        attempt: &TopologyAttempt,
-        enrollment: &NativeIdentityEnrollment,
-        view: &str,
-    ) -> ViewDiscovery {
-        ViewDiscovery::new(
-            enrollment.clone(),
-            attempt.group_name().clone(),
-            ViewId::new(view).unwrap(),
-            ViewDiscovery::required_steps().to_vec(),
-        )
-        .unwrap()
-    }
-
-    fn observation(
-        attempt: &TopologyAttempt,
-        enrollment: &NativeIdentityEnrollment,
-        observation_attempt: AttemptId,
-        view: &str,
-        members: Vec<NativeMember>,
-        executed: GtidSet,
-        decision: TopologyInstant,
-    ) -> TopologyObservation {
-        TopologyObservation::new(
-            TopologyObservationStatus::Complete,
-            observation_attempt,
-            ObservedLocalBinding::from_enrollment(enrollment),
-            attempt.group_name().clone(),
-            ViewId::new(view).unwrap(),
-            ViewId::new(view).unwrap(),
-            members,
-            executed,
-            decision,
-        )
-    }
-
-    fn native(
-        enrollment: &NativeIdentityEnrollment,
-        role: MemberRole,
-        state: MemberState,
-    ) -> NativeMember {
-        NativeMember::new(
-            enrollment.member_id().clone(),
-            enrollment.binding().member_address().clone(),
-            role,
-            state,
-        )
-    }
-
-    fn gtids(interval: &str) -> GtidSet {
-        GtidSet::from_str(&format!("{GROUP}:{interval}")).unwrap()
-    }
-
-    fn provide_socket(pid_path: PathBuf, socket_path: PathBuf) -> JoinHandle<()> {
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let pid = loop {
-                if let Ok(value) = fs::read_to_string(&pid_path)
-                    && let Ok(pid) = value.trim().parse::<u32>()
-                {
-                    break pid;
-                }
-                assert!(Instant::now() < deadline, "PID file did not appear");
-                thread::sleep(Duration::from_millis(10));
-            };
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            while Path::new(&format!("/proc/{pid}")).exists() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            drop(listener);
-            let _ = fs::remove_file(socket_path);
-        })
-    }
-
-    fn filesystem_inventory(root: &Path) -> Vec<String> {
-        let mut inventory = Vec::new();
-        let mut pending = vec![root.to_owned()];
-        while let Some(directory) = pending.pop() {
-            for entry in fs::read_dir(directory).unwrap() {
-                let entry = entry.unwrap();
-                if entry.file_type().unwrap().is_dir() {
-                    pending.push(entry.path());
-                }
-                inventory.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-        inventory
     }
 }
