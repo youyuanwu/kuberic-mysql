@@ -453,10 +453,10 @@ async fn qualify_profile_gtid_transitions() {
     );
     let report = {
         let mut qualification = MysqlNativeQualification::enter(&mut fixture.manager).unwrap();
-        qualification
-            .qualify_profile_gtid_transitions()
-            .await
-            .unwrap()
+        match qualification.qualify_profile_gtid_transitions().await {
+            QualificationLiveOutcome::Qualified(report) => report,
+            outcome => panic!("native qualification did not pass: {outcome:?}"),
+        }
     };
     assert_eq!(report.qualified_profile.member_process_sessions.len(), 3);
     assert_eq!(report.checkpoints.len(), 12);
@@ -470,8 +470,18 @@ async fn qualify_profile_gtid_transitions() {
             .iter()
             .all(|checkpoint| checkpoint.transaction_tail == checkpoint.before_tail + 1)
     );
+    assert!(
+        report
+            .final_pids
+            .iter()
+            .all(|pid| !Path::new(&format!("/proc/{pid}")).exists())
+    );
     for checkpoint in &report.checkpoints {
         assert_eq!(checkpoint.members, expected_members);
+        assert!(!checkpoint.binary_logs.is_empty());
+        for snapshot in &checkpoint.snapshots {
+            assert!(snapshot.purged.is_subset_of(&snapshot.executed));
+        }
     }
     assert_view_same_or_advanced(
         &report.checkpoints[0].view_id,

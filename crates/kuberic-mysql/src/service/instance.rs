@@ -525,6 +525,21 @@ impl MysqlInstanceManager {
         self.start()
     }
 
+    #[cfg(test)]
+    pub(super) async fn qualification_start_group_replication(
+        &mut self,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<(), MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::qualification_start(target, recovery, deadline).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn qualification_child_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+
     fn require_state(&self, expected: MysqlInstanceState) -> Result<(), MysqlInstanceError> {
         if self.state == expected {
             Ok(())

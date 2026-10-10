@@ -10,7 +10,7 @@ use crate::service::topology::QualificationManagerParts;
 use crate::service::{
     ControlStage, MemberCleanupFailure, MemberControlBinding, MysqlInstanceError,
     MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManager,
-    MysqlTopologyManagerError,
+    MysqlTopologyManagerError, NativeControlDeadline,
 };
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
@@ -254,6 +254,7 @@ struct MysqlNativeQualification<'a> {
     attempt: &'a crate::service::TopologyAttempt,
     observer: &'a crate::service::ControlCredential,
     recovery: &'a crate::service::ControlCredential,
+    native_deadline: NativeControlDeadline,
 }
 
 #[allow(dead_code)]
@@ -290,11 +291,14 @@ impl<'a> MysqlNativeQualification<'a> {
         };
         let ownership =
             QualificationOwnership::with_deadlines(instances, work_cutoff, runtime_deadline);
+        let native_deadline = NativeControlDeadline::new(attempt.id().clone(), work_cutoff)
+            .map_err(MysqlTopologyManagerError::Topology)?;
         Ok(Self {
             ownership,
             attempt,
             observer,
             recovery,
+            native_deadline,
         })
     }
 
@@ -383,10 +387,43 @@ impl<'a> MysqlNativeQualification<'a> {
         self.ownership.phase(member)
     }
 
-    async fn qualify_profile_gtid_transitions(
+    async fn qualify_profile_gtid_transitions(&mut self) -> QualificationLiveOutcome {
+        let deadline = tokio::time::Instant::from_std(self.ownership.work_cutoff);
+        match tokio::time::timeout_at(deadline, self.qualify_profile_gtid_transitions_inner()).await
+        {
+            Ok(Ok(report)) => QualificationLiveOutcome::Qualified(Box::new(report)),
+            Ok(Err(reason))
+                if reason.contains("unsupported")
+                    || reason.contains("function failed")
+                    || reason.contains("returned no row") =>
+            {
+                QualificationLiveOutcome::Unsupported {
+                    stage: QualificationStage::GtidCheckpoint,
+                    reason,
+                }
+            }
+            Ok(Err(reason)) => QualificationLiveOutcome::Unproved {
+                stage: QualificationStage::GtidCheckpoint,
+                reason,
+            },
+            Err(_) => QualificationLiveOutcome::Unproved {
+                stage: QualificationStage::Cleanup,
+                reason: "profile/GTID qualification reached scenario work cutoff".to_owned(),
+            },
+        }
+    }
+
+    async fn qualify_profile_gtid_transitions_inner(
         &mut self,
     ) -> Result<ProfileGtidQualificationReport, String> {
         let profile = self.read_profile_evidence().await?;
+        let owned_identities: [String; 3] = profile
+            .members
+            .iter()
+            .map(|member| member.server_uuid.clone())
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| "profile member cardinality changed".to_owned())?;
         let expected = profile.binding.clone();
         let qualified_profile = profile
             .qualify(&expected)
@@ -395,7 +432,7 @@ impl<'a> MysqlNativeQualification<'a> {
         self.prepare_transaction_table().await?;
         let mut checkpoints = Vec::new();
         checkpoints.push(self.commit_token("before-primary-transfer").await?);
-        self.transfer_primary().await?;
+        self.transfer_primary(&owned_identities).await?;
         checkpoints.push(self.commit_token("after-primary-transfer").await?);
 
         let primary = self.current_primary().await?;
@@ -404,10 +441,29 @@ impl<'a> MysqlNativeQualification<'a> {
             .find(|member| *member != primary)
             .expect("three-member topology has a secondary");
         checkpoints.push(self.commit_token("before-secondary-departure").await?);
+        let opening_view = self.snapshots().await?[0].view_id.clone();
         self.stop_group_replication(departure).await?;
-        self.wait_membership(2, None).await?;
+        let expected_without = owned_identities
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != departure.as_usize())
+            .map(|(_, identity)| identity.clone())
+            .collect::<HashSet<_>>();
+        self.wait_exact_membership(
+            &expected_without,
+            &owned_identities,
+            None,
+            Some(&opening_view),
+        )
+        .await?;
         self.start_group_replication(departure).await?;
-        self.wait_membership(3, None).await?;
+        self.wait_exact_membership(
+            &owned_identities.iter().cloned().collect(),
+            &owned_identities,
+            None,
+            None,
+        )
+        .await?;
         checkpoints.push(self.commit_token("after-secondary-rejoin").await?);
 
         let mut restart_bindings = Vec::new();
@@ -417,10 +473,23 @@ impl<'a> MysqlNativeQualification<'a> {
                     .await?,
             );
             if self.current_primary().await? == member {
-                self.transfer_primary().await?;
+                self.transfer_primary(&owned_identities).await?;
             }
+            let opening_view = self.snapshots().await?[0].view_id.clone();
             self.stop_group_replication(member).await?;
-            self.wait_membership(2, None).await?;
+            let expected_without = owned_identities
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != member.as_usize())
+                .map(|(_, identity)| identity.clone())
+                .collect::<HashSet<_>>();
+            self.wait_exact_membership(
+                &expected_without,
+                &owned_identities,
+                None,
+                Some(&opening_view),
+            )
+            .await?;
             let old = self.member_binding(member)?;
             self.stop_member(member, QualificationStopKind::Graceful)
                 .map_err(|error| format!("owned stop failed: {error}"))?;
@@ -435,7 +504,18 @@ impl<'a> MysqlNativeQualification<'a> {
                 new.process_session().as_str().to_owned(),
             ));
             self.start_group_replication(member).await?;
-            self.wait_membership(3, None).await?;
+            self.wait_exact_membership(
+                &owned_identities.iter().cloned().collect(),
+                &owned_identities,
+                None,
+                None,
+            )
+            .await?;
+            let rebound_profile = self.read_profile_evidence().await?;
+            let rebound_expected = rebound_profile.binding.clone();
+            rebound_profile
+                .qualify(&rebound_expected)
+                .map_err(|error| format!("restarted profile evidence rejected: {error:?}"))?;
             checkpoints.push(
                 self.commit_token(&format!("after-member-{}-restart", member.as_usize() + 1))
                     .await?,
@@ -446,6 +526,20 @@ impl<'a> MysqlNativeQualification<'a> {
         let (purged, binary_logs) = self.rotate_and_purge_binary_logs().await?;
         checkpoints.push(self.commit_token("after-purge").await?);
         let final_snapshots = self.snapshots().await?;
+        for pair in checkpoints.windows(2) {
+            for member in MysqlMemberIndex::all() {
+                if !pair[0].snapshots[member.as_usize()]
+                    .executed
+                    .is_subset_of(&pair[1].snapshots[member.as_usize()].executed)
+                {
+                    return Err(format!(
+                        "checkpoint {} lost predecessor history at member {}",
+                        pair[1].label,
+                        member.as_usize() + 1
+                    ));
+                }
+            }
+        }
         for snapshot in &final_snapshots {
             if !purged.is_subset_of(&snapshot.executed) {
                 return Err("purged history was outside executed history".to_owned());
@@ -466,6 +560,11 @@ impl<'a> MysqlNativeQualification<'a> {
             restart_bindings,
             purged,
             binary_logs,
+            final_pids: MysqlMemberIndex::all().map(|member| {
+                self.ownership.members[member.as_usize()]
+                    .qualification_child_pid()
+                    .expect("qualified running member retains a child")
+            }),
             final_members: final_snapshots
                 .iter()
                 .flat_map(|snapshot| snapshot.members.iter())
@@ -609,6 +708,18 @@ impl<'a> MysqlNativeQualification<'a> {
         let serial = NEXT_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let token = format!("{label}-{serial}");
         let mut connection = self.root_connection(primary).await?;
+        let effective_consistency = connection
+            .query_first::<String, _>(
+                "SELECT CAST(@@SESSION.group_replication_consistency AS CHAR)",
+            )
+            .await
+            .map_err(|_| "workload consistency readback failed".to_owned())?
+            .ok_or_else(|| "workload consistency readback returned no row".to_owned())?;
+        if effective_consistency != "AFTER" {
+            return Err(format!(
+                "workload session consistency was {effective_consistency}, not AFTER"
+            ));
+        }
         connection
             .exec_drop(
                 "INSERT INTO kuberic_native_qualification.tokens(token_name, token_value) \
@@ -628,6 +739,7 @@ impl<'a> MysqlNativeQualification<'a> {
                 "transaction advanced GTID tail from {before_tail} to {tail}"
             ));
         }
+        let binary_logs = self.binary_log_inventory(primary).await?;
         Ok(GtidCheckpoint {
             label: label.to_owned(),
             before_tail,
@@ -638,7 +750,23 @@ impl<'a> MysqlNativeQualification<'a> {
                 .iter()
                 .map(|member| member.member_id.clone())
                 .collect(),
+            snapshots: after,
+            binary_logs,
         })
+    }
+
+    async fn binary_log_inventory(&self, member: MysqlMemberIndex) -> Result<Vec<String>, String> {
+        let mut connection = self.root_connection(member).await?;
+        let rows = connection
+            .query::<mysql_async::Row, _>("SHOW BINARY LOGS")
+            .await
+            .map_err(|_| "binary-log inventory failed".to_owned())?;
+        let inventory = decode_binary_log_inventory(&rows)?;
+        connection
+            .disconnect()
+            .await
+            .map_err(|_| "binary-log inventory disconnect failed".to_owned())?;
+        Ok(inventory)
     }
 
     async fn wait_common_tail(
@@ -664,7 +792,7 @@ impl<'a> MysqlNativeQualification<'a> {
         current_primary_from(&self.snapshots().await?)
     }
 
-    async fn transfer_primary(&self) -> Result<(), String> {
+    async fn transfer_primary(&self, owned_identities: &[String; 3]) -> Result<(), String> {
         let snapshots = self.snapshots().await?;
         require_coherent_full_view(&snapshots)?;
         let current = current_primary_from(&snapshots)?;
@@ -686,7 +814,13 @@ impl<'a> MysqlNativeQualification<'a> {
             .disconnect()
             .await
             .map_err(|_| "primary transfer disconnect failed".to_owned())?;
-        self.wait_membership(3, Some(&target_uuid)).await?;
+        self.wait_exact_membership(
+            &owned_identities.iter().cloned().collect(),
+            owned_identities,
+            Some(&target_uuid),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -702,50 +836,69 @@ impl<'a> MysqlNativeQualification<'a> {
             .map_err(|_| "Group Replication stop disconnect failed".to_owned())
     }
 
-    async fn start_group_replication(&self, member: MysqlMemberIndex) -> Result<(), String> {
-        let statement = format!(
-            "START GROUP_REPLICATION USER='{}', PASSWORD='{}', \
-             DEFAULT_AUTH='caching_sha2_password'",
-            self.recovery.username(),
-            self.recovery.password()
-        );
-        let mut connection = self.root_connection(member).await?;
-        let result = connection.query_drop(statement).await;
-        connection
-            .disconnect()
+    async fn start_group_replication(&mut self, member: MysqlMemberIndex) -> Result<(), String> {
+        self.ownership.members[member.as_usize()]
+            .qualification_start_group_replication(self.recovery, &self.native_deadline)
             .await
-            .map_err(|_| "Group Replication start disconnect failed".to_owned())?;
-        result.map_err(|_| "Group Replication start failed".to_owned())
+            .map_err(|error| format!("Group Replication start failed: {error}"))
     }
 
-    async fn wait_membership(
+    async fn wait_exact_membership(
         &self,
-        expected_count: usize,
+        expected: &HashSet<String>,
+        owned_identities: &[String; 3],
         expected_primary: Option<&str>,
+        predecessor_view: Option<&str>,
     ) -> Result<NativeMemberSnapshot, String> {
         loop {
             self.ownership
                 .require_work_budget()
                 .map_err(|()| "membership wait reached scenario cutoff".to_owned())?;
+            let mut accepted = Vec::new();
             for member in MysqlMemberIndex::all() {
-                if !self.member_socket(member).exists() {
+                let Ok(snapshot) = read_snapshot(self.member_socket(member)).await else {
                     continue;
-                }
-                if let Ok(snapshot) = read_snapshot(self.member_socket(member)).await
-                    && snapshot.members.len() == expected_count
+                };
+                let member_ids = snapshot
+                    .members
+                    .iter()
+                    .map(|native| native.member_id.clone())
+                    .collect::<HashSet<_>>();
+                let exact_addresses = snapshot.members.iter().all(|native| {
+                    MysqlMemberIndex::all().into_iter().any(|owned| {
+                        let address = self.ownership.members[owned.as_usize()]
+                            .config()
+                            .member()
+                            .sql_address();
+                        native.member_id == owned_identities[owned.as_usize()]
+                            && native.member_host == address.ip().to_string()
+                            && native.member_port == address.port()
+                    })
+                });
+                if member_ids == *expected
+                    && exact_addresses
                     && snapshot
                         .members
                         .iter()
-                        .all(|member| member.state == "ONLINE")
-                    && expected_primary.is_none_or(|expected| {
+                        .all(|native| native.state == "ONLINE")
+                    && predecessor_view.is_none_or(|view| snapshot.view_id != view)
+                    && expected_primary.is_none_or(|identity| {
                         snapshot
                             .members
                             .iter()
-                            .any(|member| member.member_id == expected && member.role == "PRIMARY")
+                            .any(|native| native.member_id == identity && native.role == "PRIMARY")
                     })
                 {
-                    return Ok(snapshot);
+                    accepted.push(snapshot);
                 }
+            }
+            if accepted.len() == expected.len()
+                && accepted.iter().all(|snapshot| {
+                    snapshot.view_id == accepted[0].view_id
+                        && snapshot.members == accepted[0].members
+                })
+            {
+                return Ok(accepted.remove(0));
             }
             sleep(Duration::from_millis(50)).await;
         }
@@ -766,13 +919,7 @@ impl<'a> MysqlNativeQualification<'a> {
             .query::<mysql_async::Row, _>("SHOW BINARY LOGS")
             .await
             .map_err(|_| "binary-log inventory failed".to_owned())?;
-        let before = rows
-            .iter()
-            .map(|row| {
-                row.get::<String, _>(0)
-                    .ok_or_else(|| "binary-log name was malformed".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let before = decode_binary_log_inventory(&rows)?;
         if before.len() < 2 {
             return Err("binary-log rotation produced no purge boundary".to_owned());
         }
@@ -791,13 +938,7 @@ impl<'a> MysqlNativeQualification<'a> {
             .query::<mysql_async::Row, _>("SHOW BINARY LOGS")
             .await
             .map_err(|_| "post-purge binary-log inventory failed".to_owned())?;
-        let after = rows
-            .iter()
-            .map(|row| {
-                row.get::<String, _>(0)
-                    .ok_or_else(|| "post-purge binary-log name was malformed".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let after = decode_binary_log_inventory(&rows)?;
         if after.first() != Some(retained)
             || after
                 .iter()
@@ -805,6 +946,7 @@ impl<'a> MysqlNativeQualification<'a> {
         {
             return Err("binary-log purge retained an unexpected inventory".to_owned());
         }
+
         let purged_text = connection
             .query_first::<String, _>("SELECT @@GLOBAL.gtid_purged")
             .await
@@ -820,9 +962,26 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 }
 
+fn decode_binary_log_inventory(rows: &[mysql_async::Row]) -> Result<Vec<String>, String> {
+    rows.iter()
+        .map(|row| {
+            row.get::<String, _>(0)
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                        })
+                })
+                .ok_or_else(|| "binary-log name was malformed".to_owned())
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeMemberRow {
     member_id: String,
+    member_host: String,
+    member_port: u16,
     role: String,
     state: String,
 }
@@ -843,6 +1002,8 @@ struct GtidCheckpoint {
     transaction_tail: u64,
     view_id: String,
     members: HashSet<String>,
+    snapshots: [NativeMemberSnapshot; 3],
+    binary_logs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -852,7 +1013,21 @@ struct ProfileGtidQualificationReport {
     restart_bindings: Vec<(String, String)>,
     purged: GtidSet,
     binary_logs: Vec<String>,
+    final_pids: [u32; 3],
     final_members: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QualificationLiveOutcome {
+    Qualified(Box<ProfileGtidQualificationReport>),
+    Unsupported {
+        stage: QualificationStage,
+        reason: String,
+    },
+    Unproved {
+        stage: QualificationStage,
+        reason: String,
+    },
 }
 
 async fn root_connection(socket: &Path) -> Result<Conn, String> {
@@ -885,10 +1060,18 @@ async fn read_snapshot(socket: &Path) -> Result<NativeMemberSnapshot, String> {
         .ok_or_else(|| "view query returned no local row".to_owned())?;
     let members = connection
         .query_map(
-            "SELECT MEMBER_ID, MEMBER_ROLE, MEMBER_STATE \
+            "SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_ROLE, MEMBER_STATE \
              FROM performance_schema.replication_group_members ORDER BY MEMBER_ID",
-            |(member_id, role, state): (String, String, String)| NativeMemberRow {
+            |(member_id, member_host, member_port, role, state): (
+                String,
+                String,
+                u16,
+                String,
+                String,
+            )| NativeMemberRow {
                 member_id,
+                member_host,
+                member_port,
                 role,
                 state,
             },

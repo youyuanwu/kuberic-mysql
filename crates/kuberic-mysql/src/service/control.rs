@@ -442,6 +442,35 @@ pub(crate) async fn join(
     .await
 }
 
+#[cfg(test)]
+pub(super) async fn qualification_start(
+    target: OwnedControlTarget,
+    recovery: &ControlCredential,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MysqlTopologyError> {
+    let deadline = verified_deadline(
+        control_deadline,
+        recovery.attempt(),
+        ControlStage::StartGroupReplication,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_product(&mut connection, deadline).await?;
+        let mut start = start_statement(recovery);
+        let result = execute(
+            &mut connection,
+            start.as_str(),
+            deadline,
+            ControlStage::StartGroupReplication,
+        )
+        .await;
+        start.clear();
+        result
+    }
+    .await;
+    disconnect(connection, result, deadline).await
+}
+
 async fn join_with<C: ControlConnector>(
     connector: &C,
     target: OwnedControlTarget,

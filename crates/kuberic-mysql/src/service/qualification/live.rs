@@ -31,6 +31,8 @@ pub(super) struct LiveQualificationFixture {
     pub(super) sql_addresses: [SocketAddr; 3],
     pub(super) group_addresses: [SocketAddr; 3],
     pub(super) identities: [String; 3],
+    data_roots: [PathBuf; 3],
+    scratch_roots: [PathBuf; 3],
     root: PathBuf,
 }
 
@@ -67,6 +69,12 @@ impl LiveQualificationFixture {
         let sockets = configs
             .each_ref()
             .map(|config| config.runtime().socket().to_owned());
+        let data_roots = configs
+            .each_ref()
+            .map(|config| config.data_root().to_owned());
+        let scratch_roots = configs
+            .each_ref()
+            .map(|config| config.runtime().scratch_root().to_owned());
         let attempt = TopologyAttempt::new(
             AttemptId::new(format!("native-qualification-{}", std::process::id())).unwrap(),
             GroupName::new(GROUP_UUID).unwrap(),
@@ -126,18 +134,30 @@ impl LiveQualificationFixture {
             sql_addresses,
             group_addresses,
             identities: [first, second, third],
+            data_roots,
+            scratch_roots,
             root,
         }
     }
 
     pub(super) fn cleanup(mut self) {
         self.manager.stop().unwrap();
-        for socket in &self.sockets {
-            assert!(!socket.exists());
+        for index in 0..3 {
+            assert!(!self.sockets[index].exists());
+            assert!(self.data_roots[index].is_dir());
+            assert!(!self.scratch_roots[index].exists());
+            assert_no_application_store(&self.data_roots[index]);
         }
         for address in self.group_addresses {
             assert!(TcpListener::bind(address).is_ok());
         }
+        for address in self.sql_addresses {
+            assert!(
+                std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err()
+            );
+        }
+        let mysql_x = SocketAddr::from(([127, 0, 0, 1], 33_060));
+        assert!(std::net::TcpStream::connect_timeout(&mysql_x, Duration::from_millis(50)).is_err());
         fs::remove_dir_all(&self.root).unwrap();
     }
 }
@@ -252,6 +272,8 @@ async fn query_server_uuid(socket: &Path) -> String {
 }
 
 fn preflight() {
+    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(std::env::consts::ARCH, "x86_64");
     for path in [MYSQLD, APPARMOR_EXEC] {
         let metadata = fs::symlink_metadata(path).unwrap();
         assert!(!metadata.file_type().is_symlink());
@@ -264,6 +286,8 @@ fn preflight() {
     assert_eq!(version.trim(), "8.4.11-1ubuntu24.04");
     let owner = command_stdout("dpkg-query", &["-S", MYSQLD]);
     assert!(owner.starts_with("mysql-community-server-core:"));
+    let launcher_owner = command_stdout("dpkg-query", &["-S", APPARMOR_EXEC]);
+    assert!(!launcher_owner.trim().is_empty());
     let verification = Command::new("dpkg")
         .args(["--verify", "mysql-community-server-core"])
         .output()
@@ -281,9 +305,37 @@ fn preflight() {
         .unwrap();
     assert!(!foreign.success(), "foreign mysqld process is active");
     let policy = command_stdout("apt-cache", &["policy", "mysql-community-server-core"]);
+    assert!(policy.contains("Installed: 8.4.11-1ubuntu24.04"));
+    assert!(policy.contains("Candidate: 8.4.11-1ubuntu24.04"));
     assert!(policy.contains("8.4.11-1ubuntu24.04"));
     assert!(policy.contains("repo.mysql.com"));
     assert!(policy.contains("mysql-8.4-lts"));
+}
+
+fn assert_no_application_store(root: &Path) {
+    let forbidden = [
+        "journal",
+        "receipt",
+        "cursor",
+        "adoption",
+        "metadata.db",
+        "state.json",
+    ];
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            assert!(
+                !forbidden.iter().any(|forbidden| name.contains(forbidden)),
+                "private application store artifact: {}",
+                entry.path().display()
+            );
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
 }
 
 fn command_stdout(program: &str, arguments: &[&str]) -> String {
