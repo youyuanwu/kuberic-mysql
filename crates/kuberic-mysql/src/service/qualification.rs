@@ -1,9 +1,275 @@
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use crate::core::GtidSet;
 use crate::service::config::TOPOLOGY_NATIVE_PROFILE_OPTIONS;
+use crate::service::instance::QualificationStopKind;
+use crate::service::topology::QualificationManagerParts;
+use crate::service::{
+    ControlStage, MemberCleanupFailure, MemberControlBinding, MysqlInstanceError,
+    MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManager,
+    MysqlTopologyManagerError,
+};
 
 const ORACLE_PACKAGE: &str = "mysql-community-server-core=8.4.11-1ubuntu24.04";
+const CLEANUP_RESERVE: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QualificationMemberPhase {
+    Running,
+    ProcessStopped,
+    Restarting,
+    Rejoining,
+    Contained,
+}
+
+trait QualificationOwnedMember {
+    fn qualification_stop(&mut self, kind: QualificationStopKind)
+    -> Result<(), MysqlInstanceError>;
+    fn qualification_restart(&mut self) -> Result<(), MysqlInstanceError>;
+    fn qualification_contain(&mut self) -> Result<(), MysqlInstanceError>;
+}
+
+impl QualificationOwnedMember for MysqlInstanceManager {
+    fn qualification_stop(
+        &mut self,
+        kind: QualificationStopKind,
+    ) -> Result<(), MysqlInstanceError> {
+        self.qualification_stop_preserving_roots(kind)
+    }
+
+    fn qualification_restart(&mut self) -> Result<(), MysqlInstanceError> {
+        self.qualification_restart_retained()
+    }
+
+    fn qualification_contain(&mut self) -> Result<(), MysqlInstanceError> {
+        self.contain()
+    }
+}
+
+struct QualificationOwnership<'a, M: QualificationOwnedMember> {
+    members: &'a mut [M; 3],
+    phases: [QualificationMemberPhase; 3],
+    work_cutoff: Instant,
+    armed: bool,
+}
+
+impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
+    fn new(members: &'a mut [M; 3], runtime_deadline: Instant) -> Result<Self, ()> {
+        let work_cutoff = qualification_work_cutoff(runtime_deadline)?;
+        Ok(Self::with_work_cutoff(members, work_cutoff))
+    }
+
+    fn with_work_cutoff(members: &'a mut [M; 3], work_cutoff: Instant) -> Self {
+        Self {
+            members,
+            phases: [QualificationMemberPhase::Running; 3],
+            work_cutoff,
+            armed: true,
+        }
+    }
+
+    fn require_work_budget(&self) -> Result<(), ()> {
+        (Instant::now() < self.work_cutoff).then_some(()).ok_or(())
+    }
+
+    fn phase(&self, member: MysqlMemberIndex) -> QualificationMemberPhase {
+        self.phases[member.as_usize()]
+    }
+
+    fn stop(
+        &mut self,
+        member: MysqlMemberIndex,
+        kind: QualificationStopKind,
+    ) -> Result<(), MysqlInstanceError> {
+        self.require_work_budget().map_err(|()| {
+            MysqlInstanceError::Timeout(crate::service::LifecycleOperation::Shutdown)
+        })?;
+        if self.phase(member) != QualificationMemberPhase::Running {
+            return Err(MysqlInstanceError::InvalidState {
+                expected: crate::service::MysqlInstanceState::Running,
+                actual: crate::service::MysqlInstanceState::Initialized,
+            });
+        }
+        match self.members[member.as_usize()].qualification_stop(kind) {
+            Ok(()) => {
+                self.phases[member.as_usize()] = QualificationMemberPhase::ProcessStopped;
+                Ok(())
+            }
+            Err(error) => {
+                self.contain();
+                Err(error)
+            }
+        }
+    }
+
+    fn restart(&mut self, member: MysqlMemberIndex) -> Result<(), MysqlInstanceError> {
+        self.require_work_budget().map_err(|()| {
+            MysqlInstanceError::Timeout(crate::service::LifecycleOperation::Startup)
+        })?;
+        if self.phase(member) != QualificationMemberPhase::ProcessStopped {
+            return Err(MysqlInstanceError::InvalidState {
+                expected: crate::service::MysqlInstanceState::Initialized,
+                actual: crate::service::MysqlInstanceState::Running,
+            });
+        }
+        self.phases[member.as_usize()] = QualificationMemberPhase::Restarting;
+        match self.members[member.as_usize()].qualification_restart() {
+            Ok(()) => {
+                self.phases[member.as_usize()] = QualificationMemberPhase::Running;
+                Ok(())
+            }
+            Err(error) => {
+                self.contain();
+                Err(error)
+            }
+        }
+    }
+
+    fn begin_rejoin(
+        &mut self,
+        member: MysqlMemberIndex,
+    ) -> Result<QualificationOperationGuard<'_, 'a, M>, ()> {
+        self.require_work_budget()?;
+        if self.phase(member) != QualificationMemberPhase::Running {
+            return Err(());
+        }
+        self.phases[member.as_usize()] = QualificationMemberPhase::Rejoining;
+        Ok(QualificationOperationGuard {
+            ownership: self,
+            member,
+            armed: true,
+        })
+    }
+
+    fn contain(&mut self) -> Vec<MemberCleanupFailure> {
+        let mut failures = Vec::new();
+        for member in MysqlMemberIndex::all() {
+            if let Err(error) = self.members[member.as_usize()].qualification_contain() {
+                failures.push(MemberCleanupFailure::new(member, error));
+            }
+            self.phases[member.as_usize()] = QualificationMemberPhase::Contained;
+        }
+        self.armed = false;
+        failures
+    }
+}
+
+fn qualification_work_cutoff(runtime_deadline: Instant) -> Result<Instant, ()> {
+    let work_cutoff = runtime_deadline.checked_sub(CLEANUP_RESERVE).ok_or(())?;
+    (Instant::now() < work_cutoff)
+        .then_some(work_cutoff)
+        .ok_or(())
+}
+
+impl<M: QualificationOwnedMember> Drop for QualificationOwnership<'_, M> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.contain();
+        }
+    }
+}
+
+struct QualificationOperationGuard<'guard, 'members, M: QualificationOwnedMember> {
+    ownership: &'guard mut QualificationOwnership<'members, M>,
+    member: MysqlMemberIndex,
+    armed: bool,
+}
+
+impl<M: QualificationOwnedMember> QualificationOperationGuard<'_, '_, M> {
+    fn complete(mut self) {
+        self.ownership.phases[self.member.as_usize()] = QualificationMemberPhase::Running;
+        self.armed = false;
+    }
+}
+
+impl<M: QualificationOwnedMember> Drop for QualificationOperationGuard<'_, '_, M> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.ownership.contain();
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct MysqlNativeQualification<'a> {
+    ownership: QualificationOwnership<'a, MysqlInstanceManager>,
+    attempt: &'a crate::service::TopologyAttempt,
+    observer: &'a crate::service::ControlCredential,
+    recovery: &'a crate::service::ControlCredential,
+}
+
+#[allow(dead_code)]
+impl<'a> MysqlNativeQualification<'a> {
+    fn enter(manager: &'a mut MysqlTopologyManager) -> Result<Self, MysqlTopologyManagerError> {
+        let QualificationManagerParts {
+            instances,
+            attempt,
+            observer,
+            recovery,
+            runtime_deadline,
+        } = manager.enter_native_qualification()?;
+        let work_cutoff = match qualification_work_cutoff(runtime_deadline) {
+            Ok(work_cutoff) => work_cutoff,
+            Err(()) => {
+                let mut failures = Vec::new();
+                for member in MysqlMemberIndex::all() {
+                    if let Err(error) = instances[member.as_usize()].contain() {
+                        failures.push(MemberCleanupFailure::new(member, error));
+                    }
+                }
+                let primary = MysqlTopologyManagerError::Topology(MysqlTopologyError::Deadline(
+                    ControlStage::ProductValidation,
+                ));
+                return if failures.is_empty() {
+                    Err(primary)
+                } else {
+                    Err(MysqlTopologyManagerError::Cleanup {
+                        primary: Some(Box::new(primary)),
+                        failures,
+                    })
+                };
+            }
+        };
+        let ownership = QualificationOwnership::with_work_cutoff(instances, work_cutoff);
+        Ok(Self {
+            ownership,
+            attempt,
+            observer,
+            recovery,
+        })
+    }
+
+    fn stop_member(
+        &mut self,
+        member: MysqlMemberIndex,
+        kind: QualificationStopKind,
+    ) -> Result<(), MysqlTopologyManagerError> {
+        self.ownership
+            .stop(member, kind)
+            .map_err(|error| MysqlTopologyManagerError::Instance { member, error })
+    }
+
+    fn restart_member(
+        &mut self,
+        member: MysqlMemberIndex,
+    ) -> Result<MemberControlBinding, MysqlTopologyManagerError> {
+        self.ownership
+            .restart(member)
+            .map_err(|error| MysqlTopologyManagerError::Instance { member, error })?;
+        self.ownership.members[member.as_usize()]
+            .topology_binding(
+                self.attempt.id().clone(),
+                self.observer.generation().clone(),
+                self.recovery.generation().clone(),
+            )
+            .map_err(MysqlTopologyManagerError::Topology)
+    }
+
+    fn phase(&self, member: MysqlMemberIndex) -> QualificationMemberPhase {
+        self.ownership.phase(member)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeSettingScope {

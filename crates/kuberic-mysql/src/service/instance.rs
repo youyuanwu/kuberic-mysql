@@ -23,6 +23,8 @@ use crate::core::{
 };
 use crate::service::config::OwnedRoot;
 use crate::service::control::OwnedControlTarget;
+#[cfg(test)]
+use crate::service::process::qualification_kill_and_reap;
 use crate::service::process::{
     attest_child, launcher_command, terminate_and_reap, verify_product, wait_bounded,
     wait_for_absence,
@@ -50,6 +52,13 @@ pub enum MysqlInstanceState {
     Stopped,
     /// A lifecycle failure left ownership requiring explicit fixture reset.
     Faulted,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum QualificationStopKind {
+    Graceful,
+    Abrupt,
 }
 
 /// Owns one fresh MySQL generation and its sole retained child.
@@ -418,6 +427,64 @@ impl MysqlInstanceManager {
         self.scratch_root = None;
         self.state = MysqlInstanceState::Stopped;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn qualification_stop_preserving_roots(
+        &mut self,
+        kind: QualificationStopKind,
+    ) -> Result<(), MysqlInstanceError> {
+        self.require_state(MysqlInstanceState::Running)?;
+        if let Err(error) = self.revalidate_roots() {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        let child = self
+            .child
+            .as_mut()
+            .expect("running state retains the exact child");
+        if let Err(error) = attest_child(child, &self.config) {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        let stop = match kind {
+            QualificationStopKind::Graceful => {
+                terminate_and_reap(child, self.config.timeouts().shutdown())
+            }
+            QualificationStopKind::Abrupt => {
+                qualification_kill_and_reap(child, self.config.timeouts().shutdown())
+            }
+        };
+        if let Err(error) = stop {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        self.child = None;
+        if let Err(error) = wait_for_absence(
+            self.config.runtime().socket(),
+            self.config.timeouts().socket_disappearance(),
+        ) {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        match fs::remove_file(self.config.runtime().pid()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                self.state = MysqlInstanceState::Faulted;
+                return Err(MysqlInstanceError::Io {
+                    operation: LifecycleOperation::Shutdown,
+                    kind: error.kind(),
+                });
+            }
+        }
+        self.state = MysqlInstanceState::Initialized;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn qualification_restart_retained(&mut self) -> Result<(), MysqlInstanceError> {
+        self.start()
     }
 
     fn require_state(&self, expected: MysqlInstanceState) -> Result<(), MysqlInstanceError> {

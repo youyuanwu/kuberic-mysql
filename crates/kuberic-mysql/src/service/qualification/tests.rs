@@ -1,8 +1,163 @@
+use std::fs;
+use std::net::SocketAddr;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
+use crate::core::{AttemptId, CredentialGeneration, GroupName};
+use crate::service::{
+    ControlCredential, ControlCredentialRole, MysqlInstanceConfig, MysqlMemberConfig,
+    MysqlOperationTimeouts, MysqlTopologyConfig, MysqlTopologyState, TopologyAttempt,
+};
 
 const GROUP_UUID: &str = "d6f6f07e-37e1-4f7a-9105-73c13f634cb3";
+static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default)]
+struct ScriptedOwnedMember {
+    stops: Vec<QualificationStopKind>,
+    restarts: usize,
+    contains: usize,
+    fail_stop: bool,
+    fail_restart: bool,
+}
+
+impl QualificationOwnedMember for ScriptedOwnedMember {
+    fn qualification_stop(
+        &mut self,
+        kind: QualificationStopKind,
+    ) -> Result<(), MysqlInstanceError> {
+        self.stops.push(kind);
+        if self.fail_stop {
+            Err(scripted_instance_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn qualification_restart(&mut self) -> Result<(), MysqlInstanceError> {
+        self.restarts += 1;
+        if self.fail_restart {
+            Err(scripted_instance_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn qualification_contain(&mut self) -> Result<(), MysqlInstanceError> {
+        self.contains += 1;
+        Ok(())
+    }
+}
+
+fn scripted_instance_error() -> MysqlInstanceError {
+    MysqlInstanceError::InvalidState {
+        expected: crate::service::MysqlInstanceState::Running,
+        actual: crate::service::MysqlInstanceState::Configured,
+    }
+}
+
+fn configured_manager() -> (MysqlTopologyManager, PathBuf) {
+    let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "kuberic-mysql-qualification-contract-{}-{serial}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let sql_addresses = [
+        SocketAddr::from(([127, 0, 0, 1], 33_061)),
+        SocketAddr::from(([127, 0, 0, 1], 33_062)),
+        SocketAddr::from(([127, 0, 0, 1], 33_063)),
+    ];
+    let group_addresses = [
+        SocketAddr::from(([127, 0, 0, 1], 43_061)),
+        SocketAddr::from(([127, 0, 0, 1], 43_062)),
+        SocketAddr::from(([127, 0, 0, 1], 43_063)),
+    ];
+    let topology = MysqlTopologyConfig::new([
+        MysqlMemberConfig::new(
+            1,
+            sql_addresses[0],
+            group_addresses[0],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+        MysqlMemberConfig::new(
+            2,
+            sql_addresses[1],
+            group_addresses[1],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+        MysqlMemberConfig::new(
+            3,
+            sql_addresses[2],
+            group_addresses[2],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let timeouts = MysqlOperationTimeouts::new(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let configs = MysqlMemberIndex::all().map(|member| {
+        let number = member.as_usize() + 1;
+        MysqlInstanceConfig::new_topology_member(
+            "/usr/sbin/mysqld",
+            "/usr/bin/aa-exec",
+            root.join(format!("member-{number}-data")),
+            root.join(format!("member-{number}-scratch")),
+            topology.clone(),
+            member,
+            timeouts,
+        )
+        .unwrap()
+    });
+    let attempt = TopologyAttempt::new(
+        AttemptId::new("qualification-contract-attempt").unwrap(),
+        GroupName::new(GROUP_UUID).unwrap(),
+        MysqlMemberIndex::First,
+        Duration::from_secs(300),
+    )
+    .unwrap();
+    let observer = ControlCredential::new(
+        attempt.id().clone(),
+        CredentialGeneration::new("observer-generation").unwrap(),
+        ControlCredentialRole::Observer,
+        "qualification_observer",
+        "ObserverSecret1",
+    )
+    .unwrap();
+    let recovery = ControlCredential::new(
+        attempt.id().clone(),
+        CredentialGeneration::new("recovery-generation").unwrap(),
+        ControlCredentialRole::Recovery,
+        "qualification_recovery",
+        "RecoverySecret1",
+    )
+    .unwrap();
+    (
+        MysqlTopologyManager::new(
+            configs.map(MysqlInstanceManager::new),
+            attempt,
+            observer,
+            recovery,
+        )
+        .unwrap(),
+        root,
+    )
+}
 
 fn binding() -> QualificationBinding {
     QualificationBinding {
@@ -45,6 +200,135 @@ fn revocation_expectation(member: &str, process: &str) -> RevocationExpectation 
         predecessor_process_session: process.to_owned(),
         predecessor_credential_generation: "credential-1".to_owned(),
         replacement_credential_generation: "credential-2".to_owned(),
+    }
+}
+
+#[test]
+fn qualification_ownership_stops_restarts_and_rebinds_phase() {
+    let mut members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    {
+        let mut ownership =
+            QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(121))
+                .unwrap();
+        ownership
+            .stop(MysqlMemberIndex::Second, QualificationStopKind::Graceful)
+            .unwrap();
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::Second),
+            QualificationMemberPhase::ProcessStopped
+        );
+        ownership.restart(MysqlMemberIndex::Second).unwrap();
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::Second),
+            QualificationMemberPhase::Running
+        );
+    }
+    assert_eq!(members[1].stops, [QualificationStopKind::Graceful]);
+    assert_eq!(members[1].restarts, 1);
+    assert_eq!(members.each_ref().map(|member| member.contains), [1, 1, 1]);
+}
+
+#[test]
+fn qualification_entry_rejects_precompletion_without_mutation() {
+    let (mut manager, root) = configured_manager();
+    assert!(matches!(
+        MysqlNativeQualification::enter(&mut manager),
+        Err(MysqlTopologyManagerError::InvalidState {
+            expected: MysqlTopologyState::Complete,
+            actual: MysqlTopologyState::Configured,
+        })
+    ));
+    assert_eq!(manager.state(), MysqlTopologyState::Configured);
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn qualification_ownership_contains_on_failure_and_cancelled_rejoin() {
+    let mut failed_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    failed_members[0].fail_stop = true;
+    {
+        let mut ownership = QualificationOwnership::new(
+            &mut failed_members,
+            Instant::now() + Duration::from_secs(121),
+        )
+        .unwrap();
+        assert!(
+            ownership
+                .stop(MysqlMemberIndex::First, QualificationStopKind::Abrupt)
+                .is_err()
+        );
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::First),
+            QualificationMemberPhase::Contained
+        );
+    }
+    assert_eq!(
+        failed_members.each_ref().map(|member| member.contains),
+        [1, 1, 1]
+    );
+
+    let mut restart_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    restart_members[1].fail_restart = true;
+    {
+        let mut ownership = QualificationOwnership::new(
+            &mut restart_members,
+            Instant::now() + Duration::from_secs(121),
+        )
+        .unwrap();
+        ownership
+            .stop(MysqlMemberIndex::Second, QualificationStopKind::Graceful)
+            .unwrap();
+        assert!(ownership.restart(MysqlMemberIndex::Second).is_err());
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::Second),
+            QualificationMemberPhase::Contained
+        );
+    }
+    assert_eq!(
+        restart_members.each_ref().map(|member| member.contains),
+        [1, 1, 1]
+    );
+
+    let mut cancelled_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    {
+        let mut ownership = QualificationOwnership::new(
+            &mut cancelled_members,
+            Instant::now() + Duration::from_secs(121),
+        )
+        .unwrap();
+        drop(ownership.begin_rejoin(MysqlMemberIndex::Third).unwrap());
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::Third),
+            QualificationMemberPhase::Contained
+        );
+    }
+    assert_eq!(
+        cancelled_members.each_ref().map(|member| member.contains),
+        [1, 1, 1]
+    );
+}
+
+#[test]
+fn qualification_ownership_completes_rejoin_and_reserves_cleanup_budget() {
+    let mut members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    assert!(
+        QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(120))
+            .is_err()
+    );
+
+    {
+        let mut ownership =
+            QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(121))
+                .unwrap();
+        assert!(ownership.restart(MysqlMemberIndex::First).is_err());
+        ownership
+            .begin_rejoin(MysqlMemberIndex::First)
+            .unwrap()
+            .complete();
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::First),
+            QualificationMemberPhase::Running
+        );
     }
 }
 

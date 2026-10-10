@@ -236,6 +236,14 @@ fn kill_and_reap_bounded(child: &mut Child, timeout: Duration) -> Result<(), Mys
     kill_and_reap_until(child, deadline)
 }
 
+#[cfg(test)]
+pub(super) fn qualification_kill_and_reap(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), MysqlInstanceError> {
+    kill_and_reap_bounded(child, timeout)
+}
+
 fn kill_and_reap_until(child: &mut Child, deadline: Instant) -> Result<(), MysqlInstanceError> {
     if let Err(error) = child.kill() {
         if child
