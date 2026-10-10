@@ -2071,6 +2071,7 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
         self.pending_discovery = None;
         self.accepted = None;
         self.enrollments.fill(None);
+        self.authority.invalidate();
         self.state = MysqlTopologyState::Failed;
         Ok(QualificationManagerParts {
             instances: &mut self.instances,
@@ -2079,6 +2080,16 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
             recovery: &self.recovery,
             runtime_deadline: self.runtime_deadline,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_complete_for_qualification_contract(&mut self) {
+        self.state = MysqlTopologyState::Complete;
+    }
+
+    #[cfg(test)]
+    pub(super) fn qualification_authority_is_invalidated(&self) -> bool {
+        matches!(self.authority.state, AuthorityState::Invalidated)
     }
 
     /// Initializes all three fresh members before any member is started.

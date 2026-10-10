@@ -1,9 +1,11 @@
 use std::fs;
 use std::net::SocketAddr;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 
 use super::*;
 use crate::core::{AttemptId, CredentialGeneration, GroupName};
@@ -22,6 +24,8 @@ struct ScriptedOwnedMember {
     contains: usize,
     fail_stop: bool,
     fail_restart: bool,
+    fail_contain: bool,
+    contain_delay: Duration,
 }
 
 impl QualificationOwnedMember for ScriptedOwnedMember {
@@ -48,7 +52,12 @@ impl QualificationOwnedMember for ScriptedOwnedMember {
 
     fn qualification_contain(&mut self) -> Result<(), MysqlInstanceError> {
         self.contains += 1;
-        Ok(())
+        thread::sleep(self.contain_delay);
+        if self.fail_contain {
+            Err(scripted_instance_error())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -61,7 +70,7 @@ fn scripted_instance_error() -> MysqlInstanceError {
 
 fn configured_manager() -> (MysqlTopologyManager, PathBuf) {
     let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
+    let root = PathBuf::from("/tmp").join(format!(
         "kuberic-mysql-qualification-contract-{}-{serial}",
         std::process::id()
     ));
@@ -159,6 +168,106 @@ fn configured_manager() -> (MysqlTopologyManager, PathBuf) {
     )
 }
 
+fn fake_instance(label: &str) -> (MysqlInstanceManager, PathBuf) {
+    let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+    let root = PathBuf::from("/tmp").join(format!("kmq-{}-{serial}-{label}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let launcher = root.join("launcher");
+    fs::write(
+        &launcher,
+        r#"#!/bin/sh
+while [ "$1" != "--" ]; do shift; done
+shift
+mysqld="$1"
+shift
+if [ "$1" = "--version" ]; then
+  echo "$mysqld  Ver 8.4.11 for Linux on x86_64 (MySQL Community Server - GPL)"
+  exit 0
+fi
+case "$*" in
+  *--initialize-insecure*) exit 0 ;;
+esac
+config=${1#--defaults-file=}
+pid_file=$(sed -n 's/^pid-file=//p' "$config")
+echo $$ > "$pid_file"
+exec "$mysqld" 60
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let group_addresses = [
+        SocketAddr::from(([127, 0, 0, 1], 43_061)),
+        SocketAddr::from(([127, 0, 0, 1], 43_062)),
+        SocketAddr::from(([127, 0, 0, 1], 43_063)),
+    ];
+    let topology = MysqlTopologyConfig::new([
+        MysqlMemberConfig::new(
+            1,
+            SocketAddr::from(([127, 0, 0, 1], 33_061)),
+            group_addresses[0],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+        MysqlMemberConfig::new(
+            2,
+            SocketAddr::from(([127, 0, 0, 1], 33_062)),
+            group_addresses[1],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+        MysqlMemberConfig::new(
+            3,
+            SocketAddr::from(([127, 0, 0, 1], 33_063)),
+            group_addresses[2],
+            GROUP_UUID,
+            group_addresses,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let config = MysqlInstanceConfig::new_topology_member(
+        "/usr/bin/sleep",
+        &launcher,
+        root.join("d"),
+        root.join("s"),
+        topology,
+        MysqlMemberIndex::First,
+        MysqlOperationTimeouts::new(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    (MysqlInstanceManager::new(config), root)
+}
+
+fn provide_socket(pid_path: PathBuf, socket_path: PathBuf) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let pid = loop {
+            if let Ok(value) = fs::read_to_string(&pid_path)
+                && let Ok(pid) = value.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        };
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        while Path::new(&format!("/proc/{pid}")).exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(listener);
+        let _ = fs::remove_file(socket_path);
+    })
+}
+
 fn binding() -> QualificationBinding {
     QualificationBinding {
         package: ORACLE_PACKAGE.to_owned(),
@@ -218,6 +327,7 @@ fn qualification_ownership_stops_restarts_and_rebinds_phase() {
             QualificationMemberPhase::ProcessStopped
         );
         ownership.restart(MysqlMemberIndex::Second).unwrap();
+        ownership.finish_restart(MysqlMemberIndex::Second).unwrap();
         assert_eq!(
             ownership.phase(MysqlMemberIndex::Second),
             QualificationMemberPhase::Running
@@ -240,6 +350,88 @@ fn qualification_entry_rejects_precompletion_without_mutation() {
     ));
     assert_eq!(manager.state(), MysqlTopologyState::Configured);
     fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn qualification_entry_invalidates_authority_and_drop_contains_members() {
+    let (mut manager, root) = configured_manager();
+    manager.mark_complete_for_qualification_contract();
+    {
+        let qualification = MysqlNativeQualification::enter(&mut manager).unwrap();
+        assert_eq!(
+            qualification.phase(MysqlMemberIndex::First),
+            QualificationMemberPhase::Running
+        );
+    }
+    assert_eq!(manager.state(), MysqlTopologyState::Failed);
+    assert!(manager.qualification_authority_is_invalidated());
+    manager.stop().unwrap();
+    assert_eq!(manager.state(), MysqlTopologyState::Stopped);
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn retained_restart_rejects_foreign_endpoints_and_changes_process_session() {
+    for foreign_pid in [true, false] {
+        let (mut instance, root) = fake_instance(if foreign_pid { "pid" } else { "socket" });
+        instance.initialize().unwrap();
+        if foreign_pid {
+            fs::write(instance.config().runtime().pid(), "99999\n").unwrap();
+        } else {
+            let listener = UnixListener::bind(instance.config().runtime().socket()).unwrap();
+            assert!(matches!(
+                instance.qualification_restart_retained(),
+                Err(MysqlInstanceError::SocketStillPresent)
+            ));
+            drop(listener);
+            instance.contain().unwrap();
+            fs::remove_dir_all(root).unwrap();
+            continue;
+        }
+        assert!(matches!(
+            instance.qualification_restart_retained(),
+            Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InvalidPidFile
+            ))
+        ));
+        instance.contain().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    let (mut instance, root) = fake_instance("generation");
+    instance.initialize().unwrap();
+    let first_socket = provide_socket(
+        instance.config().runtime().pid().to_owned(),
+        instance.config().runtime().socket().to_owned(),
+    );
+    instance.start().unwrap();
+    let first = instance
+        .topology_binding(
+            AttemptId::new("restart-attempt").unwrap(),
+            CredentialGeneration::new("observer-generation").unwrap(),
+            CredentialGeneration::new("recovery-generation").unwrap(),
+        )
+        .unwrap();
+    instance
+        .qualification_stop_preserving_roots(QualificationStopKind::Graceful)
+        .unwrap();
+    first_socket.join().unwrap();
+    let second_socket = provide_socket(
+        instance.config().runtime().pid().to_owned(),
+        instance.config().runtime().socket().to_owned(),
+    );
+    instance.qualification_restart_retained().unwrap();
+    let second = instance
+        .topology_binding(
+            AttemptId::new("restart-attempt").unwrap(),
+            CredentialGeneration::new("observer-generation").unwrap(),
+            CredentialGeneration::new("recovery-generation").unwrap(),
+        )
+        .unwrap();
+    assert_ne!(first.process_session(), second.process_session());
+    instance.contain().unwrap();
+    second_socket.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -321,6 +513,19 @@ fn qualification_ownership_completes_rejoin_and_reserves_cleanup_budget() {
             QualificationOwnership::new(&mut members, Instant::now() + Duration::from_secs(121))
                 .unwrap();
         assert!(ownership.restart(MysqlMemberIndex::First).is_err());
+        assert_eq!(
+            ownership.phase(MysqlMemberIndex::First),
+            QualificationMemberPhase::Contained
+        );
+    }
+
+    let mut rejoin_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    {
+        let mut ownership = QualificationOwnership::new(
+            &mut rejoin_members,
+            Instant::now() + Duration::from_secs(121),
+        )
+        .unwrap();
         ownership
             .begin_rejoin(MysqlMemberIndex::First)
             .unwrap()
@@ -330,6 +535,51 @@ fn qualification_ownership_completes_rejoin_and_reserves_cleanup_budget() {
             QualificationMemberPhase::Running
         );
     }
+}
+
+#[test]
+fn qualification_cleanup_reports_failures_and_deadline_overrun() {
+    let mut failing_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    failing_members[1].fail_contain = true;
+    let mut ownership = QualificationOwnership::with_deadlines(
+        &mut failing_members,
+        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(1),
+    );
+    let report = ownership.contain();
+    assert_eq!(report.failures.len(), 1);
+    assert!(!report.deadline_overrun);
+    assert_eq!(
+        ownership.phase(MysqlMemberIndex::Second),
+        QualificationMemberPhase::ContainmentFailed
+    );
+
+    let mut slow_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    slow_members[0].contain_delay = Duration::from_millis(5);
+    let mut ownership = QualificationOwnership::with_deadlines(
+        &mut slow_members,
+        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_millis(1),
+    );
+    let report = ownership.contain();
+    assert!(report.deadline_overrun);
+    assert!(report.failures.is_empty());
+
+    let mut cutoff_members = std::array::from_fn(|_| ScriptedOwnedMember::default());
+    let mut ownership = QualificationOwnership::with_deadlines(
+        &mut cutoff_members,
+        Instant::now() - Duration::from_millis(1),
+        Instant::now() + Duration::from_secs(1),
+    );
+    assert!(
+        ownership
+            .stop(MysqlMemberIndex::First, QualificationStopKind::Abrupt)
+            .is_err()
+    );
+    assert_eq!(
+        ownership.phase(MysqlMemberIndex::First),
+        QualificationMemberPhase::Contained
+    );
 }
 
 #[test]

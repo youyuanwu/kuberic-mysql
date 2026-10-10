@@ -21,6 +21,19 @@ enum QualificationMemberPhase {
     Restarting,
     Rejoining,
     Contained,
+    ContainmentFailed,
+}
+
+#[derive(Debug)]
+struct QualificationCleanupReport {
+    failures: Vec<MemberCleanupFailure>,
+    deadline_overrun: bool,
+}
+
+#[derive(Debug)]
+struct QualificationOperationFailure {
+    primary: MysqlInstanceError,
+    cleanup: QualificationCleanupReport,
 }
 
 trait QualificationOwnedMember {
@@ -51,20 +64,26 @@ struct QualificationOwnership<'a, M: QualificationOwnedMember> {
     members: &'a mut [M; 3],
     phases: [QualificationMemberPhase; 3],
     work_cutoff: Instant,
+    runtime_deadline: Instant,
     armed: bool,
 }
 
 impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
     fn new(members: &'a mut [M; 3], runtime_deadline: Instant) -> Result<Self, ()> {
         let work_cutoff = qualification_work_cutoff(runtime_deadline)?;
-        Ok(Self::with_work_cutoff(members, work_cutoff))
+        Ok(Self::with_deadlines(members, work_cutoff, runtime_deadline))
     }
 
-    fn with_work_cutoff(members: &'a mut [M; 3], work_cutoff: Instant) -> Self {
+    fn with_deadlines(
+        members: &'a mut [M; 3],
+        work_cutoff: Instant,
+        runtime_deadline: Instant,
+    ) -> Self {
         Self {
             members,
             phases: [QualificationMemberPhase::Running; 3],
             work_cutoff,
+            runtime_deadline,
             armed: true,
         }
     }
@@ -81,49 +100,52 @@ impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
         &mut self,
         member: MysqlMemberIndex,
         kind: QualificationStopKind,
-    ) -> Result<(), MysqlInstanceError> {
-        self.require_work_budget().map_err(|()| {
-            MysqlInstanceError::Timeout(crate::service::LifecycleOperation::Shutdown)
-        })?;
+    ) -> Result<(), QualificationOperationFailure> {
+        if self.require_work_budget().is_err() {
+            return Err(self.fail(MysqlInstanceError::Timeout(
+                crate::service::LifecycleOperation::Shutdown,
+            )));
+        }
         if self.phase(member) != QualificationMemberPhase::Running {
-            return Err(MysqlInstanceError::InvalidState {
+            return Err(self.fail(MysqlInstanceError::InvalidState {
                 expected: crate::service::MysqlInstanceState::Running,
                 actual: crate::service::MysqlInstanceState::Initialized,
-            });
+            }));
         }
         match self.members[member.as_usize()].qualification_stop(kind) {
             Ok(()) => {
                 self.phases[member.as_usize()] = QualificationMemberPhase::ProcessStopped;
                 Ok(())
             }
-            Err(error) => {
-                self.contain();
-                Err(error)
-            }
+            Err(error) => Err(self.fail(error)),
         }
     }
 
-    fn restart(&mut self, member: MysqlMemberIndex) -> Result<(), MysqlInstanceError> {
-        self.require_work_budget().map_err(|()| {
-            MysqlInstanceError::Timeout(crate::service::LifecycleOperation::Startup)
-        })?;
+    fn restart(&mut self, member: MysqlMemberIndex) -> Result<(), QualificationOperationFailure> {
+        if self.require_work_budget().is_err() {
+            return Err(self.fail(MysqlInstanceError::Timeout(
+                crate::service::LifecycleOperation::Startup,
+            )));
+        }
         if self.phase(member) != QualificationMemberPhase::ProcessStopped {
-            return Err(MysqlInstanceError::InvalidState {
+            return Err(self.fail(MysqlInstanceError::InvalidState {
                 expected: crate::service::MysqlInstanceState::Initialized,
                 actual: crate::service::MysqlInstanceState::Running,
-            });
+            }));
         }
         self.phases[member.as_usize()] = QualificationMemberPhase::Restarting;
         match self.members[member.as_usize()].qualification_restart() {
-            Ok(()) => {
-                self.phases[member.as_usize()] = QualificationMemberPhase::Running;
-                Ok(())
-            }
-            Err(error) => {
-                self.contain();
-                Err(error)
-            }
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.fail(error)),
         }
+    }
+
+    fn finish_restart(&mut self, member: MysqlMemberIndex) -> Result<(), ()> {
+        if self.phase(member) != QualificationMemberPhase::Restarting {
+            return Err(());
+        }
+        self.phases[member.as_usize()] = QualificationMemberPhase::Running;
+        Ok(())
     }
 
     fn begin_rejoin(
@@ -142,16 +164,28 @@ impl<'a, M: QualificationOwnedMember> QualificationOwnership<'a, M> {
         })
     }
 
-    fn contain(&mut self) -> Vec<MemberCleanupFailure> {
+    fn fail(&mut self, primary: MysqlInstanceError) -> QualificationOperationFailure {
+        QualificationOperationFailure {
+            primary,
+            cleanup: self.contain(),
+        }
+    }
+
+    fn contain(&mut self) -> QualificationCleanupReport {
         let mut failures = Vec::new();
         for member in MysqlMemberIndex::all() {
             if let Err(error) = self.members[member.as_usize()].qualification_contain() {
                 failures.push(MemberCleanupFailure::new(member, error));
+                self.phases[member.as_usize()] = QualificationMemberPhase::ContainmentFailed;
+            } else {
+                self.phases[member.as_usize()] = QualificationMemberPhase::Contained;
             }
-            self.phases[member.as_usize()] = QualificationMemberPhase::Contained;
         }
         self.armed = false;
-        failures
+        QualificationCleanupReport {
+            failures,
+            deadline_overrun: Instant::now() > self.runtime_deadline,
+        }
     }
 }
 
@@ -165,7 +199,7 @@ fn qualification_work_cutoff(runtime_deadline: Instant) -> Result<Instant, ()> {
 impl<M: QualificationOwnedMember> Drop for QualificationOwnership<'_, M> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.contain();
+            let _report = self.contain();
         }
     }
 }
@@ -186,7 +220,7 @@ impl<M: QualificationOwnedMember> QualificationOperationGuard<'_, '_, M> {
 impl<M: QualificationOwnedMember> Drop for QualificationOperationGuard<'_, '_, M> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.ownership.contain();
+            let _report = self.ownership.contain();
         }
     }
 }
@@ -231,7 +265,8 @@ impl<'a> MysqlNativeQualification<'a> {
                 };
             }
         };
-        let ownership = QualificationOwnership::with_work_cutoff(instances, work_cutoff);
+        let ownership =
+            QualificationOwnership::with_deadlines(instances, work_cutoff, runtime_deadline);
         Ok(Self {
             ownership,
             attempt,
@@ -247,7 +282,7 @@ impl<'a> MysqlNativeQualification<'a> {
     ) -> Result<(), MysqlTopologyManagerError> {
         self.ownership
             .stop(member, kind)
-            .map_err(|error| MysqlTopologyManagerError::Instance { member, error })
+            .map_err(|failure| Self::qualification_operation_error(member, failure))
     }
 
     fn restart_member(
@@ -256,14 +291,51 @@ impl<'a> MysqlNativeQualification<'a> {
     ) -> Result<MemberControlBinding, MysqlTopologyManagerError> {
         self.ownership
             .restart(member)
-            .map_err(|error| MysqlTopologyManagerError::Instance { member, error })?;
-        self.ownership.members[member.as_usize()]
+            .map_err(|failure| Self::qualification_operation_error(member, failure))?;
+        let binding = self.ownership.members[member.as_usize()]
             .topology_binding(
                 self.attempt.id().clone(),
                 self.observer.generation().clone(),
                 self.recovery.generation().clone(),
             )
-            .map_err(MysqlTopologyManagerError::Topology)
+            .map_err(MysqlTopologyManagerError::Topology);
+        match binding {
+            Ok(binding) => {
+                self.ownership
+                    .finish_restart(member)
+                    .expect("successful retained restart remains in restarting phase");
+                Ok(binding)
+            }
+            Err(primary) => {
+                let cleanup = self.ownership.contain();
+                if cleanup.failures.is_empty() && !cleanup.deadline_overrun {
+                    Err(primary)
+                } else {
+                    Err(MysqlTopologyManagerError::Cleanup {
+                        primary: Some(Box::new(primary)),
+                        failures: cleanup.failures,
+                    })
+                }
+            }
+        }
+    }
+
+    fn qualification_operation_error(
+        member: MysqlMemberIndex,
+        failure: QualificationOperationFailure,
+    ) -> MysqlTopologyManagerError {
+        let primary = MysqlTopologyManagerError::Instance {
+            member,
+            error: failure.primary,
+        };
+        if failure.cleanup.failures.is_empty() && !failure.cleanup.deadline_overrun {
+            primary
+        } else {
+            MysqlTopologyManagerError::Cleanup {
+                primary: Some(Box::new(primary)),
+                failures: failure.cleanup.failures,
+            }
+        }
     }
 
     fn phase(&self, member: MysqlMemberIndex) -> QualificationMemberPhase {

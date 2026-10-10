@@ -71,6 +71,7 @@ pub struct MysqlInstanceManager {
     child: Option<Child>,
     data_root: Option<OwnedRoot>,
     scratch_root: Option<OwnedRoot>,
+    process_generation: u64,
 }
 
 impl MysqlInstanceManager {
@@ -83,6 +84,7 @@ impl MysqlInstanceManager {
             child: None,
             data_root: None,
             scratch_root: None,
+            process_generation: 0,
         }
     }
 
@@ -216,6 +218,12 @@ impl MysqlInstanceManager {
             self.state = MysqlInstanceState::Faulted;
             return Err(error);
         }
+        let next_generation =
+            self.process_generation
+                .checked_add(1)
+                .ok_or(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::InspectionFailed,
+                ))?;
         let stdout = File::create(self.config.runtime().stdout_log()).map_err(|error| {
             MysqlInstanceError::Io {
                 operation: LifecycleOperation::Startup,
@@ -259,6 +267,7 @@ impl MysqlInstanceManager {
                 }),
             };
         }
+        self.process_generation = next_generation;
         self.state = MysqlInstanceState::Running;
         Ok(())
     }
@@ -484,6 +493,35 @@ impl MysqlInstanceManager {
 
     #[cfg(test)]
     pub(super) fn qualification_restart_retained(&mut self) -> Result<(), MysqlInstanceError> {
+        self.require_state(MysqlInstanceState::Initialized)?;
+        if self.child.is_some() {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InspectionFailed,
+            ));
+        }
+        for path in [self.config.runtime().socket(), self.config.runtime().pid()] {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    return Err(if path == self.config.runtime().socket() {
+                        MysqlInstanceError::SocketStillPresent
+                    } else {
+                        MysqlInstanceError::Ownership(
+                            crate::service::OwnershipError::InvalidPidFile,
+                        )
+                    });
+                }
+                Err(error) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    return Err(MysqlInstanceError::Io {
+                        operation: LifecycleOperation::Startup,
+                        kind: error.kind(),
+                    });
+                }
+            }
+        }
         self.start()
     }
 
@@ -566,8 +604,9 @@ impl MysqlInstanceManager {
             .as_ref()
             .expect("running state retains exact scratch ownership");
         let process_session = ProcessSessionId::new(format!(
-            "member-{}-pid-{}-scratch-{}-{}",
+            "member-{}-generation-{}-pid-{}-scratch-{}-{}",
             self.config.member_index().as_usize() + 1,
+            self.process_generation,
             child.id(),
             scratch.device(),
             scratch.inode()
