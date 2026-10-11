@@ -1,10 +1,12 @@
 #[path = "service_common/mod.rs"]
 mod common;
 
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use common::{GROUP_UUID, TestRoot};
+use common::{GROUP_UUID, TestRoot, provide_socket};
 use kuberic_mysql::core::{
     AttemptId, CredentialGeneration, EndpointBinding, GroupName, GtidSet, MemberAddress, MemberId,
     MemberRole, MemberState, NativeMember, NativeView, ProcessSessionId, ServerUuid,
@@ -18,15 +20,21 @@ use kuberic_mysql::service::{
     MemberControlBinding, MemberEffectKind, MemberEffectReceipt, MemberMutationAuthority,
     MemberNativeEvidence, MemberPeer, MemberReceiptError, MemberSourceBoundary,
     MemberTransitionError, MemberViewError, MysqlInstanceConfig, MysqlInstanceError,
-    MysqlMemberEffectBoundary, MysqlMemberIndex, ObservedLocalBinding, PairedAttemptOutcome,
-    PrimaryTransferInput, TopologyAttempt, TopologyAuthority, TopologyInstant, TopologyObservation,
-    TopologyObservationStatus, TransitionEvaluation,
+    MysqlInstanceManager, MysqlInstanceState, MysqlMemberEffectBoundary, MysqlMemberIndex,
+    ObservedLocalBinding, PairedAttemptOutcome, PrimaryTransferInput, TopologyAttempt,
+    TopologyAuthority, TopologyInstant, TopologyObservation, TopologyObservationStatus,
+    TransitionEvaluation,
 };
 
 const MEMBER_UUIDS: [&str; 3] = [
     "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
     "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
     "dddddddd-dddd-dddd-dddd-dddddddddddd",
+];
+const MEMBERS: [MysqlMemberIndex; 3] = [
+    MysqlMemberIndex::First,
+    MysqlMemberIndex::Second,
+    MysqlMemberIndex::Third,
 ];
 
 #[test]
@@ -703,6 +711,157 @@ async fn cancellation_containment_touches_exactly_one_member_owner() {
     assert_eq!(members[2].containments, 0);
 }
 
+#[tokio::test]
+async fn real_manager_already_cancelled_admission_contains_only_exact_local_owner() {
+    let roots = [
+        TestRoot::new("cancel-real-a"),
+        TestRoot::new("cancel-real-b"),
+        TestRoot::new("cancel-real-c"),
+    ];
+    let mut members = std::array::from_fn(|index| {
+        MysqlInstanceManager::new(roots[index].config_for_member(MEMBERS[index]))
+    });
+    let sockets = start_real_members(&mut members);
+    let attempt = context("cancel-real");
+    let authorities = members
+        .each_ref()
+        .map(|member| running_authority("cancel-real", member));
+    attempt.cancel();
+
+    let invalid = members[0]
+        .terminate_backend_connection(
+            &authorities[1],
+            BackendConnectionId::new(std::num::NonZeroU64::new(1).unwrap()),
+            &attempt,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        MemberTransitionError::Authority(MemberAuthorityError::LocalBindingMismatch)
+    ));
+    assert!(
+        members
+            .iter()
+            .all(|member| member.state() == MysqlInstanceState::Running)
+    );
+
+    let cancelled = members[0]
+        .terminate_backend_connection(
+            &authorities[0],
+            BackendConnectionId::new(std::num::NonZeroU64::new(1).unwrap()),
+            &attempt,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(cancelled, MemberTransitionError::Cancelled));
+    assert_eq!(members[0].state(), MysqlInstanceState::Stopped);
+    assert!(!roots[0].scratch.exists());
+    assert!(!members[0].config().runtime().socket().exists());
+    for peer in &members[1..] {
+        assert_eq!(peer.state(), MysqlInstanceState::Running);
+        assert!(peer.config().runtime().socket().exists());
+    }
+
+    members[1].stop().unwrap();
+    members[2].stop().unwrap();
+    for socket in sockets {
+        socket.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn real_manager_future_cancellation_contains_only_the_inflight_owner() {
+    let roots = [
+        TestRoot::new("drop-real-a"),
+        TestRoot::new("drop-real-b"),
+        TestRoot::new("drop-real-c"),
+    ];
+    let mut members = std::array::from_fn(|index| {
+        MysqlInstanceManager::new(roots[index].config_for_member(MEMBERS[index]))
+    });
+    let sockets = start_real_members(&mut members);
+    let attempt = context("drop-real");
+    let authority = running_authority("drop-real", &members[0]);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            members[0].terminate_backend_connection(
+                &authority,
+                BackendConnectionId::new(std::num::NonZeroU64::new(1).unwrap()),
+                &attempt,
+            ),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(members[0].state(), MysqlInstanceState::Stopped);
+    assert!(!roots[0].scratch.exists());
+    assert!(!members[0].config().runtime().socket().exists());
+    for peer in &members[1..] {
+        assert_eq!(peer.state(), MysqlInstanceState::Running);
+        assert!(peer.config().runtime().socket().exists());
+    }
+
+    members[1].stop().unwrap();
+    members[2].stop().unwrap();
+    for socket in sockets {
+        socket.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn real_manager_cancelled_admission_pairs_primary_and_cleanup_failure() {
+    let roots = [
+        TestRoot::new("pair-real-a"),
+        TestRoot::new("pair-real-b"),
+        TestRoot::new("pair-real-c"),
+    ];
+    let mut members = std::array::from_fn(|index| {
+        MysqlInstanceManager::new(roots[index].config_for_member(MEMBERS[index]))
+    });
+    let sockets = start_real_members(&mut members);
+    let attempt = context("pair-real");
+    let authority = running_authority("pair-real", &members[0]);
+    attempt.cancel();
+    fs::set_permissions(&roots[0].root, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let error = members[0]
+        .terminate_backend_connection(
+            &authority,
+            BackendConnectionId::new(std::num::NonZeroU64::new(1).unwrap()),
+            &attempt,
+        )
+        .await
+        .unwrap_err();
+    fs::set_permissions(&roots[0].root, fs::Permissions::from_mode(0o700)).unwrap();
+    let MemberTransitionError::Cleanup { primary, cleanup } = error else {
+        panic!("cancelled admission must retain its paired cleanup failure");
+    };
+    assert!(matches!(*primary, MemberTransitionError::Cancelled));
+    assert!(matches!(
+        *cleanup,
+        MysqlInstanceError::Io {
+            operation: kuberic_mysql::service::LifecycleOperation::ScratchCleanup,
+            ..
+        }
+    ));
+    assert!(!members[0].config().runtime().socket().exists());
+    for peer in &members[1..] {
+        assert_eq!(peer.state(), MysqlInstanceState::Running);
+        assert!(peer.config().runtime().socket().exists());
+    }
+
+    let cleanup_attempt = context("pair-real-cleanup");
+    members[0].contain_member(&cleanup_attempt).unwrap();
+    members[1].stop().unwrap();
+    members[2].stop().unwrap();
+    for socket in sockets {
+        socket.join().unwrap();
+    }
+}
+
 struct ScriptMember {
     config: MysqlInstanceConfig,
     containments: usize,
@@ -777,6 +936,86 @@ impl MysqlMemberEffectBoundary for ScriptMember {
         self.containments += 1;
         Ok(AttemptCleanupState::Completed)
     }
+}
+
+fn start_real_members(members: &mut [MysqlInstanceManager; 3]) -> [std::thread::JoinHandle<()>; 3] {
+    std::array::from_fn(|index| {
+        members[index].initialize().unwrap();
+        let socket = provide_socket(
+            members[index].config().runtime().pid().to_owned(),
+            members[index].config().runtime().socket().to_owned(),
+        );
+        members[index].start().unwrap();
+        socket
+    })
+}
+
+fn running_authority(label: &str, manager: &MysqlInstanceManager) -> MemberMutationAuthority {
+    let config = manager.config();
+    let member = config.member_index();
+    let attempt = AttemptId::new(label).unwrap();
+    let scratch = fs::metadata(config.runtime().scratch_root()).unwrap();
+    let data = fs::metadata(config.data_root()).unwrap();
+    let pid = fs::read_to_string(config.runtime().pid())
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let binding = MemberControlBinding::new(
+        attempt.clone(),
+        member,
+        ProcessSessionId::new(format!(
+            "member-{}-generation-1-pid-{pid}-scratch-{}-{}",
+            member.as_usize_for_test() + 1,
+            scratch.dev(),
+            scratch.ino()
+        ))
+        .unwrap(),
+        EndpointBinding::new(format!(
+            "uds:{}:{}:{}",
+            scratch.dev(),
+            scratch.ino(),
+            config.runtime().socket().display()
+        ))
+        .unwrap(),
+        StorageBinding::new(format!("data:{}:{}", data.dev(), data.ino())).unwrap(),
+        MemberAddress::new(config.member().sql_address().to_string()).unwrap(),
+        CredentialGeneration::new("observer-generation").unwrap(),
+        CredentialGeneration::new("recovery-generation").unwrap(),
+    );
+    let observer = ControlCredential::new(
+        attempt.clone(),
+        CredentialGeneration::new("observer-generation").unwrap(),
+        ControlCredentialRole::Observer,
+        "observer_local",
+        "observer-secret",
+    )
+    .unwrap();
+    let recovery = ControlCredential::new(
+        attempt.clone(),
+        CredentialGeneration::new("recovery-generation").unwrap(),
+        ControlCredentialRole::Recovery,
+        "recovery_local",
+        "recovery-secret",
+    )
+    .unwrap();
+    let accounts = AccountProvisioningEvidence::new(
+        binding.clone(),
+        &observer,
+        &recovery,
+        AccountProvisioningEvidence::required_steps().to_vec(),
+    )
+    .unwrap();
+    let enrollment = kuberic_mysql::service::NativeIdentityEnrollment::new(
+        binding,
+        ServerUuid::new(MEMBER_UUIDS[member.as_usize_for_test()]).unwrap(),
+        &accounts,
+        true,
+        GtidSet::empty(),
+        kuberic_mysql::service::NativeIdentityEnrollment::required_steps().to_vec(),
+    )
+    .unwrap();
+    MemberMutationAuthority::new(attempt, GroupName::new(GROUP_UUID).unwrap(), enrollment).unwrap()
 }
 
 fn context(label: &str) -> AttemptContext {

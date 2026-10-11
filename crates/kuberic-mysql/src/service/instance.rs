@@ -412,11 +412,11 @@ impl MysqlInstanceManager {
         recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
-        let deadline = self.member_effect_deadline(input.authority(), attempt)?;
-        let target = self.prepare_member_effect_target(input.authority())?;
+        let target = self.prepare_member_effect_target(input.authority(), attempt)?;
         let authority = input.authority().clone();
         let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
+            let deadline = Self::member_effect_deadline(attempt)?;
             crate::service::control::member_bootstrap(
                 target.clone(),
                 &authority,
@@ -447,12 +447,12 @@ impl MysqlInstanceManager {
         recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
-        let deadline = self.member_effect_deadline(input.authority(), attempt)?;
-        let target = self.prepare_member_effect_target(input.authority())?;
+        let target = self.prepare_member_effect_target(input.authority(), attempt)?;
         let authority = input.authority().clone();
         let predecessor = input.source().evidence().clone();
         let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
+            let deadline = Self::member_effect_deadline(attempt)?;
             crate::service::control::member_join(target.clone(), &authority, recovery, &deadline)
                 .await?;
             poll_member_receipt(
@@ -477,8 +477,8 @@ impl MysqlInstanceManager {
         authority: &MemberMutationAuthority,
         attempt: &AttemptContext,
     ) -> Result<MemberNativeEvidence, MemberTransitionError> {
-        let deadline = self.member_effect_deadline(authority, attempt)?;
-        let target = self.prepare_member_effect_target(authority)?;
+        let target = self.prepare_member_effect_target(authority, attempt)?;
+        let deadline = Self::member_effect_deadline(attempt)?;
         crate::service::control::read_member_view(target, authority, &deadline).await
     }
 
@@ -489,13 +489,13 @@ impl MysqlInstanceManager {
         input: PrimaryTransferInput,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
-        let deadline = self.member_effect_deadline(input.authority(), attempt)?;
-        let target = self.prepare_member_effect_target(input.authority())?;
+        let target = self.prepare_member_effect_target(input.authority(), attempt)?;
         let authority = input.authority().clone();
         let predecessor = input.source().evidence().clone();
         let transfer_target = input.target().clone();
         let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
+            let deadline = Self::member_effect_deadline(attempt)?;
             let current =
                 crate::service::control::read_member_view(target.clone(), &authority, &deadline)
                     .await?;
@@ -536,11 +536,11 @@ impl MysqlInstanceManager {
         connection: BackendConnectionId,
         attempt: &AttemptContext,
     ) -> Result<BackendConnectionReceipt, MemberTransitionError> {
-        let deadline = self.member_effect_deadline(authority, attempt)?;
-        let target = self.prepare_member_effect_target(authority)?;
+        let target = self.prepare_member_effect_target(authority, attempt)?;
         let authority = authority.clone();
         let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
+            let deadline = Self::member_effect_deadline(attempt)?;
             crate::service::control::terminate_backend_connection(
                 target.clone(),
                 &authority,
@@ -566,15 +566,8 @@ impl MysqlInstanceManager {
     }
 
     fn member_effect_deadline(
-        &self,
-        authority: &MemberMutationAuthority,
         attempt: &AttemptContext,
     ) -> Result<NativeControlDeadline, MemberTransitionError> {
-        if attempt.attempt() != authority.attempt() {
-            return Err(MemberTransitionError::Authority(
-                MemberAuthorityError::AttemptMismatch,
-            ));
-        }
         attempt
             .admit_work()
             .map_err(member_attempt_admission_error)?;
@@ -586,7 +579,13 @@ impl MysqlInstanceManager {
     fn prepare_member_effect_target(
         &mut self,
         authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
     ) -> Result<OwnedControlTarget, MemberTransitionError> {
+        if attempt.attempt() != authority.attempt() {
+            return Err(MemberTransitionError::Authority(
+                MemberAuthorityError::AttemptMismatch,
+            ));
+        }
         let target = self.prepare_control_target()?;
         self.revalidate_member_effect_binding(authority)?;
         Ok(target)
