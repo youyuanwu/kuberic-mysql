@@ -936,6 +936,23 @@ impl MysqlMemberEffectBoundary for ScriptMember {
         self.containments += 1;
         Ok(AttemptCleanupState::Completed)
     }
+
+    fn contain_member_exact(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<kuberic_mysql::service::MemberContainmentReceipt, MysqlInstanceError> {
+        let cleanup = self.contain_member(attempt)?;
+        Ok(kuberic_mysql::service::MemberContainmentReceipt::new(
+            authority.clone(),
+            cleanup,
+            true,
+            true,
+            true,
+            true,
+            true,
+        ))
+    }
 }
 
 fn start_real_members(members: &mut [MysqlInstanceManager; 3]) -> [std::thread::JoinHandle<()>; 3] {

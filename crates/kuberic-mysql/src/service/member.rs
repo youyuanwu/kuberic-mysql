@@ -737,17 +737,23 @@ pub struct MemberContainmentReceipt {
     binding: crate::service::MemberControlBinding,
     cleanup: AttemptCleanupState,
     process_absent: bool,
+    pid_absent: bool,
+    socket_absent: bool,
     endpoint_absent: bool,
     scratch_removed: bool,
 }
 
 impl MemberContainmentReceipt {
-    /// Creates one exact terminal receipt from the effect boundary.
+    /// Creates one exact terminal receipt from explicit effect-boundary
+    /// observations. Generic cleanup completion is not terminal provenance.
     #[must_use]
-    pub(crate) fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
         authority: MemberMutationAuthority,
         cleanup: AttemptCleanupState,
         process_absent: bool,
+        pid_absent: bool,
+        socket_absent: bool,
         endpoint_absent: bool,
         scratch_removed: bool,
     ) -> Self {
@@ -757,6 +763,8 @@ impl MemberContainmentReceipt {
             binding,
             cleanup,
             process_absent,
+            pid_absent,
+            socket_absent,
             endpoint_absent,
             scratch_removed,
         }
@@ -786,6 +794,18 @@ impl MemberContainmentReceipt {
         self.process_absent
     }
 
+    /// Whether the exact process PID file is absent.
+    #[must_use]
+    pub const fn pid_absent(&self) -> bool {
+        self.pid_absent
+    }
+
+    /// Whether the exact private socket path is absent.
+    #[must_use]
+    pub const fn socket_absent(&self) -> bool {
+        self.socket_absent
+    }
+
     /// Whether the exact private endpoint is absent.
     #[must_use]
     pub const fn endpoint_absent(&self) -> bool {
@@ -803,6 +823,8 @@ impl MemberContainmentReceipt {
     pub const fn is_complete(&self) -> bool {
         matches!(self.cleanup, AttemptCleanupState::Completed)
             && self.process_absent
+            && self.pid_absent
+            && self.socket_absent
             && self.endpoint_absent
             && self.scratch_removed
     }
@@ -1122,16 +1144,7 @@ pub trait MysqlMemberEffectBoundary {
         &mut self,
         authority: &MemberMutationAuthority,
         attempt: &AttemptContext,
-    ) -> Result<MemberContainmentReceipt, MysqlInstanceError> {
-        let cleanup = self.contain_member(attempt)?;
-        Ok(MemberContainmentReceipt::new(
-            authority.clone(),
-            cleanup,
-            cleanup == AttemptCleanupState::Completed,
-            cleanup == AttemptCleanupState::Completed,
-            cleanup == AttemptCleanupState::Completed,
-        ))
-    }
+    ) -> Result<MemberContainmentReceipt, MysqlInstanceError>;
 }
 
 fn validate_attempt(

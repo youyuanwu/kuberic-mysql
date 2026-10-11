@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::os::unix::fs::FileTypeExt;
 #[cfg(test)]
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -1228,13 +1229,41 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
                 })
             })?;
         let cleanup = self.contain_with_attempt(attempt)?;
+        let process_absent = self.child.is_none();
+        let pid_absent =
+            exact_path_absent(self.config.runtime().pid(), LifecycleOperation::Shutdown)?;
+        let socket_absent = exact_path_absent(
+            self.config.runtime().socket(),
+            LifecycleOperation::SocketDisappearance,
+        )?;
+        let scratch_removed = self.scratch_root.is_none()
+            && exact_path_absent(
+                self.config.runtime().scratch_root(),
+                LifecycleOperation::ScratchCleanup,
+            )?;
         Ok(crate::service::MemberContainmentReceipt::new(
             authority.clone(),
             cleanup,
-            true,
-            true,
-            true,
+            process_absent,
+            pid_absent,
+            socket_absent,
+            socket_absent,
+            scratch_removed,
         ))
+    }
+}
+
+fn exact_path_absent(
+    path: &Path,
+    operation: LifecycleOperation,
+) -> Result<bool, MysqlInstanceError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(MysqlInstanceError::Io {
+            operation,
+            kind: error.kind(),
+        }),
     }
 }
 

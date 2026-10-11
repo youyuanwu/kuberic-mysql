@@ -1140,6 +1140,16 @@ enum Admission {
     Retry(RecordedOutcome),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AcceptedHandoffPublicationProof {
+    proof: MysqlHandoffPublicationProof,
+    epoch: MysqlReplicaEpoch,
+    role: MysqlReplicaRole,
+    configuration: MysqlReplicaConfiguration,
+    authority: MemberMutationAuthority,
+    operation_generation: u64,
+}
+
 /// Public one-member MySQL lifecycle engine.
 ///
 /// `E = MysqlInstanceManager` is the production instantiation. Other
@@ -1166,8 +1176,7 @@ where
     proxy: Option<MysqlClientProxy>,
     proxy_containment: Option<MysqlProxyContainmentReceipt>,
     handoff_publication_required: bool,
-    handoff_publication_ready: bool,
-    handoff_publication_proof: Option<MysqlHandoffPublicationProof>,
+    handoff_publication_proof: Option<AcceptedHandoffPublicationProof>,
     terminal: Option<MysqlTerminalState>,
     last_operation_generation: u64,
     operations: Vec<OperationRecord>,
@@ -1230,7 +1239,6 @@ where
             proxy: None,
             proxy_containment: None,
             handoff_publication_required: false,
-            handoff_publication_ready: false,
             handoff_publication_proof: None,
             terminal: None,
             last_operation_generation: 0,
@@ -1338,7 +1346,7 @@ where
         if let Some(authority) = self.authority.as_ref() {
             let fingerprint =
                 OperationFingerprint::Open(receipt.identity.clone(), receipt.access_generation);
-            return self
+            let result = self
                 .retry_outcome(&operation, &fingerprint)
                 .and_then(|outcome| {
                     if authority == receipt.authority() {
@@ -1347,6 +1355,10 @@ where
                         Err(MysqlReplicatorError::OpenConflict)
                     }
                 });
+            if matches!(result, Err(MysqlReplicatorError::OpenConflict)) {
+                self.invalidate_handoff_publication_proof();
+            }
+            return result;
         }
         self.admit_work()?;
         self.validate_open_receipt(&receipt)?;
@@ -1392,6 +1404,7 @@ where
         self.role_epoch = None;
         self.configuration = None;
         self.progress = None;
+        self.invalidate_handoff_publication_proof();
         self.close_access();
         let outcome = MysqlEpochOutcome { epoch };
         self.complete_last(RecordedOutcome::Epoch(outcome));
@@ -1425,6 +1438,7 @@ where
         self.role = Some(role);
         self.role_epoch = Some(epoch);
         self.progress = None;
+        self.invalidate_handoff_publication_proof();
         self.close_access();
         let outcome = MysqlFormationRoleOutcome { epoch, role };
         self.complete_last(RecordedOutcome::FormationRole(outcome));
@@ -1549,6 +1563,7 @@ where
         remaining: MysqlReplicaTarget,
     ) -> Result<MysqlHandoffBoundary, MysqlReplicatorError> {
         self.require_current_configuration()?;
+        self.admit_work()?;
         if self.role != Some(MysqlReplicaRole::Primary)
             || self
                 .access
@@ -1750,7 +1765,11 @@ where
         self.ensure_proxy_not_published()?;
         self.admit_work()?;
         if let Some(accepted) = self.handoff_publication_proof.as_ref() {
-            return Err(if accepted == &proof {
+            let exact_retry = accepted.proof == proof;
+            if !exact_retry {
+                self.invalidate_handoff_publication_proof();
+            }
+            return Err(if exact_retry {
                 MysqlReplicatorError::HandoffProofDuplicate
             } else {
                 MysqlReplicatorError::HandoffProofConflict
@@ -1775,8 +1794,16 @@ where
         let epoch = self
             .epoch
             .expect("current configuration establishes current epoch");
-        self.handoff_publication_ready = true;
-        self.handoff_publication_proof = Some(proof.clone());
+        self.handoff_publication_proof = Some(AcceptedHandoffPublicationProof {
+            proof: proof.clone(),
+            epoch,
+            role: self
+                .role
+                .expect("current configuration establishes current role"),
+            configuration: configuration.clone(),
+            authority: self.authority().clone(),
+            operation_generation: self.last_operation_generation,
+        });
         let outcome = MysqlHandoffPublicationOutcome {
             boundary: proof.boundary,
             epoch,
@@ -1878,13 +1905,17 @@ where
             self.close_access();
             return Err(MysqlReplicatorError::CloseUnsettled);
         }
-        if !containment.is_complete() {
+        if containment.authority() != &authority
+            || containment.binding() != authority.local().binding()
+            || !containment.is_complete()
+        {
             self.operations[index].status = OperationStatus::Uncertain;
             self.close_access();
             return Err(MysqlReplicatorError::CloseUnsettled);
         }
         self.clear_all_credentials();
         self.close_access();
+        self.invalidate_handoff_publication_proof();
         self.terminal = Some(MysqlTerminalState::Closed);
         let receipt = MysqlSourceTerminalReceipt::new(
             operation_receipt,
@@ -1920,6 +1951,7 @@ where
         let authority = self.authority().clone();
         self.close_access();
         self.clear_all_credentials();
+        self.invalidate_handoff_publication_proof();
         self.terminal = Some(MysqlTerminalState::Aborted);
         let containment = self
             .effects
@@ -2013,6 +2045,14 @@ where
             .as_ref()
             .expect("current configuration was required");
         let epoch = self.epoch.expect("current configuration was required");
+        let current_evidence = self
+            .native_evidence
+            .as_ref()
+            .ok_or(MysqlReplicatorError::HandoffProofRequired)?;
+        let current_progress = match self.progress.map(MysqlProgressOutcome::progress) {
+            Some(ProgressProjection::Projectable(progress)) => progress,
+            _ => return Err(MysqlReplicatorError::HandoffProofRequired),
+        };
         let exact_acceptance = |acceptance: &MysqlHandoffOutcome,
                                 expected: &MysqlReplicaTarget,
                                 role: MysqlReplicaRole|
@@ -2036,6 +2076,9 @@ where
                 MysqlReplicaRole::Secondary,
             )
             || target.authority != *self.authority()
+            || self.role != Some(MysqlReplicaRole::Primary)
+            || target.successor != *current_evidence
+            || target.progress != current_progress
             || source.identity != proof.boundary.source.identity
             || source.source != proof.boundary.source
             || source.authority != proof.boundary.source_authority
@@ -2047,6 +2090,22 @@ where
             return Err(MysqlReplicatorError::HandoffProofRequired);
         }
         Ok(())
+    }
+
+    fn validate_accepted_handoff_publication_proof(
+        &self,
+        accepted: &AcceptedHandoffPublicationProof,
+    ) -> Result<(), MysqlReplicatorError> {
+        if self.last_operation_generation != accepted.operation_generation
+            || self.epoch != Some(accepted.epoch)
+            || self.role != Some(accepted.role)
+            || self.configuration.as_ref() != Some(&accepted.configuration)
+            || self.authority.as_ref() != Some(&accepted.authority)
+            || accepted.role != MysqlReplicaRole::Primary
+        {
+            return Err(MysqlReplicatorError::HandoffProofRequired);
+        }
+        self.validate_handoff_publication_proof(&accepted.proof)
     }
 
     async fn apply_role(
@@ -2119,9 +2178,8 @@ where
         self.role_epoch = Some(epoch);
         if prior_role == Some(MysqlReplicaRole::Secondary) && role == MysqlReplicaRole::Primary {
             self.handoff_publication_required = true;
-            self.handoff_publication_ready = false;
-            self.handoff_publication_proof = None;
         }
+        self.invalidate_handoff_publication_proof();
         self.configuration = None;
         self.native_evidence = Some(evidence);
         self.progress = None;
@@ -2264,6 +2322,7 @@ where
         self.configuration = Some(configuration.clone());
         self.native_evidence = Some(evidence);
         self.progress = None;
+        self.invalidate_handoff_publication_proof();
         self.clear_control_credentials();
         self.close_access();
         let outcome = MysqlConfigurationOutcome { configuration };
@@ -2560,12 +2619,14 @@ where
         operation: MysqlOperationIdentity,
         fingerprint: OperationFingerprint,
     ) -> Result<Admission, MysqlReplicatorError> {
-        if let Some(record) = self
+        if let Some(index) = self
             .operations
             .iter()
-            .find(|record| record.operation.id == operation.id)
+            .position(|record| record.operation.id == operation.id)
         {
+            let record = &self.operations[index];
             if record.operation != operation || record.fingerprint != fingerprint {
+                self.invalidate_handoff_publication_proof();
                 return Err(MysqlReplicatorError::OperationConflict);
             }
             return match &record.status {
@@ -2673,6 +2734,7 @@ where
         }
         self.close_access();
         self.clear_all_credentials();
+        self.invalidate_handoff_publication_proof();
         self.terminal = Some(MysqlTerminalState::Aborted);
         match self.effects.contain_member(&self.attempt) {
             Ok(_) => Err(primary),
@@ -2694,6 +2756,10 @@ where
             access.read = false;
             access.write = false;
         }
+    }
+
+    fn invalidate_handoff_publication_proof(&mut self) {
+        self.handoff_publication_proof = None;
     }
 
     fn clear_control_credentials(&mut self) {
@@ -2867,8 +2933,16 @@ where
                 crate::service::MysqlProxyError::BothPermissionsRequired,
             ));
         }
-        if self.handoff_publication_required && !self.handoff_publication_ready {
-            return Err(MysqlReplicatorError::HandoffProofRequired);
+        if self.handoff_publication_required {
+            let valid = self
+                .handoff_publication_proof
+                .as_ref()
+                .ok_or(MysqlReplicatorError::HandoffProofRequired)
+                .and_then(|accepted| self.validate_accepted_handoff_publication_proof(accepted));
+            if let Err(error) = valid {
+                self.invalidate_handoff_publication_proof();
+                return Err(error);
+            }
         }
         let fingerprint = OperationFingerprint::Access(intent);
         let index = match self.begin_operation(operation, fingerprint)? {
@@ -3072,6 +3146,7 @@ where
             self.close_access();
             self.clear_all_credentials();
             let containment = self.effects.contain_member(&self.attempt);
+            self.invalidate_handoff_publication_proof();
             self.terminal = Some(MysqlTerminalState::Aborted);
             return match containment {
                 Ok(_) => Err(MysqlReplicatorError::Proxy(proxy_error)),
