@@ -78,6 +78,7 @@ pub use proxy::{
 };
 pub use replicator::{
     MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,
+    MysqlFormationRoleOutcome, MysqlFreshMemberCredentials, MysqlFreshMemberInput,
     MysqlOpenOutcome, MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts,
     MysqlPeerOperationIntent, MysqlPeerOperationKind, MysqlPeerOperationOutcome,
     MysqlPeerUnsupportedReason, MysqlProgressOutcome, MysqlReplicaConfiguration, MysqlReplicaEpoch,

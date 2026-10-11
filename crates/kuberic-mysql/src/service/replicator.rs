@@ -292,6 +292,61 @@ impl MysqlOpenReceipt {
     }
 }
 
+/// Credential buffers transferred into one fresh member owner.
+pub struct MysqlFreshMemberCredentials {
+    observer: ControlCredential,
+    recovery: ControlCredential,
+    application: ApplicationCredential,
+}
+
+impl MysqlFreshMemberCredentials {
+    /// Groups the three independently owned credential roles for one member.
+    #[must_use]
+    pub const fn new(
+        observer: ControlCredential,
+        recovery: ControlCredential,
+        application: ApplicationCredential,
+    ) -> Self {
+        Self {
+            observer,
+            recovery,
+            application,
+        }
+    }
+}
+
+/// Complete one-member input for fresh process preparation and enrollment.
+pub struct MysqlFreshMemberInput {
+    config: crate::service::MysqlInstanceConfig,
+    identity: MysqlReplicaIdentity,
+    lineage: ConfiguredGtidLineage,
+    credentials: MysqlFreshMemberCredentials,
+    attempt: AttemptContext,
+    access_generation: NonZeroU64,
+}
+
+impl MysqlFreshMemberInput {
+    /// Creates one explicit fresh-member ownership transfer.
+    #[must_use]
+    pub const fn new(
+        config: crate::service::MysqlInstanceConfig,
+        identity: MysqlReplicaIdentity,
+        lineage: ConfiguredGtidLineage,
+        credentials: MysqlFreshMemberCredentials,
+        attempt: AttemptContext,
+        access_generation: NonZeroU64,
+    ) -> Self {
+        Self {
+            config,
+            identity,
+            lineage,
+            credentials,
+            attempt,
+            access_generation,
+        }
+    }
+}
+
 /// Accepted lifecycle-open outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlOpenOutcome {
@@ -342,6 +397,27 @@ impl MysqlRoleOutcome {
     }
 
     /// Accepted role.
+    #[must_use]
+    pub const fn role(self) -> MysqlReplicaRole {
+        self.role
+    }
+}
+
+/// Accepted fresh-formation role intent pending exact configuration evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MysqlFormationRoleOutcome {
+    epoch: MysqlReplicaEpoch,
+    role: MysqlReplicaRole,
+}
+
+impl MysqlFormationRoleOutcome {
+    /// Epoch whose fresh role intent was accepted.
+    #[must_use]
+    pub const fn epoch(self) -> MysqlReplicaEpoch {
+        self.epoch
+    }
+
+    /// Intended role that the bootstrap or join receipt must prove.
     #[must_use]
     pub const fn role(self) -> MysqlReplicaRole {
         self.role
@@ -640,6 +716,7 @@ enum ConfigurationEffect {
 enum OperationFingerprint {
     Open(MysqlReplicaIdentity, NonZeroU64),
     Epoch(MysqlReplicaEpoch),
+    FormationRole(MysqlReplicaEpoch, MysqlReplicaRole),
     Role(MysqlReplicaEpoch, MysqlReplicaRole, RoleEffect),
     Configuration(MysqlReplicaConfiguration, ConfigurationEffect),
     Progress,
@@ -653,6 +730,7 @@ enum OperationFingerprint {
 enum RecordedOutcome {
     Open(MysqlOpenOutcome),
     Epoch(MysqlEpochOutcome),
+    FormationRole(MysqlFormationRoleOutcome),
     Role(MysqlRoleOutcome),
     Configuration(MysqlConfigurationOutcome),
     Progress(MysqlProgressOutcome),
@@ -723,6 +801,7 @@ where
     native_evidence: Option<MemberNativeEvidence>,
     progress: Option<MysqlProgressOutcome>,
     access: Option<MysqlAccessIntent>,
+    application_credential: Option<ApplicationCredential>,
     proxy: Option<MysqlClientProxy>,
     proxy_containment: Option<MysqlProxyContainmentReceipt>,
     terminal: Option<MysqlTerminalState>,
@@ -735,15 +814,13 @@ where
     E: MysqlMemberEffectBoundary,
 {
     fn drop(&mut self) {
-        let Some(proxy) = self.proxy.as_ref() else {
-            return;
-        };
-        proxy.seal_now();
+        if let Some(proxy) = self.proxy.as_ref() {
+            proxy.seal_now();
+        }
         self.attempt.cancel();
         let _ = self.effects.contain_member(&self.attempt);
         self.terminal = Some(MysqlTerminalState::Aborted);
-        self.observer.clear();
-        self.recovery.clear();
+        self.clear_all_credentials();
     }
 }
 
@@ -785,6 +862,7 @@ where
             native_evidence: None,
             progress: None,
             access: None,
+            application_credential: None,
             proxy: None,
             proxy_containment: None,
             terminal: None,
@@ -805,7 +883,7 @@ where
         self.epoch
     }
 
-    /// Current role, which is current only when `role_epoch == epoch`.
+    /// Current intended role. Fresh formation proves it only when configuration completes.
     #[must_use]
     pub const fn role(&self) -> Option<MysqlReplicaRole> {
         self.role
@@ -839,6 +917,48 @@ where
     #[must_use]
     pub fn credentials_cleared(&self) -> bool {
         self.observer.is_cleared() && self.recovery.is_cleared()
+    }
+
+    /// Returns whether a dedicated application credential is retained locally.
+    #[must_use]
+    pub fn application_credential_staged(&self) -> bool {
+        self.application_credential
+            .as_ref()
+            .is_some_and(|credential| !credential.is_cleared())
+    }
+
+    /// Exact current native evidence, when a receipt-bound operation completed.
+    #[must_use]
+    pub const fn native_evidence(&self) -> Option<&MemberNativeEvidence> {
+        self.native_evidence.as_ref()
+    }
+
+    /// Exact non-owning local target facts after open.
+    pub fn local_target(&self) -> Result<MysqlReplicaTarget, MysqlReplicatorError> {
+        self.require_open_active()?;
+        let enrollment = self.authority().local();
+        let binding = enrollment.binding();
+        Ok(MysqlReplicaTarget::new(
+            self.identity.clone(),
+            MemberPeer::from_enrollment(enrollment),
+            binding.process_session().clone(),
+            binding.endpoint().clone(),
+            binding.storage().clone(),
+        ))
+    }
+
+    /// Current immutable source boundary for a later member join.
+    pub fn source_boundary(&self) -> Result<MemberSourceBoundary, MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        let evidence = self
+            .native_evidence
+            .clone()
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
+        MemberSourceBoundary::new(
+            MemberPeer::from_enrollment(self.authority().local()),
+            evidence,
+        )
+        .map_err(MysqlReplicatorError::MemberTransition)
     }
 
     /// Credits open only from an exact identity, member, attempt, and credential receipt.
@@ -908,6 +1028,39 @@ where
         self.close_access();
         let outcome = MysqlEpochOutcome { epoch };
         self.complete_last(RecordedOutcome::Epoch(outcome));
+        Ok(outcome)
+    }
+
+    /// Accepts fresh bootstrap/join role intent before configuration supplies
+    /// the peer and predecessor inputs required for the exact native effect.
+    pub fn intend_formation_role(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        epoch: MysqlReplicaEpoch,
+        role: MysqlReplicaRole,
+    ) -> Result<MysqlFormationRoleOutcome, MysqlReplicatorError> {
+        self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
+        self.admit_work()?;
+        let fingerprint = OperationFingerprint::FormationRole(epoch, role);
+        match self.begin_operation(operation, fingerprint)? {
+            Admission::Retry(outcome) => return expect_formation_role(outcome),
+            Admission::New(_) => {}
+        }
+        if self.epoch != Some(epoch)
+            || self.role_epoch == Some(epoch)
+            || self.native_evidence.is_some()
+            || self.configuration.is_some()
+        {
+            self.discard_last();
+            return Err(MysqlReplicatorError::EpochBarrierRequired);
+        }
+        self.role = Some(role);
+        self.role_epoch = Some(epoch);
+        self.progress = None;
+        self.close_access();
+        let outcome = MysqlFormationRoleOutcome { epoch, role };
+        self.complete_last(RecordedOutcome::FormationRole(outcome));
         Ok(outcome)
     }
 
@@ -1104,7 +1257,7 @@ where
             self.close_access();
             return Err(MysqlReplicatorError::CloseUnsettled);
         }
-        self.clear_credentials();
+        self.clear_all_credentials();
         self.close_access();
         self.terminal = Some(MysqlTerminalState::Closed);
         Ok(MysqlTerminalOutcome {
@@ -1125,7 +1278,7 @@ where
         let fingerprint = OperationFingerprint::Abort;
         let _ = self.begin_operation(operation, fingerprint)?;
         self.close_access();
-        self.clear_credentials();
+        self.clear_all_credentials();
         self.terminal = Some(MysqlTerminalState::Aborted);
         let cleanup = self
             .effects
@@ -1286,6 +1439,10 @@ where
             ConfigurationEffect::Join { source, .. } => Some(source.as_ref().clone()),
             ConfigurationEffect::Observe | ConfigurationEffect::Bootstrap => None,
         };
+        if matches!(&effect, ConfigurationEffect::Observe) && self.native_evidence.is_none() {
+            self.discard_last();
+            return Err(MysqlReplicatorError::RoleRequired);
+        }
         let request = self.effect_request(
             &request_operation,
             epoch,
@@ -1361,7 +1518,7 @@ where
         self.configuration = Some(configuration.clone());
         self.native_evidence = Some(evidence);
         self.progress = None;
-        self.clear_credentials();
+        self.clear_control_credentials();
         self.close_access();
         let outcome = MysqlConfigurationOutcome { configuration };
         self.complete(index, RecordedOutcome::Configuration(outcome.clone()));
@@ -1773,9 +1930,114 @@ where
         }
     }
 
-    fn clear_credentials(&mut self) {
+    fn clear_control_credentials(&mut self) {
         self.observer.clear();
         self.recovery.clear();
+    }
+
+    fn clear_all_credentials(&mut self) {
+        self.clear_control_credentials();
+        if let Some(credential) = self.application_credential.as_mut() {
+            credential.clear();
+        }
+    }
+}
+
+impl MysqlReplicator<MysqlInstanceManager> {
+    /// Initializes, starts, enrolls, and transfers one exact fresh member owner
+    /// into an unopened replicator. No peer process authority is accepted.
+    pub async fn prepare_fresh_member(
+        input: MysqlFreshMemberInput,
+    ) -> Result<(Self, MysqlOpenReceipt), MysqlReplicatorError> {
+        let MysqlFreshMemberInput {
+            config,
+            identity,
+            lineage,
+            credentials:
+                MysqlFreshMemberCredentials {
+                    mut observer,
+                    mut recovery,
+                    mut application,
+                },
+            attempt,
+            access_generation,
+        } = input;
+        let invalid_configuration = config.topology().is_none();
+        let invalid_credentials = observer.attempt() != attempt.attempt()
+            || recovery.attempt() != attempt.attempt()
+            || application.attempt() != attempt.attempt()
+            || observer.role() != ControlCredentialRole::Observer
+            || recovery.role() != ControlCredentialRole::Recovery;
+        if invalid_configuration || invalid_credentials {
+            observer.clear();
+            recovery.clear();
+            application.clear();
+            return Err(if invalid_configuration {
+                MysqlReplicatorError::InvalidMemberConfiguration
+            } else {
+                MysqlReplicatorError::IdentityMismatch
+            });
+        }
+        if let Err(error) = attempt.admit_work() {
+            observer.clear();
+            recovery.clear();
+            application.clear();
+            return Err(map_admission(error));
+        }
+        let mut effects = MysqlInstanceManager::new(config);
+        if let Err(error) = effects.initialize() {
+            observer.clear();
+            recovery.clear();
+            application.clear();
+            return contain_fresh_failure(
+                &mut effects,
+                &attempt,
+                MysqlReplicatorError::Instance(error),
+            );
+        }
+        if let Err(error) = attempt.admit_work() {
+            observer.clear();
+            recovery.clear();
+            application.clear();
+            return contain_fresh_failure(&mut effects, &attempt, map_admission(error));
+        }
+        if let Err(error) = effects.start() {
+            observer.clear();
+            recovery.clear();
+            application.clear();
+            return contain_fresh_failure(
+                &mut effects,
+                &attempt,
+                MysqlReplicatorError::Instance(error),
+            );
+        }
+        if let Err(error) = attempt.admit_work() {
+            observer.clear();
+            recovery.clear();
+            application.clear();
+            return contain_fresh_failure(&mut effects, &attempt, map_admission(error));
+        }
+        let authority = match effects
+            .enroll_local_control_authority(&attempt, &observer, &recovery)
+            .await
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                observer.clear();
+                recovery.clear();
+                application.clear();
+                return contain_fresh_failure(
+                    &mut effects,
+                    &attempt,
+                    MysqlReplicatorError::MemberTransition(error),
+                );
+            }
+        };
+        let receipt = MysqlOpenReceipt::new(identity.clone(), authority, access_generation);
+        let mut engine = Self::new(effects, identity, lineage, observer, recovery, attempt)
+            .expect("fresh-member inputs were validated before process preparation");
+        engine.application_credential = Some(application);
+        Ok((engine, receipt))
     }
 }
 
@@ -1810,6 +2072,19 @@ where
         self.proxy = Some(proxy);
         self.proxy_containment = None;
         Ok(address)
+    }
+
+    /// Consumes the dedicated credential transferred during fresh-member
+    /// preparation and binds an unpublished loopback gateway.
+    pub async fn prepare_staged_client_proxy(
+        &mut self,
+        listen_address: SocketAddr,
+    ) -> Result<SocketAddr, MysqlReplicatorError> {
+        let credential = self
+            .application_credential
+            .take()
+            .ok_or(MysqlReplicatorError::ApplicationCredentialRequired)?;
+        self.prepare_client_proxy(listen_address, credential).await
     }
 
     /// Explicitly publishes the prepared endpoint for one newer all-or-nothing
@@ -1979,7 +2254,7 @@ where
         };
         if let Err(proxy_error) = proxy_result {
             self.close_access();
-            self.clear_credentials();
+            self.clear_all_credentials();
             let containment = self.effects.contain_member(&self.attempt);
             self.terminal = Some(MysqlTerminalState::Aborted);
             return match containment {
@@ -2020,6 +2295,30 @@ fn expect_epoch(outcome: RecordedOutcome) -> Result<MysqlEpochOutcome, MysqlRepl
         Ok(outcome)
     } else {
         Err(MysqlReplicatorError::OperationConflict)
+    }
+}
+
+fn expect_formation_role(
+    outcome: RecordedOutcome,
+) -> Result<MysqlFormationRoleOutcome, MysqlReplicatorError> {
+    if let RecordedOutcome::FormationRole(outcome) = outcome {
+        Ok(outcome)
+    } else {
+        Err(MysqlReplicatorError::OperationConflict)
+    }
+}
+
+fn contain_fresh_failure(
+    effects: &mut MysqlInstanceManager,
+    attempt: &AttemptContext,
+    prior: MysqlReplicatorError,
+) -> Result<(MysqlReplicator<MysqlInstanceManager>, MysqlOpenReceipt), MysqlReplicatorError> {
+    match effects.contain_member(attempt) {
+        Ok(_) => Err(prior),
+        Err(cleanup) => Err(MysqlReplicatorError::FreshPreparationCleanup {
+            prior: Box::new(prior),
+            cleanup: Box::new(cleanup),
+        }),
     }
 }
 

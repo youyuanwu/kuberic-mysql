@@ -6,6 +6,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU64;
 use std::os::unix::net::UnixListener;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kuberic_mysql::adapter::UnixSocketPath;
@@ -21,19 +23,24 @@ use kuberic_mysql::service::{
     FreshJoinInput, LifecycleOperation, MemberConfigurationIntent, MemberControlBinding,
     MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
     MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
-    MemberTransitionError, MysqlAccessIntent, MysqlInstanceConfig, MysqlInstanceError,
-    MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity,
-    MysqlPeerAuthorityFacts, MysqlPeerOperationIntent, MysqlPeerOperationKind,
-    MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason, MysqlProxyControlBoundary,
-    MysqlProxyError, MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity,
-    MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError,
-    MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
+    MemberTransitionError, MemberViewError, MysqlAccessIntent, MysqlConfigurationOutcome,
+    MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary, MysqlMemberIndex,
+    MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
+    MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
+    MysqlProxyControlBoundary, MysqlProxyError, MysqlReplicaConfiguration, MysqlReplicaEpoch,
+    MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
+    MysqlReplicatorError, MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
 };
 use service_common::{GROUP_UUID, TestRoot};
 
 const LOCAL_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const PEER_UUID: &str = "22222222-2222-2222-2222-222222222222";
 const THIRD_UUID: &str = "33333333-3333-3333-3333-333333333333";
+const MEMBERS: [MysqlMemberIndex; 3] = [
+    MysqlMemberIndex::First,
+    MysqlMemberIndex::Second,
+    MysqlMemberIndex::Third,
+];
 
 #[derive(Clone)]
 enum ReadPlan {
@@ -44,7 +51,15 @@ enum ReadPlan {
     CancelThenExact {
         role: MysqlReplicaRole,
     },
+    Evidence(Box<MemberNativeEvidence>),
     Error,
+}
+
+#[derive(Clone, Copy)]
+enum MutationPlan {
+    Exact,
+    Error,
+    Cancel,
 }
 
 #[derive(Clone)]
@@ -71,8 +86,10 @@ struct ScriptedEffects {
     proxy_socket: UnixSocketPath,
     reads: VecDeque<ReadPlan>,
     receipts: VecDeque<ReceiptPlan>,
+    bootstrap: MutationPlan,
+    join: MutationPlan,
     cleanup: CleanupPlan,
-    containments: usize,
+    containments: Arc<AtomicUsize>,
 }
 
 impl ScriptedEffects {
@@ -95,9 +112,26 @@ impl ScriptedEffects {
             proxy_socket,
             reads: reads.into(),
             receipts: receipts.into(),
+            bootstrap: MutationPlan::Exact,
+            join: MutationPlan::Exact,
             cleanup,
-            containments: 0,
+            containments: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn for_formation(
+        config: MysqlInstanceConfig,
+        reads: Vec<ReadPlan>,
+        bootstrap: MutationPlan,
+        join: MutationPlan,
+        cleanup: CleanupPlan,
+        containments: Arc<AtomicUsize>,
+    ) -> Self {
+        let mut effects = Self::new(config, reads, Vec::new(), cleanup);
+        effects.bootstrap = bootstrap;
+        effects.join = join;
+        effects.containments = containments;
+        effects
     }
 
     fn receipt_request(&mut self, request: MemberEffectRequest) -> MemberEffectRequest {
@@ -154,6 +188,20 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         _recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        match self.bootstrap {
+            MutationPlan::Exact => {}
+            MutationPlan::Error => {
+                self.containments.fetch_add(1, Ordering::Relaxed);
+                return Err(MemberTransitionError::View(
+                    MemberViewError::RequiredMemberMissing,
+                ));
+            }
+            MutationPlan::Cancel => {
+                attempt.cancel();
+                self.containments.fetch_add(1, Ordering::Relaxed);
+                return Err(MemberTransitionError::Cancelled);
+            }
+        }
         let request = input
             .request()
             .cloned()
@@ -178,6 +226,20 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         _recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        match self.join {
+            MutationPlan::Exact => {}
+            MutationPlan::Error => {
+                self.containments.fetch_add(1, Ordering::Relaxed);
+                return Err(MemberTransitionError::View(
+                    MemberViewError::RequiredMemberMissing,
+                ));
+            }
+            MutationPlan::Cancel => {
+                attempt.cancel();
+                self.containments.fetch_add(1, Ordering::Relaxed);
+                return Err(MemberTransitionError::Cancelled);
+            }
+        }
         let request = input
             .request()
             .cloned()
@@ -226,6 +288,7 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
                     ),
                 )
             }
+            ReadPlan::Evidence(evidence) => (*evidence, None),
             ReadPlan::Error => return Err(MemberTransitionError::Cancelled),
         };
         MemberEffectReceipt::for_request(
@@ -282,7 +345,7 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         &mut self,
         _attempt: &AttemptContext,
     ) -> Result<AttemptCleanupState, MysqlInstanceError> {
-        self.containments += 1;
+        self.containments.fetch_add(1, Ordering::Relaxed);
         match self.cleanup {
             CleanupPlan::Completed => Ok(AttemptCleanupState::Completed),
             CleanupPlan::NotRequired => Ok(AttemptCleanupState::NotRequired),
@@ -603,6 +666,369 @@ async fn bootstrap_and_join_credit_only_exact_typed_receipts() {
         join.engine.configuration().unwrap().epoch(),
         MysqlReplicaEpoch::new(1)
     );
+}
+
+#[tokio::test]
+async fn three_independent_owners_form_bootstrap_then_two_sequential_joins() {
+    let roots = [
+        TestRoot::new("form-one"),
+        TestRoot::new("form-two"),
+        TestRoot::new("form-three"),
+    ];
+    let attempt = context("three-owner-formation");
+    let authorities = MEMBERS.map(|member| authority_with_attempt(&attempt, member));
+    let identities = [
+        replica_identity("formation-one"),
+        replica_identity("formation-two"),
+        replica_identity("formation-three"),
+    ];
+    let targets: [MysqlReplicaTarget; 3] = std::array::from_fn(|index| {
+        target_from_authority(identities[index].clone(), &authorities[index])
+    });
+    let executed = format!("{GROUP_UUID}:1");
+    let first_view = evidence_from_members(
+        authorities[0].clone(),
+        "17:1",
+        &[(MysqlMemberIndex::First, MemberRole::Primary)],
+        &executed,
+    );
+    let second_views = [
+        evidence_from_members(
+            authorities[0].clone(),
+            "17:2",
+            &[
+                (MysqlMemberIndex::First, MemberRole::Primary),
+                (MysqlMemberIndex::Second, MemberRole::Secondary),
+            ],
+            &executed,
+        ),
+        evidence_from_members(
+            authorities[1].clone(),
+            "17:2",
+            &[
+                (MysqlMemberIndex::First, MemberRole::Primary),
+                (MysqlMemberIndex::Second, MemberRole::Secondary),
+            ],
+            &executed,
+        ),
+    ];
+    let final_views = MEMBERS.map(|member| {
+        evidence_from_members(
+            authorities[member.as_usize()].clone(),
+            "17:3",
+            &[
+                (MysqlMemberIndex::First, MemberRole::Primary),
+                (MysqlMemberIndex::Second, MemberRole::Secondary),
+                (MysqlMemberIndex::Third, MemberRole::Secondary),
+            ],
+            &executed,
+        )
+    });
+    let counters: [Arc<AtomicUsize>; 3] = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+    let reads: [Vec<ReadPlan>; 3] = [
+        vec![
+            ReadPlan::Evidence(Box::new(second_views[0].clone())),
+            ReadPlan::Evidence(Box::new(final_views[0].clone())),
+            ReadPlan::Evidence(Box::new(final_views[0].clone())),
+        ],
+        vec![
+            ReadPlan::Evidence(Box::new(final_views[1].clone())),
+            ReadPlan::Evidence(Box::new(final_views[1].clone())),
+        ],
+        vec![ReadPlan::Evidence(Box::new(final_views[2].clone()))],
+    ];
+    let mut engines: [MysqlReplicator<ScriptedEffects>; 3] = std::array::from_fn(|index| {
+        MysqlReplicator::new(
+            ScriptedEffects::for_formation(
+                roots[index].config_for_member(MEMBERS[index]),
+                reads[index].clone(),
+                MutationPlan::Exact,
+                MutationPlan::Exact,
+                CleanupPlan::Completed,
+                counters[index].clone(),
+            ),
+            identities[index].clone(),
+            kuberic_mysql::core::ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
+            credential(&attempt, ControlCredentialRole::Observer),
+            credential(&attempt, ControlCredentialRole::Recovery),
+            attempt.clone(),
+        )
+        .unwrap()
+    });
+    for index in 0..3 {
+        engines[index]
+            .open(
+                operation(&format!("formation-open-{index}"), 1),
+                MysqlOpenReceipt::new(
+                    identities[index].clone(),
+                    authorities[index].clone(),
+                    nonzero(1),
+                ),
+            )
+            .unwrap();
+        engines[index]
+            .advance_epoch(
+                operation(&format!("formation-epoch-{index}"), 2),
+                MysqlReplicaEpoch::new(1),
+            )
+            .unwrap();
+        let role = if index == 0 {
+            MysqlReplicaRole::Primary
+        } else {
+            MysqlReplicaRole::Secondary
+        };
+        engines[index]
+            .intend_formation_role(
+                operation(&format!("formation-role-{index}"), 3),
+                MysqlReplicaEpoch::new(1),
+                role,
+            )
+            .unwrap();
+        assert!(engines[index].configuration().is_none());
+        assert!(engines[index].native_evidence().is_none());
+    }
+
+    let first_configuration = formation_configuration("formation-one", 1, vec![targets[0].clone()]);
+    engines[0]
+        .bootstrap_configuration(
+            operation("formation-bootstrap", 4),
+            first_configuration.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        engines[0].native_evidence().unwrap().view(),
+        first_view.view()
+    );
+
+    let second_configuration = formation_configuration(
+        "formation-two",
+        1,
+        vec![targets[0].clone(), targets[1].clone()],
+    );
+    engines[1]
+        .join_configuration(
+            operation("formation-join-second", 4),
+            second_configuration.clone(),
+            engines[0].source_boundary().unwrap(),
+            vec![targets[0].member().clone()],
+        )
+        .await
+        .unwrap();
+    engines[0]
+        .observe_configuration(
+            operation("formation-observe-second", 5),
+            second_configuration,
+        )
+        .await
+        .unwrap();
+
+    let final_configuration = formation_configuration("formation-three", 1, targets.to_vec());
+    engines[2]
+        .join_configuration(
+            operation("formation-join-third", 4),
+            final_configuration.clone(),
+            engines[1].source_boundary().unwrap(),
+            vec![targets[0].member().clone(), targets[1].member().clone()],
+        )
+        .await
+        .unwrap();
+    engines[0]
+        .observe_configuration(
+            operation("formation-observe-third-first", 6),
+            final_configuration.clone(),
+        )
+        .await
+        .unwrap();
+    engines[1]
+        .observe_configuration(
+            operation("formation-observe-third-second", 5),
+            final_configuration.clone(),
+        )
+        .await
+        .unwrap();
+
+    let mut progress = Vec::new();
+    for index in 0..3 {
+        assert_eq!(engines[index].configuration(), Some(&final_configuration));
+        assert_eq!(
+            engines[index].native_evidence().unwrap(),
+            &final_views[index]
+        );
+        assert!(engines[index].proxy_snapshot().is_none());
+        assert!(engines[index].credentials_cleared());
+        progress.push(
+            engines[index]
+                .read_progress(operation(
+                    &format!("formation-progress-{index}"),
+                    if index == 0 {
+                        7
+                    } else if index == 1 {
+                        6
+                    } else {
+                        5
+                    },
+                ))
+                .await
+                .unwrap()
+                .progress(),
+        );
+        assert!(matches!(
+            engines[index]
+                .observe_role(
+                    operation(&format!("formation-same-role-{index}"), 20),
+                    MysqlReplicaEpoch::new(1),
+                    if index == 0 {
+                        MysqlReplicaRole::Primary
+                    } else {
+                        MysqlReplicaRole::Secondary
+                    },
+                )
+                .await,
+            Err(MysqlReplicatorError::EpochBarrierRequired)
+        ));
+    }
+    assert_eq!(progress, vec![progress[0]; 3]);
+    assert!(matches!(
+        progress[0],
+        kuberic_mysql::core::ProgressProjection::Projectable(value) if value.value() == 1
+    ));
+    kuberic_mysql::service::CanonicalViewId::parse(first_view.view().id())
+        .unwrap()
+        .require_successor(
+            kuberic_mysql::service::CanonicalViewId::parse(second_views[0].view().id()).unwrap(),
+        )
+        .unwrap();
+    kuberic_mysql::service::CanonicalViewId::parse(second_views[0].view().id())
+        .unwrap()
+        .require_successor(
+            kuberic_mysql::service::CanonicalViewId::parse(final_views[0].view().id()).unwrap(),
+        )
+        .unwrap();
+
+    for (index, engine) in engines.iter_mut().enumerate() {
+        engine
+            .close(operation(&format!("formation-close-{index}"), 30))
+            .unwrap();
+        assert_eq!(counters[index].load(Ordering::Relaxed), 1);
+    }
+}
+
+#[tokio::test]
+async fn every_formation_effect_contains_only_its_owner_on_failure_or_cancellation() {
+    for (label, member, peer_count) in [
+        ("bootstrap", MysqlMemberIndex::First, 0),
+        ("second-join", MysqlMemberIndex::Second, 1),
+        ("third-join", MysqlMemberIndex::Third, 2),
+    ] {
+        for plan in [MutationPlan::Error, MutationPlan::Cancel] {
+            let counters = [
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ];
+            let (result, mut engines) =
+                run_failed_formation_effect(label, member, peer_count, plan, counters.clone())
+                    .await;
+            assert!(matches!(
+                result,
+                Err(MysqlReplicatorError::MemberTransition(_))
+            ));
+            let failed = member_number(member) - 1;
+            for (index, counter) in counters.iter().enumerate() {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    usize::from(index == failed)
+                );
+            }
+            for (index, engine) in engines.iter_mut().enumerate() {
+                engine
+                    .abort(operation(&format!("{label}-policy-abort-{index}"), 10))
+                    .unwrap();
+            }
+            for (index, counter) in counters.iter().enumerate() {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    1 + usize::from(index == failed)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_formation_effect_rejects_after_the_shared_work_deadline() {
+    for (label, member, peer_count) in [
+        ("bootstrap-deadline", MysqlMemberIndex::First, 0),
+        ("second-join-deadline", MysqlMemberIndex::Second, 1),
+        ("third-join-deadline", MysqlMemberIndex::Third, 2),
+    ] {
+        let root = TestRoot::new(label);
+        let now = Instant::now();
+        let attempt = AttemptContext::new_at(
+            AttemptId::new(label).unwrap(),
+            now,
+            now + Duration::from_millis(80),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        let authority = authority_with_attempt(&attempt, member);
+        let identity = replica_identity(label);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut engine = MysqlReplicator::new(
+            ScriptedEffects::for_formation(
+                root.config_for_member(member),
+                Vec::new(),
+                MutationPlan::Exact,
+                MutationPlan::Exact,
+                CleanupPlan::Completed,
+                counter.clone(),
+            ),
+            identity.clone(),
+            kuberic_mysql::core::ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
+            credential(&attempt, ControlCredentialRole::Observer),
+            credential(&attempt, ControlCredentialRole::Recovery),
+            attempt.clone(),
+        )
+        .unwrap();
+        engine
+            .open(
+                operation(&format!("{label}-open"), 1),
+                MysqlOpenReceipt::new(identity.clone(), authority.clone(), nonzero(1)),
+            )
+            .unwrap();
+        engine
+            .advance_epoch(
+                operation(&format!("{label}-epoch"), 2),
+                MysqlReplicaEpoch::new(1),
+            )
+            .unwrap();
+        engine
+            .intend_formation_role(
+                operation(&format!("{label}-role"), 3),
+                MysqlReplicaEpoch::new(1),
+                if member == MysqlMemberIndex::First {
+                    MysqlReplicaRole::Primary
+                } else {
+                    MysqlReplicaRole::Secondary
+                },
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(55));
+        let result =
+            invoke_formation_effect(&mut engine, &attempt, &identity, &authority, peer_count).await;
+        assert!(matches!(
+            result,
+            Err(MysqlReplicatorError::Deadline(
+                kuberic_mysql::service::AttemptDeadlineState::CleanupReserve
+            ))
+        ));
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        engine
+            .abort(operation(&format!("{label}-abort"), 10))
+            .unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[tokio::test]
@@ -1550,6 +1976,165 @@ fn engine(
     .unwrap()
 }
 
+async fn run_failed_formation_effect(
+    label: &str,
+    member: MysqlMemberIndex,
+    peer_count: usize,
+    plan: MutationPlan,
+    counters: [Arc<AtomicUsize>; 3],
+) -> (
+    Result<MysqlConfigurationOutcome, MysqlReplicatorError>,
+    [MysqlReplicator<ScriptedEffects>; 3],
+) {
+    let roots = [
+        TestRoot::new(&format!("{label}-one")),
+        TestRoot::new(&format!("{label}-two")),
+        TestRoot::new(&format!("{label}-three")),
+    ];
+    let attempt = context(&format!("{label}-attempt"));
+    let authorities = MEMBERS.map(|member| authority_with_attempt(&attempt, member));
+    let identities =
+        MEMBERS.map(|candidate| replica_identity(&format!("{label}-{}", member_number(candidate))));
+    let failed = member_number(member) - 1;
+    let mut engines: [MysqlReplicator<ScriptedEffects>; 3] = std::array::from_fn(|index| {
+        MysqlReplicator::new(
+            ScriptedEffects::for_formation(
+                roots[index].config_for_member(MEMBERS[index]),
+                Vec::new(),
+                if index == failed && member == MysqlMemberIndex::First {
+                    plan
+                } else {
+                    MutationPlan::Exact
+                },
+                if index == failed && member != MysqlMemberIndex::First {
+                    plan
+                } else {
+                    MutationPlan::Exact
+                },
+                CleanupPlan::Completed,
+                counters[index].clone(),
+            ),
+            identities[index].clone(),
+            kuberic_mysql::core::ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
+            credential(&attempt, ControlCredentialRole::Observer),
+            credential(&attempt, ControlCredentialRole::Recovery),
+            attempt.clone(),
+        )
+        .unwrap()
+    });
+    for index in 0..3 {
+        engines[index]
+            .open(
+                operation(&format!("{label}-open-{index}"), 1),
+                MysqlOpenReceipt::new(
+                    identities[index].clone(),
+                    authorities[index].clone(),
+                    nonzero(1),
+                ),
+            )
+            .unwrap();
+        engines[index]
+            .advance_epoch(
+                operation(&format!("{label}-epoch-{index}"), 2),
+                MysqlReplicaEpoch::new(1),
+            )
+            .unwrap();
+        engines[index]
+            .intend_formation_role(
+                operation(&format!("{label}-role-{index}"), 3),
+                MysqlReplicaEpoch::new(1),
+                if index == 0 {
+                    MysqlReplicaRole::Primary
+                } else {
+                    MysqlReplicaRole::Secondary
+                },
+            )
+            .unwrap();
+    }
+    let result = invoke_formation_effect(
+        &mut engines[failed],
+        &attempt,
+        &identities[failed],
+        &authorities[failed],
+        peer_count,
+    )
+    .await;
+    (result, engines)
+}
+
+async fn invoke_formation_effect(
+    engine: &mut MysqlReplicator<ScriptedEffects>,
+    attempt: &AttemptContext,
+    identity: &MysqlReplicaIdentity,
+    authority: &MemberMutationAuthority,
+    peer_count: usize,
+) -> Result<MysqlConfigurationOutcome, MysqlReplicatorError> {
+    if peer_count == 0 {
+        return engine
+            .bootstrap_configuration(
+                operation("invoke-bootstrap", 4),
+                formation_configuration(
+                    "invoke-bootstrap",
+                    1,
+                    vec![target_from_authority(identity.clone(), authority)],
+                ),
+            )
+            .await;
+    }
+    let peer_members = &MEMBERS[..peer_count];
+    let peer_authorities = peer_members
+        .iter()
+        .map(|member| authority_with_attempt(attempt, *member))
+        .collect::<Vec<_>>();
+    let mut targets = peer_authorities
+        .iter()
+        .enumerate()
+        .map(|(index, authority)| {
+            target_from_authority(replica_identity(&format!("invoke-peer-{index}")), authority)
+        })
+        .collect::<Vec<_>>();
+    targets.push(target_from_authority(identity.clone(), authority));
+    let source_authority = peer_authorities
+        .last()
+        .expect("join formation has at least one predecessor")
+        .clone();
+    let source_evidence = evidence_from_members(
+        source_authority.clone(),
+        "81:1",
+        &peer_members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| {
+                (
+                    *member,
+                    if index == 0 {
+                        MemberRole::Primary
+                    } else {
+                        MemberRole::Secondary
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+        &format!("{GROUP_UUID}:1"),
+    );
+    let source = MemberSourceBoundary::new(
+        MemberPeer::from_enrollment(source_authority.local()),
+        source_evidence,
+    )
+    .unwrap();
+    engine
+        .join_configuration(
+            operation("invoke-join", 4),
+            formation_configuration("invoke-join", 1, targets),
+            source,
+            peer_authorities
+                .iter()
+                .map(|authority| MemberPeer::from_enrollment(authority.local()))
+                .collect(),
+        )
+        .await
+}
+
 fn open(harness: &mut Harness) {
     harness
         .engine
@@ -1655,6 +2240,32 @@ fn replica_identity(label: &str) -> MysqlReplicaIdentity {
     MysqlReplicaIdentity::new(
         ReplicaId::new(format!("replica-{label}")).unwrap(),
         ReplicaIncarnation::new(format!("incarnation-{label}")).unwrap(),
+    )
+}
+
+fn target_from_authority(
+    identity: MysqlReplicaIdentity,
+    authority: &MemberMutationAuthority,
+) -> MysqlReplicaTarget {
+    let binding = authority.local().binding();
+    MysqlReplicaTarget::new(
+        identity,
+        MemberPeer::from_enrollment(authority.local()),
+        binding.process_session().clone(),
+        binding.endpoint().clone(),
+        binding.storage().clone(),
+    )
+}
+
+fn formation_configuration(
+    label: &str,
+    epoch: u64,
+    members: Vec<MysqlReplicaTarget>,
+) -> MysqlReplicaConfiguration {
+    MysqlReplicaConfiguration::new(
+        ConfigurationId::new(format!("{label}-configuration")).unwrap(),
+        MysqlReplicaEpoch::new(epoch),
+        members,
     )
 }
 
@@ -1799,7 +2410,12 @@ fn single_member_evidence(
     view_id: &str,
 ) -> MemberNativeEvidence {
     let local = authority.local().binding().member();
-    evidence_from_members(authority, view_id, &[(local, MemberRole::Primary)], "")
+    evidence_from_members(
+        authority,
+        view_id,
+        &[(local, MemberRole::Primary)],
+        &format!("{GROUP_UUID}:1"),
+    )
 }
 
 fn joined_evidence(

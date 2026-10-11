@@ -410,6 +410,8 @@ pub enum MysqlReplicatorError {
     IdentityMismatch,
     /// The member configuration cannot support Group Replication lifecycle work.
     InvalidMemberConfiguration,
+    /// A fresh member did not retain its dedicated application credential.
+    ApplicationCredentialRequired,
     /// The operation generation was not newer than the last admitted operation.
     StaleOperationGeneration,
     /// An operation identity was retried with changed inputs.
@@ -455,6 +457,13 @@ pub enum MysqlReplicatorError {
     Terminal,
     /// The member-local effect failed or completed uncertainly.
     MemberTransition(MemberTransitionError),
+    /// Fresh member preparation failed and exact local containment also failed.
+    FreshPreparationCleanup {
+        /// Original member preparation failure.
+        prior: Box<MysqlReplicatorError>,
+        /// Exact local containment failure.
+        cleanup: Box<MysqlInstanceError>,
+    },
     /// Account, listener, protocol, generation, or gateway containment failed.
     Proxy(MysqlProxyError),
     /// Gateway cleanup failed and local process containment also failed.
