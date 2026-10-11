@@ -5,7 +5,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use crate::core::{CredentialGeneration, GtidSet};
+use crate::core::{
+    ConfiguredGtidLineage, CredentialGeneration, GtidSet, NonProjectableProgressReason,
+    ProgressProjection, QualifiedProgressKind, project_progress,
+};
 use crate::service::config::TOPOLOGY_NATIVE_PROFILE_OPTIONS;
 use crate::service::control::QualificationRecoveryMutation;
 use crate::service::instance::QualificationStopKind;
@@ -587,12 +590,16 @@ impl<'a> MysqlNativeQualification<'a> {
                     reason: "purged history was outside executed history".to_owned(),
                 });
             }
-            match classify_gtid_profile(&snapshot.executed, self.attempt.group_name().as_str()) {
-                GtidProfileCompatibility::CompatibleContiguous { .. } => {}
-                compatibility => {
+            match project_qualification_progress(
+                &snapshot.executed,
+                self.attempt.group_name().as_str(),
+            ) {
+                ProgressProjection::Projectable(progress)
+                    if progress.kind() == QualifiedProgressKind::ContiguousHistory => {}
+                projection => {
                     return Err(QualificationFailure::Incompatible {
                         stage: QualificationStage::GtidCheckpoint,
-                        reason: format!("final GTID history was incompatible: {compatibility:?}"),
+                        reason: format!("final GTID history was incompatible: {projection:?}"),
                     });
                 }
             }
@@ -1810,9 +1817,9 @@ fn validate_applying_gtid(
     let gtid =
         GtidSet::from_str(text).map_err(|error| format!("applying GTID was malformed: {error}"))?;
     if matches!(
-        classify_gtid_profile(&gtid, group_uuid),
-        GtidProfileCompatibility::DoesNotBeginAtOne
-            | GtidProfileCompatibility::CompatibleContiguous { .. }
+        project_qualification_progress(&gtid, group_uuid),
+        ProgressProjection::NonProjectable(NonProjectableProgressReason::DoesNotBeginAtOne)
+            | ProgressProjection::Projectable(_)
     ) && gtid.entries().len() == 1
         && gtid.entries()[0].intervals().len() == 1
         && gtid.entries()[0].intervals()[0].start() == expected_sequence
@@ -2260,10 +2267,10 @@ fn compatible_common_tail(
     let tails = snapshots
         .iter()
         .map(
-            |snapshot| match classify_gtid_profile(&snapshot.executed, group_uuid) {
-                GtidProfileCompatibility::CompatibleContiguous { tail } => Ok(tail),
-                GtidProfileCompatibility::CompatibleEmpty => Ok(0),
-                compatibility => Err(format!("GTID profile was incompatible: {compatibility:?}")),
+            |snapshot| match project_qualification_progress(&snapshot.executed, group_uuid) {
+                ProgressProjection::Projectable(progress) => u64::try_from(progress.value())
+                    .map_err(|_| "qualified progress was negative".to_owned()),
+                projection => Err(format!("GTID profile was incompatible: {projection:?}")),
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
@@ -2574,42 +2581,10 @@ impl NativeProfileEvidence {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum GtidProfileCompatibility {
-    CompatibleEmpty,
-    CompatibleContiguous { tail: u64 },
-    ForeignSource,
-    TaggedSource,
-    MultipleSources,
-    MultipleIntervals,
-    DoesNotBeginAtOne,
-}
-
-fn classify_gtid_profile(executed: &GtidSet, group_uuid: &str) -> GtidProfileCompatibility {
-    let entries = executed.entries();
-    if entries.is_empty() {
-        return GtidProfileCompatibility::CompatibleEmpty;
-    }
-    if entries.len() != 1 {
-        return GtidProfileCompatibility::MultipleSources;
-    }
-    let history = &entries[0];
-    if history.source().server_uuid().as_str() != group_uuid {
-        return GtidProfileCompatibility::ForeignSource;
-    }
-    if history.source().tag().is_some() {
-        return GtidProfileCompatibility::TaggedSource;
-    }
-    if history.intervals().len() != 1 {
-        return GtidProfileCompatibility::MultipleIntervals;
-    }
-    let interval = history.intervals()[0];
-    if interval.start() != 1 {
-        return GtidProfileCompatibility::DoesNotBeginAtOne;
-    }
-    GtidProfileCompatibility::CompatibleContiguous {
-        tail: interval.end(),
-    }
+fn project_qualification_progress(executed: &GtidSet, group_uuid: &str) -> ProgressProjection {
+    let lineage = ConfiguredGtidLineage::new(group_uuid)
+        .expect("qualified topology configuration has a canonical group UUID");
+    project_progress(&lineage, executed)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
