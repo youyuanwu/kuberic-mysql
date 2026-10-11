@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 
 use kuberic_mysql::adapter::UnixSocketPath;
 use kuberic_mysql::core::{
-    AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding,
-    GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState, NativeMember, NativeView,
-    ProcessSessionId, ReplicaId, ReplicaIncarnation, ServerUuid, StorageBinding, ViewId,
+    AttemptId, AuthorityGeneration, ConfigurationId, ConfiguredGtidLineage, CredentialGeneration,
+    EndpointBinding, GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState,
+    NativeMember, NativeView, ProcessSessionId, ProgressProjection, ReplicaId, ReplicaIncarnation,
+    ServerUuid, StorageBinding, ViewId, project_progress,
 };
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential,
@@ -24,12 +25,14 @@ use kuberic_mysql::service::{
     MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
     MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
     MemberTransitionError, MemberViewError, MysqlAccessIntent, MysqlConfigurationOutcome,
-    MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary, MysqlMemberIndex,
-    MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
+    MysqlHandoffBoundary, MysqlHandoffOutcome, MysqlHandoffPublicationProof, MysqlInstanceConfig,
+    MysqlInstanceError, MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt,
+    MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
     MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
     MysqlProxyControlBoundary, MysqlProxyError, MysqlReplicaConfiguration, MysqlReplicaEpoch,
     MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
-    MysqlReplicatorError, MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
+    MysqlReplicatorError, MysqlSourceTerminalReceipt, MysqlTerminalState, NativeIdentityEnrollment,
+    PrimaryTransferInput,
 };
 use service_common::{GROUP_UUID, TestRoot};
 
@@ -80,6 +83,8 @@ enum CleanupPlan {
     Completed,
     NotRequired,
     Failed,
+    StopFailed,
+    ReapFailed,
 }
 
 struct FormationFailurePlan {
@@ -426,7 +431,17 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         match self.cleanup {
             CleanupPlan::Completed => Ok(AttemptCleanupState::Completed),
             CleanupPlan::NotRequired => Ok(AttemptCleanupState::NotRequired),
-            CleanupPlan::Failed => Err(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown)),
+            CleanupPlan::StopFailed => Err(MysqlInstanceError::ChildFailure {
+                operation: LifecycleOperation::Shutdown,
+                code: Some(1),
+            }),
+            CleanupPlan::ReapFailed => {
+                Err(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))
+            }
+            CleanupPlan::Failed => Err(MysqlInstanceError::Io {
+                operation: LifecycleOperation::ScratchCleanup,
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
         }
     }
 }
@@ -2065,111 +2080,301 @@ async fn handoff_target_publication_requires_successor_acceptance() {
         .unwrap();
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HandoffFault {
-    SourceRevokeIneligible,
-    ClosureNativeAbsenceFailure,
-    NonprojectableGtid,
-    DivergentGtid,
-    StaleReceipt,
-    LateReceipt,
-    SameRoleEpochOmission,
-    WrongTransferTarget,
-    WrongTransferView,
-    WrongPrimary,
-    ConfigurationBeforeRole,
-    SourceStopFailure,
-    SourceReapFailure,
-    WrongSuccessor,
-    UnexpectedAdditionalLoss,
-    MissingHistory,
-    ChangedTargetAuthority,
-    Deadline,
-    Cancellation,
+struct PublicationScenario {
+    _roots: [TestRoot; 3],
+    source: MysqlReplicator<ScriptedEffects>,
+    target: MysqlReplicator<ScriptedEffects>,
+    remaining: MysqlReplicator<ScriptedEffects>,
+    boundary: MysqlHandoffBoundary,
+    target_outcome: MysqlHandoffOutcome,
+    remaining_outcome: MysqlHandoffOutcome,
+    source_receipt: MysqlSourceTerminalReceipt,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct HandoffFailureReport {
-    primary: HandoffFault,
-    cleanup: Vec<&'static str>,
-    publication_attempted: bool,
-    write_endpoints: [bool; 3],
+#[tokio::test(flavor = "current_thread")]
+async fn combined_publication_proof_is_required_exact_and_single_use() {
+    let mut scenario = publication_scenario(CleanupPlan::Completed).await;
+    let credential = ApplicationCredential::new(
+        scenario.boundary.source_authority().attempt().clone(),
+        CredentialGeneration::new("target-publication-credential").unwrap(),
+        "application_target",
+        "application-secret",
+    )
+    .unwrap();
+    scenario
+        .target
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            credential,
+        )
+        .await
+        .unwrap();
+    assert_publish_blocked(&mut scenario.target, "before-proof", 10);
+
+    for (label, generation, proof) in [
+        (
+            "missing-target",
+            10,
+            publication_proof(&scenario, false, true, true),
+        ),
+        (
+            "missing-remaining",
+            11,
+            publication_proof(&scenario, true, false, true),
+        ),
+        (
+            "missing-source",
+            12,
+            publication_proof(&scenario, true, true, false),
+        ),
+    ] {
+        assert!(matches!(
+            scenario
+                .target
+                .accept_handoff_publication_proof(operation(label, generation), proof,),
+            Err(MysqlReplicatorError::HandoffProofRequired)
+        ));
+        assert!(!scenario.target.access_intent().unwrap().write());
+    }
+
+    let substituted_remaining = MysqlHandoffPublicationProof::new(
+        scenario.boundary.clone(),
+        Some(scenario.target_outcome.clone()),
+        Some(scenario.target_outcome.clone()),
+        Some(scenario.source_receipt.clone()),
+    );
+    assert!(matches!(
+        scenario.target.accept_handoff_publication_proof(
+            operation("substituted-remaining", 13),
+            substituted_remaining,
+        ),
+        Err(MysqlReplicatorError::HandoffProofRequired)
+    ));
+    assert_publish_blocked(&mut scenario.target, "after-substitution", 14);
+
+    let accepted = scenario
+        .target
+        .accept_handoff_publication_proof(
+            operation("combined-proof", 14),
+            publication_proof(&scenario, true, true, true),
+        )
+        .unwrap();
+    assert_eq!(accepted.target(), scenario.boundary.target().identity());
+    assert_eq!(accepted.boundary(), &scenario.boundary);
+    assert!(matches!(
+        scenario.target.accept_handoff_publication_proof(
+            operation("duplicate-proof", 15),
+            publication_proof(&scenario, true, true, true),
+        ),
+        Err(MysqlReplicatorError::HandoffProofDuplicate)
+    ));
+    assert!(matches!(
+        scenario.target.accept_handoff_publication_proof(
+            operation("conflicting-proof", 15),
+            publication_proof(&scenario, true, true, false),
+        ),
+        Err(MysqlReplicatorError::HandoffProofConflict)
+    ));
+    let published = scenario
+        .target
+        .publish_access(
+            operation("publish-after-proof", 15),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        )
+        .unwrap();
+    assert!(published.is_open());
+    scenario
+        .target
+        .revoke_access(
+            operation("revoke-after-proof", 16),
+            MysqlAccessIntent::new(nonzero(3), false, false),
+        )
+        .await
+        .unwrap();
+    scenario
+        .target
+        .close_with_proxy(operation("target-close", 17))
+        .await
+        .unwrap();
+    scenario
+        .remaining
+        .close(operation("remaining-close", 10))
+        .unwrap();
+    assert_eq!(
+        scenario.source.terminal_state(),
+        Some(MysqlTerminalState::Closed)
+    );
 }
 
-fn run_injected_handoff_failure(
-    fault: HandoffFault,
-    cleanup: Vec<&'static str>,
-) -> HandoffFailureReport {
-    let mut write_endpoints = [false; 3];
-    let mut stage = 0_u8;
-    let fails_at = match fault {
-        HandoffFault::SourceRevokeIneligible | HandoffFault::ClosureNativeAbsenceFailure => 1,
-        HandoffFault::NonprojectableGtid | HandoffFault::DivergentGtid => 2,
-        HandoffFault::SameRoleEpochOmission => 3,
-        HandoffFault::StaleReceipt
-        | HandoffFault::LateReceipt
-        | HandoffFault::WrongTransferTarget
-        | HandoffFault::WrongTransferView
-        | HandoffFault::WrongPrimary
-        | HandoffFault::ConfigurationBeforeRole => 4,
-        HandoffFault::SourceStopFailure | HandoffFault::SourceReapFailure => 6,
-        HandoffFault::WrongSuccessor
-        | HandoffFault::UnexpectedAdditionalLoss
-        | HandoffFault::MissingHistory
-        | HandoffFault::ChangedTargetAuthority => 7,
-        HandoffFault::Deadline | HandoffFault::Cancellation => 0,
-    };
-    while stage < fails_at {
-        stage += 1;
-        assert_eq!(write_endpoints, [false; 3]);
+#[tokio::test(flavor = "current_thread")]
+async fn publication_rejects_substituted_target_remaining_and_source_receipts() {
+    let mut scenario = publication_scenario(CleanupPlan::Completed).await;
+    let substituted_source = scenario
+        .remaining
+        .close(operation("substituted-source-close", 9))
+        .unwrap()
+        .receipt()
+        .clone();
+    for (generation, proof) in [
+        (
+            10,
+            MysqlHandoffPublicationProof::new(
+                scenario.boundary.clone(),
+                Some(scenario.remaining_outcome.clone()),
+                Some(scenario.remaining_outcome.clone()),
+                Some(scenario.source_receipt.clone()),
+            ),
+        ),
+        (
+            11,
+            MysqlHandoffPublicationProof::new(
+                scenario.boundary.clone(),
+                Some(scenario.target_outcome.clone()),
+                Some(scenario.target_outcome.clone()),
+                Some(scenario.source_receipt.clone()),
+            ),
+        ),
+        (
+            12,
+            MysqlHandoffPublicationProof::new(
+                scenario.boundary.clone(),
+                Some(scenario.target_outcome.clone()),
+                Some(scenario.remaining_outcome.clone()),
+                Some(substituted_source),
+            ),
+        ),
+    ] {
+        assert!(matches!(
+            scenario.target.accept_handoff_publication_proof(
+                operation(&format!("invalid-publication-{generation}"), generation),
+                proof,
+            ),
+            Err(MysqlReplicatorError::HandoffProofRequired)
+        ));
+        assert!(!scenario.target.access_intent().unwrap().write());
     }
-    let publication_attempted = true;
-    if stage == 7 {
-        write_endpoints[1] = false;
-    }
-    HandoffFailureReport {
-        primary: fault,
-        cleanup,
-        publication_attempted,
-        write_endpoints,
-    }
+    scenario
+        .target
+        .abort(operation("invalid-target-abort", 13))
+        .unwrap();
 }
 
-#[test]
-fn handoff_fault_matrix_keeps_every_write_endpoint_closed_and_preserves_failures() {
-    let faults = [
-        HandoffFault::SourceRevokeIneligible,
-        HandoffFault::ClosureNativeAbsenceFailure,
-        HandoffFault::NonprojectableGtid,
-        HandoffFault::DivergentGtid,
-        HandoffFault::StaleReceipt,
-        HandoffFault::LateReceipt,
-        HandoffFault::SameRoleEpochOmission,
-        HandoffFault::WrongTransferTarget,
-        HandoffFault::WrongTransferView,
-        HandoffFault::WrongPrimary,
-        HandoffFault::ConfigurationBeforeRole,
-        HandoffFault::SourceStopFailure,
-        HandoffFault::SourceReapFailure,
-        HandoffFault::WrongSuccessor,
-        HandoffFault::UnexpectedAdditionalLoss,
-        HandoffFault::MissingHistory,
-        HandoffFault::ChangedTargetAuthority,
-        HandoffFault::Deadline,
-        HandoffFault::Cancellation,
+#[tokio::test(flavor = "current_thread")]
+async fn successor_faults_use_real_receipt_validation_and_never_enable_publication() {
+    let expected_roles = [
+        (MysqlMemberIndex::First, MemberRole::Primary),
+        (MysqlMemberIndex::Third, MemberRole::Secondary),
     ];
-    for fault in faults {
-        let report = run_injected_handoff_failure(
-            fault,
-            vec!["source cleanup failed", "target cleanup failed"],
+    let wrong_primary = [
+        (MysqlMemberIndex::First, MemberRole::Secondary),
+        (MysqlMemberIndex::Third, MemberRole::Primary),
+    ];
+    let missing_remaining = [(MysqlMemberIndex::First, MemberRole::Primary)];
+    let unexpected_source = [
+        (MysqlMemberIndex::First, MemberRole::Primary),
+        (MysqlMemberIndex::Second, MemberRole::Secondary),
+        (MysqlMemberIndex::Third, MemberRole::Secondary),
+    ];
+    for (label, view, members, executed, substitute_authority) in [
+        (
+            "wrong-successor-view",
+            "91:3",
+            expected_roles.as_slice(),
+            format!("{GROUP_UUID}:1-5"),
+            false,
+        ),
+        (
+            "wrong-primary",
+            "91:2",
+            wrong_primary.as_slice(),
+            format!("{GROUP_UUID}:1-5"),
+            false,
+        ),
+        (
+            "unexpected-additional-loss",
+            "91:2",
+            missing_remaining.as_slice(),
+            format!("{GROUP_UUID}:1-5"),
+            false,
+        ),
+        (
+            "wrong-successor-members",
+            "91:2",
+            unexpected_source.as_slice(),
+            format!("{GROUP_UUID}:1-5"),
+            false,
+        ),
+        (
+            "missing-history",
+            "91:2",
+            expected_roles.as_slice(),
+            format!("{GROUP_UUID}:1-4"),
+            false,
+        ),
+        (
+            "changed-target-authority",
+            "91:2",
+            expected_roles.as_slice(),
+            format!("{GROUP_UUID}:1-5"),
+            true,
+        ),
+    ] {
+        let (_root, mut target, boundary) =
+            target_ready_for_successor(view, members, &executed, substitute_authority).await;
+        assert!(
+            target
+                .accept_handoff_successor(operation(label, 8), boundary)
+                .await
+                .is_err()
         );
-        assert_eq!(report.primary, fault);
-        assert_eq!(
-            report.cleanup,
-            vec!["source cleanup failed", "target cleanup failed"]
+        assert_publish_blocked(&mut target, &format!("{label}-publish"), 9);
+        assert!(!target.access_intent().unwrap().write());
+        target
+            .abort(operation(&format!("{label}-abort"), 9))
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn source_stop_reap_and_cleanup_fail_before_terminal_receipt() {
+    for (label, plan, expected) in [
+        (
+            "stop",
+            CleanupPlan::StopFailed,
+            LifecycleOperation::Shutdown,
+        ),
+        (
+            "reap",
+            CleanupPlan::ReapFailed,
+            LifecycleOperation::Shutdown,
+        ),
+        (
+            "cleanup",
+            CleanupPlan::Failed,
+            LifecycleOperation::ScratchCleanup,
+        ),
+    ] {
+        let mut harness = harness_with_cleanup(
+            vec![
+                exact(MysqlReplicaRole::Primary),
+                exact(MysqlReplicaRole::Primary),
+            ],
+            plan,
         );
-        assert!(report.publication_attempted);
-        assert_eq!(report.write_endpoints, [false; 3]);
+        open(&mut harness);
+        establish_after_open(&mut harness, MysqlReplicaRole::Primary).await;
+        let result = harness
+            .engine
+            .close(operation(&format!("{label}-close"), 5));
+        assert!(matches!(
+            result,
+            Err(MysqlReplicatorError::Instance(
+                MysqlInstanceError::Timeout(operation)
+                    | MysqlInstanceError::ChildFailure { operation, .. }
+                    | MysqlInstanceError::Io { operation, .. }
+            )) if operation == expected
+        ));
+        assert!(!harness.engine.access_intent().unwrap().write());
     }
 }
 
@@ -2327,6 +2532,503 @@ async fn every_operation_rejects_after_terminal_boundary() {
 
 fn harness(reads: Vec<ReadPlan>) -> Harness {
     harness_with_cleanup(reads, CleanupPlan::Completed)
+}
+
+async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
+    let roots = [
+        TestRoot::new("proof-source"),
+        TestRoot::new("proof-target"),
+        TestRoot::new("proof-remaining"),
+    ];
+    let attempts = [
+        context("publication-proof"),
+        context("publication-proof"),
+        context("publication-proof"),
+    ];
+    let authorities = [
+        authority_with_attempt(&attempts[0], MysqlMemberIndex::First),
+        authority_with_attempt(&attempts[1], MysqlMemberIndex::Second),
+        authority_with_attempt(&attempts[2], MysqlMemberIndex::Third),
+    ];
+    let identities = [
+        replica_identity("proof-source"),
+        replica_identity("proof-target"),
+        replica_identity("proof-remaining"),
+    ];
+    let targets = [
+        target_from_authority(identities[0].clone(), &authorities[0]),
+        target_from_authority(identities[1].clone(), &authorities[1]),
+        target_from_authority(identities[2].clone(), &authorities[2]),
+    ];
+    let predecessor_roles = [
+        (MysqlMemberIndex::First, MemberRole::Primary),
+        (MysqlMemberIndex::Second, MemberRole::Secondary),
+        (MysqlMemberIndex::Third, MemberRole::Secondary),
+    ];
+    let transferred_roles = [
+        (MysqlMemberIndex::First, MemberRole::Secondary),
+        (MysqlMemberIndex::Second, MemberRole::Primary),
+        (MysqlMemberIndex::Third, MemberRole::Secondary),
+    ];
+    let source_reads = vec![
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[0].clone(),
+            "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[0].clone(),
+            "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[0].clone(),
+            "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[0].clone(),
+            "71:1",
+            &transferred_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+    ];
+    let target_reads = vec![
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[1].clone(),
+            "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[1].clone(),
+            "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[1].clone(),
+            "71:1",
+            &transferred_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[1].clone(),
+            "71:1",
+            &transferred_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[1].clone(),
+            "71:2",
+            &transferred_roles[1..],
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+    ];
+    let remaining_reads = vec![
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[2].clone(),
+            "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[2].clone(),
+            "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[2].clone(),
+            "71:1",
+            &transferred_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[2].clone(),
+            "71:1",
+            &transferred_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[2].clone(),
+            "71:2",
+            &transferred_roles[1..],
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+    ];
+    let mut source = engine(
+        roots[0].config_for_member(MysqlMemberIndex::First),
+        identities[0].clone(),
+        attempts[0].clone(),
+        source_reads,
+        Vec::new(),
+        cleanup,
+    );
+    let mut target = engine(
+        roots[1].config_for_member(MysqlMemberIndex::Second),
+        identities[1].clone(),
+        attempts[1].clone(),
+        target_reads,
+        Vec::new(),
+        CleanupPlan::Completed,
+    );
+    let mut remaining = engine(
+        roots[2].config_for_member(MysqlMemberIndex::Third),
+        identities[2].clone(),
+        attempts[2].clone(),
+        remaining_reads,
+        Vec::new(),
+        CleanupPlan::Completed,
+    );
+    for (engine, identity, authority) in [
+        (&mut source, &identities[0], &authorities[0]),
+        (&mut target, &identities[1], &authorities[1]),
+        (&mut remaining, &identities[2], &authorities[2]),
+    ] {
+        engine
+            .open(
+                operation(&format!("open-{}", identity.replica_id().as_str()), 1),
+                MysqlOpenReceipt::new(identity.clone(), authority.clone(), nonzero(1)),
+            )
+            .unwrap();
+    }
+    let predecessor_configuration = MysqlReplicaConfiguration::new(
+        ConfigurationId::new("proof-configuration-1").unwrap(),
+        MysqlReplicaEpoch::new(1),
+        targets.to_vec(),
+    );
+    for (engine, role, label) in [
+        (&mut source, MysqlReplicaRole::Primary, "source"),
+        (&mut target, MysqlReplicaRole::Secondary, "target"),
+        (&mut remaining, MysqlReplicaRole::Secondary, "remaining"),
+    ] {
+        engine
+            .advance_epoch(
+                operation(&format!("{label}-epoch-1"), 2),
+                MysqlReplicaEpoch::new(1),
+            )
+            .unwrap();
+        engine
+            .observe_role(
+                operation(&format!("{label}-role-1"), 3),
+                MysqlReplicaEpoch::new(1),
+                role,
+            )
+            .await
+            .unwrap();
+        engine
+            .observe_configuration(
+                operation(&format!("{label}-configuration-1"), 4),
+                predecessor_configuration.clone(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let credential = ApplicationCredential::new(
+        attempts[0].attempt().clone(),
+        CredentialGeneration::new("source-publication-credential").unwrap(),
+        "application_source",
+        "application-secret",
+    )
+    .unwrap();
+    source
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            credential,
+        )
+        .await
+        .unwrap();
+    source
+        .publish_access(
+            operation("source-publish", 5),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        )
+        .unwrap();
+    source
+        .revoke_access(
+            operation("source-revoke", 6),
+            MysqlAccessIntent::new(nonzero(3), false, false),
+        )
+        .await
+        .unwrap();
+    source
+        .read_progress(operation("source-progress", 7))
+        .await
+        .unwrap();
+    let transfer_source = source.source_boundary().unwrap();
+    let boundary = source
+        .freeze_handoff_boundary(targets[1].clone(), targets[2].clone())
+        .unwrap();
+    source.retire_contained_client_proxy().await.unwrap();
+
+    for (engine, label, generation) in [
+        (&mut source, "source", 8),
+        (&mut target, "target", 5),
+        (&mut remaining, "remaining", 5),
+    ] {
+        engine
+            .advance_epoch(
+                operation(&format!("{label}-epoch-2"), generation),
+                MysqlReplicaEpoch::new(2),
+            )
+            .unwrap();
+    }
+    source
+        .transfer_role(
+            operation("source-transfer", 9),
+            MysqlReplicaEpoch::new(2),
+            MysqlReplicaRole::Secondary,
+            transfer_source,
+            targets[1].member().clone(),
+        )
+        .await
+        .unwrap();
+    target
+        .observe_role(
+            operation("target-role-2", 6),
+            MysqlReplicaEpoch::new(2),
+            MysqlReplicaRole::Primary,
+        )
+        .await
+        .unwrap();
+    remaining
+        .observe_role(
+            operation("remaining-role-2", 6),
+            MysqlReplicaEpoch::new(2),
+            MysqlReplicaRole::Secondary,
+        )
+        .await
+        .unwrap();
+    let successor_configuration = MysqlReplicaConfiguration::new(
+        ConfigurationId::new("proof-configuration-2").unwrap(),
+        MysqlReplicaEpoch::new(2),
+        targets.to_vec(),
+    );
+    source
+        .observe_configuration(
+            operation("source-configuration-2", 10),
+            successor_configuration.clone(),
+        )
+        .await
+        .unwrap();
+    target
+        .observe_configuration(
+            operation("target-configuration-2", 7),
+            successor_configuration.clone(),
+        )
+        .await
+        .unwrap();
+    remaining
+        .observe_configuration(
+            operation("remaining-configuration-2", 7),
+            successor_configuration,
+        )
+        .await
+        .unwrap();
+    let source_terminal = source.close(operation("source-close", 11)).unwrap();
+    let remaining_outcome = remaining
+        .accept_handoff_successor(operation("remaining-successor", 8), boundary.clone())
+        .await
+        .unwrap();
+    let target_outcome = target
+        .accept_handoff_successor(operation("target-successor", 8), boundary.clone())
+        .await
+        .unwrap();
+    PublicationScenario {
+        _roots: roots,
+        source,
+        target,
+        remaining,
+        boundary,
+        target_outcome,
+        remaining_outcome,
+        source_receipt: source_terminal.receipt().clone(),
+    }
+}
+
+fn publication_proof(
+    scenario: &PublicationScenario,
+    target: bool,
+    remaining: bool,
+    source: bool,
+) -> MysqlHandoffPublicationProof {
+    MysqlHandoffPublicationProof::new(
+        scenario.boundary.clone(),
+        target.then(|| scenario.target_outcome.clone()),
+        remaining.then(|| scenario.remaining_outcome.clone()),
+        source.then(|| scenario.source_receipt.clone()),
+    )
+}
+
+fn assert_publish_blocked(
+    target: &mut MysqlReplicator<ScriptedEffects>,
+    label: &str,
+    generation: u64,
+) {
+    assert!(matches!(
+        target.publish_access(
+            operation(label, generation),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        ),
+        Err(MysqlReplicatorError::HandoffProofRequired)
+    ));
+    assert!(!target.access_intent().unwrap().write());
+}
+
+async fn target_ready_for_successor(
+    successor_view: &str,
+    successor_members: &[(MysqlMemberIndex, MemberRole)],
+    successor_executed: &str,
+    substitute_authority: bool,
+) -> (
+    TestRoot,
+    MysqlReplicator<ScriptedEffects>,
+    MysqlHandoffBoundary,
+) {
+    let root = TestRoot::new("successor-fault");
+    let attempt = context("successor-fault");
+    let target_authority = authority_with_attempt(&attempt, MysqlMemberIndex::First);
+    let source_authority = authority_with_attempt(&attempt, MysqlMemberIndex::Second);
+    let remaining_authority = authority_with_attempt(&attempt, MysqlMemberIndex::Third);
+    let target_identity = replica_identity("successor-target");
+    let source_identity = replica_identity("successor-source");
+    let remaining_identity = replica_identity("successor-remaining");
+    let targets = [
+        target_from_authority(target_identity.clone(), &target_authority),
+        target_from_authority(source_identity, &source_authority),
+        target_from_authority(remaining_identity, &remaining_authority),
+    ];
+    let predecessor_roles = [
+        (MysqlMemberIndex::First, MemberRole::Secondary),
+        (MysqlMemberIndex::Second, MemberRole::Primary),
+        (MysqlMemberIndex::Third, MemberRole::Secondary),
+    ];
+    let promoted_roles = [
+        (MysqlMemberIndex::First, MemberRole::Primary),
+        (MysqlMemberIndex::Second, MemberRole::Secondary),
+        (MysqlMemberIndex::Third, MemberRole::Secondary),
+    ];
+    let successor_authority = if substitute_authority {
+        authority("substituted-successor", MysqlMemberIndex::First)
+    } else {
+        target_authority.clone()
+    };
+    let reads = vec![
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            target_authority.clone(),
+            "91:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            target_authority.clone(),
+            "91:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            target_authority.clone(),
+            "91:1",
+            &promoted_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            target_authority.clone(),
+            "91:1",
+            &promoted_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            successor_authority,
+            successor_view,
+            successor_members,
+            successor_executed,
+        ))),
+    ];
+    let mut target = engine(
+        root.config_for_member(MysqlMemberIndex::First),
+        target_identity.clone(),
+        attempt,
+        reads,
+        Vec::new(),
+        CleanupPlan::Completed,
+    );
+    target
+        .open(
+            operation("successor-open", 1),
+            MysqlOpenReceipt::new(target_identity, target_authority.clone(), nonzero(1)),
+        )
+        .unwrap();
+    let predecessor_configuration = MysqlReplicaConfiguration::new(
+        ConfigurationId::new("successor-configuration-1").unwrap(),
+        MysqlReplicaEpoch::new(1),
+        targets.to_vec(),
+    );
+    target
+        .advance_epoch(operation("successor-epoch-1", 2), MysqlReplicaEpoch::new(1))
+        .unwrap();
+    target
+        .observe_role(
+            operation("successor-role-1", 3),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Secondary,
+        )
+        .await
+        .unwrap();
+    target
+        .observe_configuration(
+            operation("successor-configuration-1", 4),
+            predecessor_configuration.clone(),
+        )
+        .await
+        .unwrap();
+    let executed = GtidSet::from_str(&format!("{GROUP_UUID}:1-5")).unwrap();
+    let progress =
+        match project_progress(&ConfiguredGtidLineage::new(GROUP_UUID).unwrap(), &executed) {
+            ProgressProjection::Projectable(progress) => progress,
+            ProgressProjection::NonProjectable(reason) => {
+                panic!("test boundary must project: {reason:?}")
+            }
+        };
+    let boundary = MysqlHandoffBoundary::new(
+        predecessor_configuration,
+        MysqlReplicaEpoch::new(1),
+        source_authority,
+        targets[1].clone(),
+        targets[0].clone(),
+        targets[2].clone(),
+        ViewId::new("91:1").unwrap(),
+        executed,
+        progress,
+    );
+    target
+        .advance_epoch(operation("successor-epoch-2", 5), MysqlReplicaEpoch::new(2))
+        .unwrap();
+    target
+        .observe_role(
+            operation("successor-role-2", 6),
+            MysqlReplicaEpoch::new(2),
+            MysqlReplicaRole::Primary,
+        )
+        .await
+        .unwrap();
+    target
+        .observe_configuration(
+            operation("successor-configuration-2", 7),
+            MysqlReplicaConfiguration::new(
+                ConfigurationId::new("successor-configuration-2").unwrap(),
+                MysqlReplicaEpoch::new(2),
+                targets.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+    (root, target, boundary)
 }
 
 fn harness_with_cleanup(reads: Vec<ReadPlan>, cleanup: CleanupPlan) -> Harness {

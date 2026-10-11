@@ -30,6 +30,7 @@ async fn controlled_handoff_closes_source_before_target_publication() {
         HandoffStage::SourceStoppedAndReaped,
         HandoffStage::RemainingSuccessorAccepted,
         HandoffStage::TargetSuccessorAccepted,
+        HandoffStage::PublicationProofAccepted,
         HandoffStage::TargetPublished,
         HandoffStage::TargetMutationCompleted,
         HandoffStage::SourceUnavailableConfirmed,

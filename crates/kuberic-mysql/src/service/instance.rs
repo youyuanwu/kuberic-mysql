@@ -1208,6 +1208,34 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
     ) -> Result<AttemptCleanupState, MysqlInstanceError> {
         self.contain_with_attempt(attempt)
     }
+
+    fn contain_member_exact(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
+        self.revalidate_member_effect_binding(authority)
+            .map_err(|error| {
+                MysqlInstanceError::Ownership(match error {
+                    MemberTransitionError::Authority(
+                        crate::service::MemberAuthorityError::LocalBindingMismatch
+                        | crate::service::MemberAuthorityError::AttemptMismatch
+                        | crate::service::MemberAuthorityError::AuthoritySubstitution
+                        | crate::service::MemberAuthorityError::SourceMismatch
+                        | crate::service::MemberAuthorityError::WrongTransferTarget,
+                    ) => crate::service::OwnershipError::RootMismatch,
+                    _ => crate::service::OwnershipError::InspectionFailed,
+                })
+            })?;
+        let cleanup = self.contain_with_attempt(attempt)?;
+        Ok(crate::service::MemberContainmentReceipt::new(
+            authority.clone(),
+            cleanup,
+            true,
+            true,
+            true,
+        ))
+    }
 }
 
 impl MysqlProxyControlBoundary for MysqlInstanceManager {

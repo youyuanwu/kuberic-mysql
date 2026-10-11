@@ -17,11 +17,11 @@ use crate::service::{
     ApplicationCredential, AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState,
     AttemptContext, AttemptDeadlineState, CanonicalViewId, ControlCredential,
     ControlCredentialRole, FreshBootstrapInput, FreshJoinInput, MemberConfigurationIntent,
-    MemberConfigurationTarget, MemberEffectKind, MemberEffectReceipt, MemberEffectRequest,
-    MemberMutationAuthority, MemberNativeEvidence, MemberOperationIdentity, MemberPeer,
-    MemberSourceBoundary, MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary,
-    MysqlProxyContainmentReceipt, MysqlProxyControlBoundary, MysqlReplicatorError,
-    PrimaryTransferInput,
+    MemberConfigurationTarget, MemberContainmentReceipt, MemberEffectKind, MemberEffectReceipt,
+    MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence, MemberOperationIdentity,
+    MemberPeer, MemberSourceBoundary, MysqlClientProxy, MysqlInstanceManager,
+    MysqlMemberEffectBoundary, MysqlProxyContainmentReceipt, MysqlProxyControlBoundary,
+    MysqlReplicatorError, PrimaryTransferInput,
 };
 
 /// Exact logical identity of one member-local replica incarnation.
@@ -654,6 +654,8 @@ pub struct MysqlProgressOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlHandoffBoundary {
     configuration: MysqlReplicaConfiguration,
+    source_epoch: MysqlReplicaEpoch,
+    source_authority: MemberMutationAuthority,
     source: MysqlReplicaTarget,
     target: MysqlReplicaTarget,
     remaining: MysqlReplicaTarget,
@@ -663,10 +665,50 @@ pub struct MysqlHandoffBoundary {
 }
 
 impl MysqlHandoffBoundary {
+    /// Creates one explicit frozen boundary for transport or reconstruction.
+    /// Every consumer revalidates all fields against current local authority.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        configuration: MysqlReplicaConfiguration,
+        source_epoch: MysqlReplicaEpoch,
+        source_authority: MemberMutationAuthority,
+        source: MysqlReplicaTarget,
+        target: MysqlReplicaTarget,
+        remaining: MysqlReplicaTarget,
+        predecessor_view: ViewId,
+        executed: GtidSet,
+        progress: QualifiedProgress,
+    ) -> Self {
+        Self {
+            configuration,
+            source_epoch,
+            source_authority,
+            source,
+            target,
+            remaining,
+            predecessor_view,
+            executed,
+            progress,
+        }
+    }
+
     /// Current three-member configuration retained across the planned stop.
     #[must_use]
     pub const fn configuration(&self) -> &MysqlReplicaConfiguration {
         &self.configuration
+    }
+
+    /// Epoch current on the source when the boundary was frozen.
+    #[must_use]
+    pub const fn source_epoch(&self) -> MysqlReplicaEpoch {
+        self.source_epoch
+    }
+
+    /// Exact current source authority admitted when the boundary was frozen.
+    #[must_use]
+    pub const fn source_authority(&self) -> &MemberMutationAuthority {
+        &self.source_authority
     }
 
     /// Source that must be the only absent successor member.
@@ -687,6 +729,12 @@ impl MysqlHandoffBoundary {
         &self.remaining
     }
 
+    /// Exact predecessor view frozen before the source stopped.
+    #[must_use]
+    pub const fn predecessor_view(&self) -> &ViewId {
+        &self.predecessor_view
+    }
+
     /// Complete structured source history frozen after eligible revocation.
     #[must_use]
     pub const fn executed(&self) -> &GtidSet {
@@ -701,30 +749,253 @@ impl MysqlHandoffBoundary {
 }
 
 /// Accepted two-survivor controlled-handoff evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlHandoffOutcome {
+    boundary: MysqlHandoffBoundary,
+    identity: MysqlReplicaIdentity,
+    authority: MemberMutationAuthority,
+    configuration: MysqlReplicaConfiguration,
+    successor: MemberNativeEvidence,
     epoch: MysqlReplicaEpoch,
     role: MysqlReplicaRole,
     progress: QualifiedProgress,
 }
 
 impl MysqlHandoffOutcome {
+    /// Creates explicit successor evidence for transport to the target. The
+    /// target validates every field before granting publication credit.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        boundary: MysqlHandoffBoundary,
+        identity: MysqlReplicaIdentity,
+        authority: MemberMutationAuthority,
+        configuration: MysqlReplicaConfiguration,
+        successor: MemberNativeEvidence,
+        epoch: MysqlReplicaEpoch,
+        role: MysqlReplicaRole,
+        progress: QualifiedProgress,
+    ) -> Self {
+        Self {
+            boundary,
+            identity,
+            authority,
+            configuration,
+            successor,
+            epoch,
+            role,
+            progress,
+        }
+    }
+
+    /// Exact frozen boundary accepted by this successor.
+    #[must_use]
+    pub const fn boundary(&self) -> &MysqlHandoffBoundary {
+        &self.boundary
+    }
+
+    /// Exact accepting replica incarnation.
+    #[must_use]
+    pub const fn identity(&self) -> &MysqlReplicaIdentity {
+        &self.identity
+    }
+
+    /// Exact accepting member authority.
+    #[must_use]
+    pub const fn authority(&self) -> &MemberMutationAuthority {
+        &self.authority
+    }
+
+    /// Exact current configuration accepted by this successor.
+    #[must_use]
+    pub const fn configuration(&self) -> &MysqlReplicaConfiguration {
+        &self.configuration
+    }
+
+    /// Exact canonical successor view and structured history accepted locally.
+    #[must_use]
+    pub const fn successor(&self) -> &MemberNativeEvidence {
+        &self.successor
+    }
+
     /// Current epoch whose unchanged configuration remains accepted.
     #[must_use]
-    pub const fn epoch(self) -> MysqlReplicaEpoch {
+    pub const fn epoch(&self) -> MysqlReplicaEpoch {
         self.epoch
     }
 
     /// Exact local role in the successor view.
     #[must_use]
-    pub const fn role(self) -> MysqlReplicaRole {
+    pub const fn role(&self) -> MysqlReplicaRole {
         self.role
     }
 
     /// Current qualified scalar containing the frozen boundary.
     #[must_use]
-    pub const fn progress(self) -> QualifiedProgress {
+    pub const fn progress(&self) -> QualifiedProgress {
         self.progress
+    }
+}
+
+/// Exact source close/stop/reap evidence bound to the admitted source
+/// incarnation, process session, storage, endpoint, and native identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MysqlSourceTerminalReceipt {
+    operation: MysqlOperationIdentity,
+    identity: MysqlReplicaIdentity,
+    source: MysqlReplicaTarget,
+    authority: MemberMutationAuthority,
+    state: MysqlTerminalState,
+    containment: MemberContainmentReceipt,
+}
+
+impl MysqlSourceTerminalReceipt {
+    /// Creates explicit terminal evidence. Publication accepts only exact,
+    /// complete `Closed` evidence matching the frozen source boundary.
+    #[must_use]
+    pub(crate) const fn new(
+        operation: MysqlOperationIdentity,
+        identity: MysqlReplicaIdentity,
+        source: MysqlReplicaTarget,
+        authority: MemberMutationAuthority,
+        state: MysqlTerminalState,
+        containment: MemberContainmentReceipt,
+    ) -> Self {
+        Self {
+            operation,
+            identity,
+            source,
+            authority,
+            state,
+            containment,
+        }
+    }
+
+    /// Exact close or abort operation identity.
+    #[must_use]
+    pub const fn operation(&self) -> &MysqlOperationIdentity {
+        &self.operation
+    }
+
+    /// Exact logical source incarnation.
+    #[must_use]
+    pub const fn identity(&self) -> &MysqlReplicaIdentity {
+        &self.identity
+    }
+
+    /// Exact configured source identity and binding.
+    #[must_use]
+    pub const fn source(&self) -> &MysqlReplicaTarget {
+        &self.source
+    }
+
+    /// Exact source member authority.
+    #[must_use]
+    pub const fn authority(&self) -> &MemberMutationAuthority {
+        &self.authority
+    }
+
+    /// Terminal lifecycle state.
+    #[must_use]
+    pub const fn state(&self) -> MysqlTerminalState {
+        self.state
+    }
+
+    /// Production effect-boundary stop/reap/absence receipt.
+    #[must_use]
+    pub const fn containment(&self) -> &MemberContainmentReceipt {
+        &self.containment
+    }
+}
+
+/// Combined handoff evidence submitted to the target before publication.
+///
+/// Optional components make incomplete transport or durable reconstruction
+/// fail closed at the target operation rather than being inferred.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MysqlHandoffPublicationProof {
+    boundary: MysqlHandoffBoundary,
+    target: Option<MysqlHandoffOutcome>,
+    remaining: Option<MysqlHandoffOutcome>,
+    source: Option<MysqlSourceTerminalReceipt>,
+}
+
+impl MysqlHandoffPublicationProof {
+    /// Creates one proof submission, including intentionally incomplete input
+    /// that the target must reject.
+    #[must_use]
+    pub const fn new(
+        boundary: MysqlHandoffBoundary,
+        target: Option<MysqlHandoffOutcome>,
+        remaining: Option<MysqlHandoffOutcome>,
+        source: Option<MysqlSourceTerminalReceipt>,
+    ) -> Self {
+        Self {
+            boundary,
+            target,
+            remaining,
+            source,
+        }
+    }
+
+    /// Exact frozen source boundary.
+    #[must_use]
+    pub const fn boundary(&self) -> &MysqlHandoffBoundary {
+        &self.boundary
+    }
+
+    /// Exact target successor acceptance.
+    #[must_use]
+    pub const fn target(&self) -> Option<&MysqlHandoffOutcome> {
+        self.target.as_ref()
+    }
+
+    /// Exact remaining successor acceptance.
+    #[must_use]
+    pub const fn remaining(&self) -> Option<&MysqlHandoffOutcome> {
+        self.remaining.as_ref()
+    }
+
+    /// Exact source terminal close receipt.
+    #[must_use]
+    pub const fn source(&self) -> Option<&MysqlSourceTerminalReceipt> {
+        self.source.as_ref()
+    }
+}
+
+/// Accepted publication-proof result. Access is still closed until a separate
+/// newer generation is explicitly published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MysqlHandoffPublicationOutcome {
+    boundary: MysqlHandoffBoundary,
+    epoch: MysqlReplicaEpoch,
+    configuration: MysqlReplicaConfiguration,
+    target: MysqlReplicaIdentity,
+}
+
+impl MysqlHandoffPublicationOutcome {
+    /// Exact frozen source boundary.
+    #[must_use]
+    pub const fn boundary(&self) -> &MysqlHandoffBoundary {
+        &self.boundary
+    }
+
+    /// Current target epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> MysqlReplicaEpoch {
+        self.epoch
+    }
+
+    /// Current unchanged three-member configuration.
+    #[must_use]
+    pub const fn configuration(&self) -> &MysqlReplicaConfiguration {
+        &self.configuration
+    }
+
+    /// Exact target incarnation granted publication readiness.
+    #[must_use]
+    pub const fn target(&self) -> &MysqlReplicaIdentity {
+        &self.target
     }
 }
 
@@ -752,23 +1023,30 @@ pub enum MysqlTerminalState {
 }
 
 /// Accepted terminal result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlTerminalOutcome {
     state: MysqlTerminalState,
     cleanup: AttemptCleanupState,
+    receipt: MysqlSourceTerminalReceipt,
 }
 
 impl MysqlTerminalOutcome {
     /// Terminal state.
     #[must_use]
-    pub const fn state(self) -> MysqlTerminalState {
+    pub const fn state(&self) -> MysqlTerminalState {
         self.state
     }
 
     /// Local cleanup evidence.
     #[must_use]
-    pub const fn cleanup(self) -> AttemptCleanupState {
+    pub const fn cleanup(&self) -> AttemptCleanupState {
         self.cleanup
+    }
+
+    /// Exact identity-bound terminal receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> &MysqlSourceTerminalReceipt {
+        &self.receipt
     }
 }
 
@@ -800,6 +1078,7 @@ enum OperationFingerprint {
     Configuration(MysqlReplicaConfiguration, ConfigurationEffect),
     Progress,
     HandoffSuccessor(Box<MysqlHandoffBoundary>),
+    HandoffPublication(Box<MysqlHandoffPublicationProof>),
     Access(MysqlAccessIntent),
     Peer(MysqlPeerOperationKind, Box<MysqlPeerOperationIntent>),
     Close,
@@ -814,7 +1093,8 @@ enum RecordedOutcome {
     Role(MysqlRoleOutcome),
     Configuration(MysqlConfigurationOutcome),
     Progress(MysqlProgressOutcome),
-    Handoff(MysqlHandoffOutcome),
+    Handoff(Box<MysqlHandoffOutcome>),
+    HandoffPublication(Box<MysqlHandoffPublicationOutcome>),
     Access(MysqlAccessOutcome),
     Peer(MysqlPeerOperationOutcome),
 }
@@ -887,6 +1167,7 @@ where
     proxy_containment: Option<MysqlProxyContainmentReceipt>,
     handoff_publication_required: bool,
     handoff_publication_ready: bool,
+    handoff_publication_proof: Option<MysqlHandoffPublicationProof>,
     terminal: Option<MysqlTerminalState>,
     last_operation_generation: u64,
     operations: Vec<OperationRecord>,
@@ -950,6 +1231,7 @@ where
             proxy_containment: None,
             handoff_publication_required: false,
             handoff_publication_ready: false,
+            handoff_publication_proof: None,
             terminal: None,
             last_operation_generation: 0,
             operations: Vec::new(),
@@ -1229,7 +1511,7 @@ where
         self.admit_work()?;
         let request = self.current_effect_request(&operation, None)?;
         let fingerprint = OperationFingerprint::Progress;
-        let index = match self.begin_operation(operation, fingerprint)? {
+        let index = match self.begin_operation(operation.clone(), fingerprint)? {
             Admission::Retry(outcome) => return expect_progress(outcome),
             Admission::New(index) => index,
         };
@@ -1325,6 +1607,10 @@ where
         };
         Ok(MysqlHandoffBoundary {
             configuration,
+            source_epoch: self
+                .epoch
+                .expect("current configuration establishes source epoch"),
+            source_authority: self.authority().clone(),
             source,
             target,
             remaining,
@@ -1436,15 +1722,71 @@ where
             progress: projected,
             catch_up: CatchUpCapabilityResult::retained_evidence_unavailable(),
         });
-        if self.identity == boundary.target.identity {
-            self.handoff_publication_ready = true;
+        let outcome = MysqlHandoffOutcome::new(
+            boundary,
+            self.identity.clone(),
+            self.authority().clone(),
+            self.configuration
+                .as_ref()
+                .expect("current configuration was required")
+                .clone(),
+            evidence.clone(),
+            current_epoch,
+            expected_role,
+            current_progress,
+        );
+        self.complete(index, RecordedOutcome::Handoff(Box::new(outcome.clone())));
+        Ok(outcome)
+    }
+
+    /// Validates and consumes the combined target, remaining, and exact source
+    /// terminal evidence before making target publication eligible.
+    pub fn accept_handoff_publication_proof(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        proof: MysqlHandoffPublicationProof,
+    ) -> Result<MysqlHandoffPublicationOutcome, MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        self.ensure_proxy_not_published()?;
+        self.admit_work()?;
+        if let Some(accepted) = self.handoff_publication_proof.as_ref() {
+            return Err(if accepted == &proof {
+                MysqlReplicatorError::HandoffProofDuplicate
+            } else {
+                MysqlReplicatorError::HandoffProofConflict
+            });
         }
-        let outcome = MysqlHandoffOutcome {
-            epoch: current_epoch,
-            role: expected_role,
-            progress: current_progress,
+        let fingerprint = OperationFingerprint::HandoffPublication(Box::new(proof.clone()));
+        let index = match self.begin_operation(operation, fingerprint)? {
+            Admission::Retry(_) => return Err(MysqlReplicatorError::HandoffProofDuplicate),
+            Admission::New(index) => index,
         };
-        self.complete(index, RecordedOutcome::Handoff(outcome));
+        let validation = self.validate_handoff_publication_proof(&proof);
+        if let Err(error) = validation {
+            self.operations[index].status = OperationStatus::Uncertain;
+            self.close_access();
+            return Err(error);
+        }
+        let configuration = self
+            .configuration
+            .as_ref()
+            .expect("current configuration was required")
+            .clone();
+        let epoch = self
+            .epoch
+            .expect("current configuration establishes current epoch");
+        self.handoff_publication_ready = true;
+        self.handoff_publication_proof = Some(proof.clone());
+        let outcome = MysqlHandoffPublicationOutcome {
+            boundary: proof.boundary,
+            epoch,
+            configuration,
+            target: self.identity.clone(),
+        };
+        self.complete(
+            index,
+            RecordedOutcome::HandoffPublication(Box::new(outcome.clone())),
+        );
         Ok(outcome)
     }
 
@@ -1514,19 +1856,29 @@ where
             .admit_cleanup()
             .map_err(map_cleanup_admission)?;
         let fingerprint = OperationFingerprint::Close;
-        let index = match self.begin_operation(operation, fingerprint)? {
+        let index = match self.begin_operation(operation.clone(), fingerprint)? {
             Admission::Retry(_) => return Err(MysqlReplicatorError::OperationConflict),
             Admission::New(index) => index,
         };
-        let cleanup = match self.effects.contain_member(&self.attempt) {
-            Ok(cleanup) => cleanup,
+        let operation_receipt = operation.clone();
+        let identity = self.identity.clone();
+        let source = self.local_target()?;
+        let authority = self.authority().clone();
+        let containment = match self.effects.contain_member_exact(&authority, &self.attempt) {
+            Ok(containment) => containment,
             Err(error) => {
                 self.operations[index].status = OperationStatus::Uncertain;
                 self.close_access();
                 return Err(MysqlReplicatorError::Instance(error));
             }
         };
+        let cleanup = containment.cleanup();
         if cleanup != AttemptCleanupState::Completed {
+            self.operations[index].status = OperationStatus::Uncertain;
+            self.close_access();
+            return Err(MysqlReplicatorError::CloseUnsettled);
+        }
+        if !containment.is_complete() {
             self.operations[index].status = OperationStatus::Uncertain;
             self.close_access();
             return Err(MysqlReplicatorError::CloseUnsettled);
@@ -1534,9 +1886,18 @@ where
         self.clear_all_credentials();
         self.close_access();
         self.terminal = Some(MysqlTerminalState::Closed);
+        let receipt = MysqlSourceTerminalReceipt::new(
+            operation_receipt,
+            identity,
+            source,
+            authority,
+            MysqlTerminalState::Closed,
+            containment,
+        );
         Ok(MysqlTerminalOutcome {
             state: MysqlTerminalState::Closed,
             cleanup,
+            receipt,
         })
     }
 
@@ -1550,17 +1911,34 @@ where
             return Err(MysqlReplicatorError::AccessRevocationRequired);
         }
         let fingerprint = OperationFingerprint::Abort;
-        let _ = self.begin_operation(operation, fingerprint)?;
+        let index = match self.begin_operation(operation.clone(), fingerprint)? {
+            Admission::Retry(_) => return Err(MysqlReplicatorError::OperationConflict),
+            Admission::New(index) => index,
+        };
+        let identity = self.identity.clone();
+        let source = self.local_target()?;
+        let authority = self.authority().clone();
         self.close_access();
         self.clear_all_credentials();
         self.terminal = Some(MysqlTerminalState::Aborted);
-        let cleanup = self
+        let containment = self
             .effects
-            .contain_member(&self.attempt)
+            .contain_member_exact(&authority, &self.attempt)
             .map_err(MysqlReplicatorError::Instance)?;
+        let cleanup = containment.cleanup();
+        let receipt = MysqlSourceTerminalReceipt::new(
+            operation,
+            identity,
+            source,
+            authority,
+            MysqlTerminalState::Aborted,
+            containment,
+        );
+        self.operations[index].status = OperationStatus::Uncertain;
         Ok(MysqlTerminalOutcome {
             state: MysqlTerminalState::Aborted,
             cleanup,
+            receipt,
         })
     }
 
@@ -1598,6 +1976,75 @@ where
             })
         {
             return Err(MysqlReplicatorError::ReceiptMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_handoff_publication_proof(
+        &self,
+        proof: &MysqlHandoffPublicationProof,
+    ) -> Result<(), MysqlReplicatorError> {
+        if !self.handoff_publication_required
+            || self.identity != proof.boundary.target.identity
+            || self
+                .epoch
+                .is_none_or(|epoch| epoch.value() <= proof.boundary.source_epoch.value())
+            || self.configuration.as_ref().is_none_or(|configuration| {
+                configuration.members != proof.boundary.configuration.members
+                    || configuration.epoch != self.epoch.expect("epoch checked above")
+            })
+        {
+            return Err(MysqlReplicatorError::HandoffProofRequired);
+        }
+        let target = proof
+            .target
+            .as_ref()
+            .ok_or(MysqlReplicatorError::HandoffProofRequired)?;
+        let remaining = proof
+            .remaining
+            .as_ref()
+            .ok_or(MysqlReplicatorError::HandoffProofRequired)?;
+        let source = proof
+            .source
+            .as_ref()
+            .ok_or(MysqlReplicatorError::HandoffProofRequired)?;
+        let configuration = self
+            .configuration
+            .as_ref()
+            .expect("current configuration was required");
+        let epoch = self.epoch.expect("current configuration was required");
+        let exact_acceptance = |acceptance: &MysqlHandoffOutcome,
+                                expected: &MysqlReplicaTarget,
+                                role: MysqlReplicaRole|
+         -> bool {
+            acceptance.boundary == proof.boundary
+                && acceptance.identity == expected.identity
+                && acceptance.configuration == *configuration
+                && acceptance.successor.authority() == &acceptance.authority
+                && acceptance.epoch == epoch
+                && acceptance.role == role
+                && acceptance.progress.value() >= proof.boundary.progress.value()
+                && project_progress(&self.lineage, acceptance.successor.executed())
+                    == ProgressProjection::Projectable(acceptance.progress)
+                && handoff_successor_matches(&proof.boundary, &acceptance.successor)
+                && target_matches_authority(expected, &acceptance.authority)
+        };
+        if !exact_acceptance(target, &proof.boundary.target, MysqlReplicaRole::Primary)
+            || !exact_acceptance(
+                remaining,
+                &proof.boundary.remaining,
+                MysqlReplicaRole::Secondary,
+            )
+            || target.authority != *self.authority()
+            || source.identity != proof.boundary.source.identity
+            || source.source != proof.boundary.source
+            || source.authority != proof.boundary.source_authority
+            || source.state != MysqlTerminalState::Closed
+            || source.containment.authority() != &source.authority
+            || source.containment.binding() != source.authority.local().binding()
+            || !source.containment.is_complete()
+        {
+            return Err(MysqlReplicatorError::HandoffProofRequired);
         }
         Ok(())
     }
@@ -1673,6 +2120,7 @@ where
         if prior_role == Some(MysqlReplicaRole::Secondary) && role == MysqlReplicaRole::Primary {
             self.handoff_publication_required = true;
             self.handoff_publication_ready = false;
+            self.handoff_publication_proof = None;
         }
         self.configuration = None;
         self.native_evidence = Some(evidence);
@@ -2650,6 +3098,48 @@ fn map_admission(error: AttemptAdmissionError) -> MysqlReplicatorError {
     }
 }
 
+fn target_matches_authority(
+    target: &MysqlReplicaTarget,
+    authority: &MemberMutationAuthority,
+) -> bool {
+    let binding = authority.local().binding();
+    target.member.member_id() == authority.local().member_id()
+        && target.member.address() == binding.member_address()
+        && target.process_session == *binding.process_session()
+        && target.endpoint == *binding.endpoint()
+        && target.storage == *binding.storage()
+}
+
+fn handoff_successor_matches(
+    boundary: &MysqlHandoffBoundary,
+    evidence: &MemberNativeEvidence,
+) -> bool {
+    let exact_member = |target: &MysqlReplicaTarget, role: MemberRole| {
+        evidence
+            .view()
+            .member(target.member.member_id())
+            .is_some_and(|member| {
+                member.address() == target.member.address()
+                    && member.role() == role
+                    && member.state() == MemberState::Online
+            })
+    };
+    CanonicalViewId::parse(&boundary.predecessor_view)
+        .and_then(|predecessor| {
+            CanonicalViewId::parse(evidence.view().id())
+                .and_then(|successor| predecessor.require_successor(successor))
+        })
+        .is_ok()
+        && evidence.view().members().len() == 2
+        && evidence
+            .view()
+            .member(boundary.source.member.member_id())
+            .is_none()
+        && exact_member(&boundary.target, MemberRole::Primary)
+        && exact_member(&boundary.remaining, MemberRole::Secondary)
+        && boundary.executed.is_subset_of(evidence.executed())
+}
+
 fn expect_open(outcome: RecordedOutcome) -> Result<MysqlOpenOutcome, MysqlReplicatorError> {
     if let RecordedOutcome::Open(outcome) = outcome {
         Ok(outcome)
@@ -2718,7 +3208,7 @@ fn expect_progress(outcome: RecordedOutcome) -> Result<MysqlProgressOutcome, Mys
 
 fn expect_handoff(outcome: RecordedOutcome) -> Result<MysqlHandoffOutcome, MysqlReplicatorError> {
     match outcome {
-        RecordedOutcome::Handoff(outcome) => Ok(outcome),
+        RecordedOutcome::Handoff(outcome) => Ok(*outcome),
         _ => Err(MysqlReplicatorError::OperationConflict),
     }
 }

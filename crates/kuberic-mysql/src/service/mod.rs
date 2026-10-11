@@ -66,10 +66,10 @@ pub use error::{
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
 pub use member::{
     BackendConnectionId, BackendConnectionReceipt, CanonicalViewId, FreshBootstrapInput,
-    FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget, MemberEffectKind,
-    MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
-    MemberOperationIdentity, MemberPeer, MemberSourceBoundary, MysqlMemberEffectBoundary,
-    PrimaryTransferInput,
+    FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget, MemberContainmentReceipt,
+    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
+    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
+    MysqlMemberEffectBoundary, PrimaryTransferInput,
 };
 pub use proxy::{
     APPLICATION_QUALIFICATION_SCHEMA, ApplicationAccountReceipt, ApplicationCredential,
@@ -79,12 +79,13 @@ pub use proxy::{
 pub use replicator::{
     MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,
     MysqlFormationRoleOutcome, MysqlFreshMemberCredentials, MysqlFreshMemberInput,
-    MysqlHandoffBoundary, MysqlHandoffOutcome, MysqlOpenOutcome, MysqlOpenReceipt,
-    MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
-    MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
-    MysqlProgressOutcome, MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity,
-    MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator, MysqlRoleOutcome, MysqlTerminalOutcome,
-    MysqlTerminalState,
+    MysqlHandoffBoundary, MysqlHandoffOutcome, MysqlHandoffPublicationOutcome,
+    MysqlHandoffPublicationProof, MysqlOpenOutcome, MysqlOpenReceipt, MysqlOperationIdentity,
+    MysqlPeerAuthorityFacts, MysqlPeerOperationIntent, MysqlPeerOperationKind,
+    MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason, MysqlProgressOutcome,
+    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
+    MysqlReplicaTarget, MysqlReplicator, MysqlRoleOutcome, MysqlSourceTerminalReceipt,
+    MysqlTerminalOutcome, MysqlTerminalState,
 };
 pub use topology::{
     AcceptedMysqlTopology, AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect,

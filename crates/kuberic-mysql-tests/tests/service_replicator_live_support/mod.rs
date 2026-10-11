@@ -17,9 +17,9 @@ use kuberic_mysql::core::{
 use kuberic_mysql::service::{
     ApplicationCredential, AttemptContext, CanonicalViewId, ControlCredential,
     ControlCredentialRole, MysqlAccessIntent, MysqlFreshMemberCredentials, MysqlFreshMemberInput,
-    MysqlHandoffBoundary, MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex,
-    MysqlOperationIdentity, MysqlOperationTimeouts, MysqlReplicaConfiguration, MysqlReplicaEpoch,
-    MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
+    MysqlHandoffBoundary, MysqlHandoffPublicationProof, MysqlInstanceConfig, MysqlMemberConfig,
+    MysqlMemberIndex, MysqlOperationIdentity, MysqlOperationTimeouts, MysqlReplicaConfiguration,
+    MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
     MysqlTerminalState, MysqlTopologyConfig,
 };
 use mysql_async::prelude::Queryable;
@@ -67,6 +67,7 @@ pub enum HandoffStage {
     SourceStoppedAndReaped,
     RemainingSuccessorAccepted,
     TargetSuccessorAccepted,
+    PublicationProofAccepted,
     TargetPublished,
     TargetMutationCompleted,
     SourceUnavailableConfirmed,
@@ -847,6 +848,7 @@ impl ReplicatorLiveFixture {
         if terminal.state() != MysqlTerminalState::Closed {
             return Err("source did not cross the closed lifecycle boundary".to_owned());
         }
+        let source_terminal = terminal.receipt().clone();
         assert_process_absent(self.members[0].pid)?;
         if self.members[0].socket.exists() || self.members[0].pid_file.exists() {
             return Err("source socket or PID file survived exact stop/reap".to_owned());
@@ -863,7 +865,7 @@ impl ReplicatorLiveFixture {
         );
 
         let remaining_successor = self.members[2].operation("remaining-successor");
-        self.members[2]
+        let remaining_outcome = self.members[2]
             .engine_mut()
             .accept_handoff_successor(remaining_successor, boundary.clone())
             .await
@@ -875,7 +877,7 @@ impl ReplicatorLiveFixture {
             "remaining secondary accepted the exact canonical two-survivor successor".to_owned(),
         );
         let target_successor = self.members[1].operation("target-successor");
-        self.members[1]
+        let target_outcome = self.members[1]
             .engine_mut()
             .accept_handoff_successor(target_successor, boundary.clone())
             .await
@@ -885,6 +887,24 @@ impl ReplicatorLiveFixture {
             started,
             HandoffStage::TargetSuccessorAccepted,
             "target revalidated exact identity, authority, PRIMARY/ONLINE state, quorum, and frozen history"
+                .to_owned(),
+        );
+        let publication_proof = MysqlHandoffPublicationProof::new(
+            boundary.clone(),
+            Some(target_outcome),
+            Some(remaining_outcome),
+            Some(source_terminal),
+        );
+        let publication_operation = self.members[1].operation("target-publication-proof");
+        self.members[1]
+            .engine_mut()
+            .accept_handoff_publication_proof(publication_operation, publication_proof)
+            .map_err(|error| format!("accept combined publication proof: {error}"))?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::PublicationProofAccepted,
+            "target consumed exact target+remaining successor receipts and source terminal stop/reap receipt"
                 .to_owned(),
         );
 

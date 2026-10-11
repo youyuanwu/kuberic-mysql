@@ -729,6 +729,85 @@ pub struct MemberEffectReceipt {
     cleanup: AttemptCleanupState,
 }
 
+/// Exact local terminal containment proof returned by the member effect
+/// boundary after the admitted process is stopped, reaped, and absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberContainmentReceipt {
+    authority: MemberMutationAuthority,
+    binding: crate::service::MemberControlBinding,
+    cleanup: AttemptCleanupState,
+    process_absent: bool,
+    endpoint_absent: bool,
+    scratch_removed: bool,
+}
+
+impl MemberContainmentReceipt {
+    /// Creates one exact terminal receipt from the effect boundary.
+    #[must_use]
+    pub(crate) fn new(
+        authority: MemberMutationAuthority,
+        cleanup: AttemptCleanupState,
+        process_absent: bool,
+        endpoint_absent: bool,
+        scratch_removed: bool,
+    ) -> Self {
+        let binding = authority.local().binding().clone();
+        Self {
+            authority,
+            binding,
+            cleanup,
+            process_absent,
+            endpoint_absent,
+            scratch_removed,
+        }
+    }
+
+    /// Exact admitted member authority.
+    #[must_use]
+    pub const fn authority(&self) -> &MemberMutationAuthority {
+        &self.authority
+    }
+
+    /// Exact admitted process, endpoint, storage, and native binding.
+    #[must_use]
+    pub const fn binding(&self) -> &crate::service::MemberControlBinding {
+        &self.binding
+    }
+
+    /// Cleanup settlement.
+    #[must_use]
+    pub const fn cleanup(&self) -> AttemptCleanupState {
+        self.cleanup
+    }
+
+    /// Whether the exact retained process is absent after reaping.
+    #[must_use]
+    pub const fn process_absent(&self) -> bool {
+        self.process_absent
+    }
+
+    /// Whether the exact private endpoint is absent.
+    #[must_use]
+    pub const fn endpoint_absent(&self) -> bool {
+        self.endpoint_absent
+    }
+
+    /// Whether disposable scratch ownership was removed.
+    #[must_use]
+    pub const fn scratch_removed(&self) -> bool {
+        self.scratch_removed
+    }
+
+    /// Whether this receipt proves complete terminal containment.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.cleanup, AttemptCleanupState::Completed)
+            && self.process_absent
+            && self.endpoint_absent
+            && self.scratch_removed
+    }
+}
+
 impl MemberEffectReceipt {
     /// Validates and creates an exact member effect receipt.
     pub fn new(
@@ -1036,6 +1115,23 @@ pub trait MysqlMemberEffectBoundary {
         &mut self,
         attempt: &AttemptContext,
     ) -> Result<AttemptCleanupState, MysqlInstanceError>;
+
+    /// Contains the exact admitted local process and returns identity-bound
+    /// terminal evidence rather than an unbound cleanup state.
+    fn contain_member_exact(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<MemberContainmentReceipt, MysqlInstanceError> {
+        let cleanup = self.contain_member(attempt)?;
+        Ok(MemberContainmentReceipt::new(
+            authority.clone(),
+            cleanup,
+            cleanup == AttemptCleanupState::Completed,
+            cleanup == AttemptCleanupState::Completed,
+            cleanup == AttemptCleanupState::Completed,
+        ))
+    }
 }
 
 fn validate_attempt(

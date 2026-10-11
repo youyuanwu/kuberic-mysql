@@ -449,6 +449,10 @@ pub enum MysqlReplicatorError {
     NativeRoleMismatch,
     /// Controlled-handoff publication or successor evidence was incomplete.
     HandoffProofRequired,
+    /// A handoff publication proof was already accepted.
+    HandoffProofDuplicate,
+    /// A later handoff publication proof conflicted with the accepted proof.
+    HandoffProofConflict,
     /// Mandatory close settlement did not produce completed cleanup evidence.
     CloseUnsettled,
     /// The shared attempt was cancelled before operation admission.
