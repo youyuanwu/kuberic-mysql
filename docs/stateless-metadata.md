@@ -441,6 +441,10 @@ terminal values. In-process native effects complete only from exact
 request-bound receipts; those receipts bind local authority, predecessor and
 successor evidence, deadline/cancellation state, and cleanup state. They are
 not durable records and are not exposed as a private Kuberic capability.
+Successful terminal outcomes remain in process memory for exact retry. An
+unsettled abort remains terminal and is not converted into successful
+containment; drop and emergency ownership stay armed until the exact member is
+contained.
 Future signed authorization and public value translation remain external.
 MySQL must not emulate missing public fields or durable completion proof with
 an application-owned store, a private runtime capability, or a compatibility
@@ -589,9 +593,11 @@ MySQL-owned intended-order sequence:
 1. revoke the source access generation and prove listener closure, zero proxy
    sessions/commands, exact native backend absence, and no cancelled or
    ambiguous command;
-2. freeze the complete source GTID set plus its qualified scalar under the
-   exact three-member configuration, source authority, target, remaining
-   secondary, and predecessor view;
+2. have the source engine issue a stable boundary from a fresh
+   post-revocation native read, binding the revoked generation and eligible
+   closure receipt to the complete GTID set, qualified scalar, exact
+   three-member configuration, source authority, target, remaining secondary,
+   and predecessor view;
 3. prove the target and remaining secondary contain the same boundary while
    their gateways remain closed;
 4. apply a newer epoch barrier to all three engines;
@@ -606,7 +612,8 @@ MySQL-owned intended-order sequence:
 9. submit one combined proof containing the frozen boundary, both survivor
    outcomes, and the exact source terminal receipt; and
 10. publish a separate newer target access generation only after that proof is
-    freshly revalidated.
+    freshly revalidated and a publication-bound native successor view/history
+    read still matches it.
 
 If the component restarts during this PoC operation, access remains closed and
 the fixture is reset. No private journal is added to resume it.
@@ -654,6 +661,15 @@ separately records cancellation and ambiguity; either condition prevents
 handoff eligibility even when cleanup completes. The native listener remains
 private, and `read_only`/`super_read_only` provide an independent
 defense-in-depth barrier.
+
+The listener and sessions also observe shared attempt cancellation and the
+absolute work cutoff after publication. Every initiated backend is registered
+as identified or unidentified before it can disappear from accounting; an
+unidentified pre-greeting connection prevents native-absence credit. Bounded
+secret-free diagnostics survive into snapshots and containment receipts.
+Async preparation, revocation, retirement, and terminal cleanup keep ownership
+armed across awaits, and fixture roots are removed only after proxy, account,
+session, and exact member settlement succeeds.
 
 The delivered gateway supports only one loopback plaintext profile: the exact
 dedicated pre-warmed `caching_sha2_password` account, the fixed capability

@@ -77,6 +77,10 @@ primary transfer receive credit only from exact request-bound member-effect
 receipts. Build and removal entry points validate current primary authority,
 target identity, operation identity, and exact retries, then return a typed
 unsupported outcome; generic peer build/removal execution is not delivered.
+Successful close and abort retain their exact terminal outcome for idempotent
+retry. Changed retries conflict, unrelated post-terminal work rejects, and an
+unsettled abort remains terminal without claiming complete containment. Abort
+also contains an owned member that was prepared but not opened.
 
 Qualified scalar progress is now a production boundary. Empty structured GTID
 history maps to `0`; otherwise only one untagged configured group source with
@@ -93,6 +97,12 @@ negotiated capabilities, and supports bounded query, ping, and quit exchanges.
 Both read and write permission are required. Revocation atomically closes
 admission and dispatch, terminates registered native backend sessions, and
 completes only after proxy counts are zero and native absence is proved.
+Published listeners and sessions also observe shared attempt cancellation and
+the absolute work cutoff, sealing without a separate caller revoke. Every
+initiated backend is accounted; a connection that never yields an exact native
+ID makes containment unproved. Snapshots and receipts retain bounded
+secret-free outcome summaries. Text rows accept SQL `NULL` (`0xfb`) while an
+initial `0xfb` response remains rejected as `LOCAL INFILE`.
 TLS, cold/full authentication, arbitrary accounts or plugins, prepared
 statements, local-file transfer, compression, multi-statements, multi-results,
 pooling, and general MySQL protocol support are not claimed.
@@ -100,10 +110,16 @@ pooling, and general MySQL protocol support are not claimed.
 A repository-owned live fixture composes three independent member-local
 engines for fresh formation and one controlled handoff. The handoff freezes the
 source's structured/scalar boundary only after a normally completed source
-closure, transfers primary, closes and reaps the exact source process, accepts
+closure and a fresh post-revocation native observation. The source engine
+issues a stable boundary identity binding the revoked generation, closure
+receipt, transfer, newer epoch/configuration, and source terminal receipt. The
+fixture proves fresh exact three-member history after schema DDL, transfers
+primary, closes and reaps the exact source process, accepts
 the exact two-survivor successor view and frozen history on both survivors, and
 submits one combined proof before a separate target access generation can be
-published. This is controlled host-local qualification, not automated
+published. Publication performs a fresh target native view/history read, so
+intervening peer loss or view change blocks serving. This is controlled
+host-local qualification, not automated
 failover.
 
 A test-only native feasibility gate pins and reads back all nine effective
@@ -189,6 +205,7 @@ observer, single-process lifecycle, and three-member bootstrap/join gates:
 
 ```bash
 cargo fmt --all -- --check
+CARGO_BUILD_JOBS=1 cargo check --locked --offline -p kuberic-mysql --lib
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --workspace --profile ci
 CARGO_BUILD_JOBS=1 cargo test --locked --offline --doc --workspace
 CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets -- -D warnings

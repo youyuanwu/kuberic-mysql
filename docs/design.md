@@ -234,8 +234,11 @@ operation identities, monotonic epochs, roles, configurations, access
 generations, progress requests, peer-operation intents, and terminal
 operations. It enforces open, newer epoch, role, configuration, and terminal
 ordering; same-role transitions also require a newer epoch. Exact retries are
-idempotent, changed retries conflict, and uncertain or late work leaves access
-closed.
+idempotent, including retained successful close/abort outcomes. Changed retries
+conflict, unrelated post-terminal operations reject, and an incomplete abort
+remains terminal but returns typed unsettled containment rather than success.
+An owned prepared-but-unopened member can be aborted without manufacturing a
+handoff terminal receipt.
 
 Native bootstrap, join, coherent view readback, exact primary transfer, backend
 termination, and terminal stop/reap are admitted through a member-local effect
@@ -265,6 +268,13 @@ Revocation stops admission and dispatch, terminates exact registered native
 backend connections, and completes only after proxy session/command counts are
 zero and native absence is proved. Cancellation or ambiguity can establish
 containment but never handoff eligibility.
+The published accept/session path observes shared attempt cancellation and the
+work cutoff and seals without a separate revoke call. Every initiated UDS
+backend is tracked before greeting; missing identity makes native absence
+unproved. Bounded diagnostics preserve authentication rejection,
+pre-dispatch rejection, normal completion, cancellation, ambiguity, deadline,
+and cleanup classes without secrets. In text rows `0xfb` is SQL `NULL`; only
+an initial response `0xfb` is `LOCAL INFILE`.
 
 The account receives only DML grants on the fixed qualification schema.
 Creation, grants, and removal run with session binary logging disabled and
@@ -277,14 +287,18 @@ support are outside the profile.
 
 A repository-owned harness composes three independent member-local engines.
 It keeps all proxies closed during fresh bootstrap and two sequential joins,
-then publishes only the selected source generation. Its controlled handoff
-proves a normally completed source-generation closure, freezes complete and
-scalar source progress, applies newer epoch/role/configuration work, transfers
+then proves exact common structured history after schema DDL before publishing
+the selected source generation. Its controlled handoff proves a normally
+completed source-generation closure and obtains a fresh post-revocation native
+progress read. The source engine issues a stable boundary identity binding the
+revoked generation, closure receipt, transfer, newer epoch/configuration, and
+terminal receipt. It transfers
 native primary, closes and reaps the exact source, accepts the canonical
 two-survivor successor and frozen history on both survivors, and submits one
 combined source/target/remaining proof before a separate target generation is
-published. Failure, deadline, cancellation, stale evidence, changed authority,
-missing history, or substituted proof keeps target access closed.
+published only after a fresh native target view/history read. Failure,
+deadline, cancellation, stale evidence, peer loss/view change, changed
+authority, missing history, or substituted proof keeps target access closed.
 
 ### Proof-of-concept boundary
 
@@ -1099,9 +1113,11 @@ or specific-quorum implementation:
 1. Revoke the source access generation and complete a handoff-eligible closure
    receipt: no listener admission, proxy session, active command, cancelled or
    ambiguous command, or registered native backend remains.
-2. Read and freeze the complete source GTID set and qualified scalar under the
-   exact three-member configuration, source authority, target, remaining
-   secondary, and predecessor view.
+2. Have the source engine issue a stable boundary after a fresh
+   post-revocation read, binding the revoked generation and eligible closure
+   receipt to the complete GTID set, qualified scalar, exact three-member
+   configuration, source authority, target, remaining secondary, and
+   predecessor view.
 3. Prove the target and remaining secondary contain the same boundary while
    their gateways remain closed.
 4. Accept a newer epoch barrier on all three engines.
@@ -1117,7 +1133,8 @@ or specific-quorum implementation:
    boundary. The public three-member configuration remains unchanged.
 9. Submit one combined publication proof containing the frozen boundary, both
    survivor outcomes, and the exact source terminal receipt.
-10. Revalidate target authority and the accepted proof, then explicitly
+10. Revalidate target authority and perform a fresh native successor
+    view/history read bound to the publication operation, then explicitly
     publish a separate newer all-or-nothing target access generation.
 
 Failure at any step leaves writes closed. Restart during this sequence is not
@@ -1451,6 +1468,7 @@ bootstrap/join, and native feasibility gates:
 
 ```bash
 cargo fmt --all -- --check
+CARGO_BUILD_JOBS=1 cargo check --locked --offline -p kuberic-mysql --lib
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --workspace --profile ci
 CARGO_BUILD_JOBS=1 cargo test --locked --offline --doc --workspace
 CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets -- -D warnings
@@ -1508,17 +1526,20 @@ The delivered Stage 2 member-local matrix additionally includes:
   receipts, deadline/cancellation handling, and terminal containment receipts;
 - lifecycle open, newer epoch, role-before-configuration, same-role epoch,
   retry, unsupported build/removal, progress, access, close, and abort
-  contracts;
+  contracts, including exact terminal retries, unopened-owner abort, and typed
+  unsettled containment;
 - capability-filtered pre-warmed `caching_sha2_password` gateway admission,
   command/response bounds, access-generation races, exact backend termination,
-  and proxy/native closure proof;
+  attempt-driven sealing, pre-greeting backend accounting, typed diagnostics,
+  SQL-NULL rows, dropped-future ownership, and proxy/native closure proof;
 - a real-server gateway profile covering autocommit, explicit transaction,
   blocking query, ping, quit, exact native registration/termination, and local
   account cleanup; and
 - three independent member owners performing fresh formation and one
-  controlled handoff with source closure, frozen structured/scalar history,
-  exact transfer, source stop/reap, two-survivor proof, combined publication
-  evidence, and only then target generation publication.
+  controlled handoff with a post-DDL common-history barrier, source-issued
+  post-revocation boundary provenance, exact transfer, source stop/reap,
+  two-survivor proof, combined publication evidence, a fresh target read, and
+  only then target generation publication.
 
 The delivered test-only native feasibility matrix additionally includes:
 
