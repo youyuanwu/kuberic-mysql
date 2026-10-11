@@ -14,15 +14,15 @@ use kuberic_mysql::core::{
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, AttemptCleanupState, AttemptContext, BackendConnectionId,
     BackendConnectionReceipt, ControlCredential, ControlCredentialRole, FreshBootstrapInput,
-    FreshJoinInput, LifecycleOperation, MemberControlBinding, MemberEffectKind,
-    MemberEffectReceipt, MemberMutationAuthority, MemberNativeEvidence, MemberPeer,
-    MemberSourceBoundary, MemberTransitionError, MysqlAccessIntent, MysqlInstanceConfig,
-    MysqlInstanceError, MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt,
-    MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
-    MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
-    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
-    MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError, MysqlTerminalState,
-    NativeIdentityEnrollment, PrimaryTransferInput,
+    FreshJoinInput, LifecycleOperation, MemberConfigurationIntent, MemberControlBinding,
+    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
+    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
+    MemberTransitionError, MysqlAccessIntent, MysqlInstanceConfig, MysqlInstanceError,
+    MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity,
+    MysqlPeerAuthorityFacts, MysqlPeerOperationIntent, MysqlPeerOperationKind,
+    MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason, MysqlReplicaConfiguration,
+    MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
+    MysqlReplicatorError, MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
 };
 use service_common::{GROUP_UUID, TestRoot};
 
@@ -36,11 +36,21 @@ enum ReadPlan {
         role: MysqlReplicaRole,
         executed: &'static str,
     },
-    WrongAuthority(Box<MemberMutationAuthority>),
     CancelThenExact {
         role: MysqlReplicaRole,
     },
     Error,
+}
+
+#[derive(Clone)]
+enum ReceiptPlan {
+    Exact,
+    CrossOperation,
+    CrossEpoch,
+    CrossRole,
+    CrossConfiguration,
+    SubstituteAuthority(Box<MemberMutationAuthority>),
+    SubstituteSource(Box<MemberSourceBoundary>),
 }
 
 #[derive(Clone, Copy)]
@@ -53,18 +63,67 @@ enum CleanupPlan {
 struct ScriptedEffects {
     config: MysqlInstanceConfig,
     reads: VecDeque<ReadPlan>,
+    receipts: VecDeque<ReceiptPlan>,
     cleanup: CleanupPlan,
     containments: usize,
 }
 
 impl ScriptedEffects {
-    fn new(config: MysqlInstanceConfig, reads: Vec<ReadPlan>, cleanup: CleanupPlan) -> Self {
+    fn new(
+        config: MysqlInstanceConfig,
+        reads: Vec<ReadPlan>,
+        receipts: Vec<ReceiptPlan>,
+        cleanup: CleanupPlan,
+    ) -> Self {
         Self {
             config,
             reads: reads.into(),
+            receipts: receipts.into(),
             cleanup,
             containments: 0,
         }
+    }
+
+    fn receipt_request(&mut self, request: MemberEffectRequest) -> MemberEffectRequest {
+        let plan = self.receipts.pop_front().unwrap_or(ReceiptPlan::Exact);
+        let operation = match &plan {
+            ReceiptPlan::CrossOperation => MemberOperationIdentity::new(
+                AuthorityGeneration::new("substituted-operation").unwrap(),
+                request.operation().generation(),
+            ),
+            _ => request.operation().clone(),
+        };
+        let epoch = if matches!(&plan, ReceiptPlan::CrossEpoch) {
+            request.epoch() + 1
+        } else {
+            request.epoch()
+        };
+        let role = if matches!(&plan, ReceiptPlan::CrossRole) {
+            match request.role() {
+                MemberRole::Primary => MemberRole::Secondary,
+                MemberRole::Secondary => MemberRole::Primary,
+            }
+        } else {
+            request.role()
+        };
+        let configuration = if matches!(&plan, ReceiptPlan::CrossConfiguration) {
+            request.configuration().map(|configuration| {
+                MemberConfigurationIntent::new(configuration.id().clone(), Vec::new())
+            })
+        } else {
+            request.configuration().cloned()
+        };
+        let authority = if let ReceiptPlan::SubstituteAuthority(authority) = &plan {
+            authority.as_ref().clone()
+        } else {
+            request.authority().clone()
+        };
+        let source = if let ReceiptPlan::SubstituteSource(source) = &plan {
+            Some(source.as_ref().clone())
+        } else {
+            request.source().cloned()
+        };
+        MemberEffectRequest::new(operation, epoch, role, configuration, authority, source).unwrap()
     }
 }
 
@@ -79,11 +138,16 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         _recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
-        let authority = input.authority().clone();
+        let request = input
+            .request()
+            .cloned()
+            .expect("replicator bootstrap binds its request");
+        let request = self.receipt_request(request);
+        let authority = request.authority().clone();
         let successor = single_member_evidence(authority.clone(), "17:1");
-        MemberEffectReceipt::new(
+        MemberEffectReceipt::for_request(
             MemberEffectKind::Bootstrap,
-            authority.clone(),
+            request,
             None,
             successor,
             authority.local().binding(),
@@ -98,12 +162,21 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         _recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
-        let authority = input.authority().clone();
-        let predecessor = input.source().evidence().clone();
+        let request = input
+            .request()
+            .cloned()
+            .expect("replicator join binds its request");
+        let request = self.receipt_request(request);
+        let authority = request.authority().clone();
+        let predecessor = request
+            .source()
+            .expect("join receipt request retains a source")
+            .evidence()
+            .clone();
         let successor = joined_evidence(&authority, &predecessor);
-        MemberEffectReceipt::new(
+        MemberEffectReceipt::for_request(
             MemberEffectKind::Join,
-            authority.clone(),
+            request,
             Some(predecessor),
             successor,
             authority.local().binding(),
@@ -114,22 +187,40 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
 
     async fn read_member_view(
         &mut self,
-        authority: &MemberMutationAuthority,
+        request: MemberEffectRequest,
         attempt: &AttemptContext,
-    ) -> Result<MemberNativeEvidence, MemberTransitionError> {
-        match self.reads.pop_front().expect("scripted read") {
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        let request = self.receipt_request(request);
+        let authority = request.authority().clone();
+        let (evidence, receipt_attempt) = match self.reads.pop_front().expect("scripted read") {
             ReadPlan::Exact { role, executed } => {
-                Ok(evidence(authority.clone(), "23:1", role, executed))
-            }
-            ReadPlan::WrongAuthority(wrong) => {
-                Ok(evidence(*wrong, "23:1", MysqlReplicaRole::Secondary, ""))
+                (evidence(authority.clone(), "23:1", role, executed), None)
             }
             ReadPlan::CancelThenExact { role } => {
                 attempt.cancel();
-                Ok(evidence(authority.clone(), "23:1", role, ""))
+                (
+                    evidence(authority.clone(), "23:1", role, ""),
+                    Some(
+                        AttemptContext::new(
+                            attempt.attempt().clone(),
+                            Instant::now() + Duration::from_secs(60),
+                            Duration::from_secs(10),
+                        )
+                        .unwrap(),
+                    ),
+                )
             }
-            ReadPlan::Error => Err(MemberTransitionError::Cancelled),
-        }
+            ReadPlan::Error => return Err(MemberTransitionError::Cancelled),
+        };
+        MemberEffectReceipt::for_request(
+            MemberEffectKind::ViewReadback,
+            request,
+            None,
+            evidence,
+            authority.local().binding(),
+            receipt_attempt.as_ref().unwrap_or(attempt),
+            AttemptCleanupState::NotRequired,
+        )
     }
 
     async fn transfer_primary(
@@ -137,14 +228,23 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         input: PrimaryTransferInput,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
-        let authority = input.authority().clone();
-        let predecessor = input.source().evidence().clone();
+        let request = input
+            .request()
+            .cloned()
+            .expect("replicator transfer binds its request");
+        let request = self.receipt_request(request);
+        let authority = request.authority().clone();
+        let predecessor = request
+            .source()
+            .expect("transfer receipt request retains a source")
+            .evidence()
+            .clone();
         let successor = transferred_evidence(&authority, &predecessor, input.target());
-        MemberEffectReceipt::new(
+        MemberEffectReceipt::for_request(
             MemberEffectKind::PrimaryTransfer {
                 target: input.target().member_id().clone(),
             },
-            authority.clone(),
+            request,
             Some(predecessor),
             successor,
             authority.local().binding(),
@@ -453,6 +553,126 @@ async fn bootstrap_and_join_credit_only_exact_typed_receipts() {
 }
 
 #[tokio::test]
+async fn receipts_are_bound_to_operation_epoch_configuration_and_predecessor() {
+    for (label, plan) in [
+        ("cross-operation", ReceiptPlan::CrossOperation),
+        ("cross-epoch", ReceiptPlan::CrossEpoch),
+        ("cross-role", ReceiptPlan::CrossRole),
+    ] {
+        let mut harness = harness_with_receipts(
+            vec![exact(MysqlReplicaRole::Secondary)],
+            vec![plan],
+            CleanupPlan::Completed,
+        );
+        open(&mut harness);
+        harness
+            .engine
+            .advance_epoch(
+                operation(&format!("{label}-epoch"), 2),
+                MysqlReplicaEpoch::new(1),
+            )
+            .unwrap();
+        assert!(matches!(
+            harness
+                .engine
+                .observe_role(
+                    operation(&format!("{label}-role"), 3),
+                    MysqlReplicaEpoch::new(1),
+                    MysqlReplicaRole::Secondary,
+                )
+                .await,
+            Err(MysqlReplicatorError::ReceiptMismatch)
+        ));
+        assert_eq!(harness.engine.role(), None);
+    }
+
+    let mut cross_configuration = harness_with_receipts(
+        vec![
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+        ],
+        vec![ReceiptPlan::Exact, ReceiptPlan::CrossConfiguration],
+        CleanupPlan::Completed,
+    );
+    open(&mut cross_configuration);
+    cross_configuration
+        .engine
+        .advance_epoch(
+            operation("cross-config-epoch", 2),
+            MysqlReplicaEpoch::new(1),
+        )
+        .unwrap();
+    cross_configuration
+        .engine
+        .observe_role(
+            operation("cross-config-role", 3),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Secondary,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        cross_configuration
+            .engine
+            .observe_configuration(
+                operation("cross-config", 4),
+                configuration(&cross_configuration, 1),
+            )
+            .await,
+        Err(MysqlReplicatorError::ReceiptMismatch)
+    ));
+    assert!(cross_configuration.engine.configuration().is_none());
+
+    let substitute_authority = authority("replicator", MysqlMemberIndex::Third);
+    let substitute_predecessor = single_member_evidence(substitute_authority.clone(), "31:1");
+    let substitute_source = MemberSourceBoundary::new(
+        MemberPeer::from_enrollment(substitute_authority.local()),
+        substitute_predecessor,
+    )
+    .unwrap();
+    let mut predecessor_substitution = harness_with_receipts(
+        vec![exact(MysqlReplicaRole::Secondary)],
+        vec![
+            ReceiptPlan::Exact,
+            ReceiptPlan::SubstituteSource(Box::new(substitute_source)),
+        ],
+        CleanupPlan::Completed,
+    );
+    open(&mut predecessor_substitution);
+    predecessor_substitution
+        .engine
+        .advance_epoch(operation("predecessor-epoch", 2), MysqlReplicaEpoch::new(1))
+        .unwrap();
+    predecessor_substitution
+        .engine
+        .observe_role(
+            operation("predecessor-role", 3),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Secondary,
+        )
+        .await
+        .unwrap();
+    let source_authority =
+        authority_with_attempt(&predecessor_substitution.attempt, MysqlMemberIndex::Second);
+    let predecessor = single_member_evidence(source_authority, "31:1");
+    let source =
+        MemberSourceBoundary::new(predecessor_substitution.peer.member().clone(), predecessor)
+            .unwrap();
+    assert!(matches!(
+        predecessor_substitution
+            .engine
+            .join_configuration(
+                operation("predecessor-config", 4),
+                configuration(&predecessor_substitution, 1),
+                source,
+                vec![predecessor_substitution.peer.member().clone()],
+            )
+            .await,
+        Err(MysqlReplicatorError::ReceiptMismatch)
+    ));
+}
+
+#[tokio::test]
 async fn primary_transfer_receipt_credits_only_the_exact_local_demotion() {
     let mut harness = configured(
         MysqlReplicaRole::Primary,
@@ -495,8 +715,12 @@ async fn primary_transfer_receipt_credits_only_the_exact_local_demotion() {
 
 #[tokio::test]
 async fn mismatched_late_and_uncertain_effects_never_credit_or_open_access() {
-    let wrong = authority("wrong", MysqlMemberIndex::First);
-    let mut mismatch = harness(vec![ReadPlan::WrongAuthority(Box::new(wrong))]);
+    let wrong = authority("replicator", MysqlMemberIndex::Second);
+    let mut mismatch = harness_with_receipts(
+        vec![exact(MysqlReplicaRole::Secondary)],
+        vec![ReceiptPlan::SubstituteAuthority(Box::new(wrong))],
+        CleanupPlan::Completed,
+    );
     open(&mut mismatch);
     mismatch
         .engine
@@ -582,6 +806,12 @@ async fn build_and_remove_validate_prerequisites_targets_and_exact_retries() {
             .build_replica(peer_intent(&secondary, "secondary-build", 5, false)),
         Err(MysqlReplicatorError::PrimaryRequired)
     ));
+    assert!(matches!(
+        secondary
+            .engine
+            .build_replica(peer_intent(&secondary, "secondary-build", 5, false)),
+        Err(MysqlReplicatorError::PrimaryRequired)
+    ));
 
     let mut primary = configured(
         MysqlReplicaRole::Primary,
@@ -625,8 +855,9 @@ async fn build_and_remove_validate_prerequisites_targets_and_exact_retries() {
         primary.engine.remove_replica(remove).unwrap()
     );
 
+    let self_operation = operation("self", 7);
     let self_intent = MysqlPeerOperationIntent::new(
-        operation("self", 7),
+        self_operation.clone(),
         MysqlReplicaEpoch::new(1),
         ConfigurationId::new("configuration-1").unwrap(),
         peer_facts(primary.local.clone()),
@@ -635,8 +866,29 @@ async fn build_and_remove_validate_prerequisites_targets_and_exact_retries() {
         primary.engine.build_replica(self_intent),
         Err(MysqlReplicatorError::SelfTarget)
     ));
+    let self_retry = MysqlPeerOperationIntent::new(
+        self_operation.clone(),
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        peer_facts(primary.local.clone()),
+    );
+    assert!(matches!(
+        primary.engine.build_replica(self_retry),
+        Err(MysqlReplicatorError::SelfTarget)
+    ));
+    let changed_retry = MysqlPeerOperationIntent::new(
+        self_operation,
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        peer_facts(primary.peer.clone()),
+    );
+    assert!(matches!(
+        primary.engine.build_replica(changed_retry),
+        Err(MysqlReplicatorError::OperationConflict)
+    ));
+
     let stale_epoch = MysqlPeerOperationIntent::new(
-        operation("stale-peer", 7),
+        operation("stale-peer", 8),
         MysqlReplicaEpoch::new(0),
         ConfigurationId::new("configuration-1").unwrap(),
         peer_facts(primary.peer.clone()),
@@ -645,9 +897,26 @@ async fn build_and_remove_validate_prerequisites_targets_and_exact_retries() {
         primary.engine.build_replica(stale_epoch),
         Err(MysqlReplicatorError::ConfigurationRequired)
     ));
+
+    let idle = replica_target("idle", "replicator", MysqlMemberIndex::Third);
+    let idle_build = MysqlPeerOperationIntent::new(
+        operation("idle-build", 9),
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        peer_facts(idle.clone()),
+    );
+    assert!(matches!(
+        primary.engine.build_replica(idle_build).unwrap(),
+        MysqlPeerOperationOutcome::Unsupported {
+            kind: MysqlPeerOperationKind::Build,
+            target,
+            ..
+        } if target == idle
+    ));
+
     primary
         .engine
-        .advance_epoch(operation("peer-next-epoch", 7), MysqlReplicaEpoch::new(2))
+        .advance_epoch(operation("peer-next-epoch", 10), MysqlReplicaEpoch::new(2))
         .unwrap();
     assert_eq!(
         primary
@@ -656,6 +925,105 @@ async fn build_and_remove_validate_prerequisites_targets_and_exact_retries() {
             .unwrap(),
         expected
     );
+}
+
+#[tokio::test]
+async fn peer_operations_validate_every_supplied_identity_and_binding_fact() {
+    let mut primary = configured(
+        MysqlReplicaRole::Primary,
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+        ],
+    )
+    .await;
+    let target = primary.peer.clone();
+
+    let process_mismatch = MysqlPeerOperationIntent::new(
+        operation("peer-process-mismatch", 5),
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        MysqlPeerAuthorityFacts::new(
+            target.clone(),
+            ProcessSessionId::new("substituted-process").unwrap(),
+            target.endpoint().clone(),
+            target.storage().clone(),
+        ),
+    );
+    assert!(matches!(
+        primary.engine.build_replica(process_mismatch),
+        Err(MysqlReplicatorError::IdentityMismatch)
+    ));
+
+    let endpoint_mismatch = MysqlPeerOperationIntent::new(
+        operation("peer-endpoint-mismatch", 6),
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        MysqlPeerAuthorityFacts::new(
+            target.clone(),
+            target.process_session().clone(),
+            EndpointBinding::new("substituted-endpoint").unwrap(),
+            target.storage().clone(),
+        ),
+    );
+    assert!(matches!(
+        primary.engine.build_replica(endpoint_mismatch),
+        Err(MysqlReplicatorError::IdentityMismatch)
+    ));
+
+    let storage_mismatch = MysqlPeerOperationIntent::new(
+        operation("peer-storage-mismatch", 7),
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        MysqlPeerAuthorityFacts::new(
+            target.clone(),
+            target.process_session().clone(),
+            target.endpoint().clone(),
+            StorageBinding::new("substituted-storage").unwrap(),
+        ),
+    );
+    assert!(matches!(
+        primary.engine.build_replica(storage_mismatch),
+        Err(MysqlReplicatorError::IdentityMismatch)
+    ));
+
+    let changed_identity = MysqlReplicaTarget::new(
+        MysqlReplicaIdentity::new(
+            target.identity().replica_id().clone(),
+            ReplicaIncarnation::new("substituted-incarnation").unwrap(),
+        ),
+        target.member().clone(),
+        target.process_session().clone(),
+        target.endpoint().clone(),
+        target.storage().clone(),
+    );
+    let changed_identity_operation = operation("peer-incarnation-mismatch", 8);
+    let changed_identity_intent = MysqlPeerOperationIntent::new(
+        changed_identity_operation.clone(),
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        peer_facts(changed_identity),
+    );
+    assert!(matches!(
+        primary
+            .engine
+            .remove_replica(changed_identity_intent.clone()),
+        Err(MysqlReplicatorError::InvalidConfiguration)
+    ));
+    assert!(matches!(
+        primary.engine.remove_replica(changed_identity_intent),
+        Err(MysqlReplicatorError::InvalidConfiguration)
+    ));
+    let changed_retry = MysqlPeerOperationIntent::new(
+        changed_identity_operation,
+        MysqlReplicaEpoch::new(1),
+        ConfigurationId::new("configuration-1").unwrap(),
+        peer_facts(target),
+    );
+    assert!(matches!(
+        primary.engine.remove_replica(changed_retry),
+        Err(MysqlReplicatorError::OperationConflict)
+    ));
 }
 
 #[tokio::test]
@@ -691,6 +1059,116 @@ async fn progress_projection_and_catch_up_remain_independent() {
         harness.engine.catch_up_result().unwrap(),
         kuberic_mysql::core::CatchUpCapabilityResult::retained_evidence_unavailable()
     );
+}
+
+#[tokio::test]
+async fn progress_requires_current_role_configuration_authority_and_binding() {
+    let mut unopened = harness(Vec::new());
+    assert!(matches!(
+        unopened
+            .engine
+            .read_progress(operation("unopened-progress", 1))
+            .await,
+        Err(MysqlReplicatorError::NotOpen)
+    ));
+
+    let mut pre_configuration = harness(vec![exact(MysqlReplicaRole::Secondary)]);
+    open(&mut pre_configuration);
+    pre_configuration
+        .engine
+        .advance_epoch(operation("pre-config-epoch", 2), MysqlReplicaEpoch::new(1))
+        .unwrap();
+    pre_configuration
+        .engine
+        .observe_role(
+            operation("pre-config-role", 3),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Secondary,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        pre_configuration
+            .engine
+            .read_progress(operation("pre-config-progress", 4))
+            .await,
+        Err(MysqlReplicatorError::ConfigurationRequired)
+    ));
+
+    let mut stale_epoch = configured(
+        MysqlReplicaRole::Secondary,
+        vec![
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+        ],
+    )
+    .await;
+    stale_epoch
+        .engine
+        .advance_epoch(
+            operation("stale-progress-epoch", 5),
+            MysqlReplicaEpoch::new(2),
+        )
+        .unwrap();
+    assert!(matches!(
+        stale_epoch
+            .engine
+            .read_progress(operation("stale-progress", 6))
+            .await,
+        Err(MysqlReplicatorError::ConfigurationRequired)
+    ));
+
+    let mut wrong_role = harness(vec![
+        exact(MysqlReplicaRole::Secondary),
+        exact(MysqlReplicaRole::Secondary),
+        exact(MysqlReplicaRole::Primary),
+    ]);
+    establish(&mut wrong_role, MysqlReplicaRole::Secondary).await;
+    assert!(matches!(
+        wrong_role
+            .engine
+            .read_progress(operation("wrong-role-progress", 5))
+            .await,
+        Err(MysqlReplicatorError::NativeRoleMismatch)
+    ));
+    assert_eq!(wrong_role.engine.progress(), None);
+
+    let mut stale_configuration = harness_with_receipts(
+        vec![
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+        ],
+        vec![
+            ReceiptPlan::Exact,
+            ReceiptPlan::Exact,
+            ReceiptPlan::CrossConfiguration,
+        ],
+        CleanupPlan::Completed,
+    );
+    establish(&mut stale_configuration, MysqlReplicaRole::Secondary).await;
+    assert!(matches!(
+        stale_configuration
+            .engine
+            .read_progress(operation("stale-config-progress", 5))
+            .await,
+        Err(MysqlReplicatorError::ReceiptMismatch)
+    ));
+    assert_eq!(stale_configuration.engine.progress(), None);
+
+    let mut aborted = harness(Vec::new());
+    open(&mut aborted);
+    aborted
+        .engine
+        .abort(operation("progress-abort", 2))
+        .unwrap();
+    assert!(matches!(
+        aborted
+            .engine
+            .read_progress(operation("aborted-progress", 3))
+            .await,
+        Err(MysqlReplicatorError::Terminal)
+    ));
 }
 
 #[tokio::test]
@@ -788,6 +1266,7 @@ async fn cancellation_and_deadline_reject_new_work() {
         config,
         identity.clone(),
         attempt,
+        Vec::new(),
         Vec::new(),
         CleanupPlan::Completed,
     );
@@ -891,21 +1370,45 @@ fn harness(reads: Vec<ReadPlan>) -> Harness {
 }
 
 fn harness_with_cleanup(reads: Vec<ReadPlan>, cleanup: CleanupPlan) -> Harness {
+    harness_with_receipts(reads, Vec::new(), cleanup)
+}
+
+fn harness_with_receipts(
+    reads: Vec<ReadPlan>,
+    receipts: Vec<ReceiptPlan>,
+    cleanup: CleanupPlan,
+) -> Harness {
     let root = TestRoot::new("replicat");
     let config = root.config_for_member(MysqlMemberIndex::First);
     let attempt = context("replicator");
     let authority = authority_with_attempt(&attempt, MysqlMemberIndex::First);
     let identity = replica_identity("local");
+    let local_binding = authority.local().binding();
     let local = MysqlReplicaTarget::new(
         identity.clone(),
         MemberPeer::from_enrollment(authority.local()),
+        local_binding.process_session().clone(),
+        local_binding.endpoint().clone(),
+        local_binding.storage().clone(),
     );
     let peer_identity = replica_identity("peer");
+    let peer_enrollment = enrollment("replicator", MysqlMemberIndex::Second);
+    let peer_binding = peer_enrollment.binding();
     let peer = MysqlReplicaTarget::new(
         peer_identity,
-        MemberPeer::from_enrollment(&enrollment("replicator", MysqlMemberIndex::Second)),
+        MemberPeer::from_enrollment(&peer_enrollment),
+        peer_binding.process_session().clone(),
+        peer_binding.endpoint().clone(),
+        peer_binding.storage().clone(),
     );
-    let engine = engine(config, identity.clone(), attempt.clone(), reads, cleanup);
+    let engine = engine(
+        config,
+        identity.clone(),
+        attempt.clone(),
+        reads,
+        receipts,
+        cleanup,
+    );
     Harness {
         _root: root,
         engine,
@@ -922,12 +1425,13 @@ fn engine(
     identity: MysqlReplicaIdentity,
     attempt: AttemptContext,
     reads: Vec<ReadPlan>,
+    receipts: Vec<ReceiptPlan>,
     cleanup: CleanupPlan,
 ) -> MysqlReplicator<ScriptedEffects> {
     let observer = credential(&attempt, ControlCredentialRole::Observer);
     let recovery = credential(&attempt, ControlCredentialRole::Recovery);
     MysqlReplicator::new(
-        ScriptedEffects::new(config, reads, cleanup),
+        ScriptedEffects::new(config, reads, receipts, cleanup),
         identity,
         kuberic_mysql::core::ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
         observer,
@@ -1011,8 +1515,8 @@ fn peer_intent(
             MysqlPeerAuthorityFacts::new(
                 target,
                 ProcessSessionId::new("changed-peer-process").unwrap(),
-                EndpointBinding::new("peer-endpoint").unwrap(),
-                StorageBinding::new("peer-storage").unwrap(),
+                harness.peer.endpoint().clone(),
+                harness.peer.storage().clone(),
             )
         } else {
             peer_facts(target)
@@ -1021,12 +1525,10 @@ fn peer_intent(
 }
 
 fn peer_facts(target: MysqlReplicaTarget) -> MysqlPeerAuthorityFacts {
-    MysqlPeerAuthorityFacts::new(
-        target,
-        ProcessSessionId::new("peer-process").unwrap(),
-        EndpointBinding::new("peer-endpoint").unwrap(),
-        StorageBinding::new("peer-storage").unwrap(),
-    )
+    let process_session = target.process_session().clone();
+    let endpoint = target.endpoint().clone();
+    let storage = target.storage().clone();
+    MysqlPeerAuthorityFacts::new(target, process_session, endpoint, storage)
 }
 
 fn operation(label: &str, generation: u64) -> MysqlOperationIdentity {
@@ -1044,6 +1546,22 @@ fn replica_identity(label: &str) -> MysqlReplicaIdentity {
     MysqlReplicaIdentity::new(
         ReplicaId::new(format!("replica-{label}")).unwrap(),
         ReplicaIncarnation::new(format!("incarnation-{label}")).unwrap(),
+    )
+}
+
+fn replica_target(
+    label: &str,
+    attempt_label: &str,
+    member: MysqlMemberIndex,
+) -> MysqlReplicaTarget {
+    let enrollment = enrollment(attempt_label, member);
+    let binding = enrollment.binding();
+    MysqlReplicaTarget::new(
+        replica_identity(label),
+        MemberPeer::from_enrollment(&enrollment),
+        binding.process_session().clone(),
+        binding.endpoint().clone(),
+        binding.storage().clone(),
     )
 }
 

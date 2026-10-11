@@ -17,13 +17,13 @@ use kuberic_mysql::service::{
     AttemptCleanupState, AttemptContext, AttemptDeadlineState, BackendConnectionId,
     BackendConnectionReceipt, BootstrapEffect, CanonicalViewId, ControlCredential,
     ControlCredentialRole, FreshBootstrapInput, FreshJoinInput, MemberAuthorityError,
-    MemberControlBinding, MemberEffectKind, MemberEffectReceipt, MemberMutationAuthority,
-    MemberNativeEvidence, MemberPeer, MemberReceiptError, MemberSourceBoundary,
-    MemberTransitionError, MemberViewError, MysqlInstanceConfig, MysqlInstanceError,
-    MysqlInstanceManager, MysqlInstanceState, MysqlMemberEffectBoundary, MysqlMemberIndex,
-    ObservedLocalBinding, PairedAttemptOutcome, PrimaryTransferInput, TopologyAttempt,
-    TopologyAuthority, TopologyInstant, TopologyObservation, TopologyObservationStatus,
-    TransitionEvaluation,
+    MemberControlBinding, MemberEffectKind, MemberEffectReceipt, MemberEffectRequest,
+    MemberMutationAuthority, MemberNativeEvidence, MemberPeer, MemberReceiptError,
+    MemberSourceBoundary, MemberTransitionError, MemberViewError, MysqlInstanceConfig,
+    MysqlInstanceError, MysqlInstanceManager, MysqlInstanceState, MysqlMemberEffectBoundary,
+    MysqlMemberIndex, ObservedLocalBinding, PairedAttemptOutcome, PrimaryTransferInput,
+    TopologyAttempt, TopologyAuthority, TopologyInstant, TopologyObservation,
+    TopologyObservationStatus, TransitionEvaluation,
 };
 
 const MEMBER_UUIDS: [&str; 3] = [
@@ -251,7 +251,7 @@ fn topology_capabilities_narrow_to_member_inputs_without_peer_ownership() {
     let member_bootstrap = bootstrap.member_input().unwrap();
     assert_eq!(
         member_bootstrap.authority().local(),
-        &enrollments[MysqlMemberIndex::First.as_usize_for_test()]
+        &enrollments[MysqlMemberIndex::First.index_for_test()]
     );
     let bootstrap_effect = bootstrap
         .record_effect(BootstrapEffect::required_steps().to_vec())
@@ -314,7 +314,7 @@ fn topology_capabilities_narrow_to_member_inputs_without_peer_ownership() {
     let member_join = join.member_input().unwrap();
     assert_eq!(
         member_join.authority().local(),
-        &enrollments[MysqlMemberIndex::Second.as_usize_for_test()]
+        &enrollments[MysqlMemberIndex::Second.index_for_test()]
     );
     assert_eq!(member_join.peers().len(), 1);
     assert_eq!(
@@ -901,9 +901,9 @@ impl MysqlMemberEffectBoundary for ScriptMember {
 
     async fn read_member_view(
         &mut self,
-        _authority: &MemberMutationAuthority,
+        _request: MemberEffectRequest,
         _attempt: &AttemptContext,
-    ) -> Result<MemberNativeEvidence, MemberTransitionError> {
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
         unreachable!("not used by this contract")
     }
 
@@ -966,7 +966,7 @@ fn running_authority(label: &str, manager: &MysqlInstanceManager) -> MemberMutat
         member,
         ProcessSessionId::new(format!(
             "member-{}-generation-1-pid-{pid}-scratch-{}-{}",
-            member.as_usize_for_test() + 1,
+            member.index_for_test() + 1,
             scratch.dev(),
             scratch.ino()
         ))
@@ -1008,7 +1008,7 @@ fn running_authority(label: &str, manager: &MysqlInstanceManager) -> MemberMutat
     .unwrap();
     let enrollment = kuberic_mysql::service::NativeIdentityEnrollment::new(
         binding,
-        ServerUuid::new(MEMBER_UUIDS[member.as_usize_for_test()]).unwrap(),
+        ServerUuid::new(MEMBER_UUIDS[member.index_for_test()]).unwrap(),
         &accounts,
         true,
         GtidSet::empty(),
@@ -1067,7 +1067,7 @@ fn enrollment(
     .unwrap();
     kuberic_mysql::service::NativeIdentityEnrollment::new(
         binding,
-        ServerUuid::new(MEMBER_UUIDS[member.as_usize_for_test()]).unwrap(),
+        ServerUuid::new(MEMBER_UUIDS[member.index_for_test()]).unwrap(),
         &accounts,
         true,
         GtidSet::empty(),
@@ -1077,7 +1077,7 @@ fn enrollment(
 }
 
 fn binding(label: &str, member: MysqlMemberIndex) -> MemberControlBinding {
-    let number = member.as_usize_for_test() + 1;
+    let number = member.index_for_test() + 1;
     MemberControlBinding::new(
         AttemptId::new(label).unwrap(),
         member,
@@ -1091,7 +1091,7 @@ fn binding(label: &str, member: MysqlMemberIndex) -> MemberControlBinding {
 }
 
 fn member_id(member: MysqlMemberIndex) -> MemberId {
-    MemberId::new(MEMBER_UUIDS[member.as_usize_for_test()]).unwrap()
+    MemberId::new(MEMBER_UUIDS[member.index_for_test()]).unwrap()
 }
 
 fn peer(label: &str, member: MysqlMemberIndex) -> MemberPeer {
@@ -1117,7 +1117,7 @@ fn evidence_with_gtid(
         .map(|(member, role)| {
             NativeMember::new(
                 member_id(*member),
-                MemberAddress::new(format!("127.0.0.1:3306{}", member.as_usize_for_test() + 1))
+                MemberAddress::new(format!("127.0.0.1:3306{}", member.index_for_test() + 1))
                     .unwrap(),
                 *role,
                 MemberState::Online,
@@ -1138,11 +1138,11 @@ fn evidence_with_gtid(
 }
 
 trait MemberIndexTestExt {
-    fn as_usize_for_test(self) -> usize;
+    fn index_for_test(self) -> usize;
 }
 
 impl MemberIndexTestExt for MysqlMemberIndex {
-    fn as_usize_for_test(self) -> usize {
+    fn index_for_test(self) -> usize {
         match self {
             MysqlMemberIndex::First => 0,
             MysqlMemberIndex::Second => 1,

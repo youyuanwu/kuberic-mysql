@@ -13,8 +13,9 @@ use crate::core::{
 use crate::service::{
     AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState, AttemptContext,
     AttemptDeadlineState, ControlCredential, ControlCredentialRole, FreshBootstrapInput,
-    FreshJoinInput, MemberEffectKind, MemberEffectReceipt, MemberMutationAuthority,
-    MemberNativeEvidence, MemberPeer, MemberSourceBoundary, MysqlInstanceManager,
+    FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget, MemberEffectKind,
+    MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
+    MemberOperationIdentity, MemberPeer, MemberSourceBoundary, MysqlInstanceManager,
     MysqlMemberEffectBoundary, MysqlReplicatorError, PrimaryTransferInput,
 };
 
@@ -84,6 +85,10 @@ impl MysqlOperationIdentity {
     pub const fn generation(&self) -> NonZeroU64 {
         self.generation
     }
+
+    fn member_identity(&self) -> MemberOperationIdentity {
+        MemberOperationIdentity::new(self.id.clone(), self.generation)
+    }
 }
 
 /// Monotonic lifecycle epoch used only by the MySQL-owned adapter seam.
@@ -127,13 +132,28 @@ impl MysqlReplicaRole {
 pub struct MysqlReplicaTarget {
     identity: MysqlReplicaIdentity,
     member: MemberPeer,
+    process_session: crate::core::ProcessSessionId,
+    endpoint: crate::core::EndpointBinding,
+    storage: crate::core::StorageBinding,
 }
 
 impl MysqlReplicaTarget {
     /// Creates one configured target without transferring process ownership.
     #[must_use]
-    pub const fn new(identity: MysqlReplicaIdentity, member: MemberPeer) -> Self {
-        Self { identity, member }
+    pub const fn new(
+        identity: MysqlReplicaIdentity,
+        member: MemberPeer,
+        process_session: crate::core::ProcessSessionId,
+        endpoint: crate::core::EndpointBinding,
+        storage: crate::core::StorageBinding,
+    ) -> Self {
+        Self {
+            identity,
+            member,
+            process_session,
+            endpoint,
+            storage,
+        }
     }
 
     /// Logical target identity.
@@ -146,6 +166,35 @@ impl MysqlReplicaTarget {
     #[must_use]
     pub const fn member(&self) -> &MemberPeer {
         &self.member
+    }
+
+    /// Exact process-session identity.
+    #[must_use]
+    pub const fn process_session(&self) -> &crate::core::ProcessSessionId {
+        &self.process_session
+    }
+
+    /// Exact endpoint binding.
+    #[must_use]
+    pub const fn endpoint(&self) -> &crate::core::EndpointBinding {
+        &self.endpoint
+    }
+
+    /// Exact storage binding.
+    #[must_use]
+    pub const fn storage(&self) -> &crate::core::StorageBinding {
+        &self.storage
+    }
+
+    fn member_configuration_target(&self) -> MemberConfigurationTarget {
+        MemberConfigurationTarget::new(
+            self.identity.replica_id.clone(),
+            self.identity.incarnation.clone(),
+            self.member.clone(),
+            self.process_session.clone(),
+            self.endpoint.clone(),
+            self.storage.clone(),
+        )
     }
 }
 
@@ -184,6 +233,16 @@ impl MysqlReplicaConfiguration {
     #[must_use]
     pub fn members(&self) -> &[MysqlReplicaTarget] {
         &self.members
+    }
+
+    fn member_intent(&self) -> MemberConfigurationIntent {
+        MemberConfigurationIntent::new(
+            self.id.clone(),
+            self.members
+                .iter()
+                .map(MysqlReplicaTarget::member_configuration_target)
+                .collect(),
+        )
     }
 }
 
@@ -567,7 +626,7 @@ enum OperationFingerprint {
     Configuration(MysqlReplicaConfiguration, ConfigurationEffect),
     Progress,
     Access(MysqlAccessIntent),
-    Peer(MysqlPeerOperationKind, MysqlPeerOperationIntent),
+    Peer(MysqlPeerOperationKind, Box<MysqlPeerOperationIntent>),
     Close,
     Abort,
 }
@@ -583,11 +642,33 @@ enum RecordedOutcome {
     Peer(MysqlPeerOperationOutcome),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationRejection {
+    ConfigurationRequired,
+    PrimaryRequired,
+    SelfTarget,
+    InvalidConfiguration,
+    IdentityMismatch,
+}
+
+impl OperationRejection {
+    const fn error(self) -> MysqlReplicatorError {
+        match self {
+            Self::ConfigurationRequired => MysqlReplicatorError::ConfigurationRequired,
+            Self::PrimaryRequired => MysqlReplicatorError::PrimaryRequired,
+            Self::SelfTarget => MysqlReplicatorError::SelfTarget,
+            Self::InvalidConfiguration => MysqlReplicatorError::InvalidConfiguration,
+            Self::IdentityMismatch => MysqlReplicatorError::IdentityMismatch,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OperationStatus {
     Pending,
     Uncertain,
     Completed(RecordedOutcome),
+    Rejected(OperationRejection),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -868,24 +949,28 @@ where
     ) -> Result<MysqlProgressOutcome, MysqlReplicatorError> {
         self.require_current_configuration()?;
         self.admit_work()?;
+        let request = self.current_effect_request(&operation, None)?;
         let fingerprint = OperationFingerprint::Progress;
         let index = match self.begin_operation(operation, fingerprint)? {
             Admission::Retry(outcome) => return expect_progress(outcome),
             Admission::New(index) => index,
         };
-        let authority = self.authority().clone();
-        let evidence = match self
+        let receipt = match self
             .effects
-            .read_member_view(&authority, &self.attempt)
+            .read_member_view(request.clone(), &self.attempt)
             .await
         {
-            Ok(evidence) => evidence,
+            Ok(receipt) => receipt,
             Err(error) => return self.uncertain_member(index, error),
         };
         self.validate_after_effect(index)?;
-        if let Err(error) = self.validate_evidence(&evidence) {
+        if let Err(error) = self
+            .validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)
+            .and_then(|()| self.require_current_evidence(receipt.successor()))
+        {
             return self.uncertain_rejection(index, error);
         }
+        let evidence = receipt.successor().clone();
         let outcome = MysqlProgressOutcome {
             progress: project_progress(&self.lineage, evidence.executed()),
             catch_up: CatchUpCapabilityResult::retained_evidence_unavailable(),
@@ -1048,6 +1133,7 @@ where
     ) -> Result<MysqlRoleOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
         self.admit_work()?;
+        let request_operation = operation.clone();
         let fingerprint = OperationFingerprint::Role(epoch, role, effect.clone());
         let index = match self.begin_operation(operation, fingerprint)? {
             Admission::Retry(outcome) => return expect_role(outcome),
@@ -1057,29 +1143,39 @@ where
             self.discard_last();
             return Err(MysqlReplicatorError::EpochBarrierRequired);
         }
-        let authority = self.authority().clone();
+        let source = match &effect {
+            RoleEffect::Observe => None,
+            RoleEffect::Transfer { source, .. } => Some(source.as_ref().clone()),
+        };
+        let request = self.effect_request(&request_operation, epoch, role, None, source)?;
         let evidence = match effect {
             RoleEffect::Observe => {
-                match self
+                let receipt = match self
                     .effects
-                    .read_member_view(&authority, &self.attempt)
+                    .read_member_view(request.clone(), &self.attempt)
                     .await
                 {
-                    Ok(evidence) => evidence,
+                    Ok(receipt) => receipt,
                     Err(error) => return self.uncertain_member(index, error),
+                };
+                if let Err(error) =
+                    self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)
+                {
+                    return self.uncertain_rejection(index, error);
                 }
+                receipt.successor().clone()
             }
             RoleEffect::Transfer { source, target } => {
                 let expected = MemberEffectKind::PrimaryTransfer {
                     target: target.member_id().clone(),
                 };
-                let input = PrimaryTransferInput::new(authority.clone(), *source, target)
+                let input = PrimaryTransferInput::for_request(request.clone(), *source, target)
                     .map_err(MysqlReplicatorError::MemberTransition)?;
                 let receipt = match self.effects.transfer_primary(input, &self.attempt).await {
                     Ok(receipt) => receipt,
                     Err(error) => return self.uncertain_member(index, error),
                 };
-                if let Err(error) = self.validate_receipt(&receipt, &expected) {
+                if let Err(error) = self.validate_receipt(&receipt, &expected, &request) {
                     return self.uncertain_rejection(index, error);
                 }
                 receipt.successor().clone()
@@ -1111,6 +1207,7 @@ where
     ) -> Result<MysqlConfigurationOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
         self.admit_work()?;
+        let request_operation = operation.clone();
         let fingerprint =
             OperationFingerprint::Configuration(configuration.clone(), effect.clone());
         let index = match self.begin_operation(operation, fingerprint)? {
@@ -1129,38 +1226,57 @@ where
             self.discard_last();
             return Err(error);
         }
-        let authority = self.authority().clone();
+        let role = self
+            .role
+            .expect("current role checked before configuration");
+        let source = match &effect {
+            ConfigurationEffect::Join { source, .. } => Some(source.as_ref().clone()),
+            ConfigurationEffect::Observe | ConfigurationEffect::Bootstrap => None,
+        };
+        let request = self.effect_request(
+            &request_operation,
+            epoch,
+            role,
+            Some(configuration.member_intent()),
+            source,
+        )?;
         let evidence = match effect {
             ConfigurationEffect::Observe => {
-                match self
-                    .effects
-                    .read_member_view(&authority, &self.attempt)
-                    .await
-                {
-                    Ok(evidence) => evidence,
-                    Err(error) => return self.uncertain_member(index, error),
-                }
-            }
-            ConfigurationEffect::Bootstrap => {
                 let receipt = match self
                     .effects
-                    .bootstrap_member(
-                        FreshBootstrapInput::new(authority),
-                        &self.recovery,
-                        &self.attempt,
-                    )
+                    .read_member_view(request.clone(), &self.attempt)
                     .await
                 {
                     Ok(receipt) => receipt,
                     Err(error) => return self.uncertain_member(index, error),
                 };
-                if let Err(error) = self.validate_receipt(&receipt, &MemberEffectKind::Bootstrap) {
+                if let Err(error) =
+                    self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)
+                {
+                    return self.uncertain_rejection(index, error);
+                }
+                receipt.successor().clone()
+            }
+            ConfigurationEffect::Bootstrap => {
+                let input = FreshBootstrapInput::for_request(request.clone())
+                    .map_err(MysqlReplicatorError::MemberTransition)?;
+                let receipt = match self
+                    .effects
+                    .bootstrap_member(input, &self.recovery, &self.attempt)
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => return self.uncertain_member(index, error),
+                };
+                if let Err(error) =
+                    self.validate_receipt(&receipt, &MemberEffectKind::Bootstrap, &request)
+                {
                     return self.uncertain_rejection(index, error);
                 }
                 receipt.successor().clone()
             }
             ConfigurationEffect::Join { source, peers } => {
-                let input = FreshJoinInput::new(authority, *source, peers)
+                let input = FreshJoinInput::for_request(request.clone(), *source, peers)
                     .map_err(MysqlReplicatorError::MemberTransition)?;
                 let receipt = match self
                     .effects
@@ -1170,7 +1286,9 @@ where
                     Ok(receipt) => receipt,
                     Err(error) => return self.uncertain_member(index, error),
                 };
-                if let Err(error) = self.validate_receipt(&receipt, &MemberEffectKind::Join) {
+                if let Err(error) =
+                    self.validate_receipt(&receipt, &MemberEffectKind::Join, &request)
+                {
                     return self.uncertain_rejection(index, error);
                 }
                 receipt.successor().clone()
@@ -1205,18 +1323,16 @@ where
         self.require_open_active()?;
         self.admit_work()?;
         let operation = intent.operation.clone();
-        let fingerprint = OperationFingerprint::Peer(kind, intent.clone());
-        match self.begin_operation(operation, fingerprint)? {
+        let fingerprint = OperationFingerprint::Peer(kind, Box::new(intent.clone()));
+        let index = match self.begin_operation(operation, fingerprint)? {
             Admission::Retry(outcome) => return expect_peer(outcome),
-            Admission::New(_) => {}
-        }
-        if let Err(error) = self.require_current_configuration() {
-            self.discard_last();
-            return Err(error);
+            Admission::New(index) => index,
+        };
+        if self.require_current_configuration().is_err() {
+            return self.reject_operation(index, OperationRejection::ConfigurationRequired);
         }
         if self.role != Some(MysqlReplicaRole::Primary) {
-            self.discard_last();
-            return Err(MysqlReplicatorError::PrimaryRequired);
+            return self.reject_operation(index, OperationRejection::PrimaryRequired);
         }
         let configuration = self
             .configuration
@@ -1226,25 +1342,41 @@ where
         if intent.epoch != self.epoch.expect("current configuration has an epoch")
             || intent.configuration != configuration.id
         {
-            self.discard_last();
-            return Err(MysqlReplicatorError::ConfigurationRequired);
+            return self.reject_operation(index, OperationRejection::ConfigurationRequired);
         }
         let target = intent.authority.target().clone();
+        if intent.authority.process_session() != target.process_session()
+            || intent.authority.endpoint() != target.endpoint()
+            || intent.authority.storage() != target.storage()
+        {
+            return self.reject_operation(index, OperationRejection::IdentityMismatch);
+        }
         let local_member = self.authority().local().member_id();
         if target.identity == self.identity || target.member.member_id() == local_member {
-            self.discard_last();
-            return Err(MysqlReplicatorError::SelfTarget);
+            return self.reject_operation(index, OperationRejection::SelfTarget);
         }
-        if !configuration.members.iter().any(|member| member == &target) {
-            self.discard_last();
-            return Err(MysqlReplicatorError::InvalidConfiguration);
+        let configured_target = configuration.members.iter().find(|member| {
+            member.identity == target.identity
+                || member.member.member_id() == target.member.member_id()
+        });
+        match kind {
+            MysqlPeerOperationKind::Build => {
+                if configured_target.is_some_and(|configured| configured != &target) {
+                    return self.reject_operation(index, OperationRejection::InvalidConfiguration);
+                }
+            }
+            MysqlPeerOperationKind::Remove => {
+                if configured_target != Some(&target) {
+                    return self.reject_operation(index, OperationRejection::InvalidConfiguration);
+                }
+            }
         }
         let outcome = MysqlPeerOperationOutcome::Unsupported {
             kind,
             reason: MysqlPeerUnsupportedReason::NativeExecutionUnavailable,
             target,
         };
-        self.complete_last(RecordedOutcome::Peer(outcome.clone()));
+        self.complete(index, RecordedOutcome::Peer(outcome.clone()));
         Ok(outcome)
     }
 
@@ -1254,14 +1386,24 @@ where
     ) -> Result<(), MysqlReplicatorError> {
         let authority = self.authority();
         let local_member = authority.local().member_id();
+        let local_binding = authority.local().binding();
         let mut local_count = 0;
         for (index, member) in configuration.members.iter().enumerate() {
             if member.identity == self.identity && member.member.member_id() == local_member {
+                if member.process_session != *local_binding.process_session()
+                    || member.endpoint != *local_binding.endpoint()
+                    || member.storage != *local_binding.storage()
+                {
+                    return Err(MysqlReplicatorError::InvalidConfiguration);
+                }
                 local_count += 1;
             }
             if configuration.members[index + 1..].iter().any(|other| {
                 other.identity == member.identity
                     || other.member.member_id() == member.member.member_id()
+                    || other.process_session == member.process_session
+                    || other.endpoint == member.endpoint
+                    || other.storage == member.storage
             }) {
                 return Err(MysqlReplicatorError::InvalidConfiguration);
             }
@@ -1276,8 +1418,10 @@ where
         &self,
         receipt: &MemberEffectReceipt,
         expected: &MemberEffectKind,
+        request: &MemberEffectRequest,
     ) -> Result<(), MysqlReplicatorError> {
         if receipt.kind() != expected
+            || receipt.request() != Some(request)
             || receipt.authority() != self.authority()
             || receipt.cancellation_state() != AttemptCancellationState::Active
             || receipt.deadline_state() != AttemptDeadlineState::Work
@@ -1286,6 +1430,49 @@ where
             return Err(MysqlReplicatorError::ReceiptMismatch);
         }
         self.validate_evidence(receipt.successor())
+    }
+
+    fn effect_request(
+        &self,
+        operation: &MysqlOperationIdentity,
+        epoch: MysqlReplicaEpoch,
+        role: MysqlReplicaRole,
+        configuration: Option<MemberConfigurationIntent>,
+        source: Option<MemberSourceBoundary>,
+    ) -> Result<MemberEffectRequest, MysqlReplicatorError> {
+        MemberEffectRequest::new(
+            operation.member_identity(),
+            epoch.value(),
+            role.native(),
+            configuration,
+            self.authority().clone(),
+            source,
+        )
+        .map_err(MysqlReplicatorError::MemberTransition)
+    }
+
+    fn current_effect_request(
+        &self,
+        operation: &MysqlOperationIdentity,
+        source: Option<MemberSourceBoundary>,
+    ) -> Result<MemberEffectRequest, MysqlReplicatorError> {
+        let epoch = self
+            .epoch
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
+        let role = self
+            .role
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
+        let configuration = self
+            .configuration
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
+        self.effect_request(
+            operation,
+            epoch,
+            role,
+            Some(configuration.member_intent()),
+            source,
+        )
     }
 
     fn validate_evidence(
@@ -1311,6 +1498,22 @@ where
             return Err(MysqlReplicatorError::NativeRoleMismatch);
         }
         Ok(())
+    }
+
+    fn require_current_evidence(
+        &self,
+        evidence: &MemberNativeEvidence,
+    ) -> Result<(), MysqlReplicatorError> {
+        let role = self
+            .role
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
+        let configuration = self
+            .configuration
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
+        self.validate_evidence(evidence)
+            .and_then(|()| self.require_native_role(evidence, role))
+            .and_then(|()| self.require_configuration_evidence(configuration, evidence))
     }
 
     fn require_current_configuration(&self) -> Result<(), MysqlReplicatorError> {
@@ -1404,6 +1607,7 @@ where
                 OperationStatus::Pending | OperationStatus::Uncertain => {
                     Err(MysqlReplicatorError::OperationUncertain)
                 }
+                OperationStatus::Rejected(rejection) => Err(rejection.error()),
             };
         }
         let generation = operation.generation.get();
@@ -1437,6 +1641,7 @@ where
             OperationStatus::Pending | OperationStatus::Uncertain => {
                 Err(MysqlReplicatorError::OperationUncertain)
             }
+            OperationStatus::Rejected(rejection) => Err(rejection.error()),
         }
     }
 
@@ -1447,6 +1652,15 @@ where
     fn complete_last(&mut self, outcome: RecordedOutcome) {
         let index = self.operations.len() - 1;
         self.complete(index, outcome);
+    }
+
+    fn reject_operation<T>(
+        &mut self,
+        index: usize,
+        rejection: OperationRejection,
+    ) -> Result<T, MysqlReplicatorError> {
+        self.operations[index].status = OperationStatus::Rejected(rejection);
+        Err(rejection.error())
     }
 
     fn discard_last(&mut self) {

@@ -3,8 +3,9 @@
 use std::num::NonZeroU64;
 
 use crate::core::{
-    AttemptId, GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState, NativeMember,
-    NativeView, ViewId,
+    AttemptId, AuthorityGeneration, ConfigurationId, EndpointBinding, GroupName, GtidSet,
+    MemberAddress, MemberId, MemberRole, MemberState, NativeMember, NativeView, ProcessSessionId,
+    ReplicaId, ReplicaIncarnation, StorageBinding, ViewId,
 };
 use crate::service::{
     AttemptCancellationState, AttemptCleanupState, AttemptContext, AttemptDeadlineState,
@@ -313,17 +314,198 @@ impl MemberSourceBoundary {
     }
 }
 
+/// Exact neutral lifecycle operation identity attached to a member effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberOperationIdentity {
+    id: AuthorityGeneration,
+    generation: NonZeroU64,
+}
+
+impl MemberOperationIdentity {
+    /// Creates one exact operation identity.
+    #[must_use]
+    pub const fn new(id: AuthorityGeneration, generation: NonZeroU64) -> Self {
+        Self { id, generation }
+    }
+
+    /// Opaque operation identity.
+    #[must_use]
+    pub const fn id(&self) -> &AuthorityGeneration {
+        &self.id
+    }
+
+    /// Monotonic operation generation.
+    #[must_use]
+    pub const fn generation(&self) -> NonZeroU64 {
+        self.generation
+    }
+}
+
+/// Exact non-owning configured-member facts attached to a lifecycle request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberConfigurationTarget {
+    replica_id: ReplicaId,
+    incarnation: ReplicaIncarnation,
+    member: MemberPeer,
+    process_session: ProcessSessionId,
+    endpoint: EndpointBinding,
+    storage: StorageBinding,
+}
+
+impl MemberConfigurationTarget {
+    /// Creates one exact configured-member binding.
+    #[must_use]
+    pub const fn new(
+        replica_id: ReplicaId,
+        incarnation: ReplicaIncarnation,
+        member: MemberPeer,
+        process_session: ProcessSessionId,
+        endpoint: EndpointBinding,
+        storage: StorageBinding,
+    ) -> Self {
+        Self {
+            replica_id,
+            incarnation,
+            member,
+            process_session,
+            endpoint,
+            storage,
+        }
+    }
+}
+
+/// Complete requested configuration attached to a member effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberConfigurationIntent {
+    id: ConfigurationId,
+    members: Vec<MemberConfigurationTarget>,
+}
+
+impl MemberConfigurationIntent {
+    /// Creates one exact configuration request.
+    #[must_use]
+    pub fn new(id: ConfigurationId, members: Vec<MemberConfigurationTarget>) -> Self {
+        Self { id, members }
+    }
+
+    /// Configuration identity.
+    #[must_use]
+    pub const fn id(&self) -> &ConfigurationId {
+        &self.id
+    }
+
+    /// Exact configured-member facts.
+    #[must_use]
+    pub fn members(&self) -> &[MemberConfigurationTarget] {
+        &self.members
+    }
+}
+
+/// Exact lifecycle request whose native evidence may receive credit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberEffectRequest {
+    operation: MemberOperationIdentity,
+    epoch: u64,
+    role: MemberRole,
+    configuration: Option<MemberConfigurationIntent>,
+    authority: MemberMutationAuthority,
+    source: Option<MemberSourceBoundary>,
+}
+
+impl MemberEffectRequest {
+    /// Creates one fully explicit member-effect request.
+    pub fn new(
+        operation: MemberOperationIdentity,
+        epoch: u64,
+        role: MemberRole,
+        configuration: Option<MemberConfigurationIntent>,
+        authority: MemberMutationAuthority,
+        source: Option<MemberSourceBoundary>,
+    ) -> Result<Self, MemberTransitionError> {
+        if let Some(source) = source.as_ref() {
+            validate_attempt(&authority, source.evidence())?;
+        }
+        Ok(Self {
+            operation,
+            epoch,
+            role,
+            configuration,
+            authority,
+            source,
+        })
+    }
+
+    /// Exact lifecycle operation identity.
+    #[must_use]
+    pub const fn operation(&self) -> &MemberOperationIdentity {
+        &self.operation
+    }
+
+    /// Requested lifecycle epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Requested native role.
+    #[must_use]
+    pub const fn role(&self) -> MemberRole {
+        self.role
+    }
+
+    /// Requested configuration identity, when configuration is part of the operation.
+    #[must_use]
+    pub const fn configuration(&self) -> Option<&MemberConfigurationIntent> {
+        self.configuration.as_ref()
+    }
+
+    /// Exact current local authority.
+    #[must_use]
+    pub const fn authority(&self) -> &MemberMutationAuthority {
+        &self.authority
+    }
+
+    /// Exact predecessor/source boundary, when the effect requires one.
+    #[must_use]
+    pub const fn source(&self) -> Option<&MemberSourceBoundary> {
+        self.source.as_ref()
+    }
+}
+
 /// Fresh one-member bootstrap input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FreshBootstrapInput {
     authority: MemberMutationAuthority,
+    request: Option<MemberEffectRequest>,
 }
 
 impl FreshBootstrapInput {
     /// Creates member-scoped bootstrap input.
     #[must_use]
     pub const fn new(authority: MemberMutationAuthority) -> Self {
-        Self { authority }
+        Self {
+            authority,
+            request: None,
+        }
+    }
+
+    /// Creates lifecycle-bound member-scoped bootstrap input.
+    pub fn for_request(request: MemberEffectRequest) -> Result<Self, MemberTransitionError> {
+        if request.source().is_some() {
+            return Err(MemberTransitionError::Receipt(
+                MemberReceiptError::PredecessorMismatch,
+            ));
+        }
+        Ok(Self {
+            authority: request.authority().clone(),
+            request: Some(request),
+        })
+    }
+
+    /// Exact lifecycle request, when invoked through the adapter engine.
+    #[must_use]
+    pub const fn request(&self) -> Option<&MemberEffectRequest> {
+        self.request.as_ref()
     }
 
     /// Exact local authority.
@@ -337,6 +519,7 @@ impl FreshBootstrapInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FreshJoinInput {
     authority: MemberMutationAuthority,
+    request: Option<MemberEffectRequest>,
     source: MemberSourceBoundary,
     peers: Vec<MemberPeer>,
 }
@@ -346,6 +529,29 @@ impl FreshJoinInput {
     /// authority.
     pub fn new(
         authority: MemberMutationAuthority,
+        source: MemberSourceBoundary,
+        peers: Vec<MemberPeer>,
+    ) -> Result<Self, MemberTransitionError> {
+        Self::new_internal(authority, None, source, peers)
+    }
+
+    /// Creates a lifecycle-bound join request.
+    pub fn for_request(
+        request: MemberEffectRequest,
+        source: MemberSourceBoundary,
+        peers: Vec<MemberPeer>,
+    ) -> Result<Self, MemberTransitionError> {
+        if request.source() != Some(&source) {
+            return Err(MemberTransitionError::Receipt(
+                MemberReceiptError::PredecessorMismatch,
+            ));
+        }
+        Self::new_internal(request.authority().clone(), Some(request), source, peers)
+    }
+
+    fn new_internal(
+        authority: MemberMutationAuthority,
+        request: Option<MemberEffectRequest>,
         source: MemberSourceBoundary,
         peers: Vec<MemberPeer>,
     ) -> Result<Self, MemberTransitionError> {
@@ -363,9 +569,16 @@ impl FreshJoinInput {
         validate_peers(source.evidence().view(), &peers)?;
         Ok(Self {
             authority,
+            request,
             source,
             peers,
         })
+    }
+
+    /// Exact lifecycle request, when invoked through the adapter engine.
+    #[must_use]
+    pub const fn request(&self) -> Option<&MemberEffectRequest> {
+        self.request.as_ref()
     }
 
     /// Exact joining-member authority.
@@ -391,6 +604,7 @@ impl FreshJoinInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimaryTransferInput {
     authority: MemberMutationAuthority,
+    request: Option<MemberEffectRequest>,
     source: MemberSourceBoundary,
     target: MemberPeer,
 }
@@ -400,6 +614,29 @@ impl PrimaryTransferInput {
     /// one exact online secondary.
     pub fn new(
         authority: MemberMutationAuthority,
+        source: MemberSourceBoundary,
+        target: MemberPeer,
+    ) -> Result<Self, MemberTransitionError> {
+        Self::new_internal(authority, None, source, target)
+    }
+
+    /// Creates a lifecycle-bound primary-transfer request.
+    pub fn for_request(
+        request: MemberEffectRequest,
+        source: MemberSourceBoundary,
+        target: MemberPeer,
+    ) -> Result<Self, MemberTransitionError> {
+        if request.source() != Some(&source) {
+            return Err(MemberTransitionError::Receipt(
+                MemberReceiptError::PredecessorMismatch,
+            ));
+        }
+        Self::new_internal(request.authority().clone(), Some(request), source, target)
+    }
+
+    fn new_internal(
+        authority: MemberMutationAuthority,
+        request: Option<MemberEffectRequest>,
         source: MemberSourceBoundary,
         target: MemberPeer,
     ) -> Result<Self, MemberTransitionError> {
@@ -432,9 +669,16 @@ impl PrimaryTransferInput {
         }
         Ok(Self {
             authority,
+            request,
             source,
             target,
         })
+    }
+
+    /// Exact lifecycle request, when invoked through the adapter engine.
+    #[must_use]
+    pub const fn request(&self) -> Option<&MemberEffectRequest> {
+        self.request.as_ref()
     }
 
     /// Exact local source authority.
@@ -476,6 +720,7 @@ pub enum MemberEffectKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberEffectReceipt {
     kind: MemberEffectKind,
+    request: Option<MemberEffectRequest>,
     authority: MemberMutationAuthority,
     predecessor: Option<MemberNativeEvidence>,
     successor: MemberNativeEvidence,
@@ -489,6 +734,53 @@ impl MemberEffectReceipt {
     pub fn new(
         kind: MemberEffectKind,
         authority: MemberMutationAuthority,
+        predecessor: Option<MemberNativeEvidence>,
+        successor: MemberNativeEvidence,
+        final_binding: &crate::service::MemberControlBinding,
+        attempt: &AttemptContext,
+        cleanup: AttemptCleanupState,
+    ) -> Result<Self, MemberTransitionError> {
+        Self::new_internal(
+            kind,
+            authority,
+            None,
+            predecessor,
+            successor,
+            final_binding,
+            attempt,
+            cleanup,
+        )
+    }
+
+    /// Validates and creates a lifecycle-request-bound effect receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_request(
+        kind: MemberEffectKind,
+        request: MemberEffectRequest,
+        predecessor: Option<MemberNativeEvidence>,
+        successor: MemberNativeEvidence,
+        final_binding: &crate::service::MemberControlBinding,
+        attempt: &AttemptContext,
+        cleanup: AttemptCleanupState,
+    ) -> Result<Self, MemberTransitionError> {
+        let authority = request.authority().clone();
+        Self::new_internal(
+            kind,
+            authority,
+            Some(request),
+            predecessor,
+            successor,
+            final_binding,
+            attempt,
+            cleanup,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_internal(
+        kind: MemberEffectKind,
+        authority: MemberMutationAuthority,
+        request: Option<MemberEffectRequest>,
         predecessor: Option<MemberNativeEvidence>,
         successor: MemberNativeEvidence,
         final_binding: &crate::service::MemberControlBinding,
@@ -523,9 +815,25 @@ impl MemberEffectReceipt {
                 MemberReceiptError::CleanupIncomplete,
             ));
         }
+        if let Some(request) = request.as_ref() {
+            match (&kind, request.source(), predecessor.as_ref()) {
+                (
+                    MemberEffectKind::Join | MemberEffectKind::PrimaryTransfer { .. },
+                    Some(source),
+                    Some(predecessor),
+                ) if source.evidence() == predecessor => {}
+                (MemberEffectKind::Bootstrap | MemberEffectKind::ViewReadback, None, None) => {}
+                _ => {
+                    return Err(MemberTransitionError::Receipt(
+                        MemberReceiptError::PredecessorMismatch,
+                    ));
+                }
+            }
+        }
         validate_receipt(&kind, &authority, predecessor.as_ref(), &successor)?;
         Ok(Self {
             kind,
+            request,
             authority,
             predecessor,
             successor,
@@ -539,6 +847,12 @@ impl MemberEffectReceipt {
     #[must_use]
     pub const fn kind(&self) -> &MemberEffectKind {
         &self.kind
+    }
+
+    /// Exact lifecycle request that produced this receipt.
+    #[must_use]
+    pub const fn request(&self) -> Option<&MemberEffectRequest> {
+        self.request.as_ref()
     }
 
     /// Exact local process/storage/endpoint/native authority.
@@ -697,9 +1011,9 @@ pub trait MysqlMemberEffectBoundary {
     /// Reads one bracketed coherent member view.
     async fn read_member_view(
         &mut self,
-        authority: &MemberMutationAuthority,
+        request: MemberEffectRequest,
         attempt: &AttemptContext,
-    ) -> Result<MemberNativeEvidence, MemberTransitionError>;
+    ) -> Result<MemberEffectReceipt, MemberTransitionError>;
 
     /// Transfers primary to one exact native target.
     async fn transfer_primary(

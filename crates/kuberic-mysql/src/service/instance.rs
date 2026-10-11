@@ -36,10 +36,10 @@ use crate::service::{
     AttemptDeadlineState, BackendConnectionId, BackendConnectionReceipt, BootstrapCapability,
     BootstrapEffect, ControlCredential, FreshBootstrapInput, FreshJoinInput, JoinCapability,
     JoinEffect, LifecycleOperation, MemberAuthorityError, MemberControlBinding, MemberEffectKind,
-    MemberEffectReceipt, MemberMutationAuthority, MemberNativeEvidence, MemberTransitionError,
-    MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary, MysqlTopologyError,
-    NativeControlDeadline, NativeIdentityEnrollment, PairedAttemptOutcome, PrimaryTransferInput,
-    TopologyStateError, ViewDiscovery,
+    MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
+    MemberTransitionError, MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary,
+    MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment, PairedAttemptOutcome,
+    PrimaryTransferInput, TopologyStateError, ViewDiscovery,
 };
 
 const READY_POLL: Duration = Duration::from_millis(25);
@@ -413,6 +413,7 @@ impl MysqlInstanceManager {
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
         let target = self.prepare_member_effect_target(input.authority(), attempt)?;
+        let request = input.request().cloned();
         let authority = input.authority().clone();
         let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
@@ -428,8 +429,11 @@ impl MysqlInstanceManager {
                 &mut containment,
                 target,
                 MemberEffectKind::Bootstrap,
-                authority,
-                None,
+                MemberReceiptContext {
+                    authority,
+                    request,
+                    predecessor: None,
+                },
                 attempt,
                 &deadline,
             )
@@ -448,6 +452,7 @@ impl MysqlInstanceManager {
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
         let target = self.prepare_member_effect_target(input.authority(), attempt)?;
+        let request = input.request().cloned();
         let authority = input.authority().clone();
         let predecessor = input.source().evidence().clone();
         let mut containment = MemberEffectCancellationContainment::new(self, attempt);
@@ -459,8 +464,11 @@ impl MysqlInstanceManager {
                 &mut containment,
                 target,
                 MemberEffectKind::Join,
-                authority,
-                Some(predecessor),
+                MemberReceiptContext {
+                    authority,
+                    request,
+                    predecessor: Some(predecessor),
+                },
                 attempt,
                 &deadline,
             )
@@ -482,6 +490,32 @@ impl MysqlInstanceManager {
         crate::service::control::read_member_view(target, authority, &deadline).await
     }
 
+    /// Reads one request-bound coherent native member view and returns an
+    /// exact receipt suitable for lifecycle credit.
+    pub async fn read_member_view_for_request(
+        &mut self,
+        request: MemberEffectRequest,
+        attempt: &AttemptContext,
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        let authority = request.authority().clone();
+        let target = self.prepare_member_effect_target(&authority, attempt)?;
+        let deadline = Self::member_effect_deadline(attempt)?;
+        let evidence =
+            crate::service::control::read_member_view(target.clone(), &authority, &deadline)
+                .await?;
+        let final_binding = self.revalidate_member_effect_binding(&authority)?;
+        target.revalidate_socket()?;
+        MemberEffectReceipt::for_request(
+            MemberEffectKind::ViewReadback,
+            request,
+            None,
+            evidence,
+            &final_binding,
+            attempt,
+            AttemptCleanupState::NotRequired,
+        )
+    }
+
     /// Transfers native primary authority from this exact local source to one
     /// exact immutable target identity.
     pub async fn transfer_primary(
@@ -490,6 +524,7 @@ impl MysqlInstanceManager {
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
         let target = self.prepare_member_effect_target(input.authority(), attempt)?;
+        let request = input.request().cloned();
         let authority = input.authority().clone();
         let predecessor = input.source().evidence().clone();
         let transfer_target = input.target().clone();
@@ -517,8 +552,11 @@ impl MysqlInstanceManager {
                 MemberEffectKind::PrimaryTransfer {
                     target: transfer_target.member_id().clone(),
                 },
-                authority,
-                Some(predecessor),
+                MemberReceiptContext {
+                    authority,
+                    request,
+                    predecessor: Some(predecessor),
+                },
                 attempt,
                 &deadline,
             )
@@ -1102,10 +1140,10 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
 
     async fn read_member_view(
         &mut self,
-        authority: &MemberMutationAuthority,
+        request: MemberEffectRequest,
         attempt: &AttemptContext,
-    ) -> Result<MemberNativeEvidence, MemberTransitionError> {
-        MysqlInstanceManager::read_member_view(self, authority, attempt).await
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        MysqlInstanceManager::read_member_view_for_request(self, request, attempt).await
     }
 
     async fn transfer_primary(
@@ -1134,15 +1172,25 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
     }
 }
 
+struct MemberReceiptContext {
+    authority: MemberMutationAuthority,
+    request: Option<MemberEffectRequest>,
+    predecessor: Option<MemberNativeEvidence>,
+}
+
 async fn poll_member_receipt(
     containment: &mut MemberEffectCancellationContainment<'_>,
     target: OwnedControlTarget,
     kind: MemberEffectKind,
-    authority: MemberMutationAuthority,
-    predecessor: Option<MemberNativeEvidence>,
+    context: MemberReceiptContext,
     attempt: &AttemptContext,
     deadline: &NativeControlDeadline,
 ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+    let MemberReceiptContext {
+        authority,
+        request,
+        predecessor,
+    } = context;
     let cleanup = if kind == MemberEffectKind::Bootstrap {
         AttemptCleanupState::Completed
     } else {
@@ -1156,15 +1204,28 @@ async fn poll_member_receipt(
             crate::service::control::read_member_view(target.clone(), &authority, deadline).await?;
         let final_binding = containment.revalidate_binding(&authority)?;
         target.revalidate_socket()?;
-        match MemberEffectReceipt::new(
-            kind.clone(),
-            authority.clone(),
-            predecessor.clone(),
-            evidence,
-            &final_binding,
-            attempt,
-            cleanup,
-        ) {
+        let receipt = if let Some(request) = request.clone() {
+            MemberEffectReceipt::for_request(
+                kind.clone(),
+                request,
+                predecessor.clone(),
+                evidence,
+                &final_binding,
+                attempt,
+                cleanup,
+            )
+        } else {
+            MemberEffectReceipt::new(
+                kind.clone(),
+                authority.clone(),
+                predecessor.clone(),
+                evidence,
+                &final_binding,
+                attempt,
+                cleanup,
+            )
+        };
+        match receipt {
             Ok(receipt) => return Ok(receipt),
             Err(MemberTransitionError::Receipt(
                 crate::service::MemberReceiptError::SuccessorMismatch,

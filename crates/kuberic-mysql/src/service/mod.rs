@@ -62,8 +62,9 @@ pub use error::{
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
 pub use member::{
     BackendConnectionId, BackendConnectionReceipt, CanonicalViewId, FreshBootstrapInput,
-    FreshJoinInput, MemberEffectKind, MemberEffectReceipt, MemberMutationAuthority,
-    MemberNativeEvidence, MemberPeer, MemberSourceBoundary, MysqlMemberEffectBoundary,
+    FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget, MemberEffectKind,
+    MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
+    MemberOperationIdentity, MemberPeer, MemberSourceBoundary, MysqlMemberEffectBoundary,
     PrimaryTransferInput,
 };
 pub use replicator::{
