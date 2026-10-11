@@ -16,11 +16,15 @@ use kuberic_mysql::core::{
 };
 use kuberic_mysql::service::{
     ApplicationCredential, AttemptContext, CanonicalViewId, ControlCredential,
-    ControlCredentialRole, MysqlFreshMemberCredentials, MysqlFreshMemberInput, MysqlInstanceConfig,
-    MysqlMemberConfig, MysqlMemberIndex, MysqlOperationIdentity, MysqlOperationTimeouts,
-    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
-    MysqlReplicaTarget, MysqlReplicator, MysqlTopologyConfig,
+    ControlCredentialRole, MysqlAccessIntent, MysqlFreshMemberCredentials, MysqlFreshMemberInput,
+    MysqlHandoffBoundary, MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex,
+    MysqlOperationIdentity, MysqlOperationTimeouts, MysqlReplicaConfiguration, MysqlReplicaEpoch,
+    MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
+    MysqlTerminalState, MysqlTopologyConfig,
 };
+use mysql_async::prelude::Queryable;
+use mysql_async::{Conn, OptsBuilder};
+use tokio::time::sleep;
 
 pub use live_support::preflight_oracle_mysql_8_4_11;
 use live_support::{
@@ -43,6 +47,62 @@ pub struct FormationEvidence {
     second_view: String,
     final_view: String,
     progress: ProgressProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandoffStage {
+    CancellationGenerationPublished,
+    CancellationContained,
+    SourceGenerationPublished,
+    SourceAutocommitCompleted,
+    SourceTransactionCompleted,
+    SourcePingQuitCompleted,
+    SourceRevokedEligible,
+    BoundaryFrozen,
+    EpochBarriersAccepted,
+    SourceTransferCompleted,
+    TargetPromotionCompleted,
+    RemainingSameRoleCompleted,
+    ConfigurationAccepted,
+    SourceStoppedAndReaped,
+    RemainingSuccessorAccepted,
+    TargetSuccessorAccepted,
+    TargetPublished,
+    TargetMutationCompleted,
+    SourceUnavailableConfirmed,
+    CleanupCompleted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffTraceEntry {
+    pub stage: HandoffStage,
+    pub elapsed: Duration,
+    pub evidence: String,
+}
+
+pub struct ControlledHandoffEvidence {
+    trace: Vec<HandoffTraceEntry>,
+    boundary: MysqlHandoffBoundary,
+    source_endpoint: SocketAddr,
+    target_endpoint: SocketAddr,
+}
+
+impl ControlledHandoffEvidence {
+    pub fn trace(&self) -> &[HandoffTraceEntry] {
+        &self.trace
+    }
+
+    pub const fn boundary(&self) -> &MysqlHandoffBoundary {
+        &self.boundary
+    }
+
+    pub const fn source_endpoint(&self) -> SocketAddr {
+        self.source_endpoint
+    }
+
+    pub const fn target_endpoint(&self) -> SocketAddr {
+        self.target_endpoint
+    }
 }
 
 impl FormationEvidence {
@@ -75,6 +135,7 @@ pub struct ReplicatorLiveFixture {
     workload: WorkloadCredentialOwner,
     sql_addresses: [SocketAddr; 3],
     group_addresses: [SocketAddr; 3],
+    application_schema_created: bool,
     closed: bool,
 }
 
@@ -243,6 +304,7 @@ impl ReplicatorLiveFixture {
             workload,
             sql_addresses,
             group_addresses,
+            application_schema_created: false,
             closed: false,
         })
     }
@@ -433,6 +495,496 @@ impl ReplicatorLiveFixture {
         finalize_attempt(formation, cleanup_failures)
     }
 
+    pub async fn controlled_handoff_and_finalize(
+        mut self,
+    ) -> Result<ControlledHandoffEvidence, String> {
+        let started = Instant::now();
+        let primary = async {
+            let formation = self.form().await?;
+            self.controlled_handoff(formation, started).await
+        }
+        .await;
+        let cleanup_failures = self.cleanup_failures();
+        match finalize_attempt(primary, cleanup_failures) {
+            Ok(mut evidence) => {
+                evidence.trace.push(HandoffTraceEntry {
+                    stage: HandoffStage::CleanupCompleted,
+                    elapsed: started.elapsed(),
+                    evidence: "all member owners, accounts, listeners, tasks, ports, and roots were cleaned"
+                        .to_owned(),
+                });
+                Ok(evidence)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn controlled_handoff(
+        &mut self,
+        formation: FormationEvidence,
+        started: Instant,
+    ) -> Result<ControlledHandoffEvidence, String> {
+        let mut trace = Vec::new();
+        create_qualification_schema(&self.members[0].socket).await?;
+        self.application_schema_created = true;
+
+        let cancellation_proxy_address = self.members[0].proxy_address;
+        let cancellation_address = self.members[0]
+            .engine_mut()
+            .prepare_staged_client_proxy(cancellation_proxy_address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let publish_cancellation = self.members[0].operation("publish-cancellation");
+        self.members[0]
+            .engine_mut()
+            .publish_access(
+                publish_cancellation,
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .map_err(|error| error.to_string())?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::CancellationGenerationPublished,
+            format!("source cancellation generation 2 published at {cancellation_address}"),
+        );
+        let cancellation_options = tcp_options(
+            cancellation_address,
+            &self.workload.username,
+            self.workload.password()?,
+        );
+        let mut blocking = Conn::new(cancellation_options)
+            .await
+            .map_err(|error| error.to_string())?;
+        let blocking_work = tokio::spawn(async move {
+            blocking
+                .query_drop("SELECT SLEEP(60)")
+                .await
+                .map_err(|error| error.to_string())
+        });
+        await_active(self.members[0].engine()).await?;
+        let revoke_cancellation = self.members[0].operation("revoke-cancellation");
+        let cancelled = self.members[0]
+            .engine_mut()
+            .revoke_access(
+                revoke_cancellation,
+                MysqlAccessIntent::new(nonzero(3), false, false),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let cancellation_receipt = cancelled
+            .containment()
+            .ok_or_else(|| "cancellation generation returned no containment receipt".to_owned())?;
+        if !cancellation_receipt.sessions_zero()
+            || !cancellation_receipt.commands_zero()
+            || !cancellation_receipt.native_absence()
+            || !cancellation_receipt.cleanup_complete()
+            || !cancellation_receipt.cancelled_commands()
+            || !cancellation_receipt.ambiguous_effect()
+            || cancellation_receipt.handoff_eligible()
+        {
+            return Err("blocking cancellation did not remain contained and ineligible".to_owned());
+        }
+        if blocking_work
+            .await
+            .map_err(|error| error.to_string())?
+            .is_ok()
+        {
+            return Err("blocking source query unexpectedly completed normally".to_owned());
+        }
+        assert_tcp_refuses(cancellation_address)?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::CancellationContained,
+            "generation 2 reached proxy-zero and native absence with cancellation+ambiguity"
+                .to_owned(),
+        );
+        let clean_address = self.members[0]
+            .engine_mut()
+            .rearm_contained_client_proxy(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .map_err(|error| error.to_string())?;
+        let publish_source = self.members[0].operation("publish-source");
+        self.members[0]
+            .engine_mut()
+            .publish_access(
+                publish_source,
+                MysqlAccessIntent::new(nonzero(4), true, true),
+            )
+            .map_err(|error| error.to_string())?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourceGenerationPublished,
+            format!("clean source generation 4 published at {clean_address}"),
+        );
+
+        let clean_options = tcp_options(
+            clean_address,
+            &self.workload.username,
+            self.workload.password()?,
+        );
+        let mut source = Conn::new(clean_options)
+            .await
+            .map_err(|error| error.to_string())?;
+        source
+            .query_drop(
+                "INSERT INTO kuberic_proxy_qualification.tokens(token_name, token_value) \
+                 VALUES ('handoff', 1)",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourceAutocommitCompleted,
+            "autocommit mutation returned a normal OK result".to_owned(),
+        );
+        source
+            .query_drop("START TRANSACTION")
+            .await
+            .map_err(|error| error.to_string())?;
+        source
+            .query_drop(
+                "UPDATE kuberic_proxy_qualification.tokens SET token_value = 2 \
+                 WHERE token_name = 'handoff'",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        source
+            .query_drop("COMMIT")
+            .await
+            .map_err(|error| error.to_string())?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourceTransactionCompleted,
+            "explicit transaction committed with a normal OK result".to_owned(),
+        );
+        source.ping().await.map_err(|error| error.to_string())?;
+        source
+            .disconnect()
+            .await
+            .map_err(|error| error.to_string())?;
+        await_sessions(self.members[0].engine(), 0).await?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourcePingQuitCompleted,
+            "ping completed normally and quit removed the exact backend session".to_owned(),
+        );
+
+        let revoke_source = self.members[0].operation("revoke-source");
+        let source_closed = self.members[0]
+            .engine_mut()
+            .revoke_access(
+                revoke_source,
+                MysqlAccessIntent::new(nonzero(5), false, false),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let closure = source_closed
+            .containment()
+            .ok_or_else(|| "source revocation returned no containment receipt".to_owned())?;
+        if !closure.handoff_eligible() || closure.cancelled_commands() || closure.ambiguous_effect()
+        {
+            return Err("clean source generation was not handoff eligible".to_owned());
+        }
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourceRevokedEligible,
+            "source listener/dispatch/session/task/native-session counts reached zero with only normal commands"
+                .to_owned(),
+        );
+
+        let source_progress_operation = self.members[0].operation("freeze-progress");
+        let source_progress = self.members[0]
+            .engine_mut()
+            .read_progress(source_progress_operation)
+            .await
+            .map_err(|error| error.to_string())?
+            .progress();
+        for index in 1..3 {
+            let operation = self.members[index].operation("prove-frozen-progress");
+            let progress = self.members[index]
+                .engine_mut()
+                .read_progress(operation)
+                .await
+                .map_err(|error| error.to_string())?
+                .progress();
+            if progress != source_progress
+                || self.members[index]
+                    .engine()
+                    .native_evidence()
+                    .is_none_or(|evidence| {
+                        self.members[0]
+                            .engine()
+                            .native_evidence()
+                            .is_none_or(|source| evidence.executed() != source.executed())
+                    })
+            {
+                return Err("survivor did not contain the exact frozen source boundary".to_owned());
+            }
+        }
+        let transfer_source = self.members[0]
+            .engine()
+            .source_boundary()
+            .map_err(|error| error.to_string())?;
+        let boundary = self.members[0]
+            .engine()
+            .freeze_handoff_boundary(formation.targets[1].clone(), formation.targets[2].clone())
+            .map_err(|error| format!("freeze handoff boundary: {error}"))?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::BoundaryFrozen,
+            format!(
+                "structured GTID boundary frozen with scalar {}",
+                boundary.progress()
+            ),
+        );
+        self.members[0]
+            .engine_mut()
+            .retire_contained_client_proxy()
+            .await
+            .map_err(|error| format!("retire frozen source proxy/account: {error}"))?;
+
+        for index in 0..3 {
+            let operation = self.members[index].operation("handoff-epoch");
+            self.members[index]
+                .engine_mut()
+                .advance_epoch(operation, MysqlReplicaEpoch::new(2))
+                .map_err(|error| error.to_string())?;
+        }
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::EpochBarriersAccepted,
+            "newer epoch 2 accepted by source, target, and same-role remaining secondary"
+                .to_owned(),
+        );
+
+        let source_transfer = self.members[0].operation("source-transfer");
+        self.members[0]
+            .engine_mut()
+            .transfer_role(
+                source_transfer,
+                MysqlReplicaEpoch::new(2),
+                MysqlReplicaRole::Secondary,
+                transfer_source,
+                formation.targets[1].member().clone(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourceTransferCompleted,
+            "source demotion completed only from the exact target transfer receipt".to_owned(),
+        );
+        let target_promotion = self.members[1].operation("target-promotion");
+        self.members[1]
+            .engine_mut()
+            .observe_role(
+                target_promotion,
+                MysqlReplicaEpoch::new(2),
+                MysqlReplicaRole::Primary,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::TargetPromotionCompleted,
+            "target promotion completed from exact target-primary native evidence".to_owned(),
+        );
+        let remaining_role = self.members[2].operation("remaining-same-role");
+        self.members[2]
+            .engine_mut()
+            .observe_role(
+                remaining_role,
+                MysqlReplicaEpoch::new(2),
+                MysqlReplicaRole::Secondary,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::RemainingSameRoleCompleted,
+            "remaining secondary completed the newer same-role transition from fresh evidence"
+                .to_owned(),
+        );
+
+        let handoff_configuration = configuration_at(
+            "handoff-three",
+            MysqlReplicaEpoch::new(2),
+            formation.targets.to_vec(),
+        );
+        for index in 0..3 {
+            let operation = self.members[index].operation("handoff-configuration");
+            self.members[index]
+                .engine_mut()
+                .observe_configuration(operation, handoff_configuration.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::ConfigurationAccepted,
+            "all members accepted the unchanged exact three-member configuration for epoch 2"
+                .to_owned(),
+        );
+
+        let source_close = self.members[0].operation("source-close");
+        let terminal = self.members[0]
+            .engine_mut()
+            .close(source_close)
+            .map_err(|error| format!("close frozen source lifecycle: {error}"))?;
+        if terminal.state() != MysqlTerminalState::Closed {
+            return Err("source did not cross the closed lifecycle boundary".to_owned());
+        }
+        assert_process_absent(self.members[0].pid)?;
+        if self.members[0].socket.exists() || self.members[0].pid_file.exists() {
+            return Err("source socket or PID file survived exact stop/reap".to_owned());
+        }
+        assert_tcp_refuses(clean_address)?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourceStoppedAndReaped,
+            format!(
+                "source PID {} reaped and private socket disappeared",
+                self.members[0].pid
+            ),
+        );
+
+        let remaining_successor = self.members[2].operation("remaining-successor");
+        self.members[2]
+            .engine_mut()
+            .accept_handoff_successor(remaining_successor, boundary.clone())
+            .await
+            .map_err(|error| format!("accept remaining successor: {error}"))?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::RemainingSuccessorAccepted,
+            "remaining secondary accepted the exact canonical two-survivor successor".to_owned(),
+        );
+        let target_successor = self.members[1].operation("target-successor");
+        self.members[1]
+            .engine_mut()
+            .accept_handoff_successor(target_successor, boundary.clone())
+            .await
+            .map_err(|error| format!("accept target successor: {error}"))?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::TargetSuccessorAccepted,
+            "target revalidated exact identity, authority, PRIMARY/ONLINE state, quorum, and frozen history"
+                .to_owned(),
+        );
+
+        let target_proxy_address = self.members[1].proxy_address;
+        let target_address = self.members[1]
+            .engine_mut()
+            .prepare_staged_client_proxy(target_proxy_address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let target_publish = self.members[1].operation("target-publish");
+        self.members[1]
+            .engine_mut()
+            .publish_access(
+                target_publish,
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .map_err(|error| format!("publish target after successor: {error}"))?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::TargetPublished,
+            format!(
+                "target generation 2 published only after both successor acceptances at {target_address}"
+            ),
+        );
+        let mut target = Conn::new(tcp_options(
+            target_address,
+            &self.workload.username,
+            self.workload.password()?,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        target
+            .query_drop(
+                "UPDATE kuberic_proxy_qualification.tokens SET token_value = 3 \
+                 WHERE token_name = 'handoff'",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let target_value: u64 = target
+            .query_first(
+                "SELECT token_value FROM kuberic_proxy_qualification.tokens \
+                 WHERE token_name = 'handoff'",
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "target mutation row was absent".to_owned())?;
+        if target_value != 3 {
+            return Err(format!("target mutation returned value {target_value}"));
+        }
+        target
+            .disconnect()
+            .await
+            .map_err(|error| error.to_string())?;
+        await_sessions(self.members[1].engine(), 0).await?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::TargetMutationCompleted,
+            "target gateway mutation completed normally with value 3".to_owned(),
+        );
+        assert_tcp_refuses(clean_address)?;
+        assert_tcp_refuses(cancellation_address)?;
+        assert_tcp_refuses(self.sql_addresses[0])?;
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::SourceUnavailableConfirmed,
+            "both source generations and the native SQL endpoint remained unavailable".to_owned(),
+        );
+
+        let target_revoke = self.members[1].operation("target-cleanup-revoke");
+        self.members[1]
+            .engine_mut()
+            .revoke_access(
+                target_revoke,
+                MysqlAccessIntent::new(nonzero(3), false, false),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let target_close = self.members[1].operation("target-cleanup-close");
+        self.members[1]
+            .engine_mut()
+            .close_with_proxy(target_close)
+            .await
+            .map_err(|error| error.to_string())?;
+        let remaining_close = self.members[2].operation("remaining-cleanup-close");
+        self.members[2]
+            .engine_mut()
+            .close(remaining_close)
+            .map_err(|error| error.to_string())?;
+
+        Ok(ControlledHandoffEvidence {
+            trace,
+            boundary,
+            source_endpoint: clean_address,
+            target_endpoint: target_address,
+        })
+    }
+
     fn cleanup_failures(&mut self) -> Vec<String> {
         if self.closed {
             return Vec::new();
@@ -461,7 +1013,9 @@ impl ReplicatorLiveFixture {
             if let Err(error) = assert_tcp_refuses(owner.proxy_address) {
                 failures.push(error);
             }
-            if let Err(error) = assert_no_application_store(&owner.data_root) {
+            if !self.application_schema_created
+                && let Err(error) = assert_no_application_store(&owner.data_root)
+            {
                 failures.push(error);
             }
             if owner.scratch_root.exists() {
@@ -594,6 +1148,11 @@ impl WorkloadCredentialOwner {
 
     fn clear(&mut self) {
         self.password.fill(0);
+    }
+
+    fn password(&self) -> Result<&str, String> {
+        std::str::from_utf8(&self.password)
+            .map_err(|_| "application password was not valid UTF-8".to_owned())
     }
 }
 
@@ -756,11 +1315,15 @@ fn replica_identity(label: &str) -> MysqlReplicaIdentity {
 }
 
 fn configuration(label: &str, members: Vec<MysqlReplicaTarget>) -> MysqlReplicaConfiguration {
-    MysqlReplicaConfiguration::new(
-        ConfigurationId::new(label).unwrap(),
-        MysqlReplicaEpoch::new(1),
-        members,
-    )
+    configuration_at(label, MysqlReplicaEpoch::new(1), members)
+}
+
+fn configuration_at(
+    label: &str,
+    epoch: MysqlReplicaEpoch,
+    members: Vec<MysqlReplicaTarget>,
+) -> MysqlReplicaConfiguration {
+    MysqlReplicaConfiguration::new(ConfigurationId::new(label).unwrap(), epoch, members)
 }
 
 fn operation(label: &str, generation: u64) -> MysqlOperationIdentity {
@@ -776,4 +1339,97 @@ fn member_number(member: MysqlMemberIndex) -> usize {
         MysqlMemberIndex::Second => 2,
         MysqlMemberIndex::Third => 3,
     }
+}
+
+fn nonzero(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).expect("access generation is nonzero")
+}
+
+fn tcp_options(address: SocketAddr, username: &str, password: &str) -> OptsBuilder {
+    OptsBuilder::default()
+        .ip_or_hostname(address.ip().to_string())
+        .tcp_port(address.port())
+        .prefer_socket(false)
+        .socket(None::<String>)
+        .user(Some(username.to_owned()))
+        .pass(Some(password.to_owned()))
+        .db_name(Some("kuberic_proxy_qualification".to_owned()))
+}
+
+async fn root_connection(socket: &Path) -> Result<Conn, String> {
+    Conn::new(
+        OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(1)
+            .socket(Some(
+                socket
+                    .to_str()
+                    .ok_or_else(|| "private socket path was not UTF-8".to_owned())?
+                    .to_owned(),
+            ))
+            .user(Some("root".to_owned())),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn create_qualification_schema(socket: &Path) -> Result<(), String> {
+    let mut root = root_connection(socket).await?;
+    root.query_drop("CREATE DATABASE kuberic_proxy_qualification")
+        .await
+        .map_err(|error| error.to_string())?;
+    root.query_drop(
+        "CREATE TABLE kuberic_proxy_qualification.tokens (\
+         token_name VARCHAR(64) PRIMARY KEY, token_value BIGINT UNSIGNED NOT NULL)",
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    root.disconnect().await.map_err(|error| error.to_string())
+}
+
+async fn await_active(engine: &MysqlReplicator) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if engine
+            .proxy_snapshot()
+            .is_some_and(|snapshot| snapshot.active_commands() == 1)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("proxy command did not become active".to_owned());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn await_sessions(engine: &MysqlReplicator, expected: usize) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if engine
+            .proxy_snapshot()
+            .is_some_and(|snapshot| snapshot.sessions() == expected)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "proxy sessions did not reach expected count {expected}"
+            ));
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn push_trace(
+    trace: &mut Vec<HandoffTraceEntry>,
+    started: Instant,
+    stage: HandoffStage,
+    evidence: String,
+) {
+    trace.push(HandoffTraceEntry {
+        stage,
+        elapsed: started.elapsed(),
+        evidence,
+    });
 }

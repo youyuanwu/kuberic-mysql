@@ -749,6 +749,57 @@ impl MysqlClientProxy {
         Ok(receipt)
     }
 
+    /// Binds a fresh unpublished listener after complete containment while
+    /// retaining the exact prepared account and credential.
+    pub async fn rearm(
+        &mut self,
+        listen_address: SocketAddr,
+        attempt: &AttemptContext,
+    ) -> Result<SocketAddr, MysqlProxyError> {
+        attempt.admit_work().map_err(map_attempt_admission)?;
+        let snapshot = self.snapshot();
+        if !listen_address.ip().is_loopback()
+            || !self.account_active
+            || !self.is_fully_contained()
+            || snapshot.accepting()
+            || snapshot.sessions() != 0
+            || snapshot.active_commands() != 0
+            || self.accept_task.is_some()
+        {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        let listener =
+            TcpListener::bind(listen_address)
+                .await
+                .map_err(|error| MysqlProxyError::Io {
+                    phase: MysqlProxyPhase::Listener,
+                    kind: error.kind(),
+                })?;
+        let address = listener.local_addr().map_err(|error| MysqlProxyError::Io {
+            phase: MysqlProxyPhase::Listener,
+            kind: error.kind(),
+        })?;
+        {
+            let mut registry = self.shared.lock();
+            registry.accepting = false;
+            registry.generation = None;
+            registry.sessions.clear();
+            registry.retired_backends.clear();
+            registry.active_commands = 0;
+            registry.cancelled_commands = false;
+            registry.ambiguous_effect = false;
+        }
+        let (cancel, _) = watch::channel(false);
+        self.cancel = cancel;
+        self.listener = Some(listener);
+        self.address = address;
+        self.published_generation = None;
+        self.contained_generation = None;
+        self.tasks_joined = true;
+        self.native_absence_proved = true;
+        Ok(address)
+    }
+
     /// Removes the prepared account and clears the retained password.
     pub async fn cleanup_account<C: MysqlProxyControlBoundary>(
         &mut self,
@@ -783,6 +834,12 @@ impl MysqlClientProxy {
     #[must_use]
     pub fn credential_cleared(&self) -> bool {
         self.credential.is_cleared()
+    }
+
+    /// Whether the exact prepared application account remains active.
+    #[must_use]
+    pub const fn account_active(&self) -> bool {
+        self.account_active
     }
 
     /// Whether the endpoint was never published or its published generation

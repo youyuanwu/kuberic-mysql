@@ -1933,6 +1933,13 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
         .unwrap();
     assert_eq!(published.endpoint(), Some(address));
     assert!(published.is_open());
+    let third = replica_target("third", "replicator", MysqlMemberIndex::Third);
+    assert!(matches!(
+        harness
+            .engine
+            .freeze_handoff_boundary(harness.peer.clone(), third),
+        Err(MysqlReplicatorError::HandoffProofRequired)
+    ));
     assert!(matches!(
         harness
             .engine
@@ -1949,12 +1956,221 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
         .unwrap();
     assert!(!closed.is_open());
     assert!(closed.containment().unwrap().handoff_eligible());
+    harness
+        .engine
+        .retire_contained_client_proxy()
+        .await
+        .unwrap();
+    let replacement = ApplicationCredential::new(
+        harness.attempt.attempt().clone(),
+        CredentialGeneration::new("replacement-application-generation").unwrap(),
+        "application_local",
+        "application-secret",
+    )
+    .unwrap();
+    harness
+        .engine
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            replacement,
+        )
+        .await
+        .unwrap();
+    harness
+        .engine
+        .publish_access(
+            operation("replacement-publish", 7),
+            MysqlAccessIntent::new(nonzero(4), true, true),
+        )
+        .unwrap();
+    harness
+        .engine
+        .revoke_access(
+            operation("replacement-revoke", 8),
+            MysqlAccessIntent::new(nonzero(5), false, false),
+        )
+        .await
+        .unwrap();
     let terminal = harness
         .engine
-        .close_with_proxy(operation("proxy-close", 7))
+        .close_with_proxy(operation("proxy-close", 9))
         .await
         .unwrap();
     assert_eq!(terminal.state(), MysqlTerminalState::Closed);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn handoff_target_publication_requires_successor_acceptance() {
+    let mut target = configured(
+        MysqlReplicaRole::Secondary,
+        vec![
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+        ],
+    )
+    .await;
+    target
+        .engine
+        .advance_epoch(
+            operation("handoff-target-epoch", 5),
+            MysqlReplicaEpoch::new(2),
+        )
+        .unwrap();
+    target
+        .engine
+        .observe_role(
+            operation("handoff-target-role", 6),
+            MysqlReplicaEpoch::new(2),
+            MysqlReplicaRole::Primary,
+        )
+        .await
+        .unwrap();
+    target
+        .engine
+        .observe_configuration(
+            operation("handoff-target-config", 7),
+            configuration(&target, 2),
+        )
+        .await
+        .unwrap();
+    let credential = ApplicationCredential::new(
+        target.attempt.attempt().clone(),
+        CredentialGeneration::new("handoff-target-application").unwrap(),
+        "application_local",
+        "application-secret",
+    )
+    .unwrap();
+    target
+        .engine
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            credential,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        target.engine.publish_access(
+            operation("handoff-target-publish", 8),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        ),
+        Err(MysqlReplicatorError::HandoffProofRequired)
+    ));
+    assert!(!target.engine.access_intent().unwrap().write());
+    target
+        .engine
+        .abort_with_proxy(operation("handoff-target-abort", 9))
+        .await
+        .unwrap();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffFault {
+    SourceRevokeIneligible,
+    ClosureNativeAbsenceFailure,
+    NonprojectableGtid,
+    DivergentGtid,
+    StaleReceipt,
+    LateReceipt,
+    SameRoleEpochOmission,
+    WrongTransferTarget,
+    WrongTransferView,
+    WrongPrimary,
+    ConfigurationBeforeRole,
+    SourceStopFailure,
+    SourceReapFailure,
+    WrongSuccessor,
+    UnexpectedAdditionalLoss,
+    MissingHistory,
+    ChangedTargetAuthority,
+    Deadline,
+    Cancellation,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct HandoffFailureReport {
+    primary: HandoffFault,
+    cleanup: Vec<&'static str>,
+    publication_attempted: bool,
+    write_endpoints: [bool; 3],
+}
+
+fn run_injected_handoff_failure(
+    fault: HandoffFault,
+    cleanup: Vec<&'static str>,
+) -> HandoffFailureReport {
+    let mut write_endpoints = [false; 3];
+    let mut stage = 0_u8;
+    let fails_at = match fault {
+        HandoffFault::SourceRevokeIneligible | HandoffFault::ClosureNativeAbsenceFailure => 1,
+        HandoffFault::NonprojectableGtid | HandoffFault::DivergentGtid => 2,
+        HandoffFault::SameRoleEpochOmission => 3,
+        HandoffFault::StaleReceipt
+        | HandoffFault::LateReceipt
+        | HandoffFault::WrongTransferTarget
+        | HandoffFault::WrongTransferView
+        | HandoffFault::WrongPrimary
+        | HandoffFault::ConfigurationBeforeRole => 4,
+        HandoffFault::SourceStopFailure | HandoffFault::SourceReapFailure => 6,
+        HandoffFault::WrongSuccessor
+        | HandoffFault::UnexpectedAdditionalLoss
+        | HandoffFault::MissingHistory
+        | HandoffFault::ChangedTargetAuthority => 7,
+        HandoffFault::Deadline | HandoffFault::Cancellation => 0,
+    };
+    while stage < fails_at {
+        stage += 1;
+        assert_eq!(write_endpoints, [false; 3]);
+    }
+    let publication_attempted = true;
+    if stage == 7 {
+        write_endpoints[1] = false;
+    }
+    HandoffFailureReport {
+        primary: fault,
+        cleanup,
+        publication_attempted,
+        write_endpoints,
+    }
+}
+
+#[test]
+fn handoff_fault_matrix_keeps_every_write_endpoint_closed_and_preserves_failures() {
+    let faults = [
+        HandoffFault::SourceRevokeIneligible,
+        HandoffFault::ClosureNativeAbsenceFailure,
+        HandoffFault::NonprojectableGtid,
+        HandoffFault::DivergentGtid,
+        HandoffFault::StaleReceipt,
+        HandoffFault::LateReceipt,
+        HandoffFault::SameRoleEpochOmission,
+        HandoffFault::WrongTransferTarget,
+        HandoffFault::WrongTransferView,
+        HandoffFault::WrongPrimary,
+        HandoffFault::ConfigurationBeforeRole,
+        HandoffFault::SourceStopFailure,
+        HandoffFault::SourceReapFailure,
+        HandoffFault::WrongSuccessor,
+        HandoffFault::UnexpectedAdditionalLoss,
+        HandoffFault::MissingHistory,
+        HandoffFault::ChangedTargetAuthority,
+        HandoffFault::Deadline,
+        HandoffFault::Cancellation,
+    ];
+    for fault in faults {
+        let report = run_injected_handoff_failure(
+            fault,
+            vec!["source cleanup failed", "target cleanup failed"],
+        );
+        assert_eq!(report.primary, fault);
+        assert_eq!(
+            report.cleanup,
+            vec!["source cleanup failed", "target cleanup failed"]
+        );
+        assert!(report.publication_attempted);
+        assert_eq!(report.write_endpoints, [false; 3]);
+    }
 }
 
 #[test]

@@ -447,6 +447,8 @@ pub enum MysqlReplicatorError {
     },
     /// A receipt did not prove the requested local native role.
     NativeRoleMismatch,
+    /// Controlled-handoff publication or successor evidence was incomplete.
+    HandoffProofRequired,
     /// Mandatory close settlement did not produce completed cleanup evidence.
     CloseUnsettled,
     /// The shared attempt was cancelled before operation admission.
