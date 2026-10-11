@@ -1,5 +1,7 @@
 #[path = "service_common/mod.rs"]
 mod service_common;
+#[path = "service_replicator_live_support/mod.rs"]
+mod service_replicator_live_support;
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -2800,90 +2802,75 @@ async fn source_stop_reap_and_cleanup_fail_before_terminal_receipt() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn fixture_all_owner_cleanup_aggregation_preserves_primary_and_every_real_cleanup_failure() {
-    let roots = [
-        TestRoot::new("aggregate-owner-one"),
-        TestRoot::new("aggregate-owner-two"),
-        TestRoot::new("aggregate-owner-three"),
-    ];
+async fn fixture_finalize_attempt_preserves_real_handoff_and_owner_cleanup_failures_in_order() {
     let plans = [
         CleanupPlan::StopFailed,
         CleanupPlan::ReapFailed,
         CleanupPlan::Failed,
     ];
-    let mut engines: [MysqlReplicator<ScriptedEffects>; 3] = std::array::from_fn(|index| {
-        let attempt = context(&format!("aggregate-owner-{index}"));
-        let identity = replica_identity(&format!("aggregate-owner-{index}"));
-        let authority = authority_with_attempt(&attempt, MEMBERS[index]);
-        let mut engine = engine(
-            roots[index].config_for_member(MEMBERS[index]),
-            identity.clone(),
-            attempt,
-            Vec::new(),
-            Vec::new(),
-            plans[index],
-        );
-        engine
-            .open(
-                operation(&format!("aggregate-open-{index}"), 1),
-                MysqlOpenReceipt::new(identity, authority, nonzero(1)),
-            )
-            .unwrap();
-        engine
-    });
-    engines[0]
-        .advance_epoch(
-            operation("aggregate-primary-epoch", 2),
-            MysqlReplicaEpoch::new(1),
-        )
-        .unwrap();
-    let primary = engines[0]
-        .observe_configuration(
-            operation("aggregate-primary-configuration", 3),
-            MysqlReplicaConfiguration::new(
-                ConfigurationId::new("aggregate-invalid-configuration").unwrap(),
-                MysqlReplicaEpoch::new(1),
-                Vec::new(),
-            ),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(primary, MysqlReplicatorError::RoleRequired));
+    let mut owners = [
+        harness_with_cleanup(
+            vec![
+                exact(MysqlReplicaRole::Primary),
+                exact(MysqlReplicaRole::Primary),
+            ],
+            plans[0],
+        ),
+        harness_with_cleanup(Vec::new(), plans[1]),
+        harness_with_cleanup(Vec::new(), plans[2]),
+    ];
+    establish(&mut owners[0], MysqlReplicaRole::Primary).await;
+    open(&mut owners[1]);
+    open(&mut owners[2]);
 
-    let cleanup_failures = engines
+    let primary = owners[0]
+        .engine
+        .freeze_handoff_boundary(
+            owners[0].peer.clone(),
+            replica_target("aggregate-remaining", "replicator", MysqlMemberIndex::Third),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        primary,
+        MysqlReplicatorError::HandoffProofRequired
+    ));
+
+    let cleanup_failures = owners
         .iter_mut()
         .enumerate()
-        .map(|(index, engine)| {
-            (
-                index,
-                engine
-                    .abort(operation(&format!("aggregate-abort-{index}"), 4))
-                    .unwrap_err(),
-            )
+        .map(|(index, owner)| {
+            let error = owner
+                .engine
+                .abort(operation(&format!("aggregate-abort-{index}"), 5))
+                .unwrap_err();
+            format!("member {} cleanup: {error}", index + 1)
         })
         .collect::<Vec<_>>();
-    assert_eq!(cleanup_failures.len(), 3);
-    assert!(matches!(
-        &cleanup_failures[0].1,
-        MysqlReplicatorError::Instance(MysqlInstanceError::ChildFailure {
-            operation: LifecycleOperation::Shutdown,
-            ..
-        })
-    ));
-    assert!(matches!(
-        &cleanup_failures[1].1,
-        MysqlReplicatorError::Instance(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))
-    ));
-    assert!(matches!(
-        &cleanup_failures[2].1,
-        MysqlReplicatorError::Instance(MysqlInstanceError::Io {
-            operation: LifecycleOperation::ScratchCleanup,
-            ..
-        })
-    ));
-    for engine in &engines {
-        assert_eq!(engine.terminal_state(), Some(MysqlTerminalState::Aborted));
-        assert!(!engine.access_intent().unwrap().write());
+    let error = service_replicator_live_support::finalize_attempt::<()>(
+        Err(primary.to_string()),
+        cleanup_failures,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "formation failed: MySQL replicator lifecycle failure: HandoffProofRequired; \
+         cleanup failures: member 1 cleanup: MySQL replicator lifecycle failure: \
+         Instance(ChildFailure { operation: Shutdown, code: Some(1) }); member 2 cleanup: \
+         MySQL replicator lifecycle failure: Instance(Timeout(Shutdown)); member 3 cleanup: \
+         MySQL replicator lifecycle failure: Instance(Io { operation: ScratchCleanup, kind: \
+         PermissionDenied })"
+    );
+    for owner in &owners {
+        assert_eq!(
+            owner.engine.terminal_state(),
+            Some(MysqlTerminalState::Aborted)
+        );
+        let access = owner
+            .engine
+            .access_intent()
+            .expect("opened owner retains a closed access intent");
+        assert!(!access.read());
+        assert!(!access.write());
     }
 }
 

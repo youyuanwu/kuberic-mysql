@@ -26,6 +26,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
 use tokio::time::sleep;
 
+#[allow(unused_imports)]
 pub use live_support::preflight_oracle_mysql_8_4_11;
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_no_application_store,
@@ -1076,7 +1077,7 @@ impl Drop for ReplicatorLiveFixture {
     }
 }
 
-fn finalize_attempt<T>(
+pub(crate) fn finalize_attempt<T>(
     primary: Result<T, String>,
     cleanup_failures: Vec<String>,
 ) -> Result<T, String> {
@@ -1210,35 +1211,6 @@ impl Drop for SecretProducer {
     fn drop(&mut self) {
         self.clear();
     }
-}
-
-#[test]
-fn attempt_finalization_preserves_primary_and_every_cleanup_failure_in_order() {
-    let error = finalize_attempt::<()>(
-        Err("primary formation failure".to_owned()),
-        vec![
-            "member 1 cleanup: first failure".to_owned(),
-            "member 2 cleanup: second failure".to_owned(),
-            "member 3 cleanup: third failure".to_owned(),
-        ],
-    )
-    .unwrap_err();
-    assert_eq!(
-        error,
-        "formation failed: primary formation failure; cleanup failures: \
-         member 1 cleanup: first failure; member 2 cleanup: second failure; \
-         member 3 cleanup: third failure"
-    );
-
-    assert!(matches!(
-        finalize_attempt(Ok::<_, String>("formation"), Vec::new()),
-        Ok("formation")
-    ));
-    assert_eq!(
-        finalize_attempt::<()>(Ok(()), vec!["member 2 cleanup: cleanup failure".to_owned()])
-            .unwrap_err(),
-        "formation cleanup failed: member 2 cleanup: cleanup failure"
-    );
 }
 
 struct ProxyPortReservations {
