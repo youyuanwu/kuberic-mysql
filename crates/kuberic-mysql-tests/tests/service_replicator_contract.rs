@@ -9,15 +9,16 @@ use std::num::NonZeroU64;
 use std::os::unix::net::UnixListener;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 use kuberic_mysql::adapter::UnixSocketPath;
 use kuberic_mysql::core::{
     AttemptId, AuthorityGeneration, ConfigurationId, ConfiguredGtidLineage, CredentialGeneration,
     EndpointBinding, GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState,
-    NativeMember, NativeView, ProcessSessionId, ProgressProjection, ReplicaId, ReplicaIncarnation,
-    ServerUuid, StorageBinding, ViewId, project_progress,
+    NativeMember, NativeView, ProcessSessionId, ReplicaId, ReplicaIncarnation, ServerUuid,
+    StorageBinding, ViewId,
 };
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential,
@@ -150,6 +151,10 @@ struct ScriptedEffects {
     join: MutationPlan,
     cleanup: CleanupPlan,
     containments: Arc<AtomicUsize>,
+    prepare_started: Option<Arc<AtomicBool>>,
+    prepare_release: Option<Arc<Notify>>,
+    remove_started: Option<Arc<AtomicBool>>,
+    remove_release: Option<Arc<Notify>>,
 }
 
 impl ScriptedEffects {
@@ -176,6 +181,10 @@ impl ScriptedEffects {
             join: MutationPlan::Exact,
             cleanup,
             containments: Arc::new(AtomicUsize::new(0)),
+            prepare_started: None,
+            prepare_release: None,
+            remove_started: None,
+            remove_release: None,
         }
     }
 
@@ -584,7 +593,14 @@ impl MysqlProxyControlBoundary for ScriptedEffects {
         credential: &ApplicationCredential,
         _attempt: &AttemptContext,
     ) -> Result<ApplicationAccountReceipt, MysqlProxyError> {
-        Ok(ApplicationAccountReceipt::new(credential))
+        let receipt = ApplicationAccountReceipt::new(credential);
+        if let Some(started) = self.prepare_started.as_ref() {
+            started.store(true, Ordering::Release);
+        }
+        if let Some(release) = self.prepare_release.as_ref() {
+            release.notified().await;
+        }
+        Ok(receipt)
     }
 
     async fn remove_application_account(
@@ -593,6 +609,12 @@ impl MysqlProxyControlBoundary for ScriptedEffects {
         _receipt: &ApplicationAccountReceipt,
         _attempt: &AttemptContext,
     ) -> Result<(), MysqlProxyError> {
+        if let Some(started) = self.remove_started.as_ref() {
+            started.store(true, Ordering::Release);
+        }
+        if let Some(release) = self.remove_release.as_ref() {
+            release.notified().await;
+        }
         Ok(())
     }
 
@@ -2154,6 +2176,7 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
             operation("publish", 5),
             MysqlAccessIntent::new(nonzero(2), true, true),
         )
+        .await
         .unwrap();
     assert_eq!(published.endpoint(), Some(address));
     assert!(published.is_open());
@@ -2161,7 +2184,8 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
     assert!(matches!(
         harness
             .engine
-            .freeze_handoff_boundary(harness.peer.clone(), third),
+            .freeze_handoff_boundary(operation("blocked-freeze", 6), harness.peer.clone(), third,)
+            .await,
         Err(MysqlReplicatorError::HandoffProofRequired)
     ));
     assert!(matches!(
@@ -2206,6 +2230,7 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
             operation("replacement-publish", 7),
             MysqlAccessIntent::new(nonzero(4), true, true),
         )
+        .await
         .unwrap();
     harness
         .engine
@@ -2221,6 +2246,108 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
         .await
         .unwrap();
     assert_eq!(terminal.state(), MysqlTerminalState::Closed);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_proxy_lifecycle_futures_retain_or_terminally_contain_ownership() {
+    let prepare_started = Arc::new(AtomicBool::new(false));
+    let prepare_release = Arc::new(Notify::new());
+    let mut preparing = harness_with_proxy_gates(
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+        ],
+        Some(Arc::clone(&prepare_started)),
+        Some(Arc::clone(&prepare_release)),
+        None,
+        None,
+    );
+    establish(&mut preparing, MysqlReplicaRole::Primary).await;
+    let credential = ApplicationCredential::new(
+        preparing.attempt.attempt().clone(),
+        CredentialGeneration::new("drop-prepare").unwrap(),
+        "drop_prepare",
+        "application-secret",
+    )
+    .unwrap();
+    let mut prepare = Box::pin(preparing.engine.prepare_client_proxy(
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        credential,
+    ));
+    tokio::select! {
+        result = &mut prepare => panic!("prepare unexpectedly completed: {result:?}"),
+        () = wait_flag(&prepare_started) => {}
+    }
+    drop(prepare);
+    assert!(preparing.engine.application_credential_staged());
+    preparing
+        .engine
+        .abort(operation("drop-prepare-abort", 5))
+        .unwrap();
+
+    let remove_started = Arc::new(AtomicBool::new(false));
+    let remove_release = Arc::new(Notify::new());
+    let mut retiring = harness_with_proxy_gates(
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+        ],
+        None,
+        None,
+        Some(Arc::clone(&remove_started)),
+        Some(Arc::clone(&remove_release)),
+    );
+    establish(&mut retiring, MysqlReplicaRole::Primary).await;
+    prepare_publish_revoke(&mut retiring, "drop-retire").await;
+    let mut retire = Box::pin(retiring.engine.retire_contained_client_proxy());
+    tokio::select! {
+        result = &mut retire => panic!("retire unexpectedly completed: {result:?}"),
+        () = wait_flag(&remove_started) => {}
+    }
+    drop(retire);
+    assert!(retiring.engine.proxy_snapshot().is_some());
+    remove_release.notify_one();
+    retiring
+        .engine
+        .retire_contained_client_proxy()
+        .await
+        .unwrap();
+    retiring
+        .engine
+        .close(operation("drop-retire-close", 8))
+        .unwrap();
+
+    let terminal_started = Arc::new(AtomicBool::new(false));
+    let terminal_release = Arc::new(Notify::new());
+    let mut terminal = harness_with_proxy_gates(
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+        ],
+        None,
+        None,
+        Some(Arc::clone(&terminal_started)),
+        Some(Arc::clone(&terminal_release)),
+    );
+    establish(&mut terminal, MysqlReplicaRole::Primary).await;
+    prepare_publish_revoke(&mut terminal, "drop-terminal").await;
+    let mut close = Box::pin(
+        terminal
+            .engine
+            .close_with_proxy(operation("drop-terminal-close", 8)),
+    );
+    tokio::select! {
+        result = &mut close => panic!("terminal cleanup unexpectedly completed: {result:?}"),
+        () = wait_flag(&terminal_started) => {}
+    }
+    drop(close);
+    assert!(terminal.engine.proxy_snapshot().is_some());
+    terminal_release.notify_one();
+    terminal
+        .engine
+        .close_with_proxy(operation("drop-terminal-close", 8))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2275,10 +2402,13 @@ async fn handoff_target_publication_requires_successor_acceptance() {
         .await
         .unwrap();
     assert!(matches!(
-        target.engine.publish_access(
-            operation("handoff-target-publish", 8),
-            MysqlAccessIntent::new(nonzero(2), true, true),
-        ),
+        target
+            .engine
+            .publish_access(
+                operation("handoff-target-publish", 8),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .await,
         Err(MysqlReplicatorError::HandoffProofRequired)
     ));
     assert!(!target.engine.access_intent().unwrap().write());
@@ -2304,7 +2434,16 @@ struct PublicationScenario {
 #[tokio::test(flavor = "current_thread")]
 async fn combined_publication_proof_is_required_exact_and_single_use() {
     let mut scenario = publication_scenario(CleanupPlan::Completed).await;
-    assert_publish_blocked(&mut scenario.target, "before-proof", 10);
+    assert!(scenario.boundary.closure().handoff_eligible());
+    assert_eq!(
+        scenario.boundary.id().revoked_generation(),
+        scenario.boundary.closure().generation()
+    );
+    assert_eq!(
+        scenario.source_receipt.boundary(),
+        Some(scenario.boundary.id())
+    );
+    assert_publish_blocked(&mut scenario.target, "before-proof", 10).await;
 
     for (label, generation, proof) in [
         (
@@ -2345,7 +2484,7 @@ async fn combined_publication_proof_is_required_exact_and_single_use() {
         ),
         Err(MysqlReplicatorError::HandoffProofRequired)
     ));
-    assert_publish_blocked(&mut scenario.target, "after-substitution", 14);
+    assert_publish_blocked(&mut scenario.target, "after-substitution", 14).await;
 
     let accepted = scenario
         .target
@@ -2370,7 +2509,7 @@ async fn combined_publication_proof_is_required_exact_and_single_use() {
         ),
         Err(MysqlReplicatorError::HandoffProofConflict)
     ));
-    assert_publish_blocked(&mut scenario.target, "publish-after-conflict", 15);
+    assert_publish_blocked(&mut scenario.target, "publish-after-conflict", 15).await;
     scenario
         .target
         .abort(operation("target-abort-after-conflict", 15))
@@ -2402,6 +2541,7 @@ async fn exact_fresh_publication_proof_opens_only_the_prepared_target_generation
             operation("publish-after-proof", 15),
             MysqlAccessIntent::new(nonzero(2), true, true),
         )
+        .await
         .unwrap();
     assert!(published.is_open());
     scenario
@@ -2424,6 +2564,39 @@ async fn exact_fresh_publication_proof_opens_only_the_prepared_target_generation
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn peer_loss_after_proof_acceptance_blocks_fresh_target_publication() {
+    let mut scenario = publication_scenario_with_fresh_target(CleanupPlan::Completed, true).await;
+    prepare_publication_proxy(&mut scenario).await;
+    scenario
+        .target
+        .accept_handoff_publication_proof(
+            operation("combined-proof", 14),
+            publication_proof(&scenario, true, true, true),
+        )
+        .unwrap();
+    assert!(matches!(
+        scenario
+            .target
+            .publish_access(
+                operation("publish-after-peer-loss", 15),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .await,
+        Err(MysqlReplicatorError::HandoffProofRequired)
+    ));
+    assert!(!scenario.target.access_intent().unwrap().write());
+    scenario
+        .target
+        .abort_with_proxy(operation("peer-loss-target-abort", 16))
+        .await
+        .unwrap();
+    scenario
+        .remaining
+        .close(operation("peer-loss-remaining-close", 100))
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn accepted_publication_proof_is_invalidated_by_every_bound_state_mutation() {
     let mut epoch = accepted_publication_scenario().await;
     epoch
@@ -2433,7 +2606,7 @@ async fn accepted_publication_proof_is_invalidated_by_every_bound_state_mutation
             MysqlReplicaEpoch::new(3),
         )
         .unwrap();
-    assert_publication_rejected(&mut epoch.target, "publish-after-epoch", 16, 2);
+    assert_publication_rejected(&mut epoch.target, "publish-after-epoch", 16, 2).await;
     settle_blocked_scenario(&mut epoch);
 
     let mut role = accepted_publication_scenario().await;
@@ -2459,7 +2632,7 @@ async fn accepted_publication_proof_is_invalidated_by_every_bound_state_mutation
         )
         .await
         .unwrap();
-    assert_publication_rejected(&mut role.target, "publish-after-role", 18, 2);
+    assert_publication_rejected(&mut role.target, "publish-after-role", 18, 2).await;
     settle_blocked_scenario(&mut role);
 
     let mut configuration = accepted_publication_scenario().await;
@@ -2480,7 +2653,8 @@ async fn accepted_publication_proof_is_invalidated_by_every_bound_state_mutation
         "publish-after-configuration",
         16,
         2,
-    );
+    )
+    .await;
     settle_blocked_scenario(&mut configuration);
 
     let mut authority_case = accepted_publication_scenario().await;
@@ -2501,7 +2675,8 @@ async fn accepted_publication_proof_is_invalidated_by_every_bound_state_mutation
         "publish-after-authority-replacement",
         15,
         2,
-    );
+    )
+    .await;
     settle_blocked_scenario(&mut authority_case);
 }
 
@@ -2520,7 +2695,8 @@ async fn accepted_publication_proof_is_generation_bound_and_conflicts_fail_close
         "publish-after-intervening-operation",
         16,
         3,
-    );
+    )
+    .await;
     settle_blocked_scenario(&mut generation);
 
     let mut conflict = accepted_publication_scenario().await;
@@ -2536,7 +2712,8 @@ async fn accepted_publication_proof_is_generation_bound_and_conflicts_fail_close
         "publish-after-operation-conflict",
         15,
         2,
-    );
+    )
+    .await;
     settle_blocked_scenario(&mut conflict);
 
     let mut terminal = accepted_publication_scenario().await;
@@ -2545,10 +2722,13 @@ async fn accepted_publication_proof_is_generation_bound_and_conflicts_fail_close
         .abort(operation("terminal-after-proof", 15))
         .unwrap();
     assert!(matches!(
-        terminal.target.publish_access(
-            operation("publish-after-terminal", 16),
-            MysqlAccessIntent::new(nonzero(2), true, true),
-        ),
+        terminal
+            .target
+            .publish_access(
+                operation("publish-after-terminal", 16),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .await,
         Err(MysqlReplicatorError::Terminal)
     ));
     assert_eq!(
@@ -2569,6 +2749,7 @@ async fn publication_rejects_substituted_target_remaining_and_source_receipts() 
         .close(operation("substituted-source-close", 9))
         .unwrap()
         .receipt()
+        .unwrap()
         .clone();
     for (generation, proof) in [
         (
@@ -2695,7 +2876,7 @@ async fn successor_faults_use_real_receipt_validation_and_never_enable_publicati
                 .await
                 .is_err()
         );
-        assert_publication_rejected(&mut target, &format!("{label}-publish"), 9, 2);
+        assert_publication_rejected(&mut target, &format!("{label}-publish"), 9, 2).await;
         assert!(!target.access_intent().unwrap().write());
         target
             .abort(operation(&format!("{label}-abort"), 9))
@@ -2743,7 +2924,7 @@ async fn successor_readback_rejects_stale_late_and_mismatched_receipts() {
                     | MysqlReplicatorError::MemberTransition(_))
             )
         });
-        assert_publication_rejected(&mut target, &format!("{label}-publish"), 9, 2);
+        assert_publication_rejected(&mut target, &format!("{label}-publish"), 9, 2).await;
         let retry = target
             .accept_handoff_successor(operation(&format!("{label}-successor"), 8), boundary)
             .await;
@@ -2826,9 +3007,11 @@ async fn fixture_finalize_attempt_preserves_real_handoff_and_owner_cleanup_failu
     let primary = owners[0]
         .engine
         .freeze_handoff_boundary(
+            operation("aggregate-freeze", 5),
             owners[0].peer.clone(),
             replica_target("aggregate-remaining", "replicator", MysqlMemberIndex::Third),
         )
+        .await
         .unwrap_err();
     assert!(matches!(
         primary,
@@ -2902,13 +3085,15 @@ async fn generic_cleanup_and_missing_or_substituted_terminal_provenance_never_mi
         ));
         assert_eq!(harness.engine.terminal_state(), None);
         assert!(!harness.engine.access_intent().unwrap().write());
-        assert_eq!(
+        assert!(matches!(
             harness
                 .engine
-                .abort(operation(&format!("{label}-abort"), 6))
-                .unwrap()
-                .state(),
-            MysqlTerminalState::Aborted
+                .abort(operation(&format!("{label}-abort"), 6)),
+            Err(MysqlReplicatorError::AbortUnsettled)
+        ));
+        assert_eq!(
+            harness.engine.terminal_state(),
+            Some(MysqlTerminalState::Aborted)
         );
     }
 }
@@ -2944,6 +3129,7 @@ async fn cancellation_is_exercised_at_every_controlled_handoff_boundary() {
             operation("cancel-revoke-publish", 5),
             MysqlAccessIntent::new(nonzero(2), true, true),
         )
+        .await
         .unwrap();
     revoke.attempt.cancel();
     let cancelled_revoke = revoke
@@ -2996,6 +3182,7 @@ async fn cancellation_is_exercised_at_every_controlled_handoff_boundary() {
             operation("cancel-freeze-publish", 5),
             MysqlAccessIntent::new(nonzero(2), true, true),
         )
+        .await
         .unwrap();
     freeze
         .engine
@@ -3012,14 +3199,18 @@ async fn cancellation_is_exercised_at_every_controlled_handoff_boundary() {
         .unwrap();
     freeze.attempt.cancel();
     assert!(matches!(
-        freeze.engine.freeze_handoff_boundary(
-            freeze.peer.clone(),
-            replica_target(
-                "cancel-freeze-third",
-                "cancel-freeze",
-                MysqlMemberIndex::Third
-            ),
-        ),
+        freeze
+            .engine
+            .freeze_handoff_boundary(
+                operation("cancel-freeze-boundary", 8),
+                freeze.peer.clone(),
+                replica_target(
+                    "cancel-freeze-third",
+                    "cancel-freeze",
+                    MysqlMemberIndex::Third
+                ),
+            )
+            .await,
         Err(MysqlReplicatorError::Cancelled)
     ));
     freeze
@@ -3206,10 +3397,13 @@ async fn cancellation_is_exercised_at_every_controlled_handoff_boundary() {
     let mut publish = accepted_publication_scenario().await;
     publish.attempts[1].cancel();
     assert!(matches!(
-        publish.target.publish_access(
-            operation("cancel-publish", 15),
-            MysqlAccessIntent::new(nonzero(2), true, true),
-        ),
+        publish
+            .target
+            .publish_access(
+                operation("cancel-publish", 15),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .await,
         Err(MysqlReplicatorError::Cancelled)
     ));
     settle_blocked_scenario(&mut publish);
@@ -3237,6 +3431,48 @@ fn abort_is_immediate_under_cancellation_and_terminal_even_when_cleanup_fails() 
     assert_eq!(
         failed.engine.terminal_state(),
         Some(MysqlTerminalState::Aborted)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_successes_are_exactly_retryable_and_unopened_abort_is_owned() {
+    let mut closed = harness(vec![
+        exact(MysqlReplicaRole::Primary),
+        exact(MysqlReplicaRole::Primary),
+    ]);
+    establish(&mut closed, MysqlReplicaRole::Primary).await;
+    let close_operation = operation("retry-close", 5);
+    let first_close = closed.engine.close(close_operation.clone()).unwrap();
+    assert_eq!(
+        closed.engine.close(close_operation.clone()).unwrap(),
+        first_close
+    );
+    assert!(matches!(
+        closed.engine.close(MysqlOperationIdentity::new(
+            close_operation.id().clone(),
+            nonzero(6),
+        )),
+        Err(MysqlReplicatorError::OperationConflict)
+    ));
+
+    let mut aborted = harness(Vec::new());
+    open(&mut aborted);
+    let abort_operation = operation("retry-abort", 2);
+    let first_abort = aborted.engine.abort(abort_operation.clone()).unwrap();
+    assert_eq!(
+        aborted.engine.abort(abort_operation.clone()).unwrap(),
+        first_abort
+    );
+    assert!(first_abort.receipt().is_some());
+
+    let mut unopened = harness(Vec::new());
+    let unopened_operation = operation("unopened-abort", 1);
+    let unopened_outcome = unopened.engine.abort(unopened_operation.clone()).unwrap();
+    assert_eq!(unopened_outcome.state(), MysqlTerminalState::Aborted);
+    assert!(unopened_outcome.receipt().is_none());
+    assert_eq!(
+        unopened.engine.abort(unopened_operation).unwrap(),
+        unopened_outcome
     );
 }
 
@@ -3305,7 +3541,12 @@ async fn deadline_is_exercised_at_every_controlled_handoff_boundary() {
     assert!(matches!(
         harness
             .engine
-            .freeze_handoff_boundary(harness.peer.clone(), third.clone()),
+            .freeze_handoff_boundary(
+                operation("deadline-freeze", 5),
+                harness.peer.clone(),
+                third.clone(),
+            )
+            .await,
         Err(MysqlReplicatorError::Deadline(_))
     ));
     assert!(matches!(
@@ -3358,25 +3599,7 @@ async fn deadline_is_exercised_at_every_controlled_handoff_boundary() {
             .await,
         Err(MysqlReplicatorError::Deadline(_))
     ));
-    let executed = GtidSet::from_str("").unwrap();
-    let progress =
-        match project_progress(&ConfiguredGtidLineage::new(GROUP_UUID).unwrap(), &executed) {
-            ProgressProjection::Projectable(progress) => progress,
-            ProgressProjection::NonProjectable(reason) => {
-                panic!("empty test history must project: {reason:?}")
-            }
-        };
-    let boundary = MysqlHandoffBoundary::new(
-        configuration(&harness, 1),
-        MysqlReplicaEpoch::new(1),
-        harness.authority.clone(),
-        harness.local.clone(),
-        harness.peer.clone(),
-        third,
-        source_evidence.view().id().clone(),
-        executed,
-        progress,
-    );
+    let boundary = publication_scenario(CleanupPlan::Completed).await.boundary;
     assert!(matches!(
         harness
             .engine
@@ -3392,10 +3615,13 @@ async fn deadline_is_exercised_at_every_controlled_handoff_boundary() {
         Err(MysqlReplicatorError::Deadline(_))
     ));
     assert!(matches!(
-        harness.engine.publish_access(
-            operation("deadline-publish", 5),
-            MysqlAccessIntent::new(nonzero(2), true, true),
-        ),
+        harness
+            .engine
+            .publish_access(
+                operation("deadline-publish", 5),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .await,
         Err(MysqlReplicatorError::Deadline(_))
     ));
     assert!(matches!(
@@ -3449,6 +3675,7 @@ async fn deadline_is_exercised_at_every_controlled_handoff_boundary() {
             operation("deadline-revoke-publish", 5),
             MysqlAccessIntent::new(nonzero(2), true, true),
         )
+        .await
         .unwrap();
     enter_cleanup_reserve(&revoke_attempt);
     let deadline_revoke = revoke
@@ -3581,6 +3808,13 @@ fn harness(reads: Vec<ReadPlan>) -> Harness {
 }
 
 async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
+    publication_scenario_with_fresh_target(cleanup, false).await
+}
+
+async fn publication_scenario_with_fresh_target(
+    cleanup: CleanupPlan,
+    stale_publication_read: bool,
+) -> PublicationScenario {
     let roots = [
         TestRoot::new("proof-source"),
         TestRoot::new("proof-target"),
@@ -3638,6 +3872,12 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
         ReadPlan::Evidence(Box::new(evidence_from_members(
             authorities[0].clone(),
             "71:1",
+            &predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            authorities[0].clone(),
+            "71:1",
             &transferred_roles,
             &format!("{GROUP_UUID}:1-5"),
         ))),
@@ -3673,12 +3913,21 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
             &transferred_roles[1..],
             &format!("{GROUP_UUID}:1-5"),
         ))),
-        ReadPlan::Evidence(Box::new(evidence_from_members(
-            authorities[1].clone(),
-            "71:1",
-            &transferred_roles,
-            &format!("{GROUP_UUID}:1-5"),
-        ))),
+        ReadPlan::Evidence(Box::new(if stale_publication_read {
+            evidence_from_members(
+                authorities[1].clone(),
+                "71:1",
+                &transferred_roles,
+                &format!("{GROUP_UUID}:1-5"),
+            )
+        } else {
+            evidence_from_members(
+                authorities[1].clone(),
+                "71:2",
+                &transferred_roles[1..],
+                &format!("{GROUP_UUID}:1-5"),
+            )
+        })),
         ReadPlan::Evidence(Box::new(evidence_from_members(
             authorities[1].clone(),
             "71:1",
@@ -3806,6 +4055,7 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
             operation("source-publish", 5),
             MysqlAccessIntent::new(nonzero(2), true, true),
         )
+        .await
         .unwrap();
     source
         .revoke_access(
@@ -3820,12 +4070,17 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
         .unwrap();
     let transfer_source = source.source_boundary().unwrap();
     let boundary = source
-        .freeze_handoff_boundary(targets[1].clone(), targets[2].clone())
+        .freeze_handoff_boundary(
+            operation("source-freeze", 8),
+            targets[1].clone(),
+            targets[2].clone(),
+        )
+        .await
         .unwrap();
     source.retire_contained_client_proxy().await.unwrap();
 
     for (engine, label, generation) in [
-        (&mut source, "source", 8),
+        (&mut source, "source", 9),
         (&mut target, "target", 5),
         (&mut remaining, "remaining", 5),
     ] {
@@ -3838,7 +4093,7 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
     }
     source
         .transfer_role(
-            operation("source-transfer", 9),
+            operation("source-transfer", 10),
             MysqlReplicaEpoch::new(2),
             MysqlReplicaRole::Secondary,
             transfer_source,
@@ -3869,7 +4124,7 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
     );
     source
         .observe_configuration(
-            operation("source-configuration-2", 10),
+            operation("source-configuration-2", 11),
             successor_configuration.clone(),
         )
         .await
@@ -3888,7 +4143,7 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
         )
         .await
         .unwrap();
-    let source_terminal = source.close(operation("source-close", 11)).unwrap();
+    let source_terminal = source.close(operation("source-close", 12)).unwrap();
     let remaining_outcome = remaining
         .accept_handoff_successor(operation("remaining-successor", 8), boundary.clone())
         .await
@@ -3906,7 +4161,7 @@ async fn publication_scenario(cleanup: CleanupPlan) -> PublicationScenario {
         boundary,
         target_outcome,
         remaining_outcome,
-        source_receipt: source_terminal.receipt().clone(),
+        source_receipt: source_terminal.receipt().unwrap().clone(),
     }
 }
 
@@ -3943,7 +4198,7 @@ async fn prepare_publication_proxy(scenario: &mut PublicationScenario) {
 }
 
 async fn accepted_publication_scenario() -> PublicationScenario {
-    let mut scenario = publication_scenario(CleanupPlan::Completed).await;
+    let mut scenario = publication_scenario_with_fresh_target(CleanupPlan::Completed, true).await;
     let proof = publication_proof(&scenario, true, true, true);
     scenario
         .target
@@ -3952,7 +4207,7 @@ async fn accepted_publication_scenario() -> PublicationScenario {
     scenario
 }
 
-fn assert_publication_rejected(
+async fn assert_publication_rejected(
     target: &mut MysqlReplicator<ScriptedEffects>,
     label: &str,
     generation: u64,
@@ -3964,6 +4219,7 @@ fn assert_publication_rejected(
                 operation(label, generation),
                 MysqlAccessIntent::new(nonzero(access_generation), true, true),
             )
+            .await
             .is_err()
     );
     assert!(!target.access_intent().unwrap().write());
@@ -3987,16 +4243,18 @@ fn settle_blocked_scenario(scenario: &mut PublicationScenario) {
     );
 }
 
-fn assert_publish_blocked(
+async fn assert_publish_blocked(
     target: &mut MysqlReplicator<ScriptedEffects>,
     label: &str,
     generation: u64,
 ) {
     assert!(matches!(
-        target.publish_access(
-            operation(label, generation),
-            MysqlAccessIntent::new(nonzero(2), true, true),
-        ),
+        target
+            .publish_access(
+                operation(label, generation),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .await,
         Err(MysqlReplicatorError::HandoffProofRequired)
     ));
     assert!(!target.access_intent().unwrap().write());
@@ -4117,25 +4375,14 @@ async fn target_ready_for_successor(
         )
         .await
         .unwrap();
-    let executed = GtidSet::from_str(&format!("{GROUP_UUID}:1-5")).unwrap();
-    let progress =
-        match project_progress(&ConfiguredGtidLineage::new(GROUP_UUID).unwrap(), &executed) {
-            ProgressProjection::Projectable(progress) => progress,
-            ProgressProjection::NonProjectable(reason) => {
-                panic!("test boundary must project: {reason:?}")
-            }
-        };
-    let boundary = MysqlHandoffBoundary::new(
-        predecessor_configuration,
-        MysqlReplicaEpoch::new(1),
+    let boundary = issued_boundary_for_targets(
+        &attempt,
         source_authority,
-        targets[1].clone(),
-        targets[0].clone(),
-        targets[2].clone(),
-        ViewId::new("91:1").unwrap(),
-        executed,
-        progress,
-    );
+        targets.clone(),
+        predecessor_configuration,
+        &predecessor_roles,
+    )
+    .await;
     target
         .advance_epoch(operation("successor-epoch-2", 5), MysqlReplicaEpoch::new(2))
         .unwrap();
@@ -4159,6 +4406,108 @@ async fn target_ready_for_successor(
         .await
         .unwrap();
     (root, target, boundary, attempt)
+}
+
+async fn issued_boundary_for_targets(
+    attempt: &AttemptContext,
+    source_authority: MemberMutationAuthority,
+    targets: [MysqlReplicaTarget; 3],
+    configuration: MysqlReplicaConfiguration,
+    predecessor_roles: &[(MysqlMemberIndex, MemberRole)],
+) -> MysqlHandoffBoundary {
+    let root = TestRoot::new("issued-boundary");
+    let source_identity = targets[1].identity().clone();
+    let reads = vec![
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            source_authority.clone(),
+            "91:1",
+            predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            source_authority.clone(),
+            "91:1",
+            predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+        ReadPlan::Evidence(Box::new(evidence_from_members(
+            source_authority.clone(),
+            "91:1",
+            predecessor_roles,
+            &format!("{GROUP_UUID}:1-5"),
+        ))),
+    ];
+    let mut source = engine(
+        root.config_for_member(MysqlMemberIndex::Second),
+        source_identity.clone(),
+        attempt.clone(),
+        reads,
+        vec![ReceiptPlan::Exact, ReceiptPlan::Exact, ReceiptPlan::Exact],
+        CleanupPlan::Completed,
+    );
+    source
+        .open(
+            operation("issued-boundary-open", 1),
+            MysqlOpenReceipt::new(source_identity, source_authority, nonzero(1)),
+        )
+        .unwrap();
+    source
+        .advance_epoch(
+            operation("issued-boundary-epoch", 2),
+            MysqlReplicaEpoch::new(1),
+        )
+        .unwrap();
+    source
+        .observe_role(
+            operation("issued-boundary-role", 3),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Primary,
+        )
+        .await
+        .unwrap();
+    source
+        .observe_configuration(operation("issued-boundary-configuration", 4), configuration)
+        .await
+        .unwrap();
+    let credential = ApplicationCredential::new(
+        attempt.attempt().clone(),
+        CredentialGeneration::new("issued-boundary-credential").unwrap(),
+        "issued_boundary",
+        "application-secret",
+    )
+    .unwrap();
+    source
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            credential,
+        )
+        .await
+        .unwrap();
+    source
+        .publish_access(
+            operation("issued-boundary-publish", 5),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        )
+        .await
+        .unwrap();
+    source
+        .revoke_access(
+            operation("issued-boundary-revoke", 6),
+            MysqlAccessIntent::new(nonzero(3), false, false),
+        )
+        .await
+        .unwrap();
+    let boundary = source
+        .freeze_handoff_boundary(
+            operation("issued-boundary-freeze", 7),
+            targets[0].clone(),
+            targets[2].clone(),
+        )
+        .await
+        .unwrap();
+    source.retire_contained_client_proxy().await.unwrap();
+    source.abort(operation("issued-boundary-abort", 8)).unwrap();
+    boundary
 }
 
 fn harness_with_cleanup(reads: Vec<ReadPlan>, cleanup: CleanupPlan) -> Harness {
@@ -4217,6 +4566,108 @@ fn harness_with_attempt(
         local,
         peer,
         attempt,
+    }
+}
+
+fn harness_with_proxy_gates(
+    reads: Vec<ReadPlan>,
+    prepare_started: Option<Arc<AtomicBool>>,
+    prepare_release: Option<Arc<Notify>>,
+    remove_started: Option<Arc<AtomicBool>>,
+    remove_release: Option<Arc<Notify>>,
+) -> Harness {
+    let root = TestRoot::new("proxy-gates");
+    let attempt = context("proxy-gates");
+    let config = root.config_for_member(MysqlMemberIndex::First);
+    let authority = authority_with_attempt(&attempt, MysqlMemberIndex::First);
+    let identity = replica_identity("local");
+    let local_binding = authority.local().binding();
+    let local = MysqlReplicaTarget::new(
+        identity.clone(),
+        MemberPeer::from_enrollment(authority.local()),
+        local_binding.process_session().clone(),
+        local_binding.endpoint().clone(),
+        local_binding.storage().clone(),
+    );
+    let peer_identity = replica_identity("peer");
+    let peer_enrollment = enrollment("proxy-gates", MysqlMemberIndex::Second);
+    let peer_binding = peer_enrollment.binding();
+    let peer = MysqlReplicaTarget::new(
+        peer_identity,
+        MemberPeer::from_enrollment(&peer_enrollment),
+        peer_binding.process_session().clone(),
+        peer_binding.endpoint().clone(),
+        peer_binding.storage().clone(),
+    );
+    let observer = credential(&attempt, ControlCredentialRole::Observer);
+    let recovery = credential(&attempt, ControlCredentialRole::Recovery);
+    let mut effects = ScriptedEffects::new(config, reads, Vec::new(), CleanupPlan::Completed);
+    effects.prepare_started = prepare_started;
+    effects.prepare_release = prepare_release;
+    effects.remove_started = remove_started;
+    effects.remove_release = remove_release;
+    let engine = MysqlReplicator::new(
+        effects,
+        identity.clone(),
+        ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
+        observer,
+        recovery,
+        attempt.clone(),
+    )
+    .unwrap();
+    Harness {
+        _root: root,
+        engine,
+        authority,
+        identity,
+        local,
+        peer,
+        attempt,
+    }
+}
+
+async fn prepare_publish_revoke(harness: &mut Harness, label: &str) {
+    let credential = ApplicationCredential::new(
+        harness.attempt.attempt().clone(),
+        CredentialGeneration::new(format!("{label}-credential")).unwrap(),
+        format!("{}_user", label.replace('-', "_")),
+        "application-secret",
+    )
+    .unwrap();
+    harness
+        .engine
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            credential,
+        )
+        .await
+        .unwrap();
+    harness
+        .engine
+        .publish_access(
+            operation(&format!("{label}-publish"), 5),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        )
+        .await
+        .unwrap();
+    harness
+        .engine
+        .revoke_access(
+            operation(&format!("{label}-revoke"), 6),
+            MysqlAccessIntent::new(nonzero(3), false, false),
+        )
+        .await
+        .unwrap();
+}
+
+async fn wait_flag(flag: &AtomicBool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !flag.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "scripted future did not reach await"
+        );
+        tokio::task::yield_now().await;
     }
 }
 

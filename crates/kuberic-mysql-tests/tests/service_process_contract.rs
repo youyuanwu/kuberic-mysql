@@ -19,8 +19,9 @@ use kuberic_mysql::core::{
     ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
 };
 use kuberic_mysql::service::{
-    AttemptCleanupState, AttemptContext, LifecycleOperation, MysqlInstanceError,
-    MysqlInstanceManager, MysqlInstanceState, MysqlMemberEffectBoundary, OwnershipError,
+    AttemptCleanupState, AttemptContext, LifecycleOperation, MysqlInstanceConfig,
+    MysqlInstanceError, MysqlInstanceManager, MysqlInstanceState, MysqlMemberEffectBoundary,
+    MysqlOperationTimeouts, OwnershipError,
 };
 
 #[derive(Clone)]
@@ -258,6 +259,121 @@ fn scratch_cleanup_failure_is_explicit_and_preserves_data() {
     ));
     assert!(root.data.is_dir());
     assert!(root.scratch.is_dir());
+}
+
+#[test]
+fn initialization_and_startup_polling_are_bounded_by_the_shared_attempt() {
+    let init_root = TestRoot::new("attempt-init");
+    write_attempt_launcher(&init_root.launcher, true);
+    let init_config = MysqlInstanceConfig::new(
+        "/usr/bin/sleep",
+        &init_root.launcher,
+        &init_root.data,
+        &init_root.scratch,
+        process_timeouts(),
+    )
+    .unwrap();
+    let init_attempt = AttemptContext::new(
+        AttemptId::new("attempt-init").unwrap(),
+        Instant::now() + Duration::from_millis(300),
+        Duration::from_millis(125),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let mut initializing = MysqlInstanceManager::new(init_config);
+    assert!(matches!(
+        initializing.initialize_with_attempt(&init_attempt),
+        Err(MysqlInstanceError::Attempt(_))
+            | Err(MysqlInstanceError::CleanupAfter { .. })
+            | Err(MysqlInstanceError::Timeout(
+                LifecycleOperation::Initialization
+            ))
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(initializing.state(), MysqlInstanceState::Faulted);
+
+    let start_root = TestRoot::new("attempt-start");
+    write_attempt_launcher(&start_root.launcher, false);
+    let start_config = MysqlInstanceConfig::new(
+        "/usr/bin/sleep",
+        &start_root.launcher,
+        &start_root.data,
+        &start_root.scratch,
+        process_timeouts(),
+    )
+    .unwrap();
+    let setup_attempt = AttemptContext::new(
+        AttemptId::new("attempt-start-setup").unwrap(),
+        Instant::now() + Duration::from_secs(3),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut starting = MysqlInstanceManager::new(start_config);
+    starting.initialize_with_attempt(&setup_attempt).unwrap();
+    let start_attempt = AttemptContext::new(
+        AttemptId::new("attempt-start").unwrap(),
+        Instant::now() + Duration::from_millis(300),
+        Duration::from_millis(125),
+    )
+    .unwrap();
+    let started = Instant::now();
+    assert!(matches!(
+        starting.start_with_attempt(&start_attempt),
+        Err(MysqlInstanceError::Attempt(_))
+            | Err(MysqlInstanceError::CleanupAfter { .. })
+            | Err(MysqlInstanceError::Timeout(LifecycleOperation::Startup))
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(starting.state(), MysqlInstanceState::Faulted);
+    if let Ok(pid) = fs::read_to_string(starting.config().runtime().pid()) {
+        let pid = pid.trim();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "startup child survived attempt-bounded cleanup"
+        );
+    }
+}
+
+fn process_timeouts() -> MysqlOperationTimeouts {
+    MysqlOperationTimeouts::new(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .unwrap()
+}
+
+fn write_attempt_launcher(path: &Path, slow_initialization: bool) {
+    let initialization = if slow_initialization {
+        "sleep 60"
+    } else {
+        "exit 0"
+    };
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+while [ "$1" != "--" ]; do shift; done
+shift
+mysqld="$1"
+shift
+if [ "$1" = "--version" ]; then
+  echo "$mysqld  Ver 8.4.11 for Linux on x86_64 (MySQL Community Server - GPL)"
+  exit 0
+fi
+case "$*" in
+  *--initialize-insecure*) {initialization} ;;
+esac
+config=${{1#--defaults-file=}}
+pid_file=$(sed -n 's/^pid-file=//p' "$config")
+echo $$ > "$pid_file"
+exec "$mysqld" 60
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn inventory(root: &Path) -> Vec<String> {

@@ -74,18 +74,18 @@ pub use member::{
 pub use proxy::{
     APPLICATION_QUALIFICATION_SCHEMA, ApplicationAccountReceipt, ApplicationCredential,
     BackendSessionIdentity, MysqlClientProxy, MysqlProxyContainmentReceipt,
-    MysqlProxyControlBoundary, MysqlProxySnapshot,
+    MysqlProxyControlBoundary, MysqlProxyDiagnostics, MysqlProxySnapshot,
 };
 pub use replicator::{
     MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,
     MysqlFormationRoleOutcome, MysqlFreshMemberCredentials, MysqlFreshMemberInput,
-    MysqlHandoffBoundary, MysqlHandoffOutcome, MysqlHandoffPublicationOutcome,
-    MysqlHandoffPublicationProof, MysqlOpenOutcome, MysqlOpenReceipt, MysqlOperationIdentity,
-    MysqlPeerAuthorityFacts, MysqlPeerOperationIntent, MysqlPeerOperationKind,
-    MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason, MysqlProgressOutcome,
-    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
-    MysqlReplicaTarget, MysqlReplicator, MysqlRoleOutcome, MysqlSourceTerminalReceipt,
-    MysqlTerminalOutcome, MysqlTerminalState,
+    MysqlHandoffBoundary, MysqlHandoffBoundaryId, MysqlHandoffOutcome,
+    MysqlHandoffPublicationOutcome, MysqlHandoffPublicationProof, MysqlOpenOutcome,
+    MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
+    MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
+    MysqlProgressOutcome, MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity,
+    MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator, MysqlRoleOutcome,
+    MysqlSourceTerminalReceipt, MysqlTerminalOutcome, MysqlTerminalState,
 };
 pub use topology::{
     AcceptedMysqlTopology, AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect,

@@ -5,8 +5,8 @@ use std::io::ErrorKind;
 
 use crate::adapter::RequestError;
 use crate::service::{
-    AttemptCancellationState, AttemptDeadlineState, MysqlInstanceState, MysqlMemberIndex,
-    MysqlOwnedPathKind, MysqlTopologyState,
+    AttemptAdmissionError, AttemptCancellationState, AttemptDeadlineState, MysqlInstanceState,
+    MysqlMemberIndex, MysqlOwnedPathKind, MysqlTopologyState,
 };
 
 /// Bounded client-gateway protocol phase.
@@ -91,6 +91,9 @@ pub enum MysqlProxyError {
     Account(MysqlTopologyError),
     /// Exact native backend termination or absence proof failed.
     Native(MemberTransitionError),
+    /// A backend connection was initiated but no exact native connection ID
+    /// was obtained, so native absence cannot be proved.
+    UnidentifiedBackend,
     /// Cleanup failed after a primary proxy failure.
     Cleanup {
         /// Original proxy failure.
@@ -455,6 +458,9 @@ pub enum MysqlReplicatorError {
     HandoffProofConflict,
     /// Mandatory close settlement did not produce completed cleanup evidence.
     CloseUnsettled,
+    /// Abort crossed the terminal boundary but exact complete containment was
+    /// not proved.
+    AbortUnsettled,
     /// The shared attempt was cancelled before operation admission.
     Cancelled,
     /// The shared attempt was outside its primary-work budget.
@@ -761,6 +767,9 @@ pub enum MysqlInstanceError {
     },
     /// A bounded operation exceeded its deadline.
     Timeout(LifecycleOperation),
+    /// Shared attempt cancellation or work-cutoff admission stopped a process
+    /// lifecycle poll.
+    Attempt(AttemptAdmissionError),
     /// A child exited unsuccessfully.
     ChildFailure {
         /// Operation whose child failed.

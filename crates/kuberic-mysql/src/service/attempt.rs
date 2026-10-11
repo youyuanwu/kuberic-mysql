@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+
 use crate::core::AttemptId;
 use crate::service::{MysqlTopologyError, NativeControlDeadline};
 
@@ -87,6 +89,7 @@ pub struct AttemptContext {
     work_deadline: Instant,
     cleanup_reserve: Duration,
     cancelled: Arc<AtomicBool>,
+    cancellation: watch::Sender<bool>,
 }
 
 impl AttemptContext {
@@ -117,12 +120,14 @@ impl AttemptContext {
             .checked_sub(cleanup_reserve)
             .filter(|work_deadline| *work_deadline > now)
             .ok_or(AttemptAdmissionError::CleanupReserve)?;
+        let (cancellation, _) = watch::channel(false);
         Ok(Self {
             attempt,
             deadline,
             work_deadline,
             cleanup_reserve,
             cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation,
         })
     }
 
@@ -153,6 +158,7 @@ impl AttemptContext {
     /// Requests cancellation for every clone of this context.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        let _ = self.cancellation.send(true);
     }
 
     /// Current shared cancellation state.
@@ -203,6 +209,10 @@ impl AttemptContext {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn cancellation_receiver(&self) -> watch::Receiver<bool> {
+        self.cancellation.subscribe()
     }
 
     pub(crate) fn native_deadline(&self) -> Result<NativeControlDeadline, MysqlTopologyError> {

@@ -52,6 +52,7 @@ pub struct FormationEvidence {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandoffStage {
+    InitialPublicationHistoryAccepted,
     CancellationGenerationPublished,
     CancellationContained,
     SourceGenerationPublished,
@@ -493,7 +494,7 @@ impl ReplicatorLiveFixture {
 
     pub async fn form_and_finalize(mut self) -> Result<FormationEvidence, String> {
         let formation = self.form().await;
-        let cleanup_failures = self.cleanup_failures();
+        let cleanup_failures = self.cleanup_failures().await;
         finalize_attempt(formation, cleanup_failures)
     }
 
@@ -506,7 +507,7 @@ impl ReplicatorLiveFixture {
             self.controlled_handoff(formation, started).await
         }
         .await;
-        let cleanup_failures = self.cleanup_failures();
+        let cleanup_failures = self.cleanup_failures().await;
         match finalize_attempt(primary, cleanup_failures) {
             Ok(mut evidence) => {
                 evidence.trace.push(HandoffTraceEntry {
@@ -521,6 +522,35 @@ impl ReplicatorLiveFixture {
         }
     }
 
+    pub async fn inject_proxy_failure_and_finalize(mut self, publish: bool) -> Result<(), String> {
+        self.form().await?;
+        let address = self.members[0].proxy_address;
+        self.members[0]
+            .engine_mut()
+            .prepare_staged_client_proxy(address)
+            .await
+            .map_err(|error| error.to_string())?;
+        if publish {
+            let operation = self.members[0].operation("injected-publication");
+            self.members[0]
+                .engine_mut()
+                .publish_access(operation, MysqlAccessIntent::new(nonzero(2), true, true))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let marker = if publish {
+            "injected failure after publication"
+        } else {
+            "injected failure after preparation"
+        };
+        let failures = self.cleanup_failures().await;
+        match finalize_attempt::<()>(Err(marker.to_owned()), failures) {
+            Err(error) if error == format!("formation failed: {marker}") => Ok(()),
+            Err(error) => Err(error),
+            Ok(()) => Err("injected fixture failure unexpectedly succeeded".to_owned()),
+        }
+    }
+
     async fn controlled_handoff(
         &mut self,
         formation: FormationEvidence,
@@ -529,6 +559,40 @@ impl ReplicatorLiveFixture {
         let mut trace = Vec::new();
         create_qualification_schema(&self.members[0].socket).await?;
         self.application_schema_created = true;
+        let mut publication_history = None;
+        let mut publication_view = None;
+        for index in 0..3 {
+            let operation = self.members[index].operation("initial-publication-history");
+            self.members[index]
+                .engine_mut()
+                .read_progress(operation)
+                .await
+                .map_err(|error| error.to_string())?;
+            let evidence = self.members[index]
+                .engine()
+                .native_evidence()
+                .cloned()
+                .ok_or_else(|| "initial publication evidence was missing".to_owned())?;
+            if let Some(expected) = publication_history.as_ref() {
+                if evidence.executed() != expected
+                    || publication_view.as_ref() != Some(evidence.view())
+                {
+                    return Err(
+                        "schema DDL was not present in one exact common publication view/history"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                publication_history = Some(evidence.executed().clone());
+                publication_view = Some(evidence.view().clone());
+            }
+        }
+        push_trace(
+            &mut trace,
+            started,
+            HandoffStage::InitialPublicationHistoryAccepted,
+            "all three members accepted one exact structured history after schema DDL".to_owned(),
+        );
 
         let cancellation_proxy_address = self.members[0].proxy_address;
         let cancellation_address = self.members[0]
@@ -543,6 +607,7 @@ impl ReplicatorLiveFixture {
                 publish_cancellation,
                 MysqlAccessIntent::new(nonzero(2), true, true),
             )
+            .await
             .map_err(|error| error.to_string())?;
         push_trace(
             &mut trace,
@@ -614,6 +679,7 @@ impl ReplicatorLiveFixture {
                 publish_source,
                 MysqlAccessIntent::new(nonzero(4), true, true),
             )
+            .await
             .map_err(|error| error.to_string())?;
         push_trace(
             &mut trace,
@@ -734,9 +800,15 @@ impl ReplicatorLiveFixture {
             .engine()
             .source_boundary()
             .map_err(|error| error.to_string())?;
+        let freeze_operation = self.members[0].operation("freeze-handoff");
         let boundary = self.members[0]
-            .engine()
-            .freeze_handoff_boundary(formation.targets[1].clone(), formation.targets[2].clone())
+            .engine_mut()
+            .freeze_handoff_boundary(
+                freeze_operation,
+                formation.targets[1].clone(),
+                formation.targets[2].clone(),
+            )
+            .await
             .map_err(|error| format!("freeze handoff boundary: {error}"))?;
         push_trace(
             &mut trace,
@@ -849,7 +921,7 @@ impl ReplicatorLiveFixture {
         if terminal.state() != MysqlTerminalState::Closed {
             return Err("source did not cross the closed lifecycle boundary".to_owned());
         }
-        let source_terminal = terminal.receipt().clone();
+        let source_terminal = terminal.receipt().unwrap().clone();
         assert_process_absent(self.members[0].pid)?;
         if self.members[0].socket.exists() || self.members[0].pid_file.exists() {
             return Err("source socket or PID file survived exact stop/reap".to_owned());
@@ -922,6 +994,7 @@ impl ReplicatorLiveFixture {
                 target_publish,
                 MysqlAccessIntent::new(nonzero(2), true, true),
             )
+            .await
             .map_err(|error| format!("publish target after successor: {error}"))?;
         push_trace(
             &mut trace,
@@ -1006,14 +1079,14 @@ impl ReplicatorLiveFixture {
         })
     }
 
-    fn cleanup_failures(&mut self) -> Vec<String> {
+    async fn cleanup_failures(&mut self) -> Vec<String> {
         if self.closed {
             return Vec::new();
         }
         self.attempt.cancel();
         let mut failures = Vec::new();
         for (index, owner) in self.members.iter_mut().enumerate() {
-            if let Err(error) = owner.cleanup() {
+            if let Err(error) = owner.cleanup().await {
                 failures.push(format!("member {} cleanup: {error}", index + 1));
             }
         }
@@ -1051,28 +1124,42 @@ impl ReplicatorLiveFixture {
                 failures.push(error);
             }
         }
-        if let Err(error) = self.root.remove() {
-            failures.push(error);
+        if failures.is_empty() {
+            if let Err(error) = self.root.remove() {
+                failures.push(error);
+            }
+            if self.root_path.exists() {
+                failures.push(format!(
+                    "fixture root survived {}",
+                    self.root_path.display()
+                ));
+            }
+        } else {
+            self.root.preserve();
         }
-        if self.root_path.exists() {
-            failures.push(format!(
-                "fixture root survived {}",
-                self.root_path.display()
-            ));
-        }
-        self.closed = true;
+        self.closed = failures.is_empty();
         failures
     }
 }
 
 impl Drop for ReplicatorLiveFixture {
     fn drop(&mut self) {
-        let failures = self.cleanup_failures();
-        if !failures.is_empty() {
-            eprintln!(
-                "emergency replicator fixture cleanup failed: {}",
-                failures.join("; ")
-            );
+        if !self.closed {
+            self.attempt.cancel();
+            for owner in &mut self.members {
+                owner.emergency_drop_engine();
+            }
+            if self.members.iter().any(|owner| {
+                assert_process_absent(owner.pid).is_err()
+                    || owner.socket.exists()
+                    || owner.pid_file.exists()
+            }) {
+                self.root.preserve();
+                eprintln!(
+                    "emergency replicator fixture cleanup preserved {} after incomplete containment",
+                    self.root_path.display()
+                );
+            }
         }
     }
 }
@@ -1125,7 +1212,7 @@ impl MemberOwner {
         )
     }
 
-    fn cleanup(&mut self) -> Result<(), String> {
+    async fn cleanup(&mut self) -> Result<(), String> {
         if !self.armed {
             return Ok(());
         }
@@ -1133,24 +1220,32 @@ impl MemberOwner {
             &format!("cleanup-{}", self.engine().identity().replica_id().as_str()),
             u64::MAX,
         );
-        let result = if self.engine().terminal_state().is_some() {
+        let result = if self.engine().terminal_outcome().is_some() {
             Ok(())
         } else {
             self.engine_mut()
-                .abort(operation)
+                .abort_with_proxy(operation)
+                .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         };
-        self.armed = false;
+        if result.is_ok() {
+            self.armed = false;
+        }
         result
+    }
+
+    fn emergency_drop_engine(&mut self) {
+        if self.armed {
+            self.engine.take();
+            self.armed = false;
+        }
     }
 }
 
 impl Drop for MemberOwner {
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup() {
-            eprintln!("emergency member-owner cleanup failed: {error}");
-        }
+        self.emergency_drop_engine();
     }
 }
 

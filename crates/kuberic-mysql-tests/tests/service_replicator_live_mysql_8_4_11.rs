@@ -14,6 +14,7 @@ async fn controlled_handoff_closes_source_before_target_publication() {
         .unwrap_or_else(|error| panic!("{error}"));
 
     let expected = [
+        HandoffStage::InitialPublicationHistoryAccepted,
         HandoffStage::CancellationGenerationPublished,
         HandoffStage::CancellationContained,
         HandoffStage::SourceGenerationPublished,
@@ -58,4 +59,17 @@ async fn controlled_handoff_closes_source_before_target_publication() {
     );
     assert_ne!(evidence.source_endpoint(), evidence.target_endpoint());
     assert!(evidence.boundary().executed().entries().len() == 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepared_and_published_owner_failures_use_exact_fixture_cleanup() {
+    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+    for publish in [false, true] {
+        ReplicatorLiveFixture::prepare()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .inject_proxy_failure_and_finalize(publish)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
 }

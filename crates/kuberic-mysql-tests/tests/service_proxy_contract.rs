@@ -21,6 +21,7 @@ use kuberic_mysql::service::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::sync::Notify;
 
 use service_common::{GROUP_UUID, TestRoot};
 
@@ -34,6 +35,9 @@ enum AuthMode {
     Full,
     Switch,
     Rsa,
+    WithheldGreeting,
+    DelayedGreeting,
+    MalformedGreeting,
 }
 
 #[derive(Clone)]
@@ -50,6 +54,8 @@ struct FakeControl {
     fail_socket: bool,
     fail_remove: bool,
     fail_terminate: bool,
+    terminate_started: Option<Arc<AtomicU32>>,
+    terminate_release: Option<Arc<Notify>>,
 }
 
 impl MysqlProxyControlBoundary for FakeControl {
@@ -95,6 +101,12 @@ impl MysqlProxyControlBoundary for FakeControl {
         _attempt: &AttemptContext,
         _deadline: Instant,
     ) -> Result<(), MysqlProxyError> {
+        if let Some(started) = self.terminate_started.as_ref() {
+            started.fetch_add(1, Ordering::Release);
+        }
+        if let Some(release) = self.terminate_release.as_ref() {
+            release.notified().await;
+        }
         if self.fail_terminate {
             return Err(MysqlProxyError::InvalidState);
         }
@@ -117,6 +129,7 @@ struct Fixture {
     authority: MemberMutationAuthority,
     attempt: AttemptContext,
     backend_commands: Arc<Mutex<Vec<u8>>>,
+    backend_settled: Arc<AtomicU32>,
     backend: tokio::task::JoinHandle<()>,
 }
 
@@ -143,8 +156,10 @@ impl Fixture {
         let socket = UnixSocketPath::new(&socket_path).unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let backend_commands = Arc::clone(&commands);
+        let settled = Arc::new(AtomicU32::new(0));
+        let backend_settled = Arc::clone(&settled);
         let backend = tokio::spawn(async move {
-            run_fake_backend(listener, plan, backend_commands).await;
+            run_fake_backend(listener, plan, backend_commands, backend_settled).await;
         });
         let attempt = AttemptContext::new(
             AttemptId::new(format!("{label}-attempt")).unwrap(),
@@ -161,6 +176,8 @@ impl Fixture {
             fail_socket: false,
             fail_remove: false,
             fail_terminate: false,
+            terminate_started: None,
+            terminate_release: None,
         };
         let credential = ApplicationCredential::new(
             attempt.attempt().clone(),
@@ -185,6 +202,7 @@ impl Fixture {
             authority,
             attempt,
             backend_commands: commands,
+            backend_settled: settled,
             backend,
         }
     }
@@ -240,6 +258,14 @@ async fn warmed_fast_auth_query_ping_quit_and_cleanup_are_bounded() {
     for _ in 0..5 {
         let _ = read_packet(&mut client).await;
     }
+    for query in [b"null-first".as_slice(), b"null-later", b"null-all"] {
+        let mut command = vec![0x03];
+        command.extend(query);
+        write_packet(&mut client, 0, &command).await;
+        for _ in 0..6 {
+            let _ = read_packet(&mut client).await;
+        }
+    }
     write_packet(&mut client, 0, b"\x0e").await;
     assert_eq!(read_packet(&mut client).await.1[0], 0x00);
     write_packet(&mut client, 0, b"\x01").await;
@@ -249,6 +275,8 @@ async fn warmed_fast_auth_query_ping_quit_and_cleanup_are_bounded() {
     let receipt = fixture.revoke().await;
     assert!(receipt.cleanup_complete());
     assert!(receipt.handoff_eligible());
+    assert_eq!(receipt.diagnostics().normal_completions(), 8);
+    assert_eq!(receipt.diagnostics().auth_rejections(), 0);
     assert!(
         fixture
             .control
@@ -257,7 +285,7 @@ async fn warmed_fast_auth_query_ping_quit_and_cleanup_are_bounded() {
     );
     assert_eq!(
         *fixture.backend_commands.lock().unwrap(),
-        vec![0x03, 0x03, 0x03, 0x0e, 0x01]
+        vec![0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x0e, 0x01]
     );
     fixture.cleanup().await;
 }
@@ -293,6 +321,7 @@ async fn exact_username_capabilities_and_warmed_auth_fail_closed() {
         wait_sessions_zero(&fixture.proxy).await;
         let receipt = fixture.revoke().await;
         assert!(receipt.handoff_eligible());
+        assert!(receipt.diagnostics().auth_rejections() >= 1);
         assert!(fixture.backend_commands.lock().unwrap().is_empty());
         fixture.cleanup().await;
     }
@@ -467,6 +496,8 @@ async fn preparation_preserves_primary_and_account_cleanup_failures() {
         fail_socket: true,
         fail_remove: true,
         fail_terminate: false,
+        terminate_started: None,
+        terminate_release: None,
     };
     let credential = ApplicationCredential::new(
         attempt.attempt().clone(),
@@ -527,6 +558,7 @@ async fn account_removal_requires_full_containment_and_can_be_retried_after_fail
             .await
             .is_err()
     );
+    assert_eq!(fixture.proxy.snapshot().diagnostics().cleanup_failures(), 1);
     assert!(fixture.proxy.credential_cleared());
     fixture.control.fail_remove = false;
     fixture
@@ -575,6 +607,42 @@ async fn native_termination_failure_never_credits_containment_and_is_retryable()
     ));
     fixture.control.fail_terminate = false;
     assert!(fixture.revoke().await.handoff_eligible());
+    fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_revocation_future_retains_armed_task_and_backend_ownership() {
+    let mut fixture = Fixture::new(
+        "proxy-drop-revoke",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    let address = fixture.publish();
+    let _client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    await_session_count(&fixture.proxy, 1).await;
+    let started = Arc::new(AtomicU32::new(0));
+    let release = Arc::new(Notify::new());
+    fixture.control.terminate_started = Some(Arc::clone(&started));
+    fixture.control.terminate_release = Some(Arc::clone(&release));
+    let mut revoke = Box::pin(fixture.proxy.revoke(
+        &mut fixture.control,
+        &fixture.authority,
+        nonzero(1),
+        &fixture.attempt,
+    ));
+    tokio::select! {
+        result = &mut revoke => panic!("revocation unexpectedly completed: {result:?}"),
+        () = wait_atomic_count(&started, 1) => {}
+    }
+    drop(revoke);
+    assert!(!fixture.proxy.snapshot().accepting());
+    assert!(!fixture.proxy.is_fully_contained());
+    release.notify_one();
+    let receipt = fixture.revoke().await;
+    assert!(receipt.handoff_eligible());
     fixture.cleanup().await;
 }
 
@@ -645,6 +713,113 @@ async fn publication_honors_shared_cancellation_and_deadline() {
         Err(MysqlProxyError::Deadline(_))
     ));
     expired.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn published_attempt_cancellation_seals_idle_and_poised_command_work_without_revoke() {
+    let mut idle = Fixture::new(
+        "proxy-published-cancel-idle",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    let address = idle.publish();
+    let _client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    idle.attempt.cancel();
+    wait_sessions_zero(&idle.proxy).await;
+    assert!(!idle.proxy.snapshot().accepting());
+    assert!(TcpStream::connect(address).await.is_err());
+    let receipt = idle.revoke().await;
+    assert!(receipt.diagnostics().cancellations() >= 1);
+    idle.cleanup().await;
+
+    let mut poised = Fixture::new(
+        "proxy-published-cancel-command",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    let address = poised.publish();
+    let mut client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    poised.attempt.cancel();
+    let _ = write_packet_result(&mut client, 0, b"\x03must_not_dispatch").await;
+    wait_sessions_zero(&poised.proxy).await;
+    assert!(poised.backend_commands.lock().unwrap().is_empty());
+    assert!(!poised.proxy.snapshot().accepting());
+    let receipt = poised.revoke().await;
+    assert!(receipt.diagnostics().cancellations() >= 1);
+    poised.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn published_idle_listener_expires_and_stops_serving_without_revoke() {
+    let mut fixture = Fixture::new_with_budget(
+        "proxy-published-expiry",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+        Duration::from_millis(240),
+        Duration::from_millis(120),
+    )
+    .await;
+    let address = fixture.publish();
+    tokio::time::sleep(Duration::from_millis(145)).await;
+    assert!(!fixture.proxy.snapshot().accepting());
+    assert!(TcpStream::connect(address).await.is_err());
+    assert!(fixture.revoke().await.handoff_eligible());
+    fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unidentified_pre_greeting_backends_never_credit_vacuous_native_absence() {
+    for (index, auth) in [
+        AuthMode::WithheldGreeting,
+        AuthMode::DelayedGreeting,
+        AuthMode::MalformedGreeting,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut fixture = Fixture::new(
+            &format!("proxy-unidentified-{index}"),
+            BackendPlan {
+                auth,
+                block_query: false,
+            },
+        )
+        .await;
+        let address = fixture.publish();
+        let _client = TcpStream::connect(address).await.unwrap();
+        if matches!(auth, AuthMode::MalformedGreeting) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        } else {
+            await_session_count(&fixture.proxy, 1).await;
+            fixture.attempt.cancel();
+        }
+        wait_sessions_zero(&fixture.proxy).await;
+        assert_eq!(fixture.proxy.snapshot().unidentified_backends(), 1);
+        assert!(matches!(
+            fixture
+                .proxy
+                .revoke(
+                    &mut fixture.control,
+                    &fixture.authority,
+                    nonzero(1),
+                    &fixture.attempt,
+                )
+                .await,
+            Err(MysqlProxyError::UnidentifiedBackend)
+        ));
+        wait_backend_settled(&fixture.backend_settled, 1).await;
+        assert!(!fixture.proxy.is_fully_contained());
+        fixture.backend.abort();
+        let _ = fixture.backend.await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -847,6 +1022,7 @@ async fn run_fake_backend(
     listener: UnixListener,
     plan: BackendPlan,
     commands: Arc<Mutex<Vec<u8>>>,
+    settled: Arc<AtomicU32>,
 ) {
     let next_connection = Arc::new(AtomicU32::new(CONNECTION_ID));
     loop {
@@ -855,8 +1031,33 @@ async fn run_fake_backend(
         };
         let plan = plan.clone();
         let commands = Arc::clone(&commands);
+        let settled = Arc::clone(&settled);
         let connection_id = next_connection.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
+            struct Settlement(Arc<AtomicU32>);
+            impl Drop for Settlement {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::Release);
+                }
+            }
+            let _settlement = Settlement(settled);
+            match plan.auth {
+                AuthMode::WithheldGreeting => {
+                    let mut byte = [0_u8; 1];
+                    let _ = stream.read(&mut byte).await;
+                    return;
+                }
+                AuthMode::DelayedGreeting => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                AuthMode::MalformedGreeting => {
+                    write_packet(&mut stream, 0, b"malformed").await;
+                    let mut byte = [0_u8; 1];
+                    let _ = stream.read(&mut byte).await;
+                    return;
+                }
+                AuthMode::Fast | AuthMode::Full | AuthMode::Switch | AuthMode::Rsa => {}
+            }
             write_fragmented(&mut stream, &packet(0, &greeting(connection_id))).await;
             let _ = read_packet(&mut stream).await;
             match plan.auth {
@@ -876,6 +1077,11 @@ async fn run_fake_backend(
                 AuthMode::Rsa => {
                     write_packet(&mut stream, 2, b"\x01-----BEGIN PUBLIC KEY-----").await;
                     return;
+                }
+                AuthMode::WithheldGreeting
+                | AuthMode::DelayedGreeting
+                | AuthMode::MalformedGreeting => {
+                    unreachable!("greeting-only modes returned or continued as fast auth")
                 }
             }
             loop {
@@ -950,6 +1156,20 @@ async fn run_fake_backend(
                             ] {
                                 write_packet(&mut stream, sequence, &payload).await;
                             }
+                        } else if matches!(sql, b"null-first" | b"null-later" | b"null-all") {
+                            write_packet(&mut stream, 1, &[0x02]).await;
+                            write_packet(&mut stream, 2, &column_definition()).await;
+                            write_packet(&mut stream, 3, &column_definition()).await;
+                            write_packet(&mut stream, 4, &eof_packet()).await;
+                            let row = if sql == b"null-first" {
+                                vec![0xfb, 0x01, b'x']
+                            } else if sql == b"null-later" {
+                                vec![0x01, b'x', 0xfb]
+                            } else {
+                                vec![0xfb, 0xfb]
+                            };
+                            write_packet(&mut stream, 5, &row).await;
+                            write_packet(&mut stream, 6, &eof_packet()).await;
                         } else {
                             write_packet(&mut stream, 1, &ok_packet()).await;
                         }
@@ -1090,6 +1310,14 @@ async fn write_packet<W: AsyncWrite + Unpin>(stream: &mut W, sequence: u8, paylo
     stream.write_all(&packet(sequence, payload)).await.unwrap();
 }
 
+async fn write_packet_result<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    sequence: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    stream.write_all(&packet(sequence, payload)).await
+}
+
 async fn read_packet<R: AsyncRead + Unpin>(stream: &mut R) -> (u8, Vec<u8>) {
     read_packet_result(stream).await.unwrap()
 }
@@ -1139,6 +1367,29 @@ async fn await_session_count(proxy: &MysqlClientProxy, expected: usize) {
             "proxy session count did not settle"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_backend_settled(settled: &AtomicU32, expected: u32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if settled.load(Ordering::Acquire) >= expected {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "fake backend connection did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_atomic_count(value: &AtomicU32, expected: u32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while value.load(Ordering::Acquire) < expected {
+        assert!(Instant::now() < deadline, "scripted cleanup did not start");
+        tokio::task::yield_now().await;
     }
 }
 

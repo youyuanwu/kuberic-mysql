@@ -57,12 +57,14 @@ pub fn fresh_fixture_root(label: &str) -> Result<PathBuf, String> {
 
 pub struct FixtureRoot {
     root: PathBuf,
+    preserve_on_drop: bool,
 }
 
 impl FixtureRoot {
     pub fn new(label: &str) -> Result<Self, String> {
         Ok(Self {
             root: fresh_fixture_root(label)?,
+            preserve_on_drop: false,
         })
     }
 
@@ -77,10 +79,17 @@ impl FixtureRoot {
         }
         Ok(())
     }
+
+    pub fn preserve(&mut self) {
+        self.preserve_on_drop = true;
+    }
 }
 
 impl Drop for FixtureRoot {
     fn drop(&mut self) {
+        if self.preserve_on_drop {
+            return;
+        }
         let _ = fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&self.root);
     }

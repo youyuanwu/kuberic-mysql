@@ -30,7 +30,8 @@ use crate::service::control::OwnedControlTarget;
 use crate::service::process::qualification_kill_and_reap;
 use crate::service::process::{
     attest_child, launcher_command, terminate_and_reap, terminate_and_reap_before, verify_product,
-    wait_bounded, wait_for_absence, wait_for_absence_before,
+    verify_product_with_attempt, wait_bounded, wait_bounded_with_attempt, wait_for_absence,
+    wait_for_absence_before,
 };
 use crate::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential,
@@ -120,6 +121,22 @@ impl MysqlInstanceManager {
     /// Claims fresh roots, validates the exact product, renders configuration,
     /// and performs bounded insecure initialization.
     pub fn initialize(&mut self) -> Result<(), MysqlInstanceError> {
+        self.initialize_bounded(None)
+    }
+
+    /// Performs fresh initialization while observing the shared attempt work
+    /// cutoff and cancellation during every child poll.
+    pub fn initialize_with_attempt(
+        &mut self,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlInstanceError> {
+        self.initialize_bounded(Some(attempt))
+    }
+
+    fn initialize_bounded(
+        &mut self,
+        attempt: Option<&AttemptContext>,
+    ) -> Result<(), MysqlInstanceError> {
         self.require_state(MysqlInstanceState::Configured)?;
         let roots = match self.config.create_layout() {
             Ok(roots) => roots,
@@ -137,7 +154,7 @@ impl MysqlInstanceManager {
         };
         self.data_root = Some(roots.data);
         self.scratch_root = Some(roots.scratch);
-        let result = self.initialize_inner();
+        let result = self.initialize_inner(attempt);
         match result {
             Ok(()) => {
                 self.state = MysqlInstanceState::Initialized;
@@ -159,8 +176,15 @@ impl MysqlInstanceManager {
         }
     }
 
-    fn initialize_inner(&mut self) -> Result<(), MysqlInstanceError> {
-        verify_product(&self.config, &mut self.child)?;
+    fn initialize_inner(
+        &mut self,
+        attempt: Option<&AttemptContext>,
+    ) -> Result<(), MysqlInstanceError> {
+        if let Some(attempt) = attempt {
+            verify_product_with_attempt(&self.config, &mut self.child, attempt)?;
+        } else {
+            verify_product(&self.config, &mut self.child)?;
+        }
         fs::write(
             self.config.runtime().config(),
             self.config.render_server_config(),
@@ -195,14 +219,26 @@ impl MysqlInstanceManager {
                 kind: error.kind(),
             })?;
         self.child = Some(child);
-        let result = wait_bounded(
-            self.child
-                .as_mut()
-                .expect("initializer child retained before waiting"),
-            self.config.timeouts().initialization(),
-            self.config.timeouts().shutdown(),
-            LifecycleOperation::Initialization,
-        );
+        let child = self
+            .child
+            .as_mut()
+            .expect("initializer child retained before waiting");
+        let result = if let Some(attempt) = attempt {
+            wait_bounded_with_attempt(
+                child,
+                self.config.timeouts().initialization(),
+                self.config.timeouts().shutdown(),
+                LifecycleOperation::Initialization,
+                attempt,
+            )
+        } else {
+            wait_bounded(
+                child,
+                self.config.timeouts().initialization(),
+                self.config.timeouts().shutdown(),
+                LifecycleOperation::Initialization,
+            )
+        };
         let reaped = self
             .child
             .as_mut()
@@ -223,6 +259,22 @@ impl MysqlInstanceManager {
     /// Launches and attests the exact child, then waits for the owned private
     /// socket within the startup deadline.
     pub fn start(&mut self) -> Result<(), MysqlInstanceError> {
+        self.start_bounded(None)
+    }
+
+    /// Starts the exact child while observing the shared attempt work cutoff
+    /// and cancellation during readiness polling.
+    pub fn start_with_attempt(
+        &mut self,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlInstanceError> {
+        self.start_bounded(Some(attempt))
+    }
+
+    fn start_bounded(
+        &mut self,
+        attempt: Option<&AttemptContext>,
+    ) -> Result<(), MysqlInstanceError> {
         self.require_state(MysqlInstanceState::Initialized)?;
         self.config.revalidate_executables()?;
         if let Err(error) = self.revalidate_roots() {
@@ -260,12 +312,18 @@ impl MysqlInstanceManager {
                 kind: error.kind(),
             })?;
         self.child = Some(child);
-        if let Err(prior) = self.wait_until_ready() {
+        if let Err(prior) = self.wait_until_ready(attempt) {
             self.state = MysqlInstanceState::Faulted;
             let cleanup = self
                 .child
                 .as_mut()
-                .map(|child| terminate_and_reap(child, self.config.timeouts().shutdown()))
+                .map(|child| {
+                    if let Some(attempt) = attempt {
+                        terminate_and_reap_before(child, attempt.deadline())
+                    } else {
+                        terminate_and_reap(child, self.config.timeouts().shutdown())
+                    }
+                })
                 .transpose();
             return match cleanup {
                 Ok(_) => {
@@ -283,11 +341,17 @@ impl MysqlInstanceManager {
         Ok(())
     }
 
-    fn wait_until_ready(&mut self) -> Result<(), MysqlInstanceError> {
-        let deadline = checked_deadline(
+    fn wait_until_ready(
+        &mut self,
+        attempt: Option<&AttemptContext>,
+    ) -> Result<(), MysqlInstanceError> {
+        let local_deadline = checked_deadline(
             self.config.timeouts().startup(),
             LifecycleOperation::Startup,
         )?;
+        let deadline = attempt.map_or(local_deadline, |attempt| {
+            local_deadline.min(attempt.work_deadline())
+        });
         loop {
             let child = self.child.as_mut().expect("child retained during startup");
             if let Some(status) = child.try_wait().map_err(|error| MysqlInstanceError::Io {
@@ -306,6 +370,9 @@ impl MysqlInstanceManager {
             if socket_ready && self.config.runtime().pid().is_file() {
                 attest_child(child, &self.config)?;
                 return Ok(());
+            }
+            if let Some(error) = attempt.and_then(|attempt| attempt.admit_work().err()) {
+                return Err(MysqlInstanceError::Attempt(error));
             }
             if Instant::now() >= deadline {
                 return Err(MysqlInstanceError::Timeout(LifecycleOperation::Startup));
@@ -1298,7 +1365,8 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         let target = self
             .prepare_member_effect_target(authority, attempt)
             .map_err(MysqlProxyError::Native)?;
-        crate::service::control::prepare_application_account(
+        let mut cancellation_containment = MemberEffectCancellationContainment::new(self, attempt);
+        let result = crate::service::control::prepare_application_account(
             target,
             authority,
             credential,
@@ -1306,7 +1374,9 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
             attempt.deadline(),
         )
         .await
-        .map_err(MysqlProxyError::Account)
+        .map_err(MysqlProxyError::Account);
+        cancellation_containment.disarm();
+        result
     }
 
     async fn remove_application_account(
@@ -1474,6 +1544,10 @@ impl<'a> MemberEffectCancellationContainment<'a> {
         authority: &MemberMutationAuthority,
     ) -> Result<MemberControlBinding, MemberTransitionError> {
         self.instance.revalidate_member_effect_binding(authority)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 
     fn finish<T>(
