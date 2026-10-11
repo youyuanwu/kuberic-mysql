@@ -1,4 +1,9 @@
 //! Qualified scalar progress projections over structured GTID history.
+//!
+//! The complete [`GtidSet`] remains the caller-owned native authority. A
+//! [`QualifiedProgress`] is only a public scalar projection of that evidence;
+//! it does not replace or retain the structured history. Catch-up capability is
+//! evaluated separately and is never inferred from current progress.
 
 use core::fmt;
 
@@ -39,6 +44,10 @@ pub enum QualifiedProgressKind {
 }
 
 /// A signed scalar projected from a qualified complete GTID set.
+///
+/// This value carries the qualified history shape, but not the source
+/// [`GtidSet`]. Callers must retain that complete structured evidence whenever
+/// they need to justify or reconstruct the projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QualifiedProgress {
     value: i64,
@@ -53,7 +62,7 @@ impl QualifiedProgress {
         }
     }
 
-    /// Returns the exact signed scalar value.
+    /// Returns `0` for empty history or the inclusive interval tail.
     #[must_use]
     pub const fn value(self) -> i64 {
         self.value
@@ -98,6 +107,11 @@ pub enum ProgressProjection {
 }
 
 /// Projects complete native history only when it has the qualified shape.
+///
+/// The input is borrowed and remains the authoritative native evidence. Empty
+/// history maps to `0`; compatible non-empty history maps to its exact interval
+/// tail. Every other parsed shape returns one deterministic non-projectable
+/// reason without flattening or changing the [`GtidSet`].
 #[must_use]
 pub fn project_progress(lineage: &ConfiguredGtidLineage, executed: &GtidSet) -> ProgressProjection {
     let entries = executed.entries();
@@ -150,6 +164,10 @@ pub enum CatchUpUnprovedReason {
 }
 
 /// An independently evaluated Stage 2 catch-up capability outcome.
+///
+/// Neither variant carries a scalar fallback. In particular, projectable
+/// current progress does not imply that a donor retains the native history
+/// needed for incremental catch-up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatchUpCapabilityResult {
     /// This stage does not have the retained evidence required by the operation.
