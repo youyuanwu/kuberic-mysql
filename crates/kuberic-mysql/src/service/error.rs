@@ -5,8 +5,8 @@ use std::io::ErrorKind;
 
 use crate::adapter::RequestError;
 use crate::service::{
-    AttemptDeadlineState, MysqlInstanceState, MysqlMemberIndex, MysqlOwnedPathKind,
-    MysqlTopologyState,
+    AttemptCancellationState, AttemptDeadlineState, MysqlInstanceState, MysqlMemberIndex,
+    MysqlOwnedPathKind, MysqlTopologyState,
 };
 
 /// Configuration validation failure.
@@ -285,6 +285,72 @@ impl From<MysqlTopologyError> for MemberTransitionError {
         Self::Native(error)
     }
 }
+
+/// One secret-free rejection from the future-adapter lifecycle engine.
+#[derive(Debug)]
+pub enum MysqlReplicatorError {
+    /// The engine has not accepted its exact open receipt.
+    NotOpen,
+    /// Open was repeated with different identity or generation inputs.
+    OpenConflict,
+    /// A supplied replica, incarnation, member, or credential fact was not exact.
+    IdentityMismatch,
+    /// The member configuration cannot support Group Replication lifecycle work.
+    InvalidMemberConfiguration,
+    /// The operation generation was not newer than the last admitted operation.
+    StaleOperationGeneration,
+    /// An operation identity was retried with changed inputs.
+    OperationConflict,
+    /// A prior attempt with this exact operation identity completed uncertainly.
+    OperationUncertain,
+    /// The epoch was not newer than the current accepted epoch.
+    StaleEpoch,
+    /// A newer epoch barrier is required before this role operation.
+    EpochBarrierRequired,
+    /// A role must be accepted for the current epoch before configuration.
+    RoleRequired,
+    /// A current configuration must be accepted before this operation.
+    ConfigurationRequired,
+    /// The local replica must be primary under the current configuration.
+    PrimaryRequired,
+    /// A peer operation selected the exact local replica or native member.
+    SelfTarget,
+    /// A configuration omitted, duplicated, or changed an exact member identity.
+    InvalidConfiguration,
+    /// An access generation was stale or conflicting.
+    StaleAccessGeneration,
+    /// A typed member receipt or observation did not match the admitted operation.
+    ReceiptMismatch,
+    /// A typed receipt arrived after cancellation or outside primary-work time.
+    LateReceipt {
+        /// Deadline position when the receipt arrived.
+        deadline: AttemptDeadlineState,
+        /// Cancellation position when the receipt arrived.
+        cancellation: AttemptCancellationState,
+    },
+    /// A receipt did not prove the requested local native role.
+    NativeRoleMismatch,
+    /// Mandatory close settlement did not produce completed cleanup evidence.
+    CloseUnsettled,
+    /// The shared attempt was cancelled before operation admission.
+    Cancelled,
+    /// The shared attempt was outside its primary-work budget.
+    Deadline(AttemptDeadlineState),
+    /// The engine has crossed a terminal close or abort boundary.
+    Terminal,
+    /// The member-local effect failed or completed uncertainly.
+    MemberTransition(MemberTransitionError),
+    /// Exact local containment failed.
+    Instance(MysqlInstanceError),
+}
+
+impl fmt::Display for MysqlReplicatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL replicator lifecycle failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MysqlReplicatorError {}
 
 /// Why a topology capability was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

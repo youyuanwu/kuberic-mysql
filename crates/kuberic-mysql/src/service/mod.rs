@@ -41,6 +41,7 @@ mod member;
 mod process;
 #[cfg(test)]
 mod qualification;
+mod replicator;
 mod topology;
 
 pub use attempt::{
@@ -54,9 +55,9 @@ pub use config::{
 pub use error::{
     ConfigError, ControlStage, LifecycleOperation, MemberAuthorityError, MemberCleanupFailure,
     MemberReceiptError, MemberTransitionError, MemberViewError, MysqlInstanceError,
-    MysqlTopologyError, MysqlTopologyManagerError, OwnershipError, ProductError,
-    TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError, TopologyNativeStateError,
-    TopologyStateError,
+    MysqlReplicatorError, MysqlTopologyError, MysqlTopologyManagerError, OwnershipError,
+    ProductError, TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError,
+    TopologyNativeStateError, TopologyStateError,
 };
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
 pub use member::{
@@ -64,6 +65,14 @@ pub use member::{
     FreshJoinInput, MemberEffectKind, MemberEffectReceipt, MemberMutationAuthority,
     MemberNativeEvidence, MemberPeer, MemberSourceBoundary, MysqlMemberEffectBoundary,
     PrimaryTransferInput,
+};
+pub use replicator::{
+    MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,
+    MysqlOpenOutcome, MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts,
+    MysqlPeerOperationIntent, MysqlPeerOperationKind, MysqlPeerOperationOutcome,
+    MysqlPeerUnsupportedReason, MysqlProgressOutcome, MysqlReplicaConfiguration, MysqlReplicaEpoch,
+    MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator, MysqlRoleOutcome,
+    MysqlTerminalOutcome, MysqlTerminalState,
 };
 pub use topology::{
     AcceptedMysqlTopology, AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect,
