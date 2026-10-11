@@ -442,6 +442,135 @@ pub(crate) async fn join(
     .await
 }
 
+#[cfg(test)]
+pub(super) async fn qualification_start(
+    target: OwnedControlTarget,
+    recovery: &ControlCredential,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MysqlTopologyError> {
+    let deadline = verified_deadline(
+        control_deadline,
+        recovery.attempt(),
+        ControlStage::StartGroupReplication,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_product(&mut connection, deadline).await?;
+        let mut start = start_statement(recovery);
+        let result = execute(
+            &mut connection,
+            start.as_str(),
+            deadline,
+            ControlStage::StartGroupReplication,
+        )
+        .await;
+        start.clear();
+        result
+    }
+    .await;
+    disconnect(connection, result, deadline).await
+}
+
+#[cfg(test)]
+pub(super) enum QualificationRecoveryMutation<'a> {
+    Lock,
+    Replace(&'a ControlCredential),
+    Revoke,
+}
+
+#[cfg(test)]
+pub(super) async fn qualification_mutate_recovery(
+    target: OwnedControlTarget,
+    current: &ControlCredential,
+    mutation: QualificationRecoveryMutation<'_>,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MysqlTopologyError> {
+    let deadline = verified_deadline(
+        control_deadline,
+        current.attempt(),
+        ControlStage::CreateRecovery,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_product(&mut connection, deadline).await?;
+        execute(
+            &mut connection,
+            "SET SESSION sql_log_bin = 0",
+            deadline,
+            ControlStage::DisableBinaryLogging,
+        )
+        .await?;
+        execute(
+            &mut connection,
+            "SET GLOBAL super_read_only = OFF",
+            deadline,
+            ControlStage::CreateRecovery,
+        )
+        .await?;
+        let primary =
+            match mutation {
+                QualificationRecoveryMutation::Lock => {
+                    execute(
+                        &mut connection,
+                        &format!(
+                            "ALTER USER '{}'@'localhost' ACCOUNT LOCK",
+                            current.username()
+                        ),
+                        deadline,
+                        ControlStage::CreateRecovery,
+                    )
+                    .await
+                }
+                QualificationRecoveryMutation::Replace(replacement) => {
+                    let mut statement = SecretStatement::new(format!(
+                        "ALTER USER '{}'@'localhost' IDENTIFIED BY '{}'",
+                        current.username(),
+                        replacement.password()
+                    ));
+                    let result = execute(
+                        &mut connection,
+                        statement.as_str(),
+                        deadline,
+                        ControlStage::CreateRecovery,
+                    )
+                    .await;
+                    statement.clear();
+                    result
+                }
+                QualificationRecoveryMutation::Revoke => execute(
+                    &mut connection,
+                    &format!(
+                        "REVOKE REPLICATION SLAVE, CONNECTION_ADMIN ON *.* FROM '{}'@'localhost'",
+                        current.username()
+                    ),
+                    deadline,
+                    ControlStage::GrantRecovery,
+                )
+                .await,
+            };
+        let read_only_restore = execute(
+            &mut connection,
+            "SET GLOBAL super_read_only = ON",
+            deadline,
+            ControlStage::CreateRecovery,
+        )
+        .await;
+        let binary_log_restore = execute(
+            &mut connection,
+            "SET SESSION sql_log_bin = 1",
+            deadline,
+            ControlStage::RestoreBinaryLogging,
+        )
+        .await;
+        combine_primary_cleanup(
+            combine_primary_cleanup(primary, read_only_restore),
+            binary_log_restore,
+        )
+    }
+    .await;
+    disconnect(connection, result, deadline).await
+}
+
 async fn join_with<C: ControlConnector>(
     connector: &C,
     target: OwnedControlTarget,

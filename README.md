@@ -68,6 +68,35 @@ Cancelling bootstrap cannot detach a query future: bootstrap-off and proof are
 attempted after every enable attempt, while cancellation synchronously contains
 the exact owned topology before returning control.
 
+A test-only native feasibility gate pins and reads back all nine effective
+values on every member: `gtid_mode = ON`,
+`enforce_gtid_consistency = ON`,
+`group_replication_gtid_assignment_block_size = 1`,
+`group_replication_view_change_uuid = AUTOMATIC`, global and workload-session
+`group_replication_consistency = AFTER`,
+`innodb_flush_log_at_trx_commit = 1`, `sync_binlog = 1`,
+`binlog_expire_logs_seconds = 2592000`, and
+`group_replication_member_expel_timeout = 5`. It qualifies one untagged
+group-source, contiguous-from-1 GTID history across primary transfer, graceful
+departure/rejoin, retained-data restart of every process, and binary-log
+purge. Full GTID sets remain authoritative; purged sets and opaque log
+inventory do not become public catch-up capability.
+
+The gate proves a normally acknowledged singleton GTID on all members and
+proves it survives abrupt primary SIGKILL, a coherent two-survivor view, and
+restart of every participant. A deliberately blocked secondary applier exposed
+the exact transaction GTID; dropping the client before response produced an
+ambiguous client outcome whose GTID was then proved on all members. The gate
+did not establish an authoritative current-source-`AFTER` wait surface, so
+secondary loss during that wait remains unproved and no member fault is
+injected. Account lock, password
+replacement, and recovery-privilege removal do not terminate established
+native participation; even after explicit Group Replication stop and password
+replacement, the native `START GROUP_REPLICATION` command still completes.
+Because the caught-up target does not prove donor authentication, predecessor
+recovery-credential acceptance remains unproved. Native peer-session
+revocation and serving cutover therefore remain ineligible.
+
 The original five-argument `MysqlInstanceConfig::new(mysqld, launcher,
 data_root, scratch_root, timeouts)` remains the single-instance constructor and
 retains its prior profile. Fixed-topology callers must use the explicit
@@ -90,7 +119,7 @@ Native `PRIMARY`, `read_only`, and `super_read_only` values are evidence only.
 They never open Kuberic read or write access and do not prove fencing. The
 delivered fresh three-member bootstrap/join slice is not the broader Stage 2
 lifecycle PoC: member-local public Replicator wiring, SF lifecycle ordering,
-qualified scalar progress, signed build/peer admission, proxy access
+public scalar progress, effective signed build/peer admission, proxy access
 reconciliation or publication, switchover, failover, Clone/reseed, replacement
 or destructive repair, restart continuation, TLS, cross-host operation,
 containers, Kubernetes, and production availability or security claims remain
@@ -161,6 +190,22 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
   --test service_group_replication_live_mysql_8_4_11 \
   -E 'test(=three_fresh_members_bootstrap_join_and_cleanup)'
+```
+
+The native feasibility gates can be selected independently:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql --lib \
+  -E 'test(=service::qualification::tests::qualify_profile_gtid_transitions)'
+
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql --lib \
+  -E 'test(/service::qualification::tests::qualify_peer_.*/)'
+
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql --lib \
+  -E 'test(=service::qualification::tests::qualify_normal_acknowledgement) | test(=service::qualification::tests::qualify_ambiguous_disconnect) | test(=service::qualification::tests::qualify_secondary_loss_during_after) | test(=service::qualification::tests::qualify_post_ack_primary_crash_restart)'
 ```
 
 The live tests launch only isolated project-local fixture children, require all

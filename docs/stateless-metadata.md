@@ -43,6 +43,22 @@ public future is dropped while that asynchronous cleanup is incomplete, the
 retained ownership guard synchronously contains the exact topology before
 control returns; no query future is detached and no survivor is adopted.
 
+The delivered native feasibility tests add one strictly test-only exception to
+the one-generation fixture shape, not to the runtime persistence contract.
+After a completed fresh topology transfers ownership into a crate-private test
+runner, the same in-memory attempt may gracefully stop or abruptly kill an
+exact retained child, retain its already-owned data and scratch roots, start
+one new attested child, derive a fresh process-session binding, and rejoin it.
+The runner invalidates bootstrap/join credit on entry, reserves cleanup time,
+and contains all members on cancellation or mismatch. It writes no metadata
+and is absent from the normal library API.
+
+This proves selected Oracle MySQL 8.4.11 native history and crash behavior
+only. It is not restart continuation: losing the runner, its exact children,
+or its attempt context still requires fixture reset. It provides no survivor
+discovery, adoption, durable workflow cursor, effect recovery, public receipt,
+or authority after a component restart.
+
 This design applies the ownership principle from the
 [PostgreSQL restart-stateless metadata proposal](https://github.com/youyuanwu/kuberic/blob/cfc27498ce1c67336d284e7b9c51813907e2efae/docs/features/postgres/stateless-metadata.md)
 to MySQL:
@@ -278,6 +294,13 @@ projection. `catch_up_capability` is derived separately from the qualified
 retained set using `gtid_executed`, `gtid_purged`, and the exact binary-log
 inventory/retention profile. Purged history may preserve applied progress
 while making incremental recovery unavailable.
+
+The test-only Oracle 8.4.11 gate now verifies the configured one-source shape
+through the named primary, membership, process-restart, and purge transitions.
+That evidence does not activate public progress: `HistoryContext`, role-correct
+public completion, and exact retained GTID ranges remain unavailable.
+`gtid_purged` and validated binary-log filenames are kept separate, and the
+opaque inventory is not treated as `catch_up_capability`.
 
 The Stage 2 PoC may keep its structured planned-switchover boundary in memory
 because it does not resume an interrupted handoff. Restart continuation is

@@ -37,6 +37,8 @@ mod control;
 mod error;
 mod instance;
 mod process;
+#[cfg(test)]
+mod qualification;
 mod topology;
 
 pub use config::{

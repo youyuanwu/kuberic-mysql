@@ -2,6 +2,8 @@
 
 use std::fs::{self, File};
 use std::os::unix::fs::FileTypeExt;
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -23,6 +25,8 @@ use crate::core::{
 };
 use crate::service::config::OwnedRoot;
 use crate::service::control::OwnedControlTarget;
+#[cfg(test)]
+use crate::service::process::qualification_kill_and_reap;
 use crate::service::process::{
     attest_child, launcher_command, terminate_and_reap, verify_product, wait_bounded,
     wait_for_absence,
@@ -52,6 +56,13 @@ pub enum MysqlInstanceState {
     Faulted,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum QualificationStopKind {
+    Graceful,
+    Abrupt,
+}
+
 /// Owns one fresh MySQL generation and its sole retained child.
 ///
 /// Topology control methods remain bound to the currently attested private UDS
@@ -62,6 +73,8 @@ pub struct MysqlInstanceManager {
     child: Option<Child>,
     data_root: Option<OwnedRoot>,
     scratch_root: Option<OwnedRoot>,
+    process_generation: u64,
+    cleanup_quarantined: bool,
 }
 
 impl MysqlInstanceManager {
@@ -74,6 +87,8 @@ impl MysqlInstanceManager {
             child: None,
             data_root: None,
             scratch_root: None,
+            process_generation: 0,
+            cleanup_quarantined: false,
         }
     }
 
@@ -207,6 +222,12 @@ impl MysqlInstanceManager {
             self.state = MysqlInstanceState::Faulted;
             return Err(error);
         }
+        let next_generation =
+            self.process_generation
+                .checked_add(1)
+                .ok_or(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::InspectionFailed,
+                ))?;
         let stdout = File::create(self.config.runtime().stdout_log()).map_err(|error| {
             MysqlInstanceError::Io {
                 operation: LifecycleOperation::Startup,
@@ -250,6 +271,7 @@ impl MysqlInstanceManager {
                 }),
             };
         }
+        self.process_generation = next_generation;
         self.state = MysqlInstanceState::Running;
         Ok(())
     }
@@ -420,6 +442,219 @@ impl MysqlInstanceManager {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn qualification_stop_preserving_roots(
+        &mut self,
+        kind: QualificationStopKind,
+    ) -> Result<(), MysqlInstanceError> {
+        self.require_state(MysqlInstanceState::Running)?;
+        if let Err(error) = self.revalidate_roots() {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        let child = self
+            .child
+            .as_mut()
+            .expect("running state retains the exact child");
+        if let Err(error) = attest_child(child, &self.config) {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        let child_id = child.id();
+        let pid_metadata = fs::symlink_metadata(self.config.runtime().pid()).map_err(|error| {
+            self.state = MysqlInstanceState::Faulted;
+            MysqlInstanceError::Io {
+                operation: LifecycleOperation::Shutdown,
+                kind: error.kind(),
+            }
+        })?;
+        if pid_metadata.file_type().is_symlink()
+            || !pid_metadata.file_type().is_file()
+            || fs::read_to_string(self.config.runtime().pid())
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                != Some(child_id)
+        {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InvalidPidFile,
+            ));
+        }
+        let pid_identity = (pid_metadata.dev(), pid_metadata.ino());
+        let abrupt_socket_identity = if kind == QualificationStopKind::Abrupt {
+            let metadata =
+                fs::symlink_metadata(self.config.runtime().socket()).map_err(|error| {
+                    self.state = MysqlInstanceState::Faulted;
+                    MysqlInstanceError::Io {
+                        operation: LifecycleOperation::Shutdown,
+                        kind: error.kind(),
+                    }
+                })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+                self.state = MysqlInstanceState::Faulted;
+                return Err(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::InspectionFailed,
+                ));
+            }
+            Some((metadata.dev(), metadata.ino()))
+        } else {
+            None
+        };
+        let stop = match kind {
+            QualificationStopKind::Graceful => {
+                terminate_and_reap(child, self.config.timeouts().shutdown())
+            }
+            QualificationStopKind::Abrupt => {
+                qualification_kill_and_reap(child, self.config.timeouts().shutdown())
+            }
+        };
+        if let Err(error) = stop {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        self.child = None;
+        if kind == QualificationStopKind::Abrupt {
+            match fs::symlink_metadata(self.config.runtime().socket()) {
+                Ok(metadata)
+                    if !metadata.file_type().is_symlink() && metadata.file_type().is_socket() =>
+                {
+                    if abrupt_socket_identity != Some((metadata.dev(), metadata.ino())) {
+                        self.state = MysqlInstanceState::Faulted;
+                        self.cleanup_quarantined = true;
+                        return Err(MysqlInstanceError::Ownership(
+                            crate::service::OwnershipError::RootMismatch,
+                        ));
+                    }
+                    fs::remove_file(self.config.runtime().socket()).map_err(|error| {
+                        self.state = MysqlInstanceState::Faulted;
+                        MysqlInstanceError::Io {
+                            operation: LifecycleOperation::SocketDisappearance,
+                            kind: error.kind(),
+                        }
+                    })?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    self.cleanup_quarantined = true;
+                    return Err(MysqlInstanceError::Ownership(
+                        crate::service::OwnershipError::InspectionFailed,
+                    ));
+                }
+                Err(error) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    return Err(MysqlInstanceError::Io {
+                        operation: LifecycleOperation::SocketDisappearance,
+                        kind: error.kind(),
+                    });
+                }
+            }
+        }
+        if let Err(error) = wait_for_absence(
+            self.config.runtime().socket(),
+            self.config.timeouts().socket_disappearance(),
+        ) {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(error);
+        }
+        match fs::symlink_metadata(self.config.runtime().pid()) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink()
+                    && metadata.file_type().is_file()
+                    && (metadata.dev(), metadata.ino()) == pid_identity
+                    && fs::read_to_string(self.config.runtime().pid())
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok())
+                        == Some(child_id) =>
+            {
+                fs::remove_file(self.config.runtime().pid()).map_err(|error| {
+                    self.state = MysqlInstanceState::Faulted;
+                    MysqlInstanceError::Io {
+                        operation: LifecycleOperation::Shutdown,
+                        kind: error.kind(),
+                    }
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                self.state = MysqlInstanceState::Faulted;
+                return Err(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::InvalidPidFile,
+                ));
+            }
+            Err(error) => {
+                self.state = MysqlInstanceState::Faulted;
+                return Err(MysqlInstanceError::Io {
+                    operation: LifecycleOperation::Shutdown,
+                    kind: error.kind(),
+                });
+            }
+        }
+        self.state = MysqlInstanceState::Initialized;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn qualification_restart_retained(&mut self) -> Result<(), MysqlInstanceError> {
+        self.require_state(MysqlInstanceState::Initialized)?;
+        if self.child.is_some() {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InspectionFailed,
+            ));
+        }
+        for path in [self.config.runtime().socket(), self.config.runtime().pid()] {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    return Err(if path == self.config.runtime().socket() {
+                        MysqlInstanceError::SocketStillPresent
+                    } else {
+                        MysqlInstanceError::Ownership(
+                            crate::service::OwnershipError::InvalidPidFile,
+                        )
+                    });
+                }
+                Err(error) => {
+                    self.state = MysqlInstanceState::Faulted;
+                    return Err(MysqlInstanceError::Io {
+                        operation: LifecycleOperation::Startup,
+                        kind: error.kind(),
+                    });
+                }
+            }
+        }
+        self.start()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn qualification_start_group_replication(
+        &mut self,
+        recovery: &ControlCredential,
+        deadline: &NativeControlDeadline,
+    ) -> Result<(), MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::qualification_start(target, recovery, deadline).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn qualification_child_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn qualification_mutate_recovery(
+        &mut self,
+        current: &ControlCredential,
+        mutation: crate::service::control::QualificationRecoveryMutation<'_>,
+        deadline: &NativeControlDeadline,
+    ) -> Result<(), MysqlTopologyError> {
+        let target = self.prepare_control_target()?;
+        crate::service::control::qualification_mutate_recovery(target, current, mutation, deadline)
+            .await
+    }
+
     fn require_state(&self, expected: MysqlInstanceState) -> Result<(), MysqlInstanceError> {
         if self.state == expected {
             Ok(())
@@ -499,8 +734,9 @@ impl MysqlInstanceManager {
             .as_ref()
             .expect("running state retains exact scratch ownership");
         let process_session = ProcessSessionId::new(format!(
-            "member-{}-pid-{}-scratch-{}-{}",
+            "member-{}-generation-{}-pid-{}-scratch-{}-{}",
             self.config.member_index().as_usize() + 1,
+            self.process_generation,
             child.id(),
             scratch.device(),
             scratch.inode()
@@ -555,6 +791,11 @@ impl MysqlInstanceManager {
             )?;
         }
         self.revalidate_roots()?;
+        if self.cleanup_quarantined {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::RootMismatch,
+            ));
+        }
         if let Some(scratch) = self.scratch_root.as_ref() {
             remove_owned_root(scratch, LifecycleOperation::ScratchCleanup)?;
             self.scratch_root = None;

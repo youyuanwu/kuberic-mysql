@@ -1902,6 +1902,16 @@ pub struct MysqlTopologyManager<M: MysqlTopologyMemberRuntime = MysqlInstanceMan
     last_now: TopologyInstant,
 }
 
+#[cfg(test)]
+pub(super) struct QualificationManagerParts<'a, M: MysqlTopologyMemberRuntime> {
+    pub(super) instances: &'a mut [M; 3],
+    pub(super) attempt: &'a TopologyAttempt,
+    pub(super) observer: &'a ControlCredential,
+    pub(super) recovery: &'a ControlCredential,
+    pub(super) runtime_deadline: Instant,
+    pub(super) admitted_credit: TransitionCredit,
+}
+
 impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
     /// Creates one fixed manager from exactly three topology-specific instance
     /// managers using a real process-monotonic clock.
@@ -2046,6 +2056,46 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
     #[must_use]
     pub const fn write_access_open(&self) -> bool {
         false
+    }
+
+    #[cfg(test)]
+    pub(super) fn enter_native_qualification(
+        &mut self,
+    ) -> Result<QualificationManagerParts<'_, M>, MysqlTopologyManagerError> {
+        if self.state != MysqlTopologyState::Complete {
+            return Err(MysqlTopologyManagerError::InvalidState {
+                expected: MysqlTopologyState::Complete,
+                actual: self.state,
+            });
+        }
+        let admitted_credit = self
+            .accepted
+            .as_ref()
+            .ok_or(MysqlTopologyManagerError::InvalidState {
+                expected: MysqlTopologyState::Complete,
+                actual: self.state,
+            })?
+            .credit
+            .clone();
+        self.pending_effect = None;
+        self.pending_discovery = None;
+        self.accepted = None;
+        self.enrollments.fill(None);
+        self.authority.invalidate();
+        self.state = MysqlTopologyState::Failed;
+        Ok(QualificationManagerParts {
+            instances: &mut self.instances,
+            attempt: &self.authority.attempt,
+            observer: &self.observer,
+            recovery: &self.recovery,
+            runtime_deadline: self.runtime_deadline,
+            admitted_credit,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) const fn qualification_runtime_deadline(&self) -> Instant {
+        self.runtime_deadline
     }
 
     /// Initializes all three fresh members before any member is started.
