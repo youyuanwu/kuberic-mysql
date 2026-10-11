@@ -464,6 +464,14 @@ pub enum MysqlReplicatorError {
         /// Exact local containment failure.
         cleanup: Box<MysqlInstanceError>,
     },
+    /// Configuration completion failed or became uncertain and exact local
+    /// containment also failed.
+    ConfigurationCleanup {
+        /// Original configuration admission, effect, or receipt failure.
+        primary: Box<MysqlReplicatorError>,
+        /// Exact local containment failure.
+        cleanup: Box<MysqlInstanceError>,
+    },
     /// Account, listener, protocol, generation, or gateway containment failed.
     Proxy(MysqlProxyError),
     /// Gateway cleanup failed and local process containment also failed.

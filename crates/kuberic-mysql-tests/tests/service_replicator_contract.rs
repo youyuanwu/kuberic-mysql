@@ -60,6 +60,8 @@ enum MutationPlan {
     Exact,
     Error,
     Cancel,
+    CancelThenExact,
+    DelayThenExact,
 }
 
 #[derive(Clone)]
@@ -78,6 +80,46 @@ enum CleanupPlan {
     Completed,
     NotRequired,
     Failed,
+}
+
+struct FormationFailurePlan {
+    mutation: MutationPlan,
+    receipts: Vec<ReceiptPlan>,
+    cleanup: CleanupPlan,
+    attempt: Option<AttemptContext>,
+    cancel_before_invoke: bool,
+}
+
+impl FormationFailurePlan {
+    fn new(mutation: MutationPlan) -> Self {
+        Self {
+            mutation,
+            receipts: Vec::new(),
+            cleanup: CleanupPlan::Completed,
+            attempt: None,
+            cancel_before_invoke: false,
+        }
+    }
+
+    fn with_receipts(mut self, receipts: Vec<ReceiptPlan>) -> Self {
+        self.receipts = receipts;
+        self
+    }
+
+    fn with_cleanup(mut self, cleanup: CleanupPlan) -> Self {
+        self.cleanup = cleanup;
+        self
+    }
+
+    fn with_attempt(mut self, attempt: AttemptContext) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    fn cancel_before_invoke(mut self) -> Self {
+        self.cancel_before_invoke = true;
+        self
+    }
 }
 
 struct ScriptedEffects {
@@ -122,12 +164,13 @@ impl ScriptedEffects {
     fn for_formation(
         config: MysqlInstanceConfig,
         reads: Vec<ReadPlan>,
+        receipts: Vec<ReceiptPlan>,
         bootstrap: MutationPlan,
         join: MutationPlan,
         cleanup: CleanupPlan,
         containments: Arc<AtomicUsize>,
     ) -> Self {
-        let mut effects = Self::new(config, reads, Vec::new(), cleanup);
+        let mut effects = Self::new(config, reads, receipts, cleanup);
         effects.bootstrap = bootstrap;
         effects.join = join;
         effects.containments = containments;
@@ -188,18 +231,35 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         _recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        let receipt_attempt = if matches!(
+            self.bootstrap,
+            MutationPlan::CancelThenExact | MutationPlan::DelayThenExact
+        ) {
+            Some(
+                AttemptContext::new(
+                    attempt.attempt().clone(),
+                    Instant::now() + Duration::from_secs(60),
+                    Duration::from_secs(10),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
         match self.bootstrap {
             MutationPlan::Exact => {}
             MutationPlan::Error => {
-                self.containments.fetch_add(1, Ordering::Relaxed);
                 return Err(MemberTransitionError::View(
                     MemberViewError::RequiredMemberMissing,
                 ));
             }
             MutationPlan::Cancel => {
                 attempt.cancel();
-                self.containments.fetch_add(1, Ordering::Relaxed);
                 return Err(MemberTransitionError::Cancelled);
+            }
+            MutationPlan::CancelThenExact => attempt.cancel(),
+            MutationPlan::DelayThenExact => {
+                tokio::time::sleep(Duration::from_millis(260)).await;
             }
         }
         let request = input
@@ -215,7 +275,7 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
             None,
             successor,
             authority.local().binding(),
-            attempt,
+            receipt_attempt.as_ref().unwrap_or(attempt),
             AttemptCleanupState::Completed,
         )
     }
@@ -226,18 +286,35 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
         _recovery: &ControlCredential,
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        let receipt_attempt = if matches!(
+            self.join,
+            MutationPlan::CancelThenExact | MutationPlan::DelayThenExact
+        ) {
+            Some(
+                AttemptContext::new(
+                    attempt.attempt().clone(),
+                    Instant::now() + Duration::from_secs(60),
+                    Duration::from_secs(10),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
         match self.join {
             MutationPlan::Exact => {}
             MutationPlan::Error => {
-                self.containments.fetch_add(1, Ordering::Relaxed);
                 return Err(MemberTransitionError::View(
                     MemberViewError::RequiredMemberMissing,
                 ));
             }
             MutationPlan::Cancel => {
                 attempt.cancel();
-                self.containments.fetch_add(1, Ordering::Relaxed);
                 return Err(MemberTransitionError::Cancelled);
+            }
+            MutationPlan::CancelThenExact => attempt.cancel(),
+            MutationPlan::DelayThenExact => {
+                tokio::time::sleep(Duration::from_millis(260)).await;
             }
         }
         let request = input
@@ -258,7 +335,7 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
             Some(predecessor),
             successor,
             authority.local().binding(),
-            attempt,
+            receipt_attempt.as_ref().unwrap_or(attempt),
             AttemptCleanupState::NotRequired,
         )
     }
@@ -742,6 +819,7 @@ async fn three_independent_owners_form_bootstrap_then_two_sequential_joins() {
             ScriptedEffects::for_formation(
                 roots[index].config_for_member(MEMBERS[index]),
                 reads[index].clone(),
+                Vec::new(),
                 MutationPlan::Exact,
                 MutationPlan::Exact,
                 CleanupPlan::Completed,
@@ -927,9 +1005,14 @@ async fn every_formation_effect_contains_only_its_owner_on_failure_or_cancellati
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(AtomicUsize::new(0)),
             ];
-            let (result, mut engines) =
-                run_failed_formation_effect(label, member, peer_count, plan, counters.clone())
-                    .await;
+            let (result, mut engines) = run_failed_formation_effect(
+                label,
+                member,
+                peer_count,
+                FormationFailurePlan::new(plan),
+                counters.clone(),
+            )
+            .await;
             assert!(matches!(
                 result,
                 Err(MysqlReplicatorError::MemberTransition(_))
@@ -942,18 +1025,143 @@ async fn every_formation_effect_contains_only_its_owner_on_failure_or_cancellati
                 );
             }
             for (index, engine) in engines.iter_mut().enumerate() {
-                engine
-                    .abort(operation(&format!("{label}-policy-abort-{index}"), 10))
-                    .unwrap();
+                if index == failed {
+                    assert_eq!(engine.terminal_state(), Some(MysqlTerminalState::Aborted));
+                } else {
+                    engine
+                        .abort(operation(&format!("{label}-policy-abort-{index}"), 10))
+                        .unwrap();
+                }
             }
-            for (index, counter) in counters.iter().enumerate() {
-                assert_eq!(
-                    counter.load(Ordering::Relaxed),
-                    1 + usize::from(index == failed)
-                );
+            for counter in &counters {
+                assert_eq!(counter.load(Ordering::Relaxed), 1);
             }
         }
     }
+}
+
+#[tokio::test]
+async fn uncertain_formation_completion_aborts_only_the_exact_local_owner() {
+    for (label, member, peer_count) in [
+        ("bootstrap-late", MysqlMemberIndex::First, 0),
+        ("second-join-late", MysqlMemberIndex::Second, 1),
+        ("third-join-late", MysqlMemberIndex::Third, 2),
+    ] {
+        let counters = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let (result, engines) = run_failed_formation_effect(
+            label,
+            member,
+            peer_count,
+            FormationFailurePlan::new(MutationPlan::CancelThenExact),
+            counters.clone(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(MysqlReplicatorError::LateReceipt { .. })
+        ));
+        assert_only_local_owner_aborted(member, &engines, &counters);
+    }
+
+    for (label, member, peer_count) in [
+        ("bootstrap-mismatch", MysqlMemberIndex::First, 0),
+        ("second-join-mismatch", MysqlMemberIndex::Second, 1),
+        ("third-join-mismatch", MysqlMemberIndex::Third, 2),
+    ] {
+        let counters = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let (result, engines) = run_failed_formation_effect(
+            label,
+            member,
+            peer_count,
+            FormationFailurePlan::new(MutationPlan::Exact)
+                .with_receipts(vec![ReceiptPlan::CrossOperation]),
+            counters.clone(),
+        )
+        .await;
+        assert!(matches!(result, Err(MysqlReplicatorError::ReceiptMismatch)));
+        assert_only_local_owner_aborted(member, &engines, &counters);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_formation_admission_immediately_contains_only_the_local_owner() {
+    for (label, member, peer_count) in [
+        ("bootstrap-cancelled-admission", MysqlMemberIndex::First, 0),
+        (
+            "second-join-cancelled-admission",
+            MysqlMemberIndex::Second,
+            1,
+        ),
+        ("third-join-cancelled-admission", MysqlMemberIndex::Third, 2),
+    ] {
+        let counters = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let (result, engines) = run_failed_formation_effect(
+            label,
+            member,
+            peer_count,
+            FormationFailurePlan::new(MutationPlan::Exact).cancel_before_invoke(),
+            counters.clone(),
+        )
+        .await;
+        assert!(matches!(result, Err(MysqlReplicatorError::Cancelled)));
+        assert_only_local_owner_aborted(member, &engines, &counters);
+    }
+}
+
+#[tokio::test]
+async fn formation_receipt_after_work_deadline_is_contained_before_return() {
+    for (label, member, peer_count) in [
+        ("bootstrap-late-deadline", MysqlMemberIndex::First, 0),
+        ("second-join-late-deadline", MysqlMemberIndex::Second, 1),
+        ("third-join-late-deadline", MysqlMemberIndex::Third, 2),
+    ] {
+        let now = Instant::now();
+        let attempt = AttemptContext::new_at(
+            AttemptId::new(format!("{label}-attempt")).unwrap(),
+            now,
+            now + Duration::from_millis(350),
+            Duration::from_millis(120),
+        )
+        .unwrap();
+        let counters = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let (result, engines) = run_failed_formation_effect(
+            label,
+            member,
+            peer_count,
+            FormationFailurePlan::new(MutationPlan::DelayThenExact).with_attempt(attempt),
+            counters.clone(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(MysqlReplicatorError::LateReceipt {
+                deadline: kuberic_mysql::service::AttemptDeadlineState::CleanupReserve,
+                cancellation: kuberic_mysql::service::AttemptCancellationState::Active,
+            })
+        ));
+        assert_only_local_owner_aborted(member, &engines, &counters);
+    }
+}
+
+#[tokio::test]
+async fn formation_failure_preserves_primary_and_local_cleanup_failure() {
+    let counters = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+    let (result, engines) = run_failed_formation_effect(
+        "bootstrap-cleanup-failure",
+        MysqlMemberIndex::First,
+        0,
+        FormationFailurePlan::new(MutationPlan::Error).with_cleanup(CleanupPlan::Failed),
+        counters.clone(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(MysqlReplicatorError::ConfigurationCleanup {
+            primary,
+            cleanup: _
+        }) if matches!(*primary, MysqlReplicatorError::MemberTransition(_))
+    ));
+    assert_only_local_owner_aborted(MysqlMemberIndex::First, &engines, &counters);
 }
 
 #[tokio::test]
@@ -978,6 +1186,7 @@ async fn every_formation_effect_rejects_after_the_shared_work_deadline() {
         let mut engine = MysqlReplicator::new(
             ScriptedEffects::for_formation(
                 root.config_for_member(member),
+                Vec::new(),
                 Vec::new(),
                 MutationPlan::Exact,
                 MutationPlan::Exact,
@@ -1023,11 +1232,11 @@ async fn every_formation_effect_rejects_after_the_shared_work_deadline() {
                 kuberic_mysql::service::AttemptDeadlineState::CleanupReserve
             ))
         ));
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-        engine
-            .abort(operation(&format!("{label}-abort"), 10))
-            .unwrap();
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.terminal_state(), Some(MysqlTerminalState::Aborted));
+        assert!(engine.credentials_cleared());
+        assert!(!engine.access_intent().unwrap().read());
+        assert!(!engine.access_intent().unwrap().write());
     }
 }
 
@@ -1980,18 +2189,25 @@ async fn run_failed_formation_effect(
     label: &str,
     member: MysqlMemberIndex,
     peer_count: usize,
-    plan: MutationPlan,
+    plan: FormationFailurePlan,
     counters: [Arc<AtomicUsize>; 3],
 ) -> (
     Result<MysqlConfigurationOutcome, MysqlReplicatorError>,
     [MysqlReplicator<ScriptedEffects>; 3],
 ) {
+    let FormationFailurePlan {
+        mutation,
+        receipts,
+        cleanup,
+        attempt: attempt_override,
+        cancel_before_invoke,
+    } = plan;
     let roots = [
         TestRoot::new(&format!("{label}-one")),
         TestRoot::new(&format!("{label}-two")),
         TestRoot::new(&format!("{label}-three")),
     ];
-    let attempt = context(&format!("{label}-attempt"));
+    let attempt = attempt_override.unwrap_or_else(|| context(&format!("{label}-attempt")));
     let authorities = MEMBERS.map(|member| authority_with_attempt(&attempt, member));
     let identities =
         MEMBERS.map(|candidate| replica_identity(&format!("{label}-{}", member_number(candidate))));
@@ -2001,17 +2217,26 @@ async fn run_failed_formation_effect(
             ScriptedEffects::for_formation(
                 roots[index].config_for_member(MEMBERS[index]),
                 Vec::new(),
+                if index == failed {
+                    receipts.clone()
+                } else {
+                    Vec::new()
+                },
                 if index == failed && member == MysqlMemberIndex::First {
-                    plan
+                    mutation
                 } else {
                     MutationPlan::Exact
                 },
                 if index == failed && member != MysqlMemberIndex::First {
-                    plan
+                    mutation
                 } else {
                     MutationPlan::Exact
                 },
-                CleanupPlan::Completed,
+                if index == failed {
+                    cleanup
+                } else {
+                    CleanupPlan::Completed
+                },
                 counters[index].clone(),
             ),
             identities[index].clone(),
@@ -2051,6 +2276,9 @@ async fn run_failed_formation_effect(
             )
             .unwrap();
     }
+    if cancel_before_invoke {
+        attempt.cancel();
+    }
     let result = invoke_formation_effect(
         &mut engines[failed],
         &attempt,
@@ -2060,6 +2288,24 @@ async fn run_failed_formation_effect(
     )
     .await;
     (result, engines)
+}
+
+fn assert_only_local_owner_aborted(
+    failed_member: MysqlMemberIndex,
+    engines: &[MysqlReplicator<ScriptedEffects>; 3],
+    counters: &[Arc<AtomicUsize>; 3],
+) {
+    let failed = member_number(failed_member) - 1;
+    for (index, engine) in engines.iter().enumerate() {
+        assert_eq!(
+            engine.terminal_state(),
+            (index == failed).then_some(MysqlTerminalState::Aborted)
+        );
+        assert_eq!(
+            counters[index].load(Ordering::Relaxed),
+            usize::from(index == failed)
+        );
+    }
 }
 
 async fn invoke_formation_effect(

@@ -10,11 +10,10 @@ use replicator_live_support::{ReplicatorLiveFixture, preflight_oracle_mysql_8_4_
 #[tokio::test(flavor = "current_thread")]
 async fn fresh_formation_and_controlled_handoff() {
     preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
-    let mut fixture = ReplicatorLiveFixture::prepare()
+    let formation = ReplicatorLiveFixture::prepare()
         .await
-        .unwrap_or_else(|error| panic!("{error}"));
-    let formation = fixture
-        .form()
+        .unwrap_or_else(|error| panic!("{error}"))
+        .form_and_finalize()
         .await
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -33,6 +32,4 @@ async fn fresh_formation_and_controlled_handoff() {
         formation.progress(),
         ProgressProjection::Projectable(_)
     ));
-
-    fixture.close().unwrap_or_else(|error| panic!("{error}"));
 }

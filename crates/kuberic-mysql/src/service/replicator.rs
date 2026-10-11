@@ -1412,7 +1412,9 @@ where
     ) -> Result<MysqlConfigurationOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
         self.ensure_proxy_not_published()?;
-        self.admit_work()?;
+        if let Err(primary) = self.admit_work() {
+            return self.contain_configuration_failure(None, primary);
+        }
         let request_operation = operation.clone();
         let fingerprint =
             OperationFingerprint::Configuration(configuration.clone(), effect.clone());
@@ -1458,12 +1460,17 @@ where
                     .await
                 {
                     Ok(receipt) => receipt,
-                    Err(error) => return self.uncertain_member(index, error),
+                    Err(error) => {
+                        return self.contain_configuration_failure(
+                            Some(index),
+                            MysqlReplicatorError::MemberTransition(error),
+                        );
+                    }
                 };
                 if let Err(error) =
                     self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)
                 {
-                    return self.uncertain_rejection(index, error);
+                    return self.contain_configuration_failure(Some(index), error);
                 }
                 receipt.successor().clone()
             }
@@ -1476,12 +1483,17 @@ where
                     .await
                 {
                     Ok(receipt) => receipt,
-                    Err(error) => return self.uncertain_member(index, error),
+                    Err(error) => {
+                        return self.contain_configuration_failure(
+                            Some(index),
+                            MysqlReplicatorError::MemberTransition(error),
+                        );
+                    }
                 };
                 if let Err(error) =
                     self.validate_receipt(&receipt, &MemberEffectKind::Bootstrap, &request)
                 {
-                    return self.uncertain_rejection(index, error);
+                    return self.contain_configuration_failure(Some(index), error);
                 }
                 receipt.successor().clone()
             }
@@ -1494,17 +1506,24 @@ where
                     .await
                 {
                     Ok(receipt) => receipt,
-                    Err(error) => return self.uncertain_member(index, error),
+                    Err(error) => {
+                        return self.contain_configuration_failure(
+                            Some(index),
+                            MysqlReplicatorError::MemberTransition(error),
+                        );
+                    }
                 };
                 if let Err(error) =
                     self.validate_receipt(&receipt, &MemberEffectKind::Join, &request)
                 {
-                    return self.uncertain_rejection(index, error);
+                    return self.contain_configuration_failure(Some(index), error);
                 }
                 receipt.successor().clone()
             }
         };
-        self.validate_after_effect(index)?;
+        if let Err(error) = self.validate_after_effect(index) {
+            return self.contain_configuration_failure(Some(index), error);
+        }
         if let Err(error) = self.validate_evidence(&evidence).and_then(|()| {
             self.require_native_role(
                 &evidence,
@@ -1513,7 +1532,7 @@ where
             )
             .and_then(|()| self.require_configuration_evidence(&configuration, &evidence))
         }) {
-            return self.uncertain_rejection(index, error);
+            return self.contain_configuration_failure(Some(index), error);
         }
         self.configuration = Some(configuration.clone());
         self.native_evidence = Some(evidence);
@@ -1915,6 +1934,26 @@ where
         self.operations[index].status = OperationStatus::Uncertain;
         self.close_access();
         Err(error)
+    }
+
+    fn contain_configuration_failure<T>(
+        &mut self,
+        index: Option<usize>,
+        primary: MysqlReplicatorError,
+    ) -> Result<T, MysqlReplicatorError> {
+        if let Some(index) = index {
+            self.operations[index].status = OperationStatus::Uncertain;
+        }
+        self.close_access();
+        self.clear_all_credentials();
+        self.terminal = Some(MysqlTerminalState::Aborted);
+        match self.effects.contain_member(&self.attempt) {
+            Ok(_) => Err(primary),
+            Err(cleanup) => Err(MysqlReplicatorError::ConfigurationCleanup {
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            }),
+        }
     }
 
     fn close_access(&mut self) {

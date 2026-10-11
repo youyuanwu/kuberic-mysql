@@ -427,19 +427,21 @@ impl ReplicatorLiveFixture {
         })
     }
 
-    pub fn close(mut self) -> Result<(), String> {
-        self.cleanup()
+    pub async fn form_and_finalize(mut self) -> Result<FormationEvidence, String> {
+        let formation = self.form().await;
+        let cleanup_failures = self.cleanup_failures();
+        finalize_attempt(formation, cleanup_failures)
     }
 
-    fn cleanup(&mut self) -> Result<(), String> {
+    fn cleanup_failures(&mut self) -> Vec<String> {
         if self.closed {
-            return Ok(());
+            return Vec::new();
         }
         self.attempt.cancel();
         let mut failures = Vec::new();
-        for owner in &mut self.members {
+        for (index, owner) in self.members.iter_mut().enumerate() {
             if let Err(error) = owner.cleanup() {
-                failures.push(error);
+                failures.push(format!("member {} cleanup: {error}", index + 1));
             }
         }
         self.workload.clear();
@@ -484,17 +486,37 @@ impl ReplicatorLiveFixture {
             ));
         }
         self.closed = true;
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
+        failures
     }
 }
 
 impl Drop for ReplicatorLiveFixture {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        let failures = self.cleanup_failures();
+        if !failures.is_empty() {
+            eprintln!(
+                "emergency replicator fixture cleanup failed: {}",
+                failures.join("; ")
+            );
+        }
+    }
+}
+
+fn finalize_attempt<T>(
+    primary: Result<T, String>,
+    cleanup_failures: Vec<String>,
+) -> Result<T, String> {
+    match (primary, cleanup_failures.is_empty()) {
+        (Ok(value), true) => Ok(value),
+        (Err(primary), true) => Err(format!("formation failed: {primary}")),
+        (Ok(_), false) => Err(format!(
+            "formation cleanup failed: {}",
+            cleanup_failures.join("; ")
+        )),
+        (Err(primary), false) => Err(format!(
+            "formation failed: {primary}; cleanup failures: {}",
+            cleanup_failures.join("; ")
+        )),
     }
 }
 
@@ -551,7 +573,9 @@ impl MemberOwner {
 
 impl Drop for MemberOwner {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if let Err(error) = self.cleanup() {
+            eprintln!("emergency member-owner cleanup failed: {error}");
+        }
     }
 }
 
@@ -607,6 +631,35 @@ impl Drop for SecretProducer {
     fn drop(&mut self) {
         self.clear();
     }
+}
+
+#[test]
+fn attempt_finalization_preserves_primary_and_every_cleanup_failure_in_order() {
+    let error = finalize_attempt::<()>(
+        Err("primary formation failure".to_owned()),
+        vec![
+            "member 1 cleanup: first failure".to_owned(),
+            "member 2 cleanup: second failure".to_owned(),
+            "member 3 cleanup: third failure".to_owned(),
+        ],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "formation failed: primary formation failure; cleanup failures: \
+         member 1 cleanup: first failure; member 2 cleanup: second failure; \
+         member 3 cleanup: third failure"
+    );
+
+    assert!(matches!(
+        finalize_attempt(Ok::<_, String>("formation"), Vec::new()),
+        Ok("formation")
+    ));
+    assert_eq!(
+        finalize_attempt::<()>(Ok(()), vec!["member 2 cleanup: cleanup failure".to_owned()])
+            .unwrap_err(),
+        "formation cleanup failed: member 2 cleanup: cleanup failure"
+    );
 }
 
 struct ProxyPortReservations {
