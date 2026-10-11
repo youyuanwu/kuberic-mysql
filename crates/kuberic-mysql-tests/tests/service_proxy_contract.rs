@@ -17,7 +17,7 @@ use kuberic_mysql::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential, AttemptContext,
     BackendSessionIdentity, ControlCredential, ControlCredentialRole, MemberControlBinding,
     MemberMutationAuthority, MysqlClientProxy, MysqlMemberIndex, MysqlProxyControlBoundary,
-    MysqlProxyError, NativeIdentityEnrollment,
+    MysqlProxyError, MysqlProxySettlementReason, NativeIdentityEnrollment,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
@@ -566,7 +566,12 @@ async fn account_removal_requires_full_containment_and_can_be_retried_after_fail
             .await,
         Err(MysqlProxyError::InvalidState)
     ));
-    assert!(fixture.revoke().await.handoff_eligible());
+    let containment = fixture.revoke().await;
+    assert_eq!(
+        containment.settlement_reason(),
+        MysqlProxySettlementReason::TerminalSeal
+    );
+    assert!(containment.handoff_eligible());
     fixture.control.fail_remove = true;
     assert!(
         fixture
@@ -749,7 +754,12 @@ async fn published_attempt_cancellation_seals_idle_and_poised_command_work_witho
     assert!(!idle.proxy.snapshot().accepting());
     assert!(TcpStream::connect(address).await.is_err());
     let receipt = idle.revoke().await;
+    assert_eq!(
+        receipt.settlement_reason(),
+        MysqlProxySettlementReason::AttemptCancellation
+    );
     assert!(receipt.diagnostics().cancellations() >= 1);
+    assert_eq!(receipt.diagnostics().deadlines(), 0);
     idle.cleanup().await;
 
     let mut poised = Fixture::new(
@@ -768,7 +778,12 @@ async fn published_attempt_cancellation_seals_idle_and_poised_command_work_witho
     assert!(poised.backend_commands.lock().unwrap().is_empty());
     assert!(!poised.proxy.snapshot().accepting());
     let receipt = poised.revoke().await;
+    assert_eq!(
+        receipt.settlement_reason(),
+        MysqlProxySettlementReason::AttemptCancellation
+    );
     assert!(receipt.diagnostics().cancellations() >= 1);
+    assert_eq!(receipt.diagnostics().deadlines(), 0);
     poised.cleanup().await;
 }
 
@@ -788,8 +803,68 @@ async fn published_idle_listener_expires_and_stops_serving_without_revoke() {
     tokio::time::sleep(Duration::from_millis(145)).await;
     assert!(!fixture.proxy.snapshot().accepting());
     assert!(TcpStream::connect(address).await.is_err());
-    assert!(fixture.revoke().await.handoff_eligible());
+    let receipt = fixture.revoke().await;
+    assert_eq!(
+        receipt.settlement_reason(),
+        MysqlProxySettlementReason::WorkDeadlineExpired
+    );
+    assert!(receipt.handoff_eligible());
     fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authenticated_idle_and_active_work_cutoff_expiry_record_deadlines_not_cancellation() {
+    let mut idle = Fixture::new_with_budget(
+        "proxy-published-expiry-authenticated-idle",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+        Duration::from_millis(500),
+        Duration::from_millis(200),
+    )
+    .await;
+    let address = idle.publish();
+    let _client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    wait_sessions_zero(&idle.proxy).await;
+    let receipt = idle.revoke().await;
+    assert_eq!(
+        receipt.settlement_reason(),
+        MysqlProxySettlementReason::WorkDeadlineExpired
+    );
+    assert_eq!(receipt.diagnostics().deadlines(), 1);
+    assert_eq!(receipt.diagnostics().cancellations(), 0);
+    assert_eq!(receipt.diagnostics().revocations(), 0);
+    assert!(receipt.handoff_eligible());
+    idle.cleanup().await;
+
+    let mut active = Fixture::new_with_budget(
+        "proxy-published-expiry-active-command",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: true,
+        },
+        Duration::from_millis(500),
+        Duration::from_millis(200),
+    )
+    .await;
+    let address = active.publish();
+    let mut client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    write_packet(&mut client, 0, b"\x03block").await;
+    wait_active_command(&active.proxy).await;
+    wait_sessions_zero(&active.proxy).await;
+    let receipt = active.revoke().await;
+    assert_eq!(
+        receipt.settlement_reason(),
+        MysqlProxySettlementReason::WorkDeadlineExpired
+    );
+    assert_eq!(receipt.diagnostics().deadlines(), 1);
+    assert_eq!(receipt.diagnostics().cancellations(), 0);
+    assert_eq!(receipt.diagnostics().revocations(), 0);
+    assert!(receipt.cancelled_commands());
+    assert!(receipt.ambiguous_effect());
+    assert!(!receipt.handoff_eligible());
+    active.cleanup().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -898,6 +973,13 @@ async fn idle_and_transaction_holding_sessions_are_terminated_without_ambiguity(
     assert_eq!(read_packet(&mut transaction).await.1[0], 0x00);
     await_session_count(&fixture.proxy, 2).await;
     let receipt = fixture.revoke().await;
+    assert_eq!(
+        receipt.settlement_reason(),
+        MysqlProxySettlementReason::ExplicitRevocation
+    );
+    assert_eq!(receipt.diagnostics().revocations(), 2);
+    assert_eq!(receipt.diagnostics().cancellations(), 0);
+    assert_eq!(receipt.diagnostics().deadlines(), 0);
     assert!(!receipt.cancelled_commands());
     assert!(!receipt.ambiguous_effect());
     assert!(receipt.handoff_eligible());

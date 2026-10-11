@@ -58,10 +58,10 @@ pub use config::{
 pub use error::{
     ConfigError, ControlStage, LifecycleOperation, MemberAuthorityError, MemberCleanupFailure,
     MemberReceiptError, MemberTransitionError, MemberViewError, MysqlInstanceError,
-    MysqlProxyError, MysqlProxyPhase, MysqlProxyProtocolError, MysqlReplicatorError,
-    MysqlTopologyError, MysqlTopologyManagerError, OwnershipError, ProductError,
-    TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError, TopologyNativeStateError,
-    TopologyStateError,
+    MysqlProxyError, MysqlProxyPhase, MysqlProxyProtocolError, MysqlProxySettlementReason,
+    MysqlReplicatorError, MysqlTopologyError, MysqlTopologyManagerError, OwnershipError,
+    ProductError, TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError,
+    TopologyNativeStateError, TopologyStateError,
 };
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
 pub use member::{

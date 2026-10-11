@@ -17,7 +17,7 @@ use crate::adapter::UnixSocketPath;
 use crate::core::{AttemptId, CredentialGeneration};
 use crate::service::{
     AttemptContext, BackendConnectionId, MemberMutationAuthority, MysqlProxyError, MysqlProxyPhase,
-    MysqlProxyProtocolError,
+    MysqlProxyProtocolError, MysqlProxySettlementReason,
 };
 
 /// Exact schema receiving the Stage 2 application's minimum DML grants.
@@ -388,6 +388,8 @@ pub struct MysqlProxyDiagnostics {
     pre_dispatch_rejections: u64,
     normal_completions: u64,
     cancellations: u64,
+    revocations: u64,
+    terminal_seals: u64,
     ambiguities: u64,
     deadlines: u64,
     cleanup_failures: u64,
@@ -412,10 +414,22 @@ impl MysqlProxyDiagnostics {
         self.normal_completions
     }
 
-    /// Sessions cancelled by generation or attempt settlement.
+    /// Sessions settled by explicit attempt cancellation.
     #[must_use]
     pub const fn cancellations(self) -> u64 {
         self.cancellations
+    }
+
+    /// Sessions settled by explicit generation revocation.
+    #[must_use]
+    pub const fn revocations(self) -> u64 {
+        self.revocations
+    }
+
+    /// Sessions settled by terminal lifecycle containment.
+    #[must_use]
+    pub const fn terminal_seals(self) -> u64 {
+        self.terminal_seals
     }
 
     /// Dispatched commands whose effect could not be classified normally.
@@ -441,6 +455,7 @@ impl MysqlProxyDiagnostics {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlProxyContainmentReceipt {
     generation: NonZeroU64,
+    settlement_reason: MysqlProxySettlementReason,
     sessions_zero: bool,
     commands_zero: bool,
     native_absence: bool,
@@ -456,6 +471,12 @@ impl MysqlProxyContainmentReceipt {
     #[must_use]
     pub const fn generation(&self) -> NonZeroU64 {
         self.generation
+    }
+
+    /// Exact first cause that sealed the published generation.
+    #[must_use]
+    pub const fn settlement_reason(&self) -> MysqlProxySettlementReason {
+        self.settlement_reason
     }
 
     /// Proxy accepted-session count reached zero.
@@ -537,6 +558,7 @@ struct SessionRecord {
 struct Registry {
     accepting: bool,
     generation: Option<NonZeroU64>,
+    settlement_reason: Option<MysqlProxySettlementReason>,
     next_session: u64,
     sessions: BTreeMap<u64, SessionRecord>,
     retired_backends: BTreeMap<u64, BackendSessionIdentity>,
@@ -635,7 +657,7 @@ pub struct MysqlClientProxy {
     authority: MemberMutationAuthority,
     credential: ApplicationCredential,
     shared: Arc<Shared>,
-    cancel: watch::Sender<bool>,
+    settlement: watch::Sender<Option<MysqlProxySettlementReason>>,
     accept_task: Option<JoinHandle<()>>,
     published_generation: Option<NonZeroU64>,
     contained_generation: Option<NonZeroU64>,
@@ -739,7 +761,7 @@ impl MysqlClientProxy {
                 return Err(pair_cleanup(primary, cleanup));
             }
         };
-        let (cancel, _) = watch::channel(false);
+        let (settlement, _) = watch::channel(None);
         let credential = credential
             .take()
             .expect("staged credential remained owned until proxy construction");
@@ -756,6 +778,7 @@ impl MysqlClientProxy {
                 registry: Mutex::new(Registry {
                     accepting: false,
                     generation: None,
+                    settlement_reason: None,
                     next_session: 1,
                     sessions: BTreeMap::new(),
                     retired_backends: BTreeMap::new(),
@@ -766,7 +789,7 @@ impl MysqlClientProxy {
                     diagnostics: MysqlProxyDiagnostics::default(),
                 }),
             }),
-            cancel,
+            settlement,
             accept_task: None,
             published_generation: None,
             contained_generation: None,
@@ -817,6 +840,7 @@ impl MysqlClientProxy {
             }
             registry.accepting = true;
             registry.generation = Some(generation);
+            registry.settlement_reason = None;
             registry.cancelled_commands = false;
             registry.ambiguous_effect = false;
         }
@@ -824,8 +848,8 @@ impl MysqlClientProxy {
         let backend = self.backend.clone();
         let account = self.account.clone();
         let authority = self.authority.clone();
-        let cancel = self.cancel.subscribe();
-        let cancel_sender = self.cancel.clone();
+        let settlement = self.settlement.subscribe();
+        let settlement_sender = self.settlement.clone();
         let attempt = attempt.clone();
         self.accept_task = Some(tokio::spawn(async move {
             accept_loop(
@@ -838,8 +862,8 @@ impl MysqlClientProxy {
                     generation,
                     attempt,
                 },
-                cancel_sender,
-                cancel,
+                settlement_sender,
+                settlement,
             )
             .await;
         }));
@@ -853,10 +877,11 @@ impl MysqlClientProxy {
     /// Atomically stops acceptance and all later command dispatch. Native
     /// absence proof remains required through [`Self::revoke`].
     pub fn seal_now(&self) {
-        let mut registry = self.shared.lock();
-        registry.accepting = false;
-        drop(registry);
-        let _ = self.cancel.send(true);
+        self.settle_now(MysqlProxySettlementReason::TerminalSeal);
+    }
+
+    fn settle_now(&self, reason: MysqlProxySettlementReason) {
+        settle_registry(&self.shared, &self.settlement, reason);
     }
 
     /// Revokes one generation, terminates every exact registered native
@@ -873,7 +898,12 @@ impl MysqlClientProxy {
         {
             return Err(MysqlProxyError::GenerationMismatch);
         }
-        self.seal_now();
+        let reason = attempt
+            .admit_work()
+            .err()
+            .map(settlement_from_admission)
+            .unwrap_or(MysqlProxySettlementReason::ExplicitRevocation);
+        self.settle_now(reason);
         self.listener.take();
         let deadline = bounded_deadline(attempt.deadline(), REVOCATION_TIMEOUT)
             .ok_or(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation))?;
@@ -949,6 +979,9 @@ impl MysqlClientProxy {
         let registry = self.shared.lock();
         let receipt = MysqlProxyContainmentReceipt {
             generation,
+            settlement_reason: registry
+                .settlement_reason
+                .expect("published generation was settled before containment"),
             sessions_zero: registry.sessions.is_empty(),
             commands_zero: registry.active_commands == 0,
             native_absence: registry
@@ -1000,6 +1033,7 @@ impl MysqlClientProxy {
             let mut registry = self.shared.lock();
             registry.accepting = false;
             registry.generation = None;
+            registry.settlement_reason = None;
             registry.sessions.clear();
             registry.retired_backends.clear();
             registry.active_commands = 0;
@@ -1008,8 +1042,8 @@ impl MysqlClientProxy {
             registry.unidentified_backends = 0;
             registry.diagnostics = MysqlProxyDiagnostics::default();
         }
-        let (cancel, _) = watch::channel(false);
-        self.cancel = cancel;
+        let (settlement, _) = watch::channel(None);
+        self.settlement = settlement;
         self.listener = Some(listener);
         self.address = address;
         self.published_generation = None;
@@ -1121,6 +1155,20 @@ fn map_attempt_admission(error: crate::service::AttemptAdmissionError) -> MysqlP
     }
 }
 
+fn settlement_from_admission(
+    error: crate::service::AttemptAdmissionError,
+) -> MysqlProxySettlementReason {
+    match error {
+        crate::service::AttemptAdmissionError::Cancelled => {
+            MysqlProxySettlementReason::AttemptCancellation
+        }
+        crate::service::AttemptAdmissionError::CleanupReserve
+        | crate::service::AttemptAdmissionError::Expired => {
+            MysqlProxySettlementReason::WorkDeadlineExpired
+        }
+    }
+}
+
 fn bounded_deadline(attempt_deadline: Instant, duration: Duration) -> Option<Instant> {
     let now = Instant::now();
     let phase = now.checked_add(duration)?;
@@ -1140,32 +1188,44 @@ struct AcceptContext {
 async fn accept_loop(
     listener: TcpListener,
     context: AcceptContext,
-    cancel_sender: watch::Sender<bool>,
-    mut cancel: watch::Receiver<bool>,
+    settlement_sender: watch::Sender<Option<MysqlProxySettlementReason>>,
+    mut settlement: watch::Receiver<Option<MysqlProxySettlementReason>>,
 ) {
     let mut attempt_cancel = context.attempt.cancellation_receiver();
     let mut sessions = tokio::task::JoinSet::new();
     loop {
-        if *cancel.borrow() || context.attempt.admit_work().is_err() {
-            seal_registry(&context.shared);
-            let _ = cancel_sender.send(true);
+        if settlement.borrow().is_some() {
+            break;
+        }
+        if let Err(error) = context.attempt.admit_work() {
+            settle_registry(
+                &context.shared,
+                &settlement_sender,
+                settlement_from_admission(error),
+            );
             break;
         }
         tokio::select! {
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() {
+            changed = settlement.changed() => {
+                if changed.is_err() || settlement.borrow().is_some() {
                     break;
                 }
             }
             changed = attempt_cancel.changed() => {
                 let _ = changed;
-                seal_registry(&context.shared);
-                let _ = cancel_sender.send(true);
+                settle_registry(
+                    &context.shared,
+                    &settlement_sender,
+                    MysqlProxySettlementReason::AttemptCancellation,
+                );
                 break;
             }
             () = tokio::time::sleep_until(context.attempt.work_deadline().into()) => {
-                seal_registry(&context.shared);
-                let _ = cancel_sender.send(true);
+                settle_registry(
+                    &context.shared,
+                    &settlement_sender,
+                    MysqlProxySettlementReason::WorkDeadlineExpired,
+                );
                 break;
             }
             completed = sessions.join_next(), if !sessions.is_empty() => {
@@ -1184,10 +1244,19 @@ async fn accept_loop(
                     let mut registry = context.shared.lock();
                     if !registry.accepting
                         || registry.generation != Some(context.generation)
-                        || context.attempt.admit_work().is_err()
                     {
                         drop(client);
                         continue;
+                    }
+                    if let Err(error) = context.attempt.admit_work() {
+                        drop(registry);
+                        drop(client);
+                        settle_registry(
+                            &context.shared,
+                            &settlement_sender,
+                            settlement_from_admission(error),
+                        );
+                        break;
                     }
                     let id = registry.next_session;
                     registry.next_session = registry.next_session.saturating_add(1);
@@ -1210,7 +1279,7 @@ async fn accept_loop(
                         session_id,
                         attempt: context.attempt.clone(),
                     },
-                    cancel.clone(),
+                    settlement.clone(),
                 ));
             }
         }
@@ -1224,8 +1293,24 @@ async fn accept_loop(
     }
 }
 
-fn seal_registry(shared: &Shared) {
-    shared.lock().accepting = false;
+fn settle_registry(
+    shared: &Shared,
+    settlement: &watch::Sender<Option<MysqlProxySettlementReason>>,
+    reason: MysqlProxySettlementReason,
+) {
+    let first = {
+        let mut registry = shared.lock();
+        registry.accepting = false;
+        if registry.settlement_reason.is_some() {
+            false
+        } else {
+            registry.settlement_reason = Some(reason);
+            true
+        }
+    };
+    if first {
+        let _ = settlement.send(Some(reason));
+    }
 }
 
 struct SessionGuard {
@@ -1260,10 +1345,16 @@ impl SessionGuard {
         attempt: &AttemptContext,
     ) -> Result<(), MysqlProxyError> {
         let mut registry = self.shared.lock();
-        if attempt.admit_work().is_err()
-            || !registry.accepting
-            || registry.generation != Some(generation)
-        {
+        if let Err(error) = attempt.admit_work() {
+            return Err(MysqlProxyError::Settled(settlement_from_admission(error)));
+        }
+        if !registry.accepting {
+            return Err(registry
+                .settlement_reason
+                .map(MysqlProxyError::Settled)
+                .unwrap_or(MysqlProxyError::GenerationMismatch));
+        }
+        if registry.generation != Some(generation) {
             return Err(MysqlProxyError::GenerationMismatch);
         }
         let session = registry
@@ -1302,6 +1393,24 @@ impl SessionGuard {
                 registry.diagnostics.cancellations =
                     registry.diagnostics.cancellations.saturating_add(1);
             }
+            Err(MysqlProxyError::Settled(reason)) => match reason {
+                MysqlProxySettlementReason::AttemptCancellation => {
+                    registry.diagnostics.cancellations =
+                        registry.diagnostics.cancellations.saturating_add(1);
+                }
+                MysqlProxySettlementReason::ExplicitRevocation => {
+                    registry.diagnostics.revocations =
+                        registry.diagnostics.revocations.saturating_add(1);
+                }
+                MysqlProxySettlementReason::WorkDeadlineExpired => {
+                    registry.diagnostics.deadlines =
+                        registry.diagnostics.deadlines.saturating_add(1);
+                }
+                MysqlProxySettlementReason::TerminalSeal => {
+                    registry.diagnostics.terminal_seals =
+                        registry.diagnostics.terminal_seals.saturating_add(1);
+                }
+            },
             Err(MysqlProxyError::Deadline(_)) => {
                 registry.diagnostics.deadlines = registry.diagnostics.deadlines.saturating_add(1);
             }
@@ -1362,13 +1471,13 @@ struct SessionContext {
 async fn run_session(
     mut client: TcpStream,
     context: SessionContext,
-    mut cancel: watch::Receiver<bool>,
+    mut settlement: watch::Receiver<Option<MysqlProxySettlementReason>>,
 ) {
     let guard = SessionGuard {
         shared: Arc::clone(&context.shared),
         id: context.session_id,
     };
-    let result = run_session_inner(&mut client, &guard, &context, &mut cancel).await;
+    let result = run_session_inner(&mut client, &guard, &context, &mut settlement).await;
     guard.record_result(&result);
 }
 
@@ -1376,7 +1485,7 @@ async fn run_session_inner(
     client: &mut TcpStream,
     guard: &SessionGuard,
     context: &SessionContext,
-    cancel: &mut watch::Receiver<bool>,
+    settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
 ) -> Result<(), MysqlProxyError> {
     context
         .backend
@@ -1392,7 +1501,7 @@ async fn run_session_inner(
     )?;
     guard.backend_initiated();
     let connected = select_cancel(
-        cancel,
+        settlement,
         authentication_deadline,
         MysqlProxyPhase::Greeting,
         UnixStream::connect(context.backend.as_path()),
@@ -1412,7 +1521,7 @@ async fn run_session_inner(
     };
     let greeting = read_packet_cancel(
         &mut backend,
-        cancel,
+        settlement,
         authentication_deadline,
         MysqlProxyPhase::Greeting,
     )
@@ -1441,7 +1550,7 @@ async fn run_session_inner(
 
     let response = read_packet_cancel(
         client,
-        cancel,
+        settlement,
         authentication_deadline,
         MysqlProxyPhase::Authentication,
     )
@@ -1463,7 +1572,7 @@ async fn run_session_inner(
     .await?;
     let fast = read_packet_cancel(
         &mut backend,
-        cancel,
+        settlement,
         authentication_deadline,
         MysqlProxyPhase::Authentication,
     )
@@ -1484,7 +1593,7 @@ async fn run_session_inner(
     .await?;
     let ok = read_packet_cancel(
         &mut backend,
-        cancel,
+        settlement,
         authentication_deadline,
         MysqlProxyPhase::Authentication,
     )
@@ -1513,7 +1622,7 @@ async fn run_session_inner(
         )?;
         let command = read_packet_cancel(
             client,
-            cancel,
+            settlement,
             command_deadline,
             MysqlProxyPhase::ClientCommand,
         )
@@ -1540,8 +1649,11 @@ async fn run_session_inner(
             }
         }
         guard.begin_command(context.generation, &context.attempt)?;
-        if context.attempt.admit_work().is_err() || *cancel.borrow() {
-            return Err(MysqlProxyError::Cancelled);
+        if let Some(reason) = *settlement.borrow() {
+            return Err(MysqlProxyError::Settled(reason));
+        }
+        if let Err(error) = context.attempt.admit_work() {
+            return Err(MysqlProxyError::Settled(settlement_from_admission(error)));
         }
         write_packet(
             &mut backend,
@@ -1559,7 +1671,7 @@ async fn run_session_inner(
             )?;
             let mut byte = [0_u8; 1];
             let read = select_cancel(
-                cancel,
+                settlement,
                 response_deadline,
                 MysqlProxyPhase::ServerResponse,
                 backend.read(&mut byte),
@@ -1584,9 +1696,9 @@ async fn run_session_inner(
             MysqlProxyPhase::ServerResponse,
         )?;
         if command_byte == 0x0e {
-            forward_ping_response(&mut backend, client, cancel, response_deadline).await?;
+            forward_ping_response(&mut backend, client, settlement, response_deadline).await?;
         } else {
-            forward_query_response(&mut backend, client, cancel, response_deadline).await?;
+            forward_query_response(&mut backend, client, settlement, response_deadline).await?;
         }
         guard.complete_command();
     }
@@ -1595,11 +1707,16 @@ async fn run_session_inner(
 async fn forward_ping_response(
     backend: &mut UnixStream,
     client: &mut TcpStream,
-    cancel: &mut watch::Receiver<bool>,
+    settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
     deadline: Instant,
 ) -> Result<(), MysqlProxyError> {
-    let packet =
-        read_packet_cancel(backend, cancel, deadline, MysqlProxyPhase::ServerResponse).await?;
+    let packet = read_packet_cancel(
+        backend,
+        settlement,
+        deadline,
+        MysqlProxyPhase::ServerResponse,
+    )
+    .await?;
     if packet.sequence != 1 {
         return Err(protocol(
             MysqlProxyPhase::ServerResponse,
@@ -1635,11 +1752,16 @@ async fn forward_ping_response(
 async fn forward_query_response(
     backend: &mut UnixStream,
     client: &mut TcpStream,
-    cancel: &mut watch::Receiver<bool>,
+    settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
     deadline: Instant,
 ) -> Result<(), MysqlProxyError> {
-    let first =
-        read_packet_cancel(backend, cancel, deadline, MysqlProxyPhase::ServerResponse).await?;
+    let first = read_packet_cancel(
+        backend,
+        settlement,
+        deadline,
+        MysqlProxyPhase::ServerResponse,
+    )
+    .await?;
     if first.sequence != 1 {
         return Err(protocol(
             MysqlProxyPhase::ServerResponse,
@@ -1694,8 +1816,13 @@ async fn forward_query_response(
     .await?;
     let mut sequence = 2_u8;
     for _ in 0..columns {
-        let column =
-            read_packet_cancel(backend, cancel, deadline, MysqlProxyPhase::ServerResponse).await?;
+        let column = read_packet_cancel(
+            backend,
+            settlement,
+            deadline,
+            MysqlProxyPhase::ServerResponse,
+        )
+        .await?;
         require_sequence(&column, sequence)?;
         validate_column_definition(&column.payload)?;
         write_packet(
@@ -1708,8 +1835,13 @@ async fn forward_query_response(
         .await?;
         sequence = sequence.wrapping_add(1);
     }
-    let metadata_end =
-        read_packet_cancel(backend, cancel, deadline, MysqlProxyPhase::ServerResponse).await?;
+    let metadata_end = read_packet_cancel(
+        backend,
+        settlement,
+        deadline,
+        MysqlProxyPhase::ServerResponse,
+    )
+    .await?;
     require_sequence(&metadata_end, sequence)?;
     validate_eof_packet(&metadata_end.payload)?;
     write_packet(
@@ -1722,8 +1854,13 @@ async fn forward_query_response(
     .await?;
     sequence = sequence.wrapping_add(1);
     loop {
-        let row =
-            read_packet_cancel(backend, cancel, deadline, MysqlProxyPhase::ServerResponse).await?;
+        let row = read_packet_cancel(
+            backend,
+            settlement,
+            deadline,
+            MysqlProxyPhase::ServerResponse,
+        )
+        .await?;
         require_sequence(&row, sequence)?;
         let complete = row.payload.first() == Some(&0xfe) && row.payload.len() < 9;
         if complete {
@@ -2191,11 +2328,11 @@ struct Packet {
 
 async fn read_packet_cancel<R: AsyncRead + Unpin>(
     reader: &mut R,
-    cancel: &mut watch::Receiver<bool>,
+    settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
     deadline: Instant,
     phase: MysqlProxyPhase,
 ) -> Result<Packet, MysqlProxyError> {
-    select_cancel(cancel, deadline, phase, read_packet(reader, phase)).await?
+    select_cancel(settlement, deadline, phase, read_packet(reader, phase)).await?
 }
 
 async fn read_packet<R: AsyncRead + Unpin>(
@@ -2282,7 +2419,7 @@ where
 }
 
 async fn select_cancel<F, T>(
-    cancel: &mut watch::Receiver<bool>,
+    settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
     deadline: Instant,
     phase: MysqlProxyPhase,
     future: F,
@@ -2290,8 +2427,8 @@ async fn select_cancel<F, T>(
 where
     F: core::future::Future<Output = T>,
 {
-    if *cancel.borrow() {
-        return Err(MysqlProxyError::Cancelled);
+    if let Some(reason) = *settlement.borrow() {
+        return Err(MysqlProxyError::Settled(reason));
     }
     let remaining = deadline
         .checked_duration_since(Instant::now())
@@ -2299,9 +2436,17 @@ where
         .ok_or(MysqlProxyError::Deadline(phase))?;
     tokio::select! {
         biased;
-        changed = cancel.changed() => {
-            let _ = changed;
-            Err(MysqlProxyError::Cancelled)
+        changed = settlement.changed() => {
+            match changed {
+                Ok(()) => Err(MysqlProxyError::Settled(
+                    settlement
+                        .borrow()
+                        .unwrap_or(MysqlProxySettlementReason::TerminalSeal),
+                )),
+                Err(_) => Err(MysqlProxyError::Settled(
+                    MysqlProxySettlementReason::TerminalSeal,
+                )),
+            }
         }
         result = tokio::time::timeout(remaining, future) => {
             result.map_err(|_| MysqlProxyError::Deadline(phase))

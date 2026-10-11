@@ -57,6 +57,19 @@ pub enum MysqlProxyProtocolError {
     MoreResults,
 }
 
+/// Exact cause that settled an already-published proxy generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MysqlProxySettlementReason {
+    /// An explicit generation revocation sealed the proxy.
+    ExplicitRevocation,
+    /// The shared attempt was explicitly cancelled.
+    AttemptCancellation,
+    /// The shared attempt reached its primary-work cutoff.
+    WorkDeadlineExpired,
+    /// Terminal lifecycle containment sealed the proxy.
+    TerminalSeal,
+}
+
 /// Secret-free application gateway failure.
 #[derive(Debug)]
 pub enum MysqlProxyError {
@@ -87,6 +100,8 @@ pub enum MysqlProxyError {
     Deadline(MysqlProxyPhase),
     /// The shared attempt was cancelled.
     Cancelled,
+    /// An already-published generation was settled for an exact typed reason.
+    Settled(MysqlProxySettlementReason),
     /// Private-UDS account lifecycle failed.
     Account(MysqlTopologyError),
     /// Exact native backend termination or absence proof failed.

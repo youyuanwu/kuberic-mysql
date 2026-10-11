@@ -34,10 +34,10 @@ use kuberic_mysql::service::{
     MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity,
     MysqlOperationTimeouts, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
     MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
-    MysqlProxyControlBoundary, MysqlProxyError, MysqlReplicaConfiguration, MysqlReplicaEpoch,
-    MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
-    MysqlReplicatorError, MysqlSourceTerminalReceipt, MysqlTerminalState, NativeIdentityEnrollment,
-    PrimaryTransferInput,
+    MysqlProxyControlBoundary, MysqlProxyError, MysqlProxySettlementReason,
+    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
+    MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError, MysqlSourceTerminalReceipt,
+    MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
 };
 use service_common::{GROUP_UUID, TestRoot};
 
@@ -2278,7 +2278,12 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
         .await
         .unwrap();
     assert!(!closed.is_open());
-    assert!(closed.containment().unwrap().handoff_eligible());
+    let containment = closed.containment().unwrap();
+    assert_eq!(
+        containment.settlement_reason(),
+        MysqlProxySettlementReason::ExplicitRevocation
+    );
+    assert!(containment.handoff_eligible());
     harness
         .engine
         .retire_contained_client_proxy()
@@ -3456,7 +3461,12 @@ async fn cancellation_is_exercised_at_every_controlled_handoff_boundary() {
         )
         .await
         .unwrap();
-    assert!(cancelled_revoke.containment().unwrap().handoff_eligible());
+    let containment = cancelled_revoke.containment().unwrap();
+    assert_eq!(
+        containment.settlement_reason(),
+        MysqlProxySettlementReason::AttemptCancellation
+    );
+    assert!(containment.handoff_eligible());
     assert!(!revoke.engine.access_intent().unwrap().write());
     revoke
         .engine
@@ -4002,7 +4012,12 @@ async fn deadline_is_exercised_at_every_controlled_handoff_boundary() {
         )
         .await
         .unwrap();
-    assert!(deadline_revoke.containment().unwrap().handoff_eligible());
+    let containment = deadline_revoke.containment().unwrap();
+    assert_eq!(
+        containment.settlement_reason(),
+        MysqlProxySettlementReason::WorkDeadlineExpired
+    );
+    assert!(containment.handoff_eligible());
     assert!(!revoke.engine.access_intent().unwrap().write());
     revoke
         .engine
