@@ -17,10 +17,12 @@ use crate::core::{
     ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, UnsupportedReason, ViewId,
 };
 use crate::service::{
-    ControlStage, MemberCleanupFailure, MysqlInstanceConfig, MysqlInstanceError,
-    MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManagerError,
-    TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError, TopologyNativeStateError,
-    TopologyStateError,
+    AttemptContext, CanonicalViewId, ControlStage, FreshBootstrapInput, FreshJoinInput,
+    MemberCleanupFailure, MemberMutationAuthority, MemberNativeEvidence, MemberPeer,
+    MemberSourceBoundary, MemberTransitionError, MemberViewError, MysqlInstanceConfig,
+    MysqlInstanceError, MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError,
+    MysqlTopologyManagerError, TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError,
+    TopologyNativeStateError, TopologyStateError,
 };
 
 /// One monotonic tick owned by a topology clock.
@@ -118,64 +120,6 @@ impl TopologyInstant {
     pub const fn tick(self) -> u64 {
         self.0
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QualifiedXcomView {
-    fixed: u64,
-    monotonic: u32,
-}
-
-impl QualifiedXcomView {
-    fn parse(view_id: &ViewId) -> Result<Self, MysqlTopologyError> {
-        let Some((fixed, monotonic)) = view_id.as_str().split_once(':') else {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::MalformedViewId,
-            ));
-        };
-        if fixed.is_empty()
-            || monotonic.is_empty()
-            || monotonic.contains(':')
-            || !canonical_decimal(fixed)
-            || !canonical_decimal(monotonic)
-        {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::MalformedViewId,
-            ));
-        }
-        Ok(Self {
-            fixed: fixed.parse().map_err(|_| {
-                MysqlTopologyError::TopologyState(TopologyStateError::MalformedViewId)
-            })?,
-            monotonic: monotonic.parse().map_err(|_| {
-                MysqlTopologyError::TopologyState(TopologyStateError::MalformedViewId)
-            })?,
-        })
-    }
-
-    fn require_successor(self, successor: Self) -> Result<(), MysqlTopologyError> {
-        if successor.fixed != self.fixed {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::ViewFixedPartChanged,
-            ));
-        }
-        let expected = self
-            .monotonic
-            .checked_add(1)
-            .ok_or(MysqlTopologyError::TopologyState(
-                TopologyStateError::ViewSequenceOverflow,
-            ))?;
-        if successor.monotonic != expected {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::ViewSequenceNotSuccessor,
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn canonical_decimal(value: &str) -> bool {
-    value.bytes().all(|byte| byte.is_ascii_digit()) && (value == "0" || !value.starts_with('0'))
 }
 
 /// One positive process-monotonic native-control deadline bound to an attempt.
@@ -774,6 +718,18 @@ impl NativeIdentityEnrollment {
     pub(crate) fn recovery_username(&self) -> &str {
         &self.recovery_username
     }
+
+    #[cfg(test)]
+    pub(super) fn qualification_rebind(&self, binding: MemberControlBinding) -> Self {
+        Self {
+            binding,
+            server_uuid: self.server_uuid.clone(),
+            member_id: self.member_id.clone(),
+            observer_username: self.observer_username.clone(),
+            recovery_username: self.recovery_username.clone(),
+            steps: self.steps.clone(),
+        }
+    }
 }
 
 /// Single issued bootstrap capability.
@@ -785,6 +741,17 @@ pub struct BootstrapCapability {
 }
 
 impl BootstrapCapability {
+    /// Narrows topology authorization to exact local member mutation
+    /// authority without transferring peer process ownership.
+    pub fn member_input(&self) -> Result<FreshBootstrapInput, MemberTransitionError> {
+        MemberMutationAuthority::new(
+            self.attempt.id.clone(),
+            self.attempt.group_name.clone(),
+            self.target.clone(),
+        )
+        .map(FreshBootstrapInput::new)
+    }
+
     /// Records the exact effect trace. Bootstrap-off proof is mandatory.
     pub fn record_effect(
         self,
@@ -802,10 +769,12 @@ impl BootstrapCapability {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn attempt(&self) -> &TopologyAttempt {
         &self.attempt
     }
 
+    #[cfg(test)]
     pub(crate) const fn target(&self) -> &NativeIdentityEnrollment {
         &self.target
     }
@@ -882,6 +851,59 @@ pub struct JoinCapability {
 }
 
 impl JoinCapability {
+    /// Narrows sequential topology authorization to local join authority plus
+    /// immutable predecessor evidence.
+    pub fn member_input(&self) -> Result<FreshJoinInput, MemberTransitionError> {
+        let target_authority = MemberMutationAuthority::new(
+            self.attempt.id.clone(),
+            self.attempt.group_name.clone(),
+            self.target.clone(),
+        )?;
+        let source_authority = MemberMutationAuthority::new(
+            self.attempt.id.clone(),
+            self.attempt.group_name.clone(),
+            self.boundary.source.clone(),
+        )?;
+        let members = self
+            .predecessor
+            .members
+            .iter()
+            .map(|enrollment| {
+                NativeMember::new(
+                    enrollment.member_id.clone(),
+                    enrollment.binding.member_address.clone(),
+                    if enrollment.binding.member == self.attempt.designated_bootstrap {
+                        MemberRole::Primary
+                    } else {
+                        MemberRole::Secondary
+                    },
+                    MemberState::Online,
+                )
+            })
+            .collect();
+        let view = crate::core::NativeView::new(
+            self.attempt.group_name.clone(),
+            self.predecessor.view_id.clone(),
+            members,
+        )
+        .map_err(|_| {
+            MemberTransitionError::View(crate::service::MemberViewError::IncoherentReadback)
+        })?;
+        let evidence =
+            MemberNativeEvidence::new(source_authority, view, self.boundary.executed.clone())?;
+        let source = MemberSourceBoundary::new(
+            MemberPeer::from_enrollment(&self.boundary.source),
+            evidence,
+        )?;
+        let peers = self
+            .predecessor
+            .members
+            .iter()
+            .map(MemberPeer::from_enrollment)
+            .collect();
+        FreshJoinInput::new(target_authority, source, peers)
+    }
+
     /// Fresh source boundary authorized for this exact join.
     #[must_use]
     pub const fn boundary(&self) -> &SourceGtidBoundary {
@@ -902,10 +924,12 @@ impl JoinCapability {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn attempt(&self) -> &TopologyAttempt {
         &self.attempt
     }
 
+    #[cfg(test)]
     pub(crate) const fn target(&self) -> &NativeIdentityEnrollment {
         &self.target
     }
@@ -1679,16 +1703,16 @@ pub trait MysqlTopologyMemberRuntime {
         &mut self,
         capability: BootstrapCapability,
         recovery: &ControlCredential,
-        deadline: &NativeControlDeadline,
-    ) -> Result<BootstrapEffect, MysqlTopologyError>;
+        attempt: &AttemptContext,
+    ) -> Result<BootstrapEffect, MemberTransitionError>;
 
     /// Executes one non-bootstrap join effect.
     async fn join_group_replication(
         &mut self,
         capability: JoinCapability,
         recovery: &ControlCredential,
-        deadline: &NativeControlDeadline,
-    ) -> Result<JoinEffect, MysqlTopologyError>;
+        attempt: &AttemptContext,
+    ) -> Result<JoinEffect, MemberTransitionError>;
 
     /// Discovers the proposed post-effect view.
     async fn discover_topology_view(
@@ -1761,19 +1785,18 @@ impl MysqlTopologyMemberRuntime for MysqlInstanceManager {
         &mut self,
         capability: BootstrapCapability,
         recovery: &ControlCredential,
-        deadline: &NativeControlDeadline,
-    ) -> Result<BootstrapEffect, MysqlTopologyError> {
-        MysqlInstanceManager::bootstrap_group_replication(self, capability, recovery, deadline)
-            .await
+        attempt: &AttemptContext,
+    ) -> Result<BootstrapEffect, MemberTransitionError> {
+        MysqlInstanceManager::bootstrap_group_replication(self, capability, recovery, attempt).await
     }
 
     async fn join_group_replication(
         &mut self,
         capability: JoinCapability,
         recovery: &ControlCredential,
-        deadline: &NativeControlDeadline,
-    ) -> Result<JoinEffect, MysqlTopologyError> {
-        MysqlInstanceManager::join_group_replication(self, capability, recovery, deadline).await
+        attempt: &AttemptContext,
+    ) -> Result<JoinEffect, MemberTransitionError> {
+        MysqlInstanceManager::join_group_replication(self, capability, recovery, attempt).await
     }
 
     async fn discover_topology_view(
@@ -1807,6 +1830,18 @@ fn contain_members<M: MysqlTopologyMemberRuntime>(
         }
     }
     failures
+}
+
+fn topology_cleanup_reserve<M: MysqlTopologyMemberRuntime>(instances: &[M; 3]) -> Option<Duration> {
+    instances
+        .iter()
+        .try_fold(Duration::ZERO, |reserve, instance| {
+            let timeouts = instance.config().timeouts();
+            let member_reserve = timeouts
+                .shutdown()
+                .checked_add(timeouts.socket_disappearance())?;
+            Some(reserve.max(member_reserve))
+        })
 }
 
 struct TopologyCancellationContainment<'a, M: MysqlTopologyMemberRuntime> {
@@ -1898,7 +1933,9 @@ pub struct MysqlTopologyManager<M: MysqlTopologyMemberRuntime = MysqlInstanceMan
     observation_serial: u64,
     clock: Arc<dyn TopologyClock>,
     observation_deadline: ObservationInstant,
+    #[cfg(test)]
     runtime_deadline: Instant,
+    attempt_context: AttemptContext,
     last_now: TopologyInstant,
 }
 
@@ -1972,6 +2009,32 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
                 MysqlTopologyError::Deadline(ControlStage::ProductValidation),
             ));
         }
+        let cleanup_reserve =
+            topology_cleanup_reserve(&instances).ok_or(MysqlTopologyManagerError::Topology(
+                MysqlTopologyError::Deadline(ControlStage::ProductValidation),
+            ))?;
+        let work_timeout = attempt.timeout.checked_sub(cleanup_reserve).ok_or(
+            MysqlTopologyManagerError::Topology(MysqlTopologyError::Deadline(
+                ControlStage::ProductValidation,
+            )),
+        )?;
+        let work_observation_deadline =
+            clock.deadline_after(start, work_timeout).map_err(|_| {
+                MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(
+                    TopologyEvidenceError::UnrepresentableClock,
+                ))
+            })?;
+        let attempt_context = AttemptContext::new_at(
+            attempt.id().clone(),
+            mapped_start,
+            runtime_deadline,
+            cleanup_reserve,
+        )
+        .map_err(|_| {
+            MysqlTopologyManagerError::Topology(MysqlTopologyError::Deadline(
+                ControlStage::ProductValidation,
+            ))
+        })?;
         attempt.bind_deadline(start, observation_deadline);
         let validation_error = if observer.attempt() != attempt.id()
             || recovery.attempt() != attempt.id()
@@ -2022,8 +2085,10 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
             accepted: None,
             observation_serial: 0,
             clock,
-            observation_deadline,
+            observation_deadline: work_observation_deadline,
+            #[cfg(test)]
             runtime_deadline,
+            attempt_context,
             last_now: TopologyInstant::new(start.tick()),
         })
     }
@@ -2146,14 +2211,15 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
             Err(error) => return Err(self.fail(error)),
         };
         let group_name = self.authority.attempt.group_name().clone();
+        let attempt_context = self.attempt_context.clone();
         let mut containment =
             TopologyCancellationContainment::new(&mut self.instances, &mut self.state);
         let result = async {
             let effect = containment
                 .member(member)
-                .bootstrap_group_replication(capability, &self.recovery, &deadline)
+                .bootstrap_group_replication(capability, &self.recovery, &attempt_context)
                 .await
-                .map_err(MysqlTopologyManagerError::Topology)?;
+                .map_err(|error| MysqlTopologyManagerError::MemberTransition { member, error })?;
             let discovery = containment
                 .member(member)
                 .discover_topology_view(enrollment, group_name, &deadline)
@@ -2277,6 +2343,7 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
 
     /// Contains every exact member and reports every cleanup failure.
     pub fn stop(&mut self) -> Result<(), MysqlTopologyManagerError> {
+        self.attempt_context.cancel();
         let failures = self.contain_all();
         self.invalidate_context();
         if failures.is_empty() {
@@ -2363,10 +2430,11 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
                 .authorize_join(member, boundary, now)
                 .map_err(MysqlTopologyManagerError::Topology)?;
             let deadline = self.control_deadline(ControlStage::StartGroupReplication)?;
+            let attempt_context = self.attempt_context.clone();
             let effect = self.instances[member.as_usize()]
-                .join_group_replication(capability, &self.recovery, &deadline)
+                .join_group_replication(capability, &self.recovery, &attempt_context)
                 .await
-                .map_err(MysqlTopologyManagerError::Topology)?;
+                .map_err(|error| MysqlTopologyManagerError::MemberTransition { member, error })?;
             let enrollment = self.enrollment(member)?.clone();
             let discovery = self.instances[member.as_usize()]
                 .discover_topology_view(
@@ -2637,12 +2705,11 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
         stage: ControlStage,
     ) -> Result<NativeControlDeadline, MysqlTopologyManagerError> {
         self.manager_now(stage)?;
-        if self.runtime_deadline <= Instant::now() {
-            return Err(MysqlTopologyManagerError::Topology(
-                MysqlTopologyError::Deadline(stage),
-            ));
-        }
-        NativeControlDeadline::new(self.authority.attempt.id().clone(), self.runtime_deadline)
+        self.attempt_context.admit_work().map_err(|_| {
+            MysqlTopologyManagerError::Topology(MysqlTopologyError::Deadline(stage))
+        })?;
+        self.attempt_context
+            .native_deadline()
             .map_err(MysqlTopologyManagerError::Topology)
     }
 
@@ -2678,6 +2745,7 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
     }
 
     fn fail(&mut self, primary: MysqlTopologyManagerError) -> MysqlTopologyManagerError {
+        self.attempt_context.cancel();
         self.invalidate_context();
         self.state = MysqlTopologyState::Failed;
         let failures = self.contain_all();
@@ -2708,6 +2776,7 @@ impl<M: MysqlTopologyMemberRuntime> MysqlTopologyManager<M> {
 
 impl<M: MysqlTopologyMemberRuntime> Drop for MysqlTopologyManager<M> {
     fn drop(&mut self) {
+        self.attempt_context.cancel();
         self.invalidate_context();
         let _ = self.contain_all();
     }
@@ -2974,10 +3043,13 @@ fn validate_transition(
         ));
     }
     validate_local_binding(target, &evidence.local)?;
-    let post_view = QualifiedXcomView::parse(&evidence.view_id)?;
+    let post_view = CanonicalViewId::parse(&evidence.view_id).map_err(map_member_view_error)?;
     if let Some(predecessor) = predecessor {
-        let predecessor_view = QualifiedXcomView::parse(&predecessor.view_id)?;
-        predecessor_view.require_successor(post_view)?;
+        let predecessor_view =
+            CanonicalViewId::parse(&predecessor.view_id).map_err(map_member_view_error)?;
+        predecessor_view
+            .require_successor(post_view)
+            .map_err(map_member_view_error)?;
     }
 
     let mut expected = predecessor.map_or_else(Vec::new, |credit| credit.members.clone());
@@ -3036,6 +3108,17 @@ fn validate_transition(
         members: expected,
         executed: evidence.executed.clone(),
     }))
+}
+
+fn map_member_view_error(error: MemberViewError) -> MysqlTopologyError {
+    let state = match error {
+        MemberViewError::MalformedViewId => TopologyStateError::MalformedViewId,
+        MemberViewError::ViewFixedPartChanged => TopologyStateError::ViewFixedPartChanged,
+        MemberViewError::ViewSequenceNotSuccessor => TopologyStateError::ViewSequenceNotSuccessor,
+        MemberViewError::ViewSequenceOverflow => TopologyStateError::ViewSequenceOverflow,
+        _ => TopologyStateError::InvalidTransition,
+    };
+    MysqlTopologyError::TopologyState(state)
 }
 
 fn validate_local_binding(
@@ -3191,7 +3274,7 @@ mod manager_tests {
             AttemptId::new("public-invalid-state").unwrap(),
             GroupName::new(group).unwrap(),
             MysqlMemberIndex::First,
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         )
         .unwrap();
         let observer = ControlCredential::new(

@@ -75,6 +75,25 @@ impl TestRoot {
         self.config_for_member_in_topology(topology(), member_index, timeouts)
     }
 
+    pub fn config_for_member_with_initialization_delay(
+        &self,
+        member_index: MysqlMemberIndex,
+        timeouts: MysqlOperationTimeouts,
+        delay: Duration,
+    ) -> MysqlInstanceConfig {
+        write_delayed_launcher(&self.launcher, delay);
+        MysqlInstanceConfig::new_topology_member(
+            "/usr/bin/sleep",
+            &self.launcher,
+            &self.data,
+            &self.scratch,
+            topology(),
+            member_index,
+            timeouts,
+        )
+        .unwrap()
+    }
+
     pub fn config_for_member_in_topology(
         &self,
         topology: MysqlTopologyConfig,
@@ -159,6 +178,34 @@ pid_file=$(sed -n 's/^pid-file=//p' "$config")
 echo $$ > "$pid_file"
 exec "$mysqld" 60
 "#,
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn write_delayed_launcher(path: &Path, delay: Duration) {
+    let delay = format!("{}.{:03}", delay.as_secs(), delay.subsec_millis());
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+while [ "$1" != "--" ]; do shift; done
+shift
+mysqld="$1"
+shift
+if [ "$1" = "--version" ]; then
+  echo "$mysqld  Ver 8.4.11 for Linux on x86_64 (MySQL Community Server - GPL)"
+  exit 0
+fi
+case "$*" in
+  *--initialize-insecure*) exec "$mysqld" {delay} ;;
+esac
+config=${{1#--defaults-file=}}
+pid_file=$(sed -n 's/^pid-file=//p' "$config")
+echo $$ > "$pid_file"
+exec "$mysqld" 60
+"#
+        ),
     )
     .unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();

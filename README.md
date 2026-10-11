@@ -1,10 +1,11 @@
 # kuberic-mysql
 
 `kuberic-mysql` contains a deterministic Rust safety core, a read-only native
-observer, and bounded lifecycle ownership for fresh Oracle MySQL servers. The
-delivered native target is Oracle MySQL Community Server 8.4.11 on Linux
-x86-64. Administration and observation use caller-selected private
-Unix-domain sockets; Group Replication uses distinct loopback-only endpoints.
+observer, bounded lifecycle ownership for fresh Oracle MySQL servers, and the
+MySQL-owned Stage 2 integration foundation. The delivered native target is
+Oracle MySQL Community Server 8.4.11 on Linux x86-64. Administration and
+observation use private Unix-domain sockets; Group Replication and the bounded
+application gateway use distinct loopback-only endpoints.
 
 The [high-level design](docs/design.md) defines the intended authority,
 identity, progress, lifecycle, fencing, recovery, security, testing, and staged
@@ -12,19 +13,19 @@ delivery contracts. Kuberic remains the durable lifecycle and client-access
 authority; MySQL retains native Group Replication membership, transport, and
 GTID history.
 
-Future lifecycle work follows the
+Lifecycle work follows the
 [restart-stateless metadata proposal](docs/stateless-metadata.md): the MySQL
 adapter and lifecycle component persist no private recovery metadata. Durable
 orchestration evidence belongs to Kuberic's generic controller and agent
 facilities, while native database facts remain in the MySQL data directory.
 
-The future production shape uses one member-local public SF-shaped Replicator
-per Kuberic replica. The delivered fixed three-process topology manager remains
-qualification infrastructure, not the production lifecycle owner. Activation
-also requires Kuberic's aligned public value types, a qualified
-`HistoryContext`-scoped GTID-to-LSN profile, signed build/peer authorization,
-and an application-owned client proxy; no private managed lifecycle or native
-receipt attachment is permitted.
+The delivered component shape is one MySQL-owned member-local lifecycle engine
+per replica plus a narrow Kuberic-neutral adapter seam. The fixed three-process
+topology manager and the new three-engine handoff fixture remain qualification
+infrastructure, not production topology owners. A future Kuberic adapter must
+translate stabilized public values and ordering into this seam; the repository
+does not depend on `kuberic-runtime`, verify future signed build/peer
+authorization, or attach private managed lifecycle capabilities.
 
 ## Status
 
@@ -68,6 +69,65 @@ Cancelling bootstrap cannot detach a query future: bootstrap-off and proof are
 attempted after every enable attempt, while cancellation synchronously contains
 the exact owned topology before returning control.
 
+The same module now exposes `MysqlReplicator`, a one-member lifecycle engine
+that owns one `MysqlInstanceManager` and enforces open, newer epoch, role,
+configuration, access, and terminal ordering. Same-role transitions still
+require an epoch barrier. Native bootstrap, join, coherent view readback, and
+primary transfer receive credit only from exact request-bound member-effect
+receipts. Build and removal entry points validate current primary authority,
+target identity, operation identity, and exact retries, then return a typed
+unsupported outcome; generic peer build/removal execution is not delivered.
+Successful close and abort retain their exact terminal outcome for idempotent
+retry. Changed retries conflict, unrelated post-terminal work rejects, and an
+unsettled abort remains terminal without claiming complete containment. Abort
+also contains an owned member that was prepared but not opened. Exact retries
+of a completed access publication return the retained endpoint and outcome
+before one-time handoff prerequisites are reconsidered.
+
+Qualified scalar progress is now a production boundary. Empty structured GTID
+history maps to `0`; otherwise only one untagged configured group source with
+one contiguous interval beginning at `1` maps to its exact signed tail.
+Complete `GtidSet` evidence remains authoritative. Foreign, tagged, gapped, or
+multi-source history is typed non-projectable, and catch-up capability remains
+an independent unsupported/unproved result when retained donor/binlog evidence
+is unavailable.
+
+The application endpoint is a generation-fenced plaintext loopback MySQL
+Classic Protocol gateway backed by the exact private UDS. It admits one
+dedicated pre-warmed `caching_sha2_password` application account, filters the
+negotiated capabilities, and supports bounded query, ping, and quit exchanges.
+Both read and write permission are required. Revocation atomically closes
+admission and dispatch, terminates registered native backend sessions, and
+completes only after proxy counts are zero and native absence is proved.
+Published listeners and sessions also observe shared attempt cancellation and
+the absolute work cutoff, sealing without a separate caller revoke. Every
+initiated backend is accounted; a connection that never yields an exact native
+ID makes containment unproved. The obligation is armed before polling the UDS
+connect, so cancellation or future drop after server acceptance cannot produce
+vacuous absence. Snapshots and receipts retain bounded
+secret-free outcome summaries. Text rows accept SQL `NULL` (`0xfb`) while an
+initial `0xfb` response remains rejected as `LOCAL INFILE`.
+TLS, cold/full authentication, arbitrary accounts or plugins, prepared
+statements, local-file transfer, compression, multi-statements, multi-results,
+pooling, and general MySQL protocol support are not claimed.
+
+A repository-owned live fixture composes three independent member-local
+engines for fresh formation and one controlled handoff. The handoff freezes the
+source's structured/scalar boundary only after a normally completed source
+closure and a fresh post-revocation native observation. The source engine
+issues a stable boundary identity binding the revoked generation, closure
+receipt, transfer, newer epoch/configuration, and source terminal receipt.
+Rearming or publishing a later source generation invalidates that boundary;
+an obsolete eligible closure cannot authorize transfer or target publication.
+The fixture proves fresh exact three-member history after schema DDL, transfers
+primary, closes and reaps the exact source process, accepts
+the exact two-survivor successor view and frozen history on both survivors, and
+submits one combined proof before a separate target access generation can be
+published. Publication performs a fresh target native view/history read, so
+intervening peer loss or view change blocks serving. This is controlled
+host-local qualification, not automated
+failover.
+
 A test-only native feasibility gate pins and reads back all nine effective
 values on every member: `gtid_mode = ON`,
 `enforce_gtid_consistency = ON`,
@@ -110,20 +170,19 @@ integration contracts, protocol simulators, fixtures, shared test
 infrastructure, and live Oracle qualification targets.
 
 The design requires structured GTID and native-view evidence, exact
-process/storage ownership, and fresh reconciliation before client write
-publication. Its later automated-failover stages additionally require
-independent old-primary fencing. Native `PRIMARY` role or MySQL read-only
-variables alone do not grant or fence writes.
+process/storage ownership, generation closure, source terminal evidence, and
+fresh successor reconciliation before target write publication. Later
+automated-failover stages additionally require independent old-primary
+fencing. Native `PRIMARY` role or MySQL read-only variables alone do not grant
+or fence writes.
 
 Native `PRIMARY`, `read_only`, and `super_read_only` values are evidence only.
-They never open Kuberic read or write access and do not prove fencing. The
-delivered fresh three-member bootstrap/join slice is not the broader Stage 2
-lifecycle PoC: member-local public Replicator wiring, SF lifecycle ordering,
-public scalar progress, effective signed build/peer admission, proxy access
-reconciliation or publication, switchover, failover, Clone/reseed, replacement
-or destructive repair, restart continuation, TLS, cross-host operation,
-containers, Kubernetes, and production availability or security claims remain
-out of scope.
+They never open read or write access and do not prove fencing. The delivered
+Stage 2 foundation still excludes the Kuberic adapter, effective signed
+build/peer admission, generic build/removal completion, automated failover,
+Clone/reseed, replacement or destructive repair, restart continuation or
+survivor adoption, TLS, cross-host operation, containers, Kubernetes, and
+production availability, durability, performance, or security claims.
 
 The live gate qualifies the exact installed Oracle MySQL 8.4.11 package.
 Any other patch requires an explicit compatibility update.
@@ -152,6 +211,7 @@ observer, single-process lifecycle, and three-member bootstrap/join gates:
 
 ```bash
 cargo fmt --all -- --check
+CARGO_BUILD_JOBS=1 cargo check --locked --offline -p kuberic-mysql --lib
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --workspace --profile ci
 CARGO_BUILD_JOBS=1 cargo test --locked --offline --doc --workspace
 CARGO_BUILD_JOBS=1 cargo clippy --locked --offline --workspace --all-targets -- -D warnings
@@ -165,6 +225,33 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
   --test service_config_contract --test service_process_contract \
   --test service_topology_contract
+```
+
+The Stage 2 member-local lifecycle, gateway, and handoff contracts can be run
+without launching MySQL:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-tests \
+  --test core_progress_contract \
+  --test service_member_transition_contract \
+  --test service_proxy_contract \
+  --test service_replicator_contract
+```
+
+The bounded real-server gateway compatibility gate can be rerun independently:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-tests --test service_proxy_live_mysql_8_4_11
+```
+
+The fresh formation and controlled-handoff gate can be rerun independently:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-tests --test service_replicator_live_mysql_8_4_11 \
+  -E 'test(=controlled_handoff_closes_source_before_target_publication)'
 ```
 
 The native observer gate can be rerun independently:

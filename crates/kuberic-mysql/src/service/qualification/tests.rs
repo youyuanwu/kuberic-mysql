@@ -9,7 +9,10 @@ use std::thread;
 
 use super::live::LiveQualificationFixture;
 use super::*;
-use crate::core::{AttemptId, CredentialGeneration, GroupName};
+use crate::core::{
+    AttemptId, CredentialGeneration, GroupName, MAX_SEQUENCE, NonProjectableProgressReason,
+    ProgressProjection, QualifiedProgressKind,
+};
 use crate::service::{
     ControlCredential, ControlCredentialRole, MysqlInstanceConfig, MysqlMemberConfig,
     MysqlOperationTimeouts, MysqlTopologyConfig, MysqlTopologyState, TopologyAttempt,
@@ -1094,63 +1097,90 @@ fn profile_requires_workload_session_consistency() {
 
 #[test]
 fn gtid_profile_preserves_full_shape_and_rejects_every_incompatible_class() {
+    let lineage = ConfiguredGtidLineage::new(GROUP_UUID).unwrap();
+    let ProgressProjection::Projectable(initial) = project_progress(&lineage, &GtidSet::empty())
+    else {
+        panic!("empty history must project");
+    };
+    assert_eq!(initial.value(), 0);
+    assert_eq!(initial.kind(), QualifiedProgressKind::EmptyHistory);
+    let ProgressProjection::Projectable(progress) = project_progress(
+        &lineage,
+        &GtidSet::from_str(&format!("{GROUP_UUID}:1-8")).unwrap(),
+    ) else {
+        panic!("qualified history must project");
+    };
+    assert_eq!(progress.value(), 8);
+    assert_eq!(progress.kind(), QualifiedProgressKind::ContiguousHistory);
     assert_eq!(
-        classify_gtid_profile(&GtidSet::empty(), GROUP_UUID),
-        GtidProfileCompatibility::CompatibleEmpty
-    );
-    assert_eq!(
-        classify_gtid_profile(
-            &GtidSet::from_str(&format!("{GROUP_UUID}:1-8")).unwrap(),
-            GROUP_UUID
+        project_progress(
+            &lineage,
+            &GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1").unwrap()
         ),
-        GtidProfileCompatibility::CompatibleContiguous { tail: 8 }
+        ProgressProjection::NonProjectable(NonProjectableProgressReason::ForeignSource)
     );
     assert_eq!(
-        classify_gtid_profile(
-            &GtidSet::from_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1").unwrap(),
-            GROUP_UUID
+        project_progress(
+            &lineage,
+            &GtidSet::from_str(&format!("{GROUP_UUID}:tag:1")).unwrap()
         ),
-        GtidProfileCompatibility::ForeignSource
+        ProgressProjection::NonProjectable(NonProjectableProgressReason::TaggedSource)
     );
     assert_eq!(
-        classify_gtid_profile(
-            &GtidSet::from_str(&format!("{GROUP_UUID}:tag:1")).unwrap(),
-            GROUP_UUID
-        ),
-        GtidProfileCompatibility::TaggedSource
-    );
-    assert_eq!(
-        classify_gtid_profile(
+        project_progress(
+            &lineage,
             &GtidSet::from_str(&format!(
                 "{GROUP_UUID}:1,aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1"
             ))
-            .unwrap(),
-            GROUP_UUID
+            .unwrap()
         ),
-        GtidProfileCompatibility::MultipleSources
+        ProgressProjection::NonProjectable(NonProjectableProgressReason::MultipleSources)
     );
     assert_eq!(
-        classify_gtid_profile(
-            &GtidSet::from_str(&format!("{GROUP_UUID}:1-2:4")).unwrap(),
-            GROUP_UUID
+        project_progress(
+            &lineage,
+            &GtidSet::from_str(&format!("{GROUP_UUID}:1-2:4")).unwrap()
         ),
-        GtidProfileCompatibility::MultipleIntervals
+        ProgressProjection::NonProjectable(NonProjectableProgressReason::MultipleIntervals)
     );
     assert_eq!(
-        classify_gtid_profile(
-            &GtidSet::from_str(&format!("{GROUP_UUID}:2-4")).unwrap(),
-            GROUP_UUID
+        project_progress(
+            &lineage,
+            &GtidSet::from_str(&format!("{GROUP_UUID}:2-4")).unwrap()
         ),
-        GtidProfileCompatibility::DoesNotBeginAtOne
+        ProgressProjection::NonProjectable(NonProjectableProgressReason::DoesNotBeginAtOne)
     );
 
     let predecessor = GtidSet::from_str(&format!("{GROUP_UUID}:1-8")).unwrap();
     let shorter_but_contiguous = GtidSet::from_str(&format!("{GROUP_UUID}:1-7")).unwrap();
+    let ProgressProjection::Projectable(shorter_progress) =
+        project_progress(&lineage, &shorter_but_contiguous)
+    else {
+        panic!("contiguous history must project");
+    };
+    assert_eq!(shorter_progress.value(), 7);
     assert_eq!(
-        classify_gtid_profile(&shorter_but_contiguous, GROUP_UUID),
-        GtidProfileCompatibility::CompatibleContiguous { tail: 7 }
+        shorter_progress.kind(),
+        QualifiedProgressKind::ContiguousHistory
     );
     assert!(!predecessor.is_subset_of(&shorter_but_contiguous));
+
+    let maximum = GtidSet::from_str(&format!("{GROUP_UUID}:1-{MAX_SEQUENCE}")).unwrap();
+    let ProgressProjection::Projectable(maximum_progress) = project_progress(&lineage, &maximum)
+    else {
+        panic!("maximum valid sequence must project");
+    };
+    assert_eq!(
+        maximum_progress.value(),
+        i64::try_from(MAX_SEQUENCE).unwrap()
+    );
+
+    let above_maximum =
+        GtidSet::from_str(&format!("{GROUP_UUID}:{}", MAX_SEQUENCE + 1)).unwrap_err();
+    assert_eq!(
+        above_maximum.kind(),
+        &crate::core::GtidParseErrorKind::SequenceOutOfRange
+    );
 }
 
 #[test]

@@ -5,8 +5,126 @@ use std::io::ErrorKind;
 
 use crate::adapter::RequestError;
 use crate::service::{
-    MysqlInstanceState, MysqlMemberIndex, MysqlOwnedPathKind, MysqlTopologyState,
+    AttemptAdmissionError, AttemptCancellationState, AttemptDeadlineState, MysqlInstanceState,
+    MysqlMemberIndex, MysqlOwnedPathKind, MysqlTopologyState,
 };
+
+/// Bounded client-gateway protocol phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MysqlProxyPhase {
+    /// Loopback listener preparation or acceptance.
+    Listener,
+    /// Backend private-UDS connection and greeting.
+    Greeting,
+    /// Client handshake response and server authentication exchange.
+    Authentication,
+    /// One complete client command packet.
+    ClientCommand,
+    /// One bounded server response.
+    ServerResponse,
+    /// Generation revocation and native absence proof.
+    Revocation,
+    /// Application-account creation, cache preparation, or removal.
+    AccountLifecycle,
+}
+
+/// Stable reason a Classic Protocol exchange was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MysqlProxyProtocolError {
+    /// Packet header or payload ended before the declared boundary.
+    IncompletePacket,
+    /// A packet exceeded the one-mebibyte payload limit.
+    PacketTooLarge,
+    /// A continuation-sized packet was observed.
+    ContinuationPacket,
+    /// Packet sequence did not match the exact bounded state.
+    SequenceMismatch,
+    /// Server greeting was not protocol version 10 or was malformed.
+    InvalidGreeting,
+    /// An advertised or requested capability was outside the fixed profile.
+    UnsupportedCapability,
+    /// The client username was not the dedicated application identity.
+    UsernameMismatch,
+    /// The authentication plugin or exchange was outside warmed fast auth.
+    UnsupportedAuthentication,
+    /// The command was not query, ping, or quit.
+    UnsupportedCommand,
+    /// A local-infile request was observed.
+    LocalInfile,
+    /// A result used a nonlegacy or otherwise unsupported termination mode.
+    UnsupportedResult,
+    /// A response advertised additional results.
+    MoreResults,
+}
+
+/// Exact cause that settled an already-published proxy generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MysqlProxySettlementReason {
+    /// An explicit generation revocation sealed the proxy.
+    ExplicitRevocation,
+    /// The shared attempt was explicitly cancelled.
+    AttemptCancellation,
+    /// The shared attempt reached its primary-work cutoff.
+    WorkDeadlineExpired,
+    /// Terminal lifecycle containment sealed the proxy.
+    TerminalSeal,
+}
+
+/// Secret-free application gateway failure.
+#[derive(Debug)]
+pub enum MysqlProxyError {
+    /// Listener input was not an exact loopback address or the account input
+    /// was invalid.
+    InvalidConfiguration,
+    /// The requested transition was incompatible with current proxy state.
+    InvalidState,
+    /// Stage 2 requires both read and write permission.
+    BothPermissionsRequired,
+    /// The supplied generation was stale or did not own the active endpoint.
+    GenerationMismatch,
+    /// A listener or transport operation failed.
+    Io {
+        /// Protocol phase being performed.
+        phase: MysqlProxyPhase,
+        /// Stable operating-system error category.
+        kind: ErrorKind,
+    },
+    /// Bounded protocol validation failed.
+    Protocol {
+        /// Protocol phase being performed.
+        phase: MysqlProxyPhase,
+        /// Stable rejection reason.
+        reason: MysqlProxyProtocolError,
+    },
+    /// A fixed phase deadline expired.
+    Deadline(MysqlProxyPhase),
+    /// The shared attempt was cancelled.
+    Cancelled,
+    /// An already-published generation was settled for an exact typed reason.
+    Settled(MysqlProxySettlementReason),
+    /// Private-UDS account lifecycle failed.
+    Account(MysqlTopologyError),
+    /// Exact native backend termination or absence proof failed.
+    Native(MemberTransitionError),
+    /// A backend connection was initiated but no exact native connection ID
+    /// was obtained, so native absence cannot be proved.
+    UnidentifiedBackend,
+    /// Cleanup failed after a primary proxy failure.
+    Cleanup {
+        /// Original proxy failure.
+        primary: Box<Self>,
+        /// Mandatory cleanup failure.
+        cleanup: Box<Self>,
+    },
+}
+
+impl fmt::Display for MysqlProxyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL client proxy failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MysqlProxyError {}
 
 /// Configuration validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +264,18 @@ pub enum ControlStage {
     CreateRecovery,
     /// Granting the exact distributed-recovery privileges.
     GrantRecovery,
+    /// Creating the dedicated local application account.
+    CreateApplication,
+    /// Granting exact qualification-schema DML privileges.
+    GrantApplicationDml,
+    /// Removing the dedicated local application account.
+    DropApplication,
+    /// Warming the dedicated account's `caching_sha2_password` cache.
+    WarmApplicationAuthentication,
+    /// Reading back the exact application-account generation and grants.
+    InspectApplicationAccount,
+    /// Proving the exact application account is absent.
+    ProveApplicationAccountAbsent,
     /// Restoring the original session binary-log switch.
     RestoreBinaryLogging,
     /// Proving the session binary-log switch was restored.
@@ -168,9 +298,227 @@ pub enum ControlStage {
     ProveBootstrapDisabled,
     /// Discovering the current native view identity.
     DiscoverView,
+    /// Reading one bracketed coherent native membership view.
+    ReadMembership,
+    /// Reading structured executed GTID history for a member view.
+    ReadExecutedHistory,
+    /// Transferring the native primary role to one exact member UUID.
+    TransferPrimary,
+    /// Terminating one exact native backend connection.
+    TerminateConnection,
+    /// Proving one exact native backend connection is absent.
+    ProveConnectionAbsent,
+    /// Reading back the exact native backend account identity.
+    InspectConnectionIdentity,
     /// Explicit connected-session teardown.
     Disconnect,
 }
+
+/// Why member-scoped mutation authority was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberAuthorityError {
+    /// The authority belongs to another attempt.
+    AttemptMismatch,
+    /// The authority names another local member binding.
+    LocalBindingMismatch,
+    /// A peer evidence value was substituted for local mutation authority.
+    AuthoritySubstitution,
+    /// The selected source was not the exact locally owned source.
+    SourceMismatch,
+    /// The transfer target was absent, local, or otherwise not exact.
+    WrongTransferTarget,
+}
+
+/// Why coherent member/view evidence was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberViewError {
+    /// A bracketed native read changed before it closed.
+    IncoherentReadback,
+    /// The supplied predecessor evidence was stale or changed.
+    StaleView,
+    /// A view identity was not canonical `<u64>:<u32>`.
+    MalformedViewId,
+    /// A successor changed the fixed XCom component.
+    ViewFixedPartChanged,
+    /// A successor did not advance by exactly one.
+    ViewSequenceNotSuccessor,
+    /// The predecessor monotonic component could not advance.
+    ViewSequenceOverflow,
+    /// A required member was absent.
+    RequiredMemberMissing,
+    /// An unapproved member was present.
+    UnexpectedMember,
+    /// A member address differed from its immutable peer input.
+    MemberAddressMismatch,
+    /// Native membership did not contain exactly one primary.
+    PrimaryCardinality,
+    /// A required member was not online.
+    MemberNotOnline,
+    /// A required member had the wrong role.
+    MemberRoleMismatch,
+    /// Structured history contained a non-group source.
+    NonGroupSource,
+    /// Successor history did not contain the predecessor boundary.
+    SourceBoundaryNotContained,
+}
+
+/// Why a typed member effect receipt was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberReceiptError {
+    /// Receipt identity did not match the admitted authority.
+    BindingMismatch,
+    /// Receipt predecessor evidence did not match the exact source boundary.
+    PredecessorMismatch,
+    /// Receipt successor evidence did not prove the requested effect.
+    SuccessorMismatch,
+    /// The attempt was cancelled before receipt credit.
+    Cancelled,
+    /// The receipt was created outside the primary-work budget.
+    Deadline(AttemptDeadlineState),
+    /// Mandatory cleanup did not complete.
+    CleanupIncomplete,
+}
+
+/// One secret-free member-local native effect failure.
+#[derive(Debug)]
+pub enum MemberTransitionError {
+    /// Member-scoped mutation authority was invalid.
+    Authority(MemberAuthorityError),
+    /// Native membership or view evidence was invalid.
+    View(MemberViewError),
+    /// The shared attempt was cancelled.
+    Cancelled,
+    /// The attempt was outside its primary-work budget.
+    Deadline(AttemptDeadlineState),
+    /// A typed effect receipt was inconsistent.
+    Receipt(MemberReceiptError),
+    /// Native control failed after local ownership validation.
+    Native(MysqlTopologyError),
+    /// Primary failure plus local-only containment failure.
+    Cleanup {
+        /// Original member effect failure.
+        primary: Box<Self>,
+        /// Exact local cleanup failure.
+        cleanup: Box<MysqlInstanceError>,
+    },
+}
+
+impl fmt::Display for MemberTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL member transition failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MemberTransitionError {}
+
+impl From<MysqlTopologyError> for MemberTransitionError {
+    fn from(error: MysqlTopologyError) -> Self {
+        Self::Native(error)
+    }
+}
+
+/// One secret-free rejection from the future-adapter lifecycle engine.
+#[derive(Debug)]
+pub enum MysqlReplicatorError {
+    /// The engine has not accepted its exact open receipt.
+    NotOpen,
+    /// Open was repeated with different identity or generation inputs.
+    OpenConflict,
+    /// A supplied replica, incarnation, member, or credential fact was not exact.
+    IdentityMismatch,
+    /// The member configuration cannot support Group Replication lifecycle work.
+    InvalidMemberConfiguration,
+    /// A fresh member did not retain its dedicated application credential.
+    ApplicationCredentialRequired,
+    /// The operation generation was not newer than the last admitted operation.
+    StaleOperationGeneration,
+    /// An operation identity was retried with changed inputs.
+    OperationConflict,
+    /// A prior attempt with this exact operation identity completed uncertainly.
+    OperationUncertain,
+    /// The epoch was not newer than the current accepted epoch.
+    StaleEpoch,
+    /// A newer epoch barrier is required before this role operation.
+    EpochBarrierRequired,
+    /// A role must be accepted for the current epoch before configuration.
+    RoleRequired,
+    /// A current configuration must be accepted before this operation.
+    ConfigurationRequired,
+    /// The local replica must be primary under the current configuration.
+    PrimaryRequired,
+    /// A peer operation selected the exact local replica or native member.
+    SelfTarget,
+    /// A configuration omitted, duplicated, or changed an exact member identity.
+    InvalidConfiguration,
+    /// An access generation was stale or conflicting.
+    StaleAccessGeneration,
+    /// Published gateway authority must be revoked and contained first.
+    AccessRevocationRequired,
+    /// A typed member receipt or observation did not match the admitted operation.
+    ReceiptMismatch,
+    /// A typed receipt arrived after cancellation or outside primary-work time.
+    LateReceipt {
+        /// Deadline position when the receipt arrived.
+        deadline: AttemptDeadlineState,
+        /// Cancellation position when the receipt arrived.
+        cancellation: AttemptCancellationState,
+    },
+    /// A receipt did not prove the requested local native role.
+    NativeRoleMismatch,
+    /// Controlled-handoff publication or successor evidence was incomplete.
+    HandoffProofRequired,
+    /// A handoff publication proof was already accepted.
+    HandoffProofDuplicate,
+    /// A later handoff publication proof conflicted with the accepted proof.
+    HandoffProofConflict,
+    /// Mandatory close settlement did not produce completed cleanup evidence.
+    CloseUnsettled,
+    /// Abort crossed the terminal boundary but exact complete containment was
+    /// not proved.
+    AbortUnsettled,
+    /// The shared attempt was cancelled before operation admission.
+    Cancelled,
+    /// The shared attempt was outside its primary-work budget.
+    Deadline(AttemptDeadlineState),
+    /// The engine has crossed a terminal close or abort boundary.
+    Terminal,
+    /// The member-local effect failed or completed uncertainly.
+    MemberTransition(MemberTransitionError),
+    /// Fresh member preparation failed and exact local containment also failed.
+    FreshPreparationCleanup {
+        /// Original member preparation failure.
+        prior: Box<MysqlReplicatorError>,
+        /// Exact local containment failure.
+        cleanup: Box<MysqlInstanceError>,
+    },
+    /// Configuration completion failed or became uncertain and exact local
+    /// containment also failed.
+    ConfigurationCleanup {
+        /// Original configuration admission, effect, or receipt failure.
+        primary: Box<MysqlReplicatorError>,
+        /// Exact local containment failure.
+        cleanup: Box<MysqlInstanceError>,
+    },
+    /// Account, listener, protocol, generation, or gateway containment failed.
+    Proxy(MysqlProxyError),
+    /// Gateway cleanup failed and local process containment also failed.
+    ProxyCleanup {
+        /// Original gateway cleanup failure.
+        proxy: Box<MysqlProxyError>,
+        /// Exact local containment failure.
+        instance: Box<MysqlInstanceError>,
+    },
+    /// Exact local containment failed.
+    Instance(MysqlInstanceError),
+}
+
+impl fmt::Display for MysqlReplicatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL replicator lifecycle failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MysqlReplicatorError {}
 
 /// Why a topology capability was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +731,13 @@ pub enum MysqlTopologyManagerError {
         /// Exact member lifecycle failure.
         error: MysqlInstanceError,
     },
+    /// One member-scoped native effect failed with its local cleanup evidence.
+    MemberTransition {
+        /// Exact member whose effect failed.
+        member: MysqlMemberIndex,
+        /// Member-local effect and paired containment failure, when any.
+        error: MemberTransitionError,
+    },
     /// Native control or topology evidence validation failed.
     Topology(MysqlTopologyError),
     /// The manager could not construct an exact observer request.
@@ -427,6 +782,9 @@ pub enum MysqlInstanceError {
     },
     /// A bounded operation exceeded its deadline.
     Timeout(LifecycleOperation),
+    /// Shared attempt cancellation or work-cutoff admission stopped a process
+    /// lifecycle poll.
+    Attempt(AttemptAdmissionError),
     /// A child exited unsuccessfully.
     ChildFailure {
         /// Operation whose child failed.

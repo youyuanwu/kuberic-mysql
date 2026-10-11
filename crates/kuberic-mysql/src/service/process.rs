@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::service::{
-    LifecycleOperation, MysqlInstanceConfig, MysqlInstanceError, OwnershipError, ProductError,
+    AttemptContext, LifecycleOperation, MysqlInstanceConfig, MysqlInstanceError, OwnershipError,
+    ProductError,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -30,6 +31,22 @@ pub(crate) fn verify_product(
     config: &MysqlInstanceConfig,
     retained: &mut Option<Child>,
 ) -> Result<(), MysqlInstanceError> {
+    verify_product_inner(config, retained, None)
+}
+
+pub(crate) fn verify_product_with_attempt(
+    config: &MysqlInstanceConfig,
+    retained: &mut Option<Child>,
+    attempt: &AttemptContext,
+) -> Result<(), MysqlInstanceError> {
+    verify_product_inner(config, retained, Some(attempt))
+}
+
+fn verify_product_inner(
+    config: &MysqlInstanceConfig,
+    retained: &mut Option<Child>,
+    attempt: Option<&AttemptContext>,
+) -> Result<(), MysqlInstanceError> {
     config.revalidate_executables()?;
     let log =
         File::create(config.runtime().version_log()).map_err(|error| MysqlInstanceError::Io {
@@ -47,20 +64,32 @@ pub(crate) fn verify_product(
         .spawn()
         .map_err(|_| MysqlInstanceError::Product(ProductError::InspectionFailed))?;
     *retained = Some(child);
-    let result = wait_bounded(
-        retained
-            .as_mut()
-            .expect("product inspector retained before waiting"),
-        config.timeouts().initialization(),
-        config.timeouts().shutdown(),
-        LifecycleOperation::ProductValidation,
-    );
+    let child = retained
+        .as_mut()
+        .expect("product inspector retained before waiting");
+    let result = if let Some(attempt) = attempt {
+        wait_bounded_with_attempt(
+            child,
+            config.timeouts().initialization(),
+            config.timeouts().shutdown(),
+            LifecycleOperation::ProductValidation,
+            attempt,
+        )
+    } else {
+        wait_bounded(
+            child,
+            config.timeouts().initialization(),
+            config.timeouts().shutdown(),
+            LifecycleOperation::ProductValidation,
+        )
+    };
     let reaped = retained
         .as_mut()
         .is_some_and(|child| child.try_wait().ok().flatten().is_some());
     if reaped {
         *retained = None;
     }
+
     let status = result?;
     if !status.success() {
         return Err(MysqlInstanceError::Product(ProductError::InspectionFailed));
@@ -100,6 +129,47 @@ pub(crate) fn verify_product(
     Ok(())
 }
 
+pub(crate) fn wait_bounded_with_attempt(
+    child: &mut Child,
+    timeout: Duration,
+    reap_timeout: Duration,
+    operation: LifecycleOperation,
+    attempt: &AttemptContext,
+) -> Result<ExitStatus, MysqlInstanceError> {
+    let local_deadline = checked_deadline(timeout, operation)?;
+    let deadline = local_deadline.min(attempt.work_deadline());
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| MysqlInstanceError::Io {
+            operation,
+            kind: error.kind(),
+        })? {
+            return Ok(status);
+        }
+        let admission = attempt.admit_work();
+        if admission.is_err() || Instant::now() >= deadline {
+            let prior = admission.err().map_or(
+                MysqlInstanceError::Timeout(operation),
+                MysqlInstanceError::Attempt,
+            );
+            let remaining = attempt
+                .deadline()
+                .saturating_duration_since(Instant::now())
+                .min(reap_timeout);
+            if remaining.is_zero() {
+                return Err(prior);
+            }
+            if let Err(cleanup) = kill_and_reap_bounded(child, remaining) {
+                return Err(MysqlInstanceError::CleanupAfter {
+                    prior: Box::new(prior),
+                    cleanup: Box::new(cleanup),
+                });
+            }
+            return Err(prior);
+        }
+        sleep_until(deadline);
+    }
+}
+
 pub(crate) fn wait_bounded(
     child: &mut Child,
     timeout: Duration,
@@ -114,6 +184,7 @@ pub(crate) fn wait_bounded(
         })? {
             return Ok(status);
         }
+
         if Instant::now() >= deadline {
             let prior = MysqlInstanceError::Timeout(operation);
             if let Err(cleanup) = kill_and_reap_bounded(child, reap_timeout) {
@@ -163,6 +234,14 @@ pub(crate) fn terminate_and_reap(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<(), MysqlInstanceError> {
+    let deadline = checked_deadline(timeout, LifecycleOperation::Shutdown)?;
+    terminate_and_reap_before(child, deadline)
+}
+
+pub(crate) fn terminate_and_reap_before(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<(), MysqlInstanceError> {
     if child
         .try_wait()
         .map_err(|error| MysqlInstanceError::Io {
@@ -174,11 +253,12 @@ pub(crate) fn terminate_and_reap(
         return Ok(());
     }
     let started = Instant::now();
-    let deadline = started
-        .checked_add(timeout)
+    let remaining = deadline
+        .checked_duration_since(started)
+        .filter(|remaining| !remaining.is_zero())
         .ok_or(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))?;
     let term_deadline = started
-        .checked_add(timeout / 2)
+        .checked_add(remaining / 2)
         .ok_or(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))?;
     let mut signal = Command::new("/bin/kill")
         .arg("-TERM")
@@ -313,6 +393,13 @@ fn kill_and_reap_until(child: &mut Child, deadline: Instant) -> Result<(), Mysql
 
 pub(crate) fn wait_for_absence(path: &Path, timeout: Duration) -> Result<(), MysqlInstanceError> {
     let deadline = checked_deadline(timeout, LifecycleOperation::SocketDisappearance)?;
+    wait_for_absence_before(path, deadline)
+}
+
+pub(crate) fn wait_for_absence_before(
+    path: &Path,
+    deadline: Instant,
+) -> Result<(), MysqlInstanceError> {
     loop {
         if fs::symlink_metadata(path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)

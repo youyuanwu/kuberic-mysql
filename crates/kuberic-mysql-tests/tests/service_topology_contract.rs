@@ -25,16 +25,16 @@ use kuberic_mysql::core::{
     ReplicaId, ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
 };
 use kuberic_mysql::service::{
-    AccountProvisioningEvidence, BootstrapEffect, ControlCredential, ControlCredentialRole,
-    ControlStage, ControlStep, JoinEffect, MemberControlBinding, MysqlInstanceConfig,
-    MysqlInstanceManager, MysqlMemberIndex, MysqlOwnedPathKind, MysqlTopologyError,
-    MysqlTopologyManager, MysqlTopologyManagerError, MysqlTopologyMemberRuntime,
-    MysqlTopologyState, NativeControlDeadline, NativeIdentityEnrollment, ObservedLocalBinding,
-    OwnershipError, SourceGtidBoundary, TopologyAttempt, TopologyAuthority, TopologyAuthorityError,
-    TopologyClock, TopologyEvidenceError, TopologyGtidError, TopologyInstant,
-    TopologyNativeStateError, TopologyObservation, TopologyObservationContext,
-    TopologyObservationStatus, TopologyStateError, TransitionCredit, TransitionEvaluation,
-    ViewDiscovery,
+    AccountProvisioningEvidence, AttemptContext, BootstrapEffect, ControlCredential,
+    ControlCredentialRole, ControlStage, ControlStep, JoinEffect, MemberControlBinding,
+    MemberTransitionError, MysqlInstanceConfig, MysqlInstanceManager, MysqlMemberIndex,
+    MysqlOwnedPathKind, MysqlTopologyError, MysqlTopologyManager, MysqlTopologyManagerError,
+    MysqlTopologyMemberRuntime, MysqlTopologyState, NativeControlDeadline,
+    NativeIdentityEnrollment, ObservedLocalBinding, OwnershipError, SourceGtidBoundary,
+    TopologyAttempt, TopologyAuthority, TopologyAuthorityError, TopologyClock,
+    TopologyEvidenceError, TopologyGtidError, TopologyInstant, TopologyNativeStateError,
+    TopologyObservation, TopologyObservationContext, TopologyObservationStatus, TopologyStateError,
+    TransitionCredit, TransitionEvaluation, ViewDiscovery,
 };
 
 const GROUP_UUID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
@@ -1892,30 +1892,32 @@ impl MysqlTopologyMemberRuntime for ScriptedMember {
         &mut self,
         capability: kuberic_mysql::service::BootstrapCapability,
         _recovery: &ControlCredential,
-        _deadline: &NativeControlDeadline,
-    ) -> Result<BootstrapEffect, MysqlTopologyError> {
+        _attempt: &AttemptContext,
+    ) -> Result<BootstrapEffect, MemberTransitionError> {
         let failure = {
             let mut state = self.state.lock().unwrap();
             state.events.push("bootstrap".to_owned());
             state.failure
         };
         if failure == ScriptFailure::Bootstrap {
-            return Err(MysqlTopologyError::ControlProtocol(
-                ControlStage::StartGroupReplication,
+            return Err(MemberTransitionError::Native(
+                MysqlTopologyError::ControlProtocol(ControlStage::StartGroupReplication),
             ));
         }
         if failure == ScriptFailure::BootstrapPending {
             return std::future::pending().await;
         }
-        capability.record_effect(BootstrapEffect::required_steps().to_vec())
+        capability
+            .record_effect(BootstrapEffect::required_steps().to_vec())
+            .map_err(MemberTransitionError::Native)
     }
 
     async fn join_group_replication(
         &mut self,
         capability: kuberic_mysql::service::JoinCapability,
         _recovery: &ControlCredential,
-        _deadline: &NativeControlDeadline,
-    ) -> Result<JoinEffect, MysqlTopologyError> {
+        _attempt: &AttemptContext,
+    ) -> Result<JoinEffect, MemberTransitionError> {
         let member = self.member();
         let mut state = self.state.lock().unwrap();
         state
@@ -1923,12 +1925,14 @@ impl MysqlTopologyMemberRuntime for ScriptedMember {
             .push(capability.boundary().observation_attempt().clone());
         state.events.push(format!("join:{member:?}"));
         if state.failure == ScriptFailure::Join(member) {
-            return Err(MysqlTopologyError::ControlProtocol(
-                ControlStage::StartGroupReplication,
+            return Err(MemberTransitionError::Native(
+                MysqlTopologyError::ControlProtocol(ControlStage::StartGroupReplication),
             ));
         }
         drop(state);
-        capability.record_effect(JoinEffect::required_steps().to_vec())
+        capability
+            .record_effect(JoinEffect::required_steps().to_vec())
+            .map_err(MemberTransitionError::Native)
     }
 
     async fn discover_topology_view(

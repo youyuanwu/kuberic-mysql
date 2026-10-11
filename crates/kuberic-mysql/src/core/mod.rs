@@ -1,7 +1,7 @@
 //! Deterministic, server-free safety types for the Kuberic MySQL integration.
 //!
-//! This crate models Stage 1 evidence only. It does not connect to MySQL,
-//! perform topology changes, or grant client access.
+//! These types do not connect to MySQL, perform topology changes, or grant
+//! client access.
 //!
 //! GTID histories have a four-way set relation rather than scalar progress:
 //!
@@ -69,6 +69,7 @@ pub mod error;
 pub mod gtid;
 pub mod identity;
 pub mod observation;
+pub mod progress;
 pub mod view;
 
 pub use authority::{
@@ -93,6 +94,11 @@ pub use observation::{
     ObservationDraft, ObservationField, ObservationInstant, ObservationMetadata,
     ObservationOutcome, ObservationProvenance, ProvenanceError, StaleReason, UnsupportedReason,
     ValidObservation,
+};
+pub use progress::{
+    CatchUpCapabilityResult, CatchUpUnprovedReason, CatchUpUnsupportedReason,
+    ConfiguredGtidLineage, NonProjectableProgressReason, ProgressProjection, QualifiedProgress,
+    QualifiedProgressKind, project_progress,
 };
 pub use view::{
     MemberRole, MemberState, NativeAccessState, NativeField, NativeLocalState, NativeMember,

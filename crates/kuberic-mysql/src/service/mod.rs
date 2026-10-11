@@ -24,34 +24,69 @@
 //! live beneath a separate disposable scratch root. No application metadata
 //! file, journal, receipt database, state JSON, or adoption record is created.
 //!
-//! The managers do not publish client access or implement Kuberic callbacks,
-//! access reconciliation, switchover, failover, repair, or restart
-//! continuation. Member-local setup and bounded bootstrap/join control use a
-//! separate root session over the currently owned private socket. Observation
-//! remains delegated unchanged to [`crate::adapter::MysqlObserver`].
+//! [`MysqlReplicator`] may publish one bounded loopback Classic Protocol
+//! gateway for an explicit all-or-nothing access generation and proves proxy
+//! zero plus exact native-session absence before revocation completes. It does
+//! not implement Kuberic callbacks, switchover, failover, repair, or restart
+//! continuation. Member-local setup and bounded native control use a separate
+//! root session over the currently owned private socket. Observation remains
+//! delegated unchanged to [`crate::adapter::MysqlObserver`].
 //! [`MysqlInstanceConfig::new`] retains the original single-instance profile;
 //! topology members require [`MysqlInstanceConfig::new_topology_member`].
 
+mod attempt;
 mod config;
 mod control;
 mod error;
 mod instance;
+mod member;
 mod process;
+mod proxy;
 #[cfg(test)]
 mod qualification;
+mod replicator;
 mod topology;
 
+pub use attempt::{
+    AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState, AttemptContext,
+    AttemptDeadlineState, PairedAttemptOutcome,
+};
 pub use config::{
     MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts,
     MysqlOwnedPathKind, MysqlRuntimePaths, MysqlTopologyConfig,
 };
 pub use error::{
-    ConfigError, ControlStage, LifecycleOperation, MemberCleanupFailure, MysqlInstanceError,
-    MysqlTopologyError, MysqlTopologyManagerError, OwnershipError, ProductError,
-    TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError, TopologyNativeStateError,
-    TopologyStateError,
+    ConfigError, ControlStage, LifecycleOperation, MemberAuthorityError, MemberCleanupFailure,
+    MemberReceiptError, MemberTransitionError, MemberViewError, MysqlInstanceError,
+    MysqlProxyError, MysqlProxyPhase, MysqlProxyProtocolError, MysqlProxySettlementReason,
+    MysqlReplicatorError, MysqlTopologyError, MysqlTopologyManagerError, OwnershipError,
+    ProductError, TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError,
+    TopologyNativeStateError, TopologyStateError,
 };
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
+pub use member::{
+    BackendConnectionId, BackendConnectionReceipt, CanonicalViewId, FreshBootstrapInput,
+    FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget, MemberContainmentReceipt,
+    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
+    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
+    MysqlMemberEffectBoundary, PrimaryTransferInput,
+};
+pub use proxy::{
+    APPLICATION_QUALIFICATION_SCHEMA, ApplicationAccountReceipt, ApplicationCredential,
+    BackendSessionIdentity, MysqlClientProxy, MysqlProxyContainmentReceipt,
+    MysqlProxyControlBoundary, MysqlProxyDiagnostics, MysqlProxySnapshot,
+};
+pub use replicator::{
+    MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,
+    MysqlFormationRoleOutcome, MysqlFreshMemberCredentials, MysqlFreshMemberInput,
+    MysqlHandoffBoundary, MysqlHandoffBoundaryId, MysqlHandoffOutcome,
+    MysqlHandoffPublicationOutcome, MysqlHandoffPublicationProof, MysqlOpenOutcome,
+    MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
+    MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
+    MysqlProgressOutcome, MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity,
+    MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator, MysqlRoleOutcome,
+    MysqlSourceTerminalReceipt, MysqlTerminalOutcome, MysqlTerminalState,
+};
 pub use topology::{
     AcceptedMysqlTopology, AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect,
     ControlCredential, ControlCredentialRole, ControlStep, CredentialError, JoinCapability,

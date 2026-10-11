@@ -2,25 +2,722 @@
 
 use core::future::Future;
 use core::str::FromStr;
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Error, OptsBuilder};
 
 use crate::adapter::UnixSocketPath;
-use crate::core::{GroupName, ServerUuid, ViewId};
-use crate::service::{
-    AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect, ControlCredential,
-    ControlCredentialRole, ControlStage, JoinCapability, JoinEffect, MemberControlBinding,
-    MysqlMemberConfig, MysqlMemberIndex, MysqlTopologyError, NativeControlDeadline,
-    NativeIdentityEnrollment, TopologyAuthorityError, TopologyEvidenceError, TopologyStateError,
-    ViewDiscovery,
+use crate::core::{
+    GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState, NativeMember, NativeView,
+    ServerUuid, ViewId,
 };
+use crate::service::{
+    APPLICATION_QUALIFICATION_SCHEMA, AccountProvisioningEvidence, ApplicationAccountReceipt,
+    ApplicationCredential, BackendSessionIdentity, ControlCredential, ControlCredentialRole,
+    ControlStage, MemberAuthorityError, MemberControlBinding, MemberMutationAuthority,
+    MemberNativeEvidence, MemberPeer, MemberTransitionError, MemberViewError, MysqlMemberConfig,
+    MysqlMemberIndex, MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment,
+    TopologyAuthorityError, TopologyEvidenceError, TopologyStateError, ViewDiscovery,
+};
+#[cfg(test)]
+use crate::service::{BootstrapCapability, BootstrapEffect, JoinCapability, JoinEffect};
 
+#[derive(Clone)]
 pub(crate) struct OwnedControlTarget {
     socket: UnixSocketPath,
     member_index: MysqlMemberIndex,
     member: MysqlMemberConfig,
+}
+
+pub(crate) async fn member_bootstrap(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    recovery: &ControlCredential,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    verify_recovery_credential(authority.local(), recovery)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::EnableBootstrap,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        let effect_deadline = reserve_cleanup_deadline(deadline, ControlStage::EnableBootstrap)?;
+        let enable = execute(
+            &mut connection,
+            "SET GLOBAL group_replication_bootstrap_group = ON",
+            effect_deadline,
+            ControlStage::EnableBootstrap,
+        )
+        .await;
+        let primary = match enable {
+            Ok(()) => {
+                let mut start = start_statement(recovery);
+                let result = execute(
+                    &mut connection,
+                    start.as_str(),
+                    effect_deadline,
+                    ControlStage::StartGroupReplication,
+                )
+                .await;
+                start.clear();
+                result
+            }
+            Err(error) => Err(error),
+        };
+        let disable = execute(
+            &mut connection,
+            "SET GLOBAL group_replication_bootstrap_group = OFF",
+            deadline,
+            ControlStage::DisableBootstrap,
+        )
+        .await;
+        let proof = prove_bootstrap_off(&mut connection, deadline).await;
+        let cleanup = combine_primary_cleanup(disable, proof);
+        combine_primary_cleanup(primary, cleanup)
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn member_join(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    recovery: &ControlCredential,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    verify_recovery_credential(authority.local(), recovery)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::StartGroupReplication,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_bootstrap_off(&mut connection, deadline).await?;
+        let mut start = start_statement(recovery);
+        let result = execute(
+            &mut connection,
+            start.as_str(),
+            deadline,
+            ControlStage::StartGroupReplication,
+        )
+        .await;
+        start.clear();
+        result
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn read_member_view(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    control_deadline: &NativeControlDeadline,
+) -> Result<MemberNativeEvidence, MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::ReadMembership,
+    )?;
+    let mut session = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = read_member_view_connected(&mut session, authority, deadline).await;
+    let disconnected = session
+        .disconnect(deadline)
+        .await
+        .map_err(MemberTransitionError::Native);
+    match (result, disconnected) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(prior), Ok(())) => Err(prior),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(prior), Err(cleanup)) => Err(MemberTransitionError::Native(
+            MysqlTopologyError::PairedControl {
+                prior: Box::new(member_error_as_topology(prior)),
+                cleanup: Box::new(member_error_as_topology(cleanup)),
+            },
+        )),
+    }
+}
+
+pub(crate) async fn transfer_primary(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    transfer_target: &MemberPeer,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::TransferPrimary,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        execute(
+            &mut connection,
+            &format!(
+                "SELECT group_replication_set_as_primary('{}')",
+                transfer_target.member_id().as_str()
+            ),
+            deadline,
+            ControlStage::TransferPrimary,
+        )
+        .await
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn terminate_backend_connection(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    connection_id: NonZeroU64,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::TerminateConnection,
+    )?;
+    terminate_backend_connection_before(target, authority, connection_id, deadline).await
+}
+
+pub(crate) async fn terminate_backend_connection_before(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    connection_id: NonZeroU64,
+    deadline: Instant,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        let control_connection: u64 = query_one(
+            &mut connection,
+            "SELECT CONNECTION_ID()",
+            deadline,
+            ControlStage::TerminateConnection,
+        )
+        .await?;
+        if control_connection == connection_id.get() {
+            return Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::TerminateConnection,
+            ));
+        }
+        if backend_connection_count(&mut connection, connection_id, deadline).await? != 0 {
+            execute(
+                &mut connection,
+                &format!("KILL CONNECTION {}", connection_id.get()),
+                deadline,
+                ControlStage::TerminateConnection,
+            )
+            .await?;
+        }
+        loop {
+            if backend_connection_count(&mut connection, connection_id, deadline).await? == 0 {
+                return Ok(());
+            }
+            bounded_sleep(deadline, ControlStage::ProveConnectionAbsent).await?;
+        }
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn terminate_proxy_backend_before(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    session: &BackendSessionIdentity,
+    deadline: Instant,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    if session.authority() != authority || session.socket() != &target.socket {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AuthoritySubstitution,
+        ));
+    }
+    session.socket().revalidate().map_err(|_| {
+        MemberTransitionError::Native(MysqlTopologyError::ControlTransport(
+            ControlStage::SocketValidation,
+        ))
+    })?;
+    let connection_id =
+        NonZeroU64::new(session.connection().get()).expect("BackendConnectionId is nonzero");
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_application_account(
+            &mut connection,
+            session.account(),
+            deadline,
+            ControlStage::InspectApplicationAccount,
+        )
+        .await?;
+        let control_connection: u64 = query_one(
+            &mut connection,
+            "SELECT CONNECTION_ID()",
+            deadline,
+            ControlStage::TerminateConnection,
+        )
+        .await?;
+        if control_connection == connection_id.get() {
+            return Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::TerminateConnection,
+            ));
+        }
+        let (total, exact) = backend_connection_identity_counts(
+            &mut connection,
+            connection_id,
+            session.account().username(),
+            deadline,
+        )
+        .await?;
+        if !validate_backend_identity_counts(total, exact)? {
+            execute(
+                &mut connection,
+                &format!("KILL CONNECTION {}", connection_id.get()),
+                deadline,
+                ControlStage::TerminateConnection,
+            )
+            .await?;
+        }
+        loop {
+            let (total, exact) = backend_connection_identity_counts(
+                &mut connection,
+                connection_id,
+                session.account().username(),
+                deadline,
+            )
+            .await?;
+            if validate_backend_identity_counts(total, exact)? {
+                prove_application_account(
+                    &mut connection,
+                    session.account(),
+                    deadline,
+                    ControlStage::InspectApplicationAccount,
+                )
+                .await?;
+                return Ok(());
+            }
+            bounded_sleep(deadline, ControlStage::ProveConnectionAbsent).await?;
+        }
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+fn validate_backend_identity_counts(total: u64, exact: u64) -> Result<bool, MysqlTopologyError> {
+    if total != exact || total > 1 {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::InspectConnectionIdentity,
+        ))
+    } else {
+        Ok(total == 0)
+    }
+}
+
+async fn read_member_view_connected(
+    session: &mut MysqlControlSession,
+    authority: &MemberMutationAuthority,
+    deadline: Instant,
+) -> Result<MemberNativeEvidence, MemberTransitionError> {
+    validate_member_product(session, authority, deadline).await?;
+    let opening_group: String = query_one(
+        session,
+        "SELECT @@GLOBAL.group_replication_group_name",
+        deadline,
+        ControlStage::ReadMembership,
+    )
+    .await?;
+    if opening_group != authority.group_name().as_str() {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AuthoritySubstitution,
+        ));
+    }
+    let opening_view = query_view_id(session, deadline).await?;
+    let opening_members = query_members(session, deadline).await?;
+    let executed: String = query_one(
+        session,
+        "SELECT @@GLOBAL.gtid_executed",
+        deadline,
+        ControlStage::ReadExecutedHistory,
+    )
+    .await?;
+    let purged: String = query_one(
+        session,
+        "SELECT @@GLOBAL.gtid_purged",
+        deadline,
+        ControlStage::ReadExecutedHistory,
+    )
+    .await?;
+    let closing_server_uuid: String = query_one(
+        session,
+        "SELECT @@GLOBAL.server_uuid",
+        deadline,
+        ControlStage::VerifyEnrolledIdentity,
+    )
+    .await?;
+    let closing_view = query_view_id(session, deadline).await?;
+    let closing_members = query_members(session, deadline).await?;
+    if closing_server_uuid != authority.local().server_uuid().as_str()
+        || closing_view != opening_view
+        || closing_members != opening_members
+    {
+        return Err(MemberTransitionError::View(
+            MemberViewError::IncoherentReadback,
+        ));
+    }
+    let members = opening_members
+        .into_iter()
+        .map(|(member_id, host, port, role, state)| {
+            Ok(NativeMember::new(
+                MemberId::new(member_id).map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+                MemberAddress::new(
+                    std::net::SocketAddr::new(
+                        host.parse().map_err(|_| {
+                            MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                                ControlStage::ReadMembership,
+                            ))
+                        })?,
+                        port,
+                    )
+                    .to_string(),
+                )
+                .map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+                MemberRole::from_str(&role).map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+                MemberState::from_str(&state).map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>, MemberTransitionError>>()?;
+    let view = NativeView::new(
+        authority.group_name().clone(),
+        ViewId::new(opening_view).map_err(|_| {
+            MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                ControlStage::ReadMembership,
+            ))
+        })?,
+        members,
+    )
+    .map_err(|_| MemberTransitionError::View(MemberViewError::IncoherentReadback))?;
+    let executed = GtidSet::from_str(&executed).map_err(|_| {
+        MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+            ControlStage::ReadExecutedHistory,
+        ))
+    })?;
+    let purged = GtidSet::from_str(&purged).map_err(|_| {
+        MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+            ControlStage::ReadExecutedHistory,
+        ))
+    })?;
+    MemberNativeEvidence::new_with_purged(authority.clone(), view, executed, purged)
+}
+
+async fn validate_member_product(
+    connection: &mut impl ControlSession,
+    authority: &MemberMutationAuthority,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    let server_uuid = validate_product(connection, deadline).await?;
+    if &server_uuid != authority.local().server_uuid() {
+        return Err(MysqlTopologyError::Evidence(
+            TopologyEvidenceError::IdentityDrift,
+        ));
+    }
+    Ok(())
+}
+
+async fn query_view_id(
+    session: &mut MysqlControlSession,
+    deadline: Instant,
+) -> Result<String, MemberTransitionError> {
+    query_one_mysql(
+        &mut session.connection,
+        "SELECT VIEW_ID FROM performance_schema.replication_group_member_stats \
+         WHERE MEMBER_ID = @@GLOBAL.server_uuid",
+        deadline,
+        ControlStage::ReadMembership,
+    )
+    .await
+    .map_err(MemberTransitionError::Native)
+}
+
+type NativeMemberTuple = (String, String, u16, String, String);
+
+async fn query_members(
+    session: &mut MysqlControlSession,
+    deadline: Instant,
+) -> Result<Vec<NativeMemberTuple>, MemberTransitionError> {
+    bounded(
+        deadline,
+        ControlStage::ReadMembership,
+        session.connection.query_map(
+            "SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_ROLE, MEMBER_STATE \
+             FROM performance_schema.replication_group_members ORDER BY MEMBER_ID",
+            |row: NativeMemberTuple| row,
+        ),
+    )
+    .await
+    .map_err(MemberTransitionError::Native)
+}
+
+async fn backend_connection_count(
+    session: &mut MysqlControlSession,
+    connection_id: NonZeroU64,
+    deadline: Instant,
+) -> Result<u64, MysqlTopologyError> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM performance_schema.threads WHERE PROCESSLIST_ID = {}",
+        connection_id.get()
+    );
+    query_one_mysql(
+        &mut session.connection,
+        &sql,
+        deadline,
+        ControlStage::ProveConnectionAbsent,
+    )
+    .await
+}
+
+async fn backend_connection_identity_counts(
+    session: &mut MysqlControlSession,
+    connection_id: NonZeroU64,
+    username: &str,
+    deadline: Instant,
+) -> Result<(u64, u64), MysqlTopologyError> {
+    let sql = format!(
+        "SELECT COUNT(*), COALESCE(SUM( \
+         PROCESSLIST_USER = '{}' AND TYPE = 'FOREGROUND' \
+         AND NAME = 'thread/sql/one_connection'), 0) \
+         FROM performance_schema.threads WHERE PROCESSLIST_ID = {}",
+        username,
+        connection_id.get(),
+    );
+    query_one_mysql(
+        &mut session.connection,
+        &sql,
+        deadline,
+        ControlStage::InspectConnectionIdentity,
+    )
+    .await
+}
+
+async fn application_backend_connection_ids(
+    session: &mut MysqlControlSession,
+    username: &str,
+    deadline: Instant,
+) -> Result<Vec<NonZeroU64>, MysqlTopologyError> {
+    let sql = format!(
+        "SELECT PROCESSLIST_ID FROM performance_schema.threads \
+         WHERE PROCESSLIST_USER = '{}' AND TYPE = 'FOREGROUND' \
+         AND NAME = 'thread/sql/one_connection' ORDER BY PROCESSLIST_ID",
+        username
+    );
+    let ids: Vec<u64> = bounded(
+        deadline,
+        ControlStage::InspectConnectionIdentity,
+        session.connection.query_map(sql, |id: u64| id),
+    )
+    .await?;
+    ids.into_iter()
+        .map(|id| {
+            NonZeroU64::new(id).ok_or(MysqlTopologyError::ControlProtocol(
+                ControlStage::InspectConnectionIdentity,
+            ))
+        })
+        .collect()
+}
+
+async fn application_account_presence_count(
+    session: &mut impl ControlSession,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<u64, MysqlTopologyError> {
+    query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost'",
+            receipt.username()
+        ),
+        deadline,
+        ControlStage::ProveApplicationAccountAbsent,
+    )
+    .await
+}
+
+async fn prove_application_account_ownership(
+    session: &mut impl ControlSession,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+    stage: ControlStage,
+) -> Result<(), MysqlTopologyError> {
+    let count: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.user AS u \
+             JOIN information_schema.user_attributes AS a \
+             ON a.USER = u.User AND a.HOST = u.Host \
+             WHERE u.User = '{}' AND u.Host = 'localhost' \
+             AND u.plugin = 'caching_sha2_password' \
+             AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+            receipt.username(),
+            receipt.marker()
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    if count == 1 {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(stage))
+    }
+}
+
+async fn prove_application_account(
+    session: &mut impl ControlSession,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+    stage: ControlStage,
+) -> Result<(), MysqlTopologyError> {
+    prove_application_account_ownership(session, receipt, deadline, stage).await?;
+    let grantee = format!("'''{}''@''localhost'''", receipt.username());
+    let exact: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.schema_privileges \
+             WHERE GRANTEE = {grantee} \
+             AND TABLE_SCHEMA = '{}' \
+             AND PRIVILEGE_TYPE IN ('SELECT','INSERT','UPDATE','DELETE')",
+            receipt.schema()
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let total: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.schema_privileges \
+             WHERE GRANTEE = {grantee}"
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let global: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.user_privileges \
+             WHERE GRANTEE = {grantee} AND PRIVILEGE_TYPE <> 'USAGE'"
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let table: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.table_privileges \
+             WHERE GRANTEE = {grantee}"
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let routine: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.procs_priv \
+             WHERE User = '{}' AND Host = 'localhost'",
+            receipt.username()
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    if exact == 4 && total == 4 && global == 0 && table == 0 && routine == 0 {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(stage))
+    }
+}
+
+async fn bounded_sleep(deadline: Instant, stage: ControlStage) -> Result<(), MysqlTopologyError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(MysqlTopologyError::Deadline(stage))?;
+    tokio::time::sleep(remaining.min(std::time::Duration::from_millis(25))).await;
+    if Instant::now() >= deadline {
+        Err(MysqlTopologyError::Deadline(stage))
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_member_authority(
+    target: &OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+) -> Result<(), MemberTransitionError> {
+    verify_target(target, authority.local().binding())?;
+    if target.member.group_uuid() != authority.group_name().as_str() {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AuthoritySubstitution,
+        ));
+    }
+    Ok(())
+}
+
+fn member_error_as_topology(error: MemberTransitionError) -> MysqlTopologyError {
+    match error {
+        MemberTransitionError::Native(error) => error,
+        MemberTransitionError::Authority(_) => {
+            MysqlTopologyError::Evidence(TopologyEvidenceError::OwnershipDrift)
+        }
+        MemberTransitionError::View(_) | MemberTransitionError::Receipt(_) => {
+            MysqlTopologyError::Evidence(TopologyEvidenceError::BindingMismatch)
+        }
+        MemberTransitionError::Cancelled | MemberTransitionError::Deadline(_) => {
+            MysqlTopologyError::Deadline(ControlStage::Disconnect)
+        }
+        MemberTransitionError::Cleanup { primary, .. } => member_error_as_topology(*primary),
+    }
 }
 
 impl OwnedControlTarget {
@@ -34,6 +731,18 @@ impl OwnedControlTarget {
             member_index,
             member,
         }
+    }
+
+    pub(crate) fn revalidate_socket(&self) -> Result<(), MemberTransitionError> {
+        self.socket.revalidate().map_err(|_| {
+            MemberTransitionError::Native(MysqlTopologyError::ControlTransport(
+                ControlStage::SocketValidation,
+            ))
+        })
+    }
+
+    pub(crate) fn socket(&self) -> UnixSocketPath {
+        self.socket.clone()
     }
 }
 
@@ -253,6 +962,399 @@ async fn provision_accounts_inner<S: ControlSession>(
     .await
 }
 
+pub(crate) async fn prepare_application_account(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    credential: &ApplicationCredential,
+    work_deadline: Instant,
+    cleanup_deadline: Instant,
+) -> Result<ApplicationAccountReceipt, MysqlTopologyError> {
+    verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
+    if credential.attempt() != authority.attempt() || credential.is_cleared() {
+        return Err(MysqlTopologyError::Authority(
+            TopologyAuthorityError::CredentialGenerationMismatch,
+        ));
+    }
+    let receipt = ApplicationAccountReceipt::new(credential);
+    let mut connection = MysqlControlConnector
+        .connect(&target, work_deadline)
+        .await?;
+    let provisioned = provision_application_account_connected(
+        &mut connection,
+        authority,
+        credential,
+        &receipt,
+        work_deadline,
+    )
+    .await;
+    if let Err(prior) = disconnect(connection, provisioned, work_deadline).await {
+        let cleanup =
+            remove_application_account_exact(target.clone(), authority, &receipt, cleanup_deadline)
+                .await;
+        return combine_primary_cleanup(Err(prior), cleanup).map(|()| receipt);
+    }
+    let warmed = warm_application_account(
+        &target,
+        authority,
+        credential,
+        &receipt,
+        work_deadline,
+        cleanup_deadline,
+    )
+    .await;
+    if let Err(prior) = warmed {
+        let cleanup =
+            remove_application_account_exact(target, authority, &receipt, cleanup_deadline).await;
+        return combine_primary_cleanup(Err(prior), cleanup).map(|()| receipt);
+    }
+    Ok(receipt)
+}
+
+async fn provision_application_account_connected<S: ControlSession>(
+    connection: &mut S,
+    authority: &MemberMutationAuthority,
+    credential: &ApplicationCredential,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    validate_member_product(connection, authority, deadline).await?;
+    let original = disable_binary_logging(connection, deadline).await?;
+    let mut create = SecretStatement::new(format!(
+        "CREATE USER '{}'@'localhost' IDENTIFIED WITH caching_sha2_password BY '{}' COMMENT '{}'",
+        credential.username(),
+        credential.password(),
+        receipt.marker()
+    ));
+    let primary = match execute(
+        connection,
+        create.as_str(),
+        deadline,
+        ControlStage::CreateApplication,
+    )
+    .await
+    {
+        Ok(()) => {
+            create.clear();
+            let granted = execute(
+                connection,
+                &format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON \
+                     `{APPLICATION_QUALIFICATION_SCHEMA}`.* TO '{}'@'localhost'",
+                    credential.username()
+                ),
+                deadline,
+                ControlStage::GrantApplicationDml,
+            )
+            .await;
+            match granted {
+                Ok(()) => {
+                    prove_application_account(
+                        connection,
+                        receipt,
+                        deadline,
+                        ControlStage::InspectApplicationAccount,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    create.clear();
+    let restore = restore_binary_logging(connection, original, deadline).await;
+    combine_primary_cleanup(primary, restore)
+}
+
+pub(crate) async fn remove_application_account(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    if receipt.attempt() != authority.attempt() {
+        return Err(MysqlTopologyError::Authority(
+            TopologyAuthorityError::AttemptMismatch,
+        ));
+    }
+    remove_application_account_exact(target, authority, receipt, deadline).await
+}
+
+async fn remove_application_account_exact(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    let primary =
+        remove_application_account_once(target.clone(), authority, receipt, deadline).await;
+    if primary.is_ok() {
+        return primary;
+    }
+    let cleanup = remove_application_account_once(target, authority, receipt, deadline).await;
+    combine_primary_cleanup(primary, cleanup)
+}
+
+async fn remove_application_account_once(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result =
+        remove_application_account_connected(&mut connection, authority, receipt, deadline).await;
+    disconnect(connection, result, deadline).await
+}
+
+async fn remove_application_account_connected<S: ControlSession>(
+    connection: &mut S,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    validate_member_product(connection, authority, deadline).await?;
+    if application_account_presence_count(connection, receipt, deadline).await? == 0 {
+        return Ok(());
+    }
+    prove_application_account_ownership(
+        connection,
+        receipt,
+        deadline,
+        ControlStage::InspectApplicationAccount,
+    )
+    .await?;
+    let original = disable_binary_logging(connection, deadline).await?;
+    let primary = execute(
+        connection,
+        &format!("DROP USER '{}'@'localhost'", receipt.username()),
+        deadline,
+        ControlStage::DropApplication,
+    )
+    .await;
+    let restore = restore_binary_logging(connection, original, deadline).await;
+    combine_primary_cleanup(primary, restore)?;
+    if application_account_presence_count(connection, receipt, deadline).await? == 0 {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::ProveApplicationAccountAbsent,
+        ))
+    }
+}
+
+async fn warm_application_account(
+    target: &OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    credential: &ApplicationCredential,
+    receipt: &ApplicationAccountReceipt,
+    work_deadline: Instant,
+    cleanup_deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    if !receipt.matches_credential(credential) {
+        return Err(MysqlTopologyError::Authority(
+            TopologyAuthorityError::CredentialGenerationMismatch,
+        ));
+    }
+    target
+        .socket
+        .revalidate()
+        .map_err(|_| MysqlTopologyError::ControlTransport(ControlStage::SocketValidation))?;
+    let options = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(1)
+        .socket(Some(
+            target
+                .socket
+                .as_path()
+                .to_str()
+                .expect("UnixSocketPath rejects non-UTF-8 paths")
+                .to_owned(),
+        ))
+        .user(Some(credential.username().to_owned()))
+        .pass(Some(credential.password().to_owned()));
+    let application = bounded(
+        work_deadline,
+        ControlStage::WarmApplicationAuthentication,
+        Conn::new(options),
+    )
+    .await;
+    let mut application = match application {
+        Ok(application) => application,
+        Err(primary) => {
+            let settlement = terminate_application_account_sessions_before(
+                target.clone(),
+                authority,
+                receipt,
+                cleanup_deadline,
+            )
+            .await
+            .map_err(member_error_as_topology);
+            return combine_primary_cleanup(Err(primary), settlement);
+        }
+    };
+    let Some(connection_id) = NonZeroU64::new(u64::from(application.id())) else {
+        let primary = Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::WarmApplicationAuthentication,
+        ));
+        let disconnected = bounded(
+            cleanup_deadline,
+            ControlStage::Disconnect,
+            application.disconnect(),
+        )
+        .await;
+        let settlement = terminate_application_account_sessions_before(
+            target.clone(),
+            authority,
+            receipt,
+            cleanup_deadline,
+        )
+        .await
+        .map_err(member_error_as_topology);
+        return settle_application_warm(primary, disconnected, settlement);
+    };
+    let primary = bounded(
+        work_deadline,
+        ControlStage::WarmApplicationAuthentication,
+        application.query_drop("DO 1"),
+    )
+    .await;
+    let disconnected = bounded(
+        work_deadline,
+        ControlStage::WarmApplicationAuthentication,
+        application.disconnect(),
+    )
+    .await;
+    let session = BackendSessionIdentity::new(
+        crate::service::BackendConnectionId::new(connection_id),
+        receipt.clone(),
+        authority.clone(),
+        target.socket(),
+    );
+    let settlement =
+        terminate_proxy_backend_before(target.clone(), authority, &session, cleanup_deadline)
+            .await
+            .map_err(member_error_as_topology);
+    settle_application_warm(primary, disconnected, settlement)
+}
+
+fn settle_application_warm(
+    primary: Result<(), MysqlTopologyError>,
+    disconnected: Result<(), MysqlTopologyError>,
+    settlement: Result<(), MysqlTopologyError>,
+) -> Result<(), MysqlTopologyError> {
+    combine_primary_cleanup(combine_primary_cleanup(primary, disconnected), settlement)
+}
+
+async fn terminate_application_account_sessions_before(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_application_account(
+            &mut connection,
+            receipt,
+            deadline,
+            ControlStage::InspectApplicationAccount,
+        )
+        .await?;
+        loop {
+            let sessions =
+                application_backend_connection_ids(&mut connection, receipt.username(), deadline)
+                    .await?;
+            if sessions.is_empty() {
+                prove_application_account(
+                    &mut connection,
+                    receipt,
+                    deadline,
+                    ControlStage::InspectApplicationAccount,
+                )
+                .await?;
+                return Ok(());
+            }
+            for session in sessions {
+                execute(
+                    &mut connection,
+                    &format!("KILL CONNECTION {}", session.get()),
+                    deadline,
+                    ControlStage::TerminateConnection,
+                )
+                .await?;
+            }
+            bounded_sleep(deadline, ControlStage::ProveConnectionAbsent).await?;
+        }
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+async fn disable_binary_logging<S: ControlSession>(
+    connection: &mut S,
+    deadline: Instant,
+) -> Result<u8, MysqlTopologyError> {
+    let original: u8 = query_one(
+        connection,
+        "SELECT @@SESSION.sql_log_bin",
+        deadline,
+        ControlStage::ReadBinaryLogging,
+    )
+    .await?;
+    execute(
+        connection,
+        "SET SESSION sql_log_bin = OFF",
+        deadline,
+        ControlStage::DisableBinaryLogging,
+    )
+    .await?;
+    Ok(original)
+}
+
+async fn restore_binary_logging<S: ControlSession>(
+    connection: &mut S,
+    original: u8,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    let restore_sql = if original == 0 {
+        "SET SESSION sql_log_bin = OFF"
+    } else {
+        "SET SESSION sql_log_bin = ON"
+    };
+    let restore = execute(
+        connection,
+        restore_sql,
+        deadline,
+        ControlStage::RestoreBinaryLogging,
+    )
+    .await;
+    match restore {
+        Ok(()) => query_one::<u8>(
+            connection,
+            "SELECT @@SESSION.sql_log_bin",
+            deadline,
+            ControlStage::ProveBinaryLoggingRestored,
+        )
+        .await
+        .and_then(|current| {
+            if current == original {
+                Ok(())
+            } else {
+                Err(MysqlTopologyError::ControlProtocol(
+                    ControlStage::ProveBinaryLoggingRestored,
+                ))
+            }
+        }),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn enroll_identity(
     target: OwnedControlTarget,
     binding: MemberControlBinding,
@@ -340,22 +1442,7 @@ async fn enroll_identity_with<C: ControlConnector>(
     disconnect(connection, result, deadline).await
 }
 
-pub(crate) async fn bootstrap(
-    target: OwnedControlTarget,
-    capability: BootstrapCapability,
-    recovery: &ControlCredential,
-    control_deadline: &NativeControlDeadline,
-) -> Result<BootstrapEffect, MysqlTopologyError> {
-    bootstrap_with(
-        &MysqlControlConnector,
-        target,
-        capability,
-        recovery,
-        control_deadline,
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn bootstrap_with<C: ControlConnector>(
     connector: &C,
     target: OwnedControlTarget,
@@ -424,22 +1511,6 @@ fn reserve_cleanup_deadline(
     now.checked_add(remaining / 2)
         .filter(|effect_deadline| *effect_deadline < deadline)
         .ok_or(MysqlTopologyError::Deadline(stage))
-}
-
-pub(crate) async fn join(
-    target: OwnedControlTarget,
-    capability: JoinCapability,
-    recovery: &ControlCredential,
-    control_deadline: &NativeControlDeadline,
-) -> Result<JoinEffect, MysqlTopologyError> {
-    join_with(
-        &MysqlControlConnector,
-        target,
-        capability,
-        recovery,
-        control_deadline,
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -571,6 +1642,7 @@ pub(super) async fn qualification_mutate_recovery(
     disconnect(connection, result, deadline).await
 }
 
+#[cfg(test)]
 async fn join_with<C: ControlConnector>(
     connector: &C,
     target: OwnedControlTarget,
@@ -703,6 +1775,7 @@ fn verify_target(
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_capability_target(
     target: &OwnedControlTarget,
     binding: &MemberControlBinding,
@@ -839,12 +1912,19 @@ impl ControlSession for MysqlControlSession {
             | ControlStage::ProveBootstrapDisabled => Ok(ControlQueryResult::Unsigned8(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
-            ControlStage::InspectExistingGroup => Ok(ControlQueryResult::Unsigned64(
+            ControlStage::InspectExistingGroup
+            | ControlStage::TerminateConnection
+            | ControlStage::ProveConnectionAbsent
+            | ControlStage::InspectConnectionIdentity
+            | ControlStage::InspectApplicationAccount
+            | ControlStage::ProveApplicationAccountAbsent => Ok(ControlQueryResult::Unsigned64(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
             ControlStage::InspectExistingHistory
             | ControlStage::EnrollIdentity
-            | ControlStage::VerifyEnrolledIdentity => Ok(ControlQueryResult::Text(
+            | ControlStage::VerifyEnrolledIdentity
+            | ControlStage::ReadMembership
+            | ControlStage::ReadExecutedHistory => Ok(ControlQueryResult::Text(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
             ControlStage::DiscoverView => {
@@ -1376,6 +2456,191 @@ mod tests {
                  @@version_compile_os, @@GLOBAL.server_uuid",
             product(server_uuid),
         )
+    }
+
+    fn application_identity() -> (
+        TopologyAttempt,
+        MemberMutationAuthority,
+        ApplicationCredential,
+        ApplicationAccountReceipt,
+    ) {
+        let attempt = test_attempt();
+        let authority = MemberMutationAuthority::new(
+            attempt.id().clone(),
+            GroupName::new(GROUP_UUID).unwrap(),
+            test_enrollment(&attempt, MysqlMemberIndex::First),
+        )
+        .unwrap();
+        let credential = ApplicationCredential::new(
+            attempt.id().clone(),
+            CredentialGeneration::new("application-generation").unwrap(),
+            "application_local",
+            "application-secret",
+        )
+        .unwrap();
+        let receipt = ApplicationAccountReceipt::new(&credential);
+        (attempt, authority, credential, receipt)
+    }
+
+    fn application_provision_actions(
+        credential: &ApplicationCredential,
+        receipt: &ApplicationAccountReceipt,
+    ) -> Vec<ScriptAction> {
+        let grantee = format!("'''{}''@''localhost'''", receipt.username());
+        vec![
+            product_query(MEMBER_UUIDS[0]),
+            query_action(
+                ControlStage::ReadBinaryLogging,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+            execute_action(
+                ControlStage::DisableBinaryLogging,
+                "SET SESSION sql_log_bin = OFF",
+            ),
+            execute_action(
+                ControlStage::CreateApplication,
+                format!(
+                    "CREATE USER '{}'@'localhost' IDENTIFIED WITH caching_sha2_password BY '{}' COMMENT '{}'",
+                    credential.username(),
+                    credential.password(),
+                    receipt.marker()
+                ),
+            ),
+            execute_action(
+                ControlStage::GrantApplicationDml,
+                format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON \
+                     `{APPLICATION_QUALIFICATION_SCHEMA}`.* TO '{}'@'localhost'",
+                    credential.username()
+                ),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user AS u \
+                     JOIN information_schema.user_attributes AS a \
+                     ON a.USER = u.User AND a.HOST = u.Host \
+                     WHERE u.User = '{}' AND u.Host = 'localhost' \
+                     AND u.plugin = 'caching_sha2_password' \
+                     AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+                    receipt.username(),
+                    receipt.marker()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.schema_privileges \
+                     WHERE GRANTEE = {grantee} \
+                     AND TABLE_SCHEMA = '{}' \
+                     AND PRIVILEGE_TYPE IN ('SELECT','INSERT','UPDATE','DELETE')",
+                    receipt.schema()
+                ),
+                ControlQueryResult::Unsigned64(4),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.schema_privileges \
+                     WHERE GRANTEE = {grantee}"
+                ),
+                ControlQueryResult::Unsigned64(4),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.user_privileges \
+                     WHERE GRANTEE = {grantee} AND PRIVILEGE_TYPE <> 'USAGE'"
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.table_privileges \
+                     WHERE GRANTEE = {grantee}"
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.procs_priv \
+                     WHERE User = '{}' AND Host = 'localhost'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+            execute_action(
+                ControlStage::RestoreBinaryLogging,
+                "SET SESSION sql_log_bin = ON",
+            ),
+            query_action(
+                ControlStage::ProveBinaryLoggingRestored,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+        ]
+    }
+
+    fn application_removal_actions(receipt: &ApplicationAccountReceipt) -> Vec<ScriptAction> {
+        vec![
+            product_query(MEMBER_UUIDS[0]),
+            query_action(
+                ControlStage::ProveApplicationAccountAbsent,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user AS u \
+                     JOIN information_schema.user_attributes AS a \
+                     ON a.USER = u.User AND a.HOST = u.Host \
+                     WHERE u.User = '{}' AND u.Host = 'localhost' \
+                     AND u.plugin = 'caching_sha2_password' \
+                     AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+                    receipt.username(),
+                    receipt.marker()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::ReadBinaryLogging,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+            execute_action(
+                ControlStage::DisableBinaryLogging,
+                "SET SESSION sql_log_bin = OFF",
+            ),
+            execute_action(
+                ControlStage::DropApplication,
+                format!("DROP USER '{}'@'localhost'", receipt.username()),
+            ),
+            execute_action(
+                ControlStage::RestoreBinaryLogging,
+                "SET SESSION sql_log_bin = ON",
+            ),
+            query_action(
+                ControlStage::ProveBinaryLoggingRestored,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+            query_action(
+                ControlStage::ProveApplicationAccountAbsent,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+        ]
     }
 
     fn test_attempt() -> TopologyAttempt {
@@ -2180,6 +3445,313 @@ mod tests {
         assert!(!format!("{actual:?}").contains("recovery-secret"));
         assert_closed(&authority, 0);
         connector.assert_complete(0, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_provisioning_validates_exact_readback_and_restores_logging() {
+        let socket = SocketFixture::new("application-account");
+        let (_attempt, authority, credential, receipt) = application_identity();
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let connector = ScriptConnector::new(
+            &socket.path,
+            application_provision_actions(&credential, &receipt),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        provision_application_account_connected(
+            &mut session,
+            &authority,
+            &credential,
+            &receipt,
+            deadline,
+        )
+        .await
+        .unwrap();
+        connector.assert_complete(0, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_provisioning_faults_preserve_primary_and_restoration_failures() {
+        for (label, boundary) in [
+            ("application-create", ControlStage::CreateApplication),
+            ("application-grant", ControlStage::GrantApplicationDml),
+            (
+                "application-readback",
+                ControlStage::InspectApplicationAccount,
+            ),
+            ("application-restore", ControlStage::RestoreBinaryLogging),
+        ] {
+            let socket = SocketFixture::new(label);
+            let (_attempt, authority, credential, receipt) = application_identity();
+            let target = test_target(&socket, MysqlMemberIndex::First);
+            let mut actions = application_provision_actions(&credential, &receipt);
+            match boundary {
+                ControlStage::CreateApplication => {
+                    actions[3] = failed_execute(
+                        boundary,
+                        match &actions[3] {
+                            ScriptAction::Execute { sql, .. } => sql.clone(),
+                            _ => unreachable!(),
+                        },
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.drain(4..11);
+                }
+                ControlStage::GrantApplicationDml => {
+                    actions[4] = failed_execute(
+                        boundary,
+                        match &actions[4] {
+                            ScriptAction::Execute { sql, .. } => sql.clone(),
+                            _ => unreachable!(),
+                        },
+                        MysqlTopologyError::ControlPermission(boundary),
+                    );
+                    actions.drain(5..11);
+                }
+                ControlStage::InspectApplicationAccount => {
+                    let sql = match &actions[5] {
+                        ScriptAction::Query { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[5] = ScriptAction::Query {
+                        stage: boundary,
+                        sql,
+                        result: Err(MysqlTopologyError::ControlProtocol(boundary)),
+                    };
+                    actions.drain(6..11);
+                }
+                ControlStage::RestoreBinaryLogging => {
+                    let sql = match &actions[11] {
+                        ScriptAction::Execute { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[11] = failed_execute(
+                        boundary,
+                        sql,
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.truncate(12);
+                }
+                _ => unreachable!(),
+            }
+            let connector = ScriptConnector::new(&socket.path, actions);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut session = connector.connect(&target, deadline).await.unwrap();
+            let error = provision_application_account_connected(
+                &mut session,
+                &authority,
+                &credential,
+                &receipt,
+                deadline,
+            )
+            .await
+            .unwrap_err();
+            match boundary {
+                ControlStage::CreateApplication => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlTransport(ControlStage::CreateApplication)
+                )),
+                ControlStage::GrantApplicationDml => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlPermission(ControlStage::GrantApplicationDml)
+                )),
+                ControlStage::InspectApplicationAccount => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlProtocol(ControlStage::InspectApplicationAccount)
+                )),
+                ControlStage::RestoreBinaryLogging => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlTransport(ControlStage::RestoreBinaryLogging)
+                )),
+                _ => unreachable!(),
+            }
+            connector.assert_complete(0, 0);
+        }
+
+        let socket = SocketFixture::new("application-paired");
+        let (_attempt, authority, credential, receipt) = application_identity();
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let mut actions = application_provision_actions(&credential, &receipt);
+        let create_sql = match &actions[3] {
+            ScriptAction::Execute { sql, .. } => sql.clone(),
+            _ => unreachable!(),
+        };
+        let restore_sql = match &actions[11] {
+            ScriptAction::Execute { sql, .. } => sql.clone(),
+            _ => unreachable!(),
+        };
+        actions[3] = failed_execute(
+            ControlStage::CreateApplication,
+            create_sql,
+            MysqlTopologyError::ControlTransport(ControlStage::CreateApplication),
+        );
+        actions.drain(4..11);
+        actions[4] = failed_execute(
+            ControlStage::RestoreBinaryLogging,
+            restore_sql,
+            MysqlTopologyError::ControlTransport(ControlStage::RestoreBinaryLogging),
+        );
+        actions.truncate(5);
+        let connector = ScriptConnector::new(&socket.path, actions);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        let error = provision_application_account_connected(
+            &mut session,
+            &authority,
+            &credential,
+            &receipt,
+            deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, MysqlTopologyError::PairedControl { .. }));
+        connector.assert_complete(0, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_removal_requires_exact_generation_and_proves_absence() {
+        let socket = SocketFixture::new("application-remove");
+        let (_attempt, authority, _credential, receipt) = application_identity();
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let connector = ScriptConnector::new(&socket.path, application_removal_actions(&receipt));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        remove_application_account_connected(&mut session, &authority, &receipt, deadline)
+            .await
+            .unwrap();
+        connector.assert_complete(0, 0);
+
+        let socket = SocketFixture::new("application-substitute");
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let mut actions = application_removal_actions(&receipt);
+        if let ScriptAction::Query { result, .. } = &mut actions[2] {
+            *result = Ok(ControlQueryResult::Unsigned64(0));
+        } else {
+            unreachable!();
+        }
+        actions.truncate(3);
+        let connector = ScriptConnector::new(&socket.path, actions);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        assert!(matches!(
+            remove_application_account_connected(&mut session, &authority, &receipt, deadline)
+                .await,
+            Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::InspectApplicationAccount
+            ))
+        ));
+        connector.assert_complete(0, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_removal_faults_do_not_skip_restore_or_absence_readback() {
+        for (label, boundary) in [
+            ("application-drop", ControlStage::DropApplication),
+            (
+                "application-remove-restore",
+                ControlStage::RestoreBinaryLogging,
+            ),
+            (
+                "application-remove-readback",
+                ControlStage::ProveApplicationAccountAbsent,
+            ),
+        ] {
+            let socket = SocketFixture::new(label);
+            let (_attempt, authority, _credential, receipt) = application_identity();
+            let target = test_target(&socket, MysqlMemberIndex::First);
+            let mut actions = application_removal_actions(&receipt);
+            match boundary {
+                ControlStage::DropApplication => {
+                    let sql = match &actions[5] {
+                        ScriptAction::Execute { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[5] = failed_execute(
+                        boundary,
+                        sql,
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.truncate(8);
+                }
+                ControlStage::RestoreBinaryLogging => {
+                    let sql = match &actions[6] {
+                        ScriptAction::Execute { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[6] = failed_execute(
+                        boundary,
+                        sql,
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.truncate(7);
+                }
+                ControlStage::ProveApplicationAccountAbsent => {
+                    if let ScriptAction::Query { result, .. } = &mut actions[8] {
+                        *result = Ok(ControlQueryResult::Unsigned64(1));
+                    } else {
+                        unreachable!();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let connector = ScriptConnector::new(&socket.path, actions);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut session = connector.connect(&target, deadline).await.unwrap();
+            let error =
+                remove_application_account_connected(&mut session, &authority, &receipt, deadline)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MysqlTopologyError::ControlTransport(stage)
+                        if stage == boundary
+                ) || matches!(
+                    error,
+                    MysqlTopologyError::ControlProtocol(
+                        ControlStage::ProveApplicationAccountAbsent
+                    )
+                )
+            );
+            connector.assert_complete(0, 0);
+        }
+    }
+
+    #[test]
+    fn application_cache_warm_preserves_query_disconnect_and_exact_settlement_failures() {
+        let error = settle_application_warm(
+            Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::WarmApplicationAuthentication,
+            )),
+            Err(MysqlTopologyError::ControlTransport(
+                ControlStage::Disconnect,
+            )),
+            Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::InspectConnectionIdentity,
+            )),
+        )
+        .unwrap_err();
+        let MysqlTopologyError::PairedControl { prior, cleanup } = error else {
+            panic!("warm settlement did not retain its paired failures");
+        };
+        assert!(matches!(*prior, MysqlTopologyError::PairedControl { .. }));
+        assert!(matches!(
+            *cleanup,
+            MysqlTopologyError::ControlProtocol(ControlStage::InspectConnectionIdentity)
+        ));
+    }
+
+    #[test]
+    fn backend_identity_rejects_connection_id_reuse_and_account_substitution() {
+        assert!(validate_backend_identity_counts(0, 0).unwrap());
+        assert!(!validate_backend_identity_counts(1, 1).unwrap());
+        for (total, exact) in [(1, 0), (2, 1), (2, 2)] {
+            assert!(matches!(
+                validate_backend_identity_counts(total, exact),
+                Err(MysqlTopologyError::ControlProtocol(
+                    ControlStage::InspectConnectionIdentity
+                ))
+            ));
+        }
     }
 
     #[test]

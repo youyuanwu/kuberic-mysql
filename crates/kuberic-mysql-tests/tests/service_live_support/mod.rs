@@ -37,7 +37,13 @@ pub fn preflight_oracle_mysql_8_4_11() -> Result<(), String> {
 
 pub fn fresh_fixture_root(label: &str) -> Result<PathBuf, String> {
     let short_label = &label[..label.len().min(12)];
-    let root = std::env::temp_dir().join(format!("km-{short_label}-{}", std::process::id()));
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "resolve workspace root".to_owned())?;
+    let root = workspace
+        .join("target")
+        .join(format!("km-{short_label}-{}", std::process::id()));
     if root.exists() {
         fs::remove_dir_all(&root)
             .map_err(|error| format!("remove stale fixture {}: {error}", root.display()))?;
@@ -51,12 +57,14 @@ pub fn fresh_fixture_root(label: &str) -> Result<PathBuf, String> {
 
 pub struct FixtureRoot {
     root: PathBuf,
+    preserve_on_drop: bool,
 }
 
 impl FixtureRoot {
     pub fn new(label: &str) -> Result<Self, String> {
         Ok(Self {
             root: fresh_fixture_root(label)?,
+            preserve_on_drop: false,
         })
     }
 
@@ -71,10 +79,17 @@ impl FixtureRoot {
         }
         Ok(())
     }
+
+    pub fn preserve(&mut self) {
+        self.preserve_on_drop = true;
+    }
 }
 
 impl Drop for FixtureRoot {
     fn drop(&mut self) {
+        if self.preserve_on_drop {
+            return;
+        }
         let _ = fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&self.root);
     }

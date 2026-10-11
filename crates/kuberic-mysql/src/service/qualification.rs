@@ -5,15 +5,20 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use crate::core::{CredentialGeneration, GtidSet};
+use crate::core::{
+    ConfiguredGtidLineage, CredentialGeneration, GtidSet, NonProjectableProgressReason,
+    ProgressProjection, QualifiedProgressKind, project_progress,
+};
 use crate::service::config::TOPOLOGY_NATIVE_PROFILE_OPTIONS;
 use crate::service::control::QualificationRecoveryMutation;
 use crate::service::instance::QualificationStopKind;
 use crate::service::topology::QualificationManagerParts;
 use crate::service::{
-    ControlCredential, ControlStage, MemberCleanupFailure, MemberControlBinding,
+    AttemptContext, ControlCredential, ControlStage, MemberCleanupFailure, MemberControlBinding,
+    MemberMutationAuthority, MemberNativeEvidence, MemberPeer, MemberSourceBoundary,
     MysqlInstanceError, MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError,
-    MysqlTopologyManager, MysqlTopologyManagerError, NativeControlDeadline, TransitionCredit,
+    MysqlTopologyManager, MysqlTopologyManagerError, NativeControlDeadline, PrimaryTransferInput,
+    TransitionCredit,
 };
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
@@ -269,6 +274,8 @@ impl<M: QualificationOwnedMember> Drop for QualificationOperationGuard<'_, '_, M
 struct MysqlNativeQualification<'a> {
     ownership: QualificationOwnership<'a, MysqlInstanceManager>,
     attempt: &'a crate::service::TopologyAttempt,
+    attempt_context: AttemptContext,
+    member_authorities: [MemberMutationAuthority; 3],
     observer: &'a crate::service::ControlCredential,
     recovery: &'a crate::service::ControlCredential,
     native_deadline: NativeControlDeadline,
@@ -308,13 +315,46 @@ impl<'a> MysqlNativeQualification<'a> {
                 };
             }
         };
+        let attempt_context =
+            AttemptContext::new(attempt.id().clone(), runtime_deadline, CLEANUP_RESERVE).map_err(
+                |_| {
+                    MysqlTopologyManagerError::Topology(MysqlTopologyError::Deadline(
+                        ControlStage::ProductValidation,
+                    ))
+                },
+            )?;
+        let mut member_authorities: [Option<MemberMutationAuthority>; 3] =
+            std::array::from_fn(|_| None);
+        for enrollment in admitted_credit.members() {
+            let member = enrollment.binding().member();
+            member_authorities[member.as_usize()] = Some(
+                MemberMutationAuthority::new(
+                    attempt.id().clone(),
+                    attempt.group_name().clone(),
+                    enrollment.clone(),
+                )
+                .map_err(|error| {
+                    MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(match error {
+                        crate::service::MemberTransitionError::Authority(_) => {
+                            crate::service::TopologyEvidenceError::OwnershipDrift
+                        }
+                        _ => crate::service::TopologyEvidenceError::BindingMismatch,
+                    }))
+                })?,
+            );
+        }
+        let member_authorities = member_authorities
+            .map(|authority| authority.expect("complete topology has every member authority"));
         let ownership =
             QualificationOwnership::with_deadlines(instances, work_cutoff, runtime_deadline);
-        let native_deadline = NativeControlDeadline::new(attempt.id().clone(), work_cutoff)
-            .map_err(MysqlTopologyManagerError::Topology)?;
+        let native_deadline =
+            NativeControlDeadline::new(attempt.id().clone(), attempt_context.work_deadline())
+                .map_err(MysqlTopologyManagerError::Topology)?;
         Ok(Self {
             ownership,
             attempt,
+            attempt_context,
+            member_authorities,
             observer,
             recovery,
             native_deadline,
@@ -348,6 +388,22 @@ impl<'a> MysqlNativeQualification<'a> {
             .map_err(MysqlTopologyManagerError::Topology);
         match binding {
             Ok(binding) => {
+                let rebound = self.member_authorities[member.as_usize()]
+                    .local()
+                    .qualification_rebind(binding.clone());
+                self.member_authorities[member.as_usize()] = MemberMutationAuthority::new(
+                    self.attempt.id().clone(),
+                    self.attempt.group_name().clone(),
+                    rebound,
+                )
+                .map_err(|error| {
+                    MysqlTopologyManagerError::Topology(MysqlTopologyError::Evidence(match error {
+                        crate::service::MemberTransitionError::Authority(_) => {
+                            crate::service::TopologyEvidenceError::OwnershipDrift
+                        }
+                        _ => crate::service::TopologyEvidenceError::BindingMismatch,
+                    }))
+                })?;
                 self.ownership
                     .finish_restart(member)
                     .expect("successful retained restart remains in restarting phase");
@@ -587,12 +643,16 @@ impl<'a> MysqlNativeQualification<'a> {
                     reason: "purged history was outside executed history".to_owned(),
                 });
             }
-            match classify_gtid_profile(&snapshot.executed, self.attempt.group_name().as_str()) {
-                GtidProfileCompatibility::CompatibleContiguous { .. } => {}
-                compatibility => {
+            match project_qualification_progress(
+                &snapshot.executed,
+                self.attempt.group_name().as_str(),
+            ) {
+                ProgressProjection::Projectable(progress)
+                    if progress.kind() == QualifiedProgressKind::ContiguousHistory => {}
+                projection => {
                     return Err(QualificationFailure::Incompatible {
                         stage: QualificationStage::GtidCheckpoint,
-                        reason: format!("final GTID history was incompatible: {compatibility:?}"),
+                        reason: format!("final GTID history was incompatible: {projection:?}"),
                     });
                 }
             }
@@ -634,17 +694,29 @@ impl<'a> MysqlNativeQualification<'a> {
                 .iter()
                 .find(|enrollment| enrollment.binding().member() == member)
                 .ok_or_else(|| "admitted topology lacked an expected member".to_owned())?;
-            if snapshots[member.as_usize()].server_uuid != admitted.server_uuid().as_str()
-                || binding.attempt() != admitted.binding().attempt()
-                || binding.endpoint() != admitted.binding().endpoint()
-                || binding.storage() != admitted.binding().storage()
-                || binding.member_address() != admitted.binding().member_address()
-                || binding.observer_generation() != admitted.binding().observer_generation()
-                || binding.recovery_generation() != admitted.binding().recovery_generation()
+            let drift = if snapshots[member.as_usize()].server_uuid
+                != admitted.server_uuid().as_str()
             {
+                Some("native identity")
+            } else if binding.attempt() != admitted.binding().attempt() {
+                Some("attempt")
+            } else if binding.endpoint() != admitted.binding().endpoint() {
+                Some("endpoint")
+            } else if binding.storage() != admitted.binding().storage() {
+                Some("storage")
+            } else if binding.member_address() != admitted.binding().member_address() {
+                Some("member address")
+            } else if binding.observer_generation() != admitted.binding().observer_generation() {
+                Some("observer generation")
+            } else if binding.recovery_generation() != admitted.binding().recovery_generation() {
+                Some("recovery generation")
+            } else {
+                None
+            };
+            if let Some(drift) = drift {
                 return Err(format!(
-                    "member {} drifted from admitted native/storage binding",
-                    member.as_usize() + 1
+                    "member {} drifted from admitted {drift} binding",
+                    member.as_usize() + 1,
                 ));
             }
             let mut connection = self.root_connection(member).await?;
@@ -764,14 +836,21 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 
     async fn snapshots(&mut self) -> Result<[NativeMemberSnapshot; 3], String> {
+        self.member_evidence()
+            .await
+            .map(|evidence| evidence.map(native_snapshot_from_evidence))
+    }
+
+    async fn member_evidence(&mut self) -> Result<[MemberNativeEvidence; 3], String> {
         let mut snapshots = Vec::new();
         for member in MysqlMemberIndex::all() {
-            let process_session = self
-                .member_binding(member)?
-                .process_session()
-                .as_str()
-                .to_owned();
-            snapshots.push(read_snapshot(self.member_socket(member), process_session).await?);
+            let authority = self.member_authorities[member.as_usize()].clone();
+            snapshots.push(
+                self.ownership.members[member.as_usize()]
+                    .read_member_view(&authority, &self.attempt_context)
+                    .await
+                    .map_err(|error| format!("production member view readback failed: {error}"))?,
+            );
         }
         snapshots
             .try_into()
@@ -901,7 +980,14 @@ impl<'a> MysqlNativeQualification<'a> {
     }
 
     async fn transfer_primary(&mut self, owned_identities: &[String; 3]) -> Result<(), String> {
-        let snapshots = self.snapshots().await?;
+        let evidence = self.member_evidence().await?;
+        if !evidence[1..]
+            .iter()
+            .all(|candidate| evidence[0].coherent_with(candidate))
+        {
+            return Err("native snapshots did not form one coherent online view".to_owned());
+        }
+        let snapshots = evidence.clone().map(native_snapshot_from_evidence);
         require_coherent_full_view(&snapshots)?;
         let opening_view = snapshots[0].view_id.clone();
         let current = current_primary_from(&snapshots)?;
@@ -909,20 +995,30 @@ impl<'a> MysqlNativeQualification<'a> {
             .into_iter()
             .find(|member| *member != current)
             .unwrap();
-        let target_uuid = snapshots[target.as_usize()].server_uuid.clone();
-        crate::core::ServerUuid::new(target_uuid.clone())
-            .map_err(|_| "primary target UUID was malformed".to_owned())?;
-        let mut connection = self.root_connection(current).await?;
-        connection
-            .query_drop(format!(
-                "SELECT group_replication_set_as_primary('{target_uuid}')"
-            ))
+        let source_evidence = evidence[current.as_usize()].clone();
+        let source = MemberSourceBoundary::new(
+            MemberPeer::from_enrollment(self.member_authorities[current.as_usize()].local()),
+            source_evidence,
+        )
+        .map_err(|error| format!("primary source boundary rejected: {error}"))?;
+        let target_peer =
+            MemberPeer::from_enrollment(self.member_authorities[target.as_usize()].local());
+        let target_uuid = target_peer.member_id().as_str().to_owned();
+        let input = PrimaryTransferInput::new(
+            self.member_authorities[current.as_usize()].clone(),
+            source,
+            target_peer,
+        )
+        .map_err(|error| format!("primary transfer input rejected: {error}"))?;
+        let receipt = self.ownership.members[current.as_usize()]
+            .transfer_primary(input, &self.attempt_context)
             .await
-            .map_err(|error| format!("primary transfer function failed: {error}"))?;
-        connection
-            .disconnect()
-            .await
-            .map_err(|_| "primary transfer disconnect failed".to_owned())?;
+            .map_err(|error| format!("production primary transfer failed: {error}"))?;
+        if receipt.predecessor().is_none()
+            || receipt.successor().view().id().as_str() != opening_view
+        {
+            return Err("primary transfer receipt lost predecessor/view evidence".to_owned());
+        }
         let accepted = self
             .wait_exact_membership(
                 &owned_identities.iter().cloned().collect(),
@@ -1660,17 +1756,14 @@ impl<'a> MysqlNativeQualification<'a> {
                 .map_err(|()| "membership wait reached scenario cutoff".to_owned())?;
             let mut accepted = Vec::new();
             for member in MysqlMemberIndex::all() {
-                let Ok(binding) = self.member_binding(member) else {
-                    continue;
-                };
-                let Ok(snapshot) = read_snapshot(
-                    self.member_socket(member),
-                    binding.process_session().as_str().to_owned(),
-                )
-                .await
+                let authority = self.member_authorities[member.as_usize()].clone();
+                let Ok(evidence) = self.ownership.members[member.as_usize()]
+                    .read_member_view(&authority, &self.attempt_context)
+                    .await
                 else {
                     continue;
                 };
+                let snapshot = native_snapshot_from_evidence(evidence);
                 let member_ids = snapshot
                     .members
                     .iter()
@@ -1782,24 +1875,15 @@ impl<'a> MysqlNativeQualification<'a> {
 }
 
 fn qualified_view_advanced(predecessor: &str, successor: &str) -> bool {
-    let Some((predecessor_fixed, predecessor_monotonic)) = predecessor.split_once(':') else {
-        return false;
-    };
-    let Some((successor_fixed, successor_monotonic)) = successor.split_once(':') else {
-        return false;
-    };
-    let fixed = predecessor_fixed.parse::<u64>().ok();
-    let successor_fixed_value = successor_fixed.parse::<u64>().ok();
-    let before = predecessor_monotonic.parse::<u32>().ok();
-    let after = successor_monotonic.parse::<u32>().ok();
-    predecessor_fixed == successor_fixed
-        && fixed.is_some_and(|value| value.to_string() == predecessor_fixed)
-        && successor_fixed_value.is_some_and(|value| value.to_string() == successor_fixed)
-        && before.is_some_and(|value| value.to_string() == predecessor_monotonic)
-        && after.is_some_and(|value| value.to_string() == successor_monotonic)
-        && before
-            .zip(after)
-            .is_some_and(|(before, after)| before.checked_add(1) == Some(after))
+    let predecessor = crate::core::ViewId::new(predecessor)
+        .ok()
+        .and_then(|view| crate::service::CanonicalViewId::parse(&view).ok());
+    let successor = crate::core::ViewId::new(successor)
+        .ok()
+        .and_then(|view| crate::service::CanonicalViewId::parse(&view).ok());
+    predecessor
+        .zip(successor)
+        .is_some_and(|(before, after)| before.require_successor(after).is_ok())
 }
 
 fn validate_applying_gtid(
@@ -1810,9 +1894,9 @@ fn validate_applying_gtid(
     let gtid =
         GtidSet::from_str(text).map_err(|error| format!("applying GTID was malformed: {error}"))?;
     if matches!(
-        classify_gtid_profile(&gtid, group_uuid),
-        GtidProfileCompatibility::DoesNotBeginAtOne
-            | GtidProfileCompatibility::CompatibleContiguous { .. }
+        project_qualification_progress(&gtid, group_uuid),
+        ProgressProjection::NonProjectable(NonProjectableProgressReason::DoesNotBeginAtOne)
+            | ProgressProjection::Projectable(_)
     ) && gtid.entries().len() == 1
         && gtid.entries()[0].intervals().len() == 1
         && gtid.entries()[0].intervals()[0].start() == expected_sequence
@@ -1871,6 +1955,61 @@ struct NativeMemberSnapshot {
     members: Vec<NativeMemberRow>,
     executed: GtidSet,
     purged: GtidSet,
+}
+
+fn native_snapshot_from_evidence(evidence: MemberNativeEvidence) -> NativeMemberSnapshot {
+    NativeMemberSnapshot {
+        server_uuid: evidence
+            .authority()
+            .local()
+            .server_uuid()
+            .as_str()
+            .to_owned(),
+        process_session: evidence
+            .authority()
+            .local()
+            .binding()
+            .process_session()
+            .as_str()
+            .to_owned(),
+        view_id: evidence.view().id().as_str().to_owned(),
+        members: evidence
+            .view()
+            .members()
+            .iter()
+            .map(|member| NativeMemberRow {
+                member_id: member.id().as_str().to_owned(),
+                member_host: member
+                    .address()
+                    .as_str()
+                    .parse::<std::net::SocketAddr>()
+                    .expect("production member evidence uses a configured socket address")
+                    .ip()
+                    .to_string(),
+                member_port: member
+                    .address()
+                    .as_str()
+                    .parse::<std::net::SocketAddr>()
+                    .expect("production member evidence uses a configured socket address")
+                    .port(),
+                role: match member.role() {
+                    crate::core::MemberRole::Primary => "PRIMARY",
+                    crate::core::MemberRole::Secondary => "SECONDARY",
+                }
+                .to_owned(),
+                state: match member.state() {
+                    crate::core::MemberState::Online => "ONLINE",
+                    crate::core::MemberState::Recovering => "RECOVERING",
+                    crate::core::MemberState::Offline => "OFFLINE",
+                    crate::core::MemberState::Error => "ERROR",
+                    crate::core::MemberState::Unreachable => "UNREACHABLE",
+                }
+                .to_owned(),
+            })
+            .collect(),
+        executed: evidence.executed().clone(),
+        purged: evidence.purged().clone(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2260,10 +2399,10 @@ fn compatible_common_tail(
     let tails = snapshots
         .iter()
         .map(
-            |snapshot| match classify_gtid_profile(&snapshot.executed, group_uuid) {
-                GtidProfileCompatibility::CompatibleContiguous { tail } => Ok(tail),
-                GtidProfileCompatibility::CompatibleEmpty => Ok(0),
-                compatibility => Err(format!("GTID profile was incompatible: {compatibility:?}")),
+            |snapshot| match project_qualification_progress(&snapshot.executed, group_uuid) {
+                ProgressProjection::Projectable(progress) => u64::try_from(progress.value())
+                    .map_err(|_| "qualified progress was negative".to_owned()),
+                projection => Err(format!("GTID profile was incompatible: {projection:?}")),
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
@@ -2574,42 +2713,10 @@ impl NativeProfileEvidence {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum GtidProfileCompatibility {
-    CompatibleEmpty,
-    CompatibleContiguous { tail: u64 },
-    ForeignSource,
-    TaggedSource,
-    MultipleSources,
-    MultipleIntervals,
-    DoesNotBeginAtOne,
-}
-
-fn classify_gtid_profile(executed: &GtidSet, group_uuid: &str) -> GtidProfileCompatibility {
-    let entries = executed.entries();
-    if entries.is_empty() {
-        return GtidProfileCompatibility::CompatibleEmpty;
-    }
-    if entries.len() != 1 {
-        return GtidProfileCompatibility::MultipleSources;
-    }
-    let history = &entries[0];
-    if history.source().server_uuid().as_str() != group_uuid {
-        return GtidProfileCompatibility::ForeignSource;
-    }
-    if history.source().tag().is_some() {
-        return GtidProfileCompatibility::TaggedSource;
-    }
-    if history.intervals().len() != 1 {
-        return GtidProfileCompatibility::MultipleIntervals;
-    }
-    let interval = history.intervals()[0];
-    if interval.start() != 1 {
-        return GtidProfileCompatibility::DoesNotBeginAtOne;
-    }
-    GtidProfileCompatibility::CompatibleContiguous {
-        tail: interval.end(),
-    }
+fn project_qualification_progress(executed: &GtidSet, group_uuid: &str) -> ProgressProjection {
+    let lineage = ConfiguredGtidLineage::new(group_uuid)
+        .expect("qualified topology configuration has a canonical group UUID");
+    project_progress(&lineage, executed)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
