@@ -2,25 +2,453 @@
 
 use core::future::Future;
 use core::str::FromStr;
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Error, OptsBuilder};
 
 use crate::adapter::UnixSocketPath;
-use crate::core::{GroupName, ServerUuid, ViewId};
+use crate::core::{
+    GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState, NativeMember, NativeView,
+    ServerUuid, ViewId,
+};
 use crate::service::{
     AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect, ControlCredential,
-    ControlCredentialRole, ControlStage, JoinCapability, JoinEffect, MemberControlBinding,
-    MysqlMemberConfig, MysqlMemberIndex, MysqlTopologyError, NativeControlDeadline,
-    NativeIdentityEnrollment, TopologyAuthorityError, TopologyEvidenceError, TopologyStateError,
-    ViewDiscovery,
+    ControlCredentialRole, ControlStage, JoinCapability, JoinEffect, MemberAuthorityError,
+    MemberControlBinding, MemberMutationAuthority, MemberNativeEvidence, MemberPeer,
+    MemberTransitionError, MemberViewError, MysqlMemberConfig, MysqlMemberIndex,
+    MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment, TopologyAuthorityError,
+    TopologyEvidenceError, TopologyStateError, ViewDiscovery,
 };
 
+#[derive(Clone)]
 pub(crate) struct OwnedControlTarget {
     socket: UnixSocketPath,
     member_index: MysqlMemberIndex,
     member: MysqlMemberConfig,
+}
+
+pub(crate) async fn member_bootstrap(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    recovery: &ControlCredential,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    verify_recovery_credential(authority.local(), recovery)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::EnableBootstrap,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        let effect_deadline = reserve_cleanup_deadline(deadline, ControlStage::EnableBootstrap)?;
+        let enable = execute(
+            &mut connection,
+            "SET GLOBAL group_replication_bootstrap_group = ON",
+            effect_deadline,
+            ControlStage::EnableBootstrap,
+        )
+        .await;
+        let primary = match enable {
+            Ok(()) => {
+                let mut start = start_statement(recovery);
+                let result = execute(
+                    &mut connection,
+                    start.as_str(),
+                    effect_deadline,
+                    ControlStage::StartGroupReplication,
+                )
+                .await;
+                start.clear();
+                result
+            }
+            Err(error) => Err(error),
+        };
+        let disable = execute(
+            &mut connection,
+            "SET GLOBAL group_replication_bootstrap_group = OFF",
+            deadline,
+            ControlStage::DisableBootstrap,
+        )
+        .await;
+        let proof = prove_bootstrap_off(&mut connection, deadline).await;
+        let cleanup = combine_primary_cleanup(disable, proof);
+        combine_primary_cleanup(primary, cleanup)
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn member_join(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    recovery: &ControlCredential,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    verify_recovery_credential(authority.local(), recovery)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::StartGroupReplication,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_bootstrap_off(&mut connection, deadline).await?;
+        let mut start = start_statement(recovery);
+        let result = execute(
+            &mut connection,
+            start.as_str(),
+            deadline,
+            ControlStage::StartGroupReplication,
+        )
+        .await;
+        start.clear();
+        result
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn read_member_view(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    control_deadline: &NativeControlDeadline,
+) -> Result<MemberNativeEvidence, MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::ReadMembership,
+    )?;
+    let mut session = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = read_member_view_connected(&mut session, authority, deadline).await;
+    let disconnected = session
+        .disconnect(deadline)
+        .await
+        .map_err(MemberTransitionError::Native);
+    match (result, disconnected) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(prior), Ok(())) => Err(prior),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(prior), Err(cleanup)) => Err(MemberTransitionError::Native(
+            MysqlTopologyError::PairedControl {
+                prior: Box::new(member_error_as_topology(prior)),
+                cleanup: Box::new(member_error_as_topology(cleanup)),
+            },
+        )),
+    }
+}
+
+pub(crate) async fn transfer_primary(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    transfer_target: &MemberPeer,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::TransferPrimary,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        execute(
+            &mut connection,
+            &format!(
+                "SELECT group_replication_set_as_primary('{}')",
+                transfer_target.member_id().as_str()
+            ),
+            deadline,
+            ControlStage::TransferPrimary,
+        )
+        .await
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn terminate_backend_connection(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    connection_id: NonZeroU64,
+    control_deadline: &NativeControlDeadline,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let deadline = verified_deadline(
+        control_deadline,
+        authority.attempt(),
+        ControlStage::TerminateConnection,
+    )?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        let control_connection: u64 = query_one(
+            &mut connection,
+            "SELECT CONNECTION_ID()",
+            deadline,
+            ControlStage::TerminateConnection,
+        )
+        .await?;
+        if control_connection == connection_id.get() {
+            return Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::TerminateConnection,
+            ));
+        }
+        let count = backend_connection_count(&mut connection, connection_id, deadline).await?;
+        if count != 0 {
+            execute(
+                &mut connection,
+                &format!("KILL CONNECTION {}", connection_id.get()),
+                deadline,
+                ControlStage::TerminateConnection,
+            )
+            .await?;
+        }
+        loop {
+            if backend_connection_count(&mut connection, connection_id, deadline).await? == 0 {
+                return Ok(());
+            }
+            bounded_sleep(deadline, ControlStage::ProveConnectionAbsent).await?;
+        }
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+async fn read_member_view_connected(
+    session: &mut MysqlControlSession,
+    authority: &MemberMutationAuthority,
+    deadline: Instant,
+) -> Result<MemberNativeEvidence, MemberTransitionError> {
+    validate_member_product(session, authority, deadline).await?;
+    let opening_group: String = query_one(
+        session,
+        "SELECT @@GLOBAL.group_replication_group_name",
+        deadline,
+        ControlStage::ReadMembership,
+    )
+    .await?;
+    if opening_group != authority.group_name().as_str() {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AuthoritySubstitution,
+        ));
+    }
+    let opening_view = query_view_id(session, deadline).await?;
+    let opening_members = query_members(session, deadline).await?;
+    let executed: String = query_one(
+        session,
+        "SELECT @@GLOBAL.gtid_executed",
+        deadline,
+        ControlStage::ReadExecutedHistory,
+    )
+    .await?;
+    let purged: String = query_one(
+        session,
+        "SELECT @@GLOBAL.gtid_purged",
+        deadline,
+        ControlStage::ReadExecutedHistory,
+    )
+    .await?;
+    let closing_server_uuid: String = query_one(
+        session,
+        "SELECT @@GLOBAL.server_uuid",
+        deadline,
+        ControlStage::VerifyEnrolledIdentity,
+    )
+    .await?;
+    let closing_view = query_view_id(session, deadline).await?;
+    let closing_members = query_members(session, deadline).await?;
+    if closing_server_uuid != authority.local().server_uuid().as_str()
+        || closing_view != opening_view
+        || closing_members != opening_members
+    {
+        return Err(MemberTransitionError::View(
+            MemberViewError::IncoherentReadback,
+        ));
+    }
+    let members = opening_members
+        .into_iter()
+        .map(|(member_id, host, port, role, state)| {
+            Ok(NativeMember::new(
+                MemberId::new(member_id).map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+                MemberAddress::new(
+                    std::net::SocketAddr::new(
+                        host.parse().map_err(|_| {
+                            MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                                ControlStage::ReadMembership,
+                            ))
+                        })?,
+                        port,
+                    )
+                    .to_string(),
+                )
+                .map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+                MemberRole::from_str(&role).map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+                MemberState::from_str(&state).map_err(|_| {
+                    MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                        ControlStage::ReadMembership,
+                    ))
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>, MemberTransitionError>>()?;
+    let view = NativeView::new(
+        authority.group_name().clone(),
+        ViewId::new(opening_view).map_err(|_| {
+            MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+                ControlStage::ReadMembership,
+            ))
+        })?,
+        members,
+    )
+    .map_err(|_| MemberTransitionError::View(MemberViewError::IncoherentReadback))?;
+    let executed = GtidSet::from_str(&executed).map_err(|_| {
+        MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+            ControlStage::ReadExecutedHistory,
+        ))
+    })?;
+    let purged = GtidSet::from_str(&purged).map_err(|_| {
+        MemberTransitionError::Native(MysqlTopologyError::ControlProtocol(
+            ControlStage::ReadExecutedHistory,
+        ))
+    })?;
+    MemberNativeEvidence::new_with_purged(authority.clone(), view, executed, purged)
+}
+
+async fn validate_member_product(
+    connection: &mut impl ControlSession,
+    authority: &MemberMutationAuthority,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    let server_uuid = validate_product(connection, deadline).await?;
+    if &server_uuid != authority.local().server_uuid() {
+        return Err(MysqlTopologyError::Evidence(
+            TopologyEvidenceError::IdentityDrift,
+        ));
+    }
+    Ok(())
+}
+
+async fn query_view_id(
+    session: &mut MysqlControlSession,
+    deadline: Instant,
+) -> Result<String, MemberTransitionError> {
+    query_one_mysql(
+        &mut session.connection,
+        "SELECT VIEW_ID FROM performance_schema.replication_group_member_stats \
+         WHERE MEMBER_ID = @@GLOBAL.server_uuid",
+        deadline,
+        ControlStage::ReadMembership,
+    )
+    .await
+    .map_err(MemberTransitionError::Native)
+}
+
+type NativeMemberTuple = (String, String, u16, String, String);
+
+async fn query_members(
+    session: &mut MysqlControlSession,
+    deadline: Instant,
+) -> Result<Vec<NativeMemberTuple>, MemberTransitionError> {
+    bounded(
+        deadline,
+        ControlStage::ReadMembership,
+        session.connection.query_map(
+            "SELECT MEMBER_ID, MEMBER_HOST, MEMBER_PORT, MEMBER_ROLE, MEMBER_STATE \
+             FROM performance_schema.replication_group_members ORDER BY MEMBER_ID",
+            |row: NativeMemberTuple| row,
+        ),
+    )
+    .await
+    .map_err(MemberTransitionError::Native)
+}
+
+async fn backend_connection_count(
+    session: &mut MysqlControlSession,
+    connection_id: NonZeroU64,
+    deadline: Instant,
+) -> Result<u64, MysqlTopologyError> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM performance_schema.threads WHERE PROCESSLIST_ID = {}",
+        connection_id.get()
+    );
+    query_one_mysql(
+        &mut session.connection,
+        &sql,
+        deadline,
+        ControlStage::ProveConnectionAbsent,
+    )
+    .await
+}
+
+async fn bounded_sleep(deadline: Instant, stage: ControlStage) -> Result<(), MysqlTopologyError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(MysqlTopologyError::Deadline(stage))?;
+    tokio::time::sleep(remaining.min(std::time::Duration::from_millis(25))).await;
+    if Instant::now() >= deadline {
+        Err(MysqlTopologyError::Deadline(stage))
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_member_authority(
+    target: &OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+) -> Result<(), MemberTransitionError> {
+    verify_target(target, authority.local().binding())?;
+    if target.member.group_uuid() != authority.group_name().as_str() {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AuthoritySubstitution,
+        ));
+    }
+    Ok(())
+}
+
+fn member_error_as_topology(error: MemberTransitionError) -> MysqlTopologyError {
+    match error {
+        MemberTransitionError::Native(error) => error,
+        MemberTransitionError::Authority(_) => {
+            MysqlTopologyError::Evidence(TopologyEvidenceError::OwnershipDrift)
+        }
+        MemberTransitionError::View(_) | MemberTransitionError::Receipt(_) => {
+            MysqlTopologyError::Evidence(TopologyEvidenceError::BindingMismatch)
+        }
+        MemberTransitionError::Cancelled | MemberTransitionError::Deadline(_) => {
+            MysqlTopologyError::Deadline(ControlStage::Disconnect)
+        }
+        MemberTransitionError::Cleanup { primary, .. } => member_error_as_topology(*primary),
+    }
 }
 
 impl OwnedControlTarget {
@@ -839,12 +1267,16 @@ impl ControlSession for MysqlControlSession {
             | ControlStage::ProveBootstrapDisabled => Ok(ControlQueryResult::Unsigned8(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
-            ControlStage::InspectExistingGroup => Ok(ControlQueryResult::Unsigned64(
-                query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
-            )),
+            ControlStage::InspectExistingGroup | ControlStage::TerminateConnection => {
+                Ok(ControlQueryResult::Unsigned64(
+                    query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
+                ))
+            }
             ControlStage::InspectExistingHistory
             | ControlStage::EnrollIdentity
-            | ControlStage::VerifyEnrolledIdentity => Ok(ControlQueryResult::Text(
+            | ControlStage::VerifyEnrolledIdentity
+            | ControlStage::ReadMembership
+            | ControlStage::ReadExecutedHistory => Ok(ControlQueryResult::Text(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
             ControlStage::DiscoverView => {

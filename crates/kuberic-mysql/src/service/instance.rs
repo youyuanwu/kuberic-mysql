@@ -32,10 +32,14 @@ use crate::service::process::{
     wait_for_absence,
 };
 use crate::service::{
-    AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect, ControlCredential,
-    JoinCapability, JoinEffect, LifecycleOperation, MemberControlBinding, MysqlInstanceConfig,
-    MysqlInstanceError, MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment,
-    TopologyStateError, ViewDiscovery,
+    AccountProvisioningEvidence, AttemptAdmissionError, AttemptCleanupState, AttemptContext,
+    AttemptDeadlineState, BackendConnectionId, BackendConnectionReceipt, BootstrapCapability,
+    BootstrapEffect, ControlCredential, FreshBootstrapInput, FreshJoinInput, JoinCapability,
+    JoinEffect, LifecycleOperation, MemberAuthorityError, MemberControlBinding, MemberEffectKind,
+    MemberEffectReceipt, MemberMutationAuthority, MemberNativeEvidence, MemberTransitionError,
+    MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary, MysqlTopologyError,
+    NativeControlDeadline, NativeIdentityEnrollment, PrimaryTransferInput, TopologyStateError,
+    ViewDiscovery,
 };
 
 const READY_POLL: Duration = Duration::from_millis(25);
@@ -400,6 +404,203 @@ impl MysqlInstanceManager {
         crate::service::control::discover_view(target, enrollment, group_name, deadline).await
     }
 
+    /// Executes one fresh member-scoped bootstrap and returns creditable
+    /// successor evidence only after exact local validation.
+    pub async fn bootstrap_member(
+        &mut self,
+        input: FreshBootstrapInput,
+        recovery: &ControlCredential,
+        attempt: &AttemptContext,
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        let deadline = self.member_effect_deadline(input.authority(), attempt)?;
+        let target = self.prepare_member_effect_target(input.authority())?;
+        let authority = input.authority().clone();
+        let containment = MemberEffectCancellationContainment::new(self);
+        let result = async {
+            crate::service::control::member_bootstrap(
+                target.clone(),
+                &authority,
+                recovery,
+                &deadline,
+            )
+            .await?;
+            poll_member_receipt(
+                target,
+                MemberEffectKind::Bootstrap,
+                authority,
+                None,
+                attempt,
+                AttemptCleanupState::Completed,
+                &deadline,
+            )
+            .await
+        }
+        .await;
+        containment.finish(result)
+    }
+
+    /// Executes one fresh member-scoped non-bootstrap join without acquiring
+    /// ownership of any predecessor process.
+    pub async fn join_member(
+        &mut self,
+        input: FreshJoinInput,
+        recovery: &ControlCredential,
+        attempt: &AttemptContext,
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        let deadline = self.member_effect_deadline(input.authority(), attempt)?;
+        let target = self.prepare_member_effect_target(input.authority())?;
+        let authority = input.authority().clone();
+        let predecessor = input.source().evidence().clone();
+        let containment = MemberEffectCancellationContainment::new(self);
+        let result = async {
+            crate::service::control::member_join(target.clone(), &authority, recovery, &deadline)
+                .await?;
+            poll_member_receipt(
+                target,
+                MemberEffectKind::Join,
+                authority,
+                Some(predecessor),
+                attempt,
+                AttemptCleanupState::NotRequired,
+                &deadline,
+            )
+            .await
+        }
+        .await;
+        containment.finish(result)
+    }
+
+    /// Reads one bracketed coherent native member view after exact local
+    /// process, root, socket, endpoint, storage, and enrollment validation.
+    pub async fn read_member_view(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<MemberNativeEvidence, MemberTransitionError> {
+        let deadline = self.member_effect_deadline(authority, attempt)?;
+        let target = self.prepare_member_effect_target(authority)?;
+        crate::service::control::read_member_view(target, authority, &deadline).await
+    }
+
+    /// Transfers native primary authority from this exact local source to one
+    /// exact immutable target identity.
+    pub async fn transfer_primary(
+        &mut self,
+        input: PrimaryTransferInput,
+        attempt: &AttemptContext,
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        let deadline = self.member_effect_deadline(input.authority(), attempt)?;
+        let target = self.prepare_member_effect_target(input.authority())?;
+        let authority = input.authority().clone();
+        let predecessor = input.source().evidence().clone();
+        let transfer_target = input.target().clone();
+        let containment = MemberEffectCancellationContainment::new(self);
+        let result = async {
+            let current =
+                crate::service::control::read_member_view(target.clone(), &authority, &deadline)
+                    .await?;
+            if current != predecessor {
+                return Err(MemberTransitionError::View(
+                    crate::service::MemberViewError::StaleView,
+                ));
+            }
+            crate::service::control::transfer_primary(
+                target.clone(),
+                &authority,
+                &transfer_target,
+                &deadline,
+            )
+            .await?;
+            poll_member_receipt(
+                target,
+                MemberEffectKind::PrimaryTransfer {
+                    target: transfer_target.member_id().clone(),
+                },
+                authority,
+                Some(predecessor),
+                attempt,
+                AttemptCleanupState::NotRequired,
+                &deadline,
+            )
+            .await
+        }
+        .await;
+        containment.finish(result)
+    }
+
+    /// Terminates one exact local native backend connection and proves it is
+    /// absent before returning.
+    pub async fn terminate_backend_connection(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        connection: BackendConnectionId,
+        attempt: &AttemptContext,
+    ) -> Result<BackendConnectionReceipt, MemberTransitionError> {
+        let deadline = self.member_effect_deadline(authority, attempt)?;
+        let target = self.prepare_member_effect_target(authority)?;
+        let authority = authority.clone();
+        let containment = MemberEffectCancellationContainment::new(self);
+        let result = async {
+            crate::service::control::terminate_backend_connection(
+                target,
+                &authority,
+                std::num::NonZeroU64::new(connection.get())
+                    .expect("BackendConnectionId is nonzero"),
+                &deadline,
+            )
+            .await?;
+            BackendConnectionReceipt::new(
+                authority,
+                connection,
+                attempt,
+                AttemptCleanupState::Completed,
+            )
+        }
+        .await;
+        containment.finish(result)
+    }
+
+    fn member_effect_deadline(
+        &self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<NativeControlDeadline, MemberTransitionError> {
+        if attempt.attempt() != authority.attempt() {
+            return Err(MemberTransitionError::Authority(
+                MemberAuthorityError::AttemptMismatch,
+            ));
+        }
+        attempt
+            .admit_work()
+            .map_err(member_attempt_admission_error)?;
+        attempt
+            .native_deadline()
+            .map_err(MemberTransitionError::Native)
+    }
+
+    fn prepare_member_effect_target(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<OwnedControlTarget, MemberTransitionError> {
+        let target = self.prepare_control_target()?;
+        let binding = self.topology_binding(
+            authority.attempt().clone(),
+            authority.local().binding().observer_generation().clone(),
+            authority.local().binding().recovery_generation().clone(),
+        )?;
+        if &binding != authority.local().binding()
+            || self.config.member_index() != authority.member()
+            || self.config.member().group_uuid() != authority.group_name().as_str()
+            || self.config.member().sql_address().to_string()
+                != authority.local().binding().member_address().as_str()
+        {
+            return Err(MemberTransitionError::Authority(
+                MemberAuthorityError::LocalBindingMismatch,
+            ));
+        }
+        Ok(target)
+    }
+
     /// Attests, terminates, and reaps the exact retained child, proves socket
     /// disappearance, and removes only disposable scratch. Persistent data is
     /// retained.
@@ -409,6 +610,7 @@ impl MysqlInstanceManager {
             self.state = MysqlInstanceState::Faulted;
             return Err(error);
         }
+
         let child = self
             .child
             .as_mut()
@@ -815,6 +1017,154 @@ impl MysqlInstanceManager {
             self.scratch_root = None;
         }
         result
+    }
+}
+
+impl MysqlMemberEffectBoundary for MysqlInstanceManager {
+    fn config(&self) -> &MysqlInstanceConfig {
+        self.config()
+    }
+
+    async fn bootstrap_member(
+        &mut self,
+        input: FreshBootstrapInput,
+        recovery: &ControlCredential,
+        attempt: &AttemptContext,
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        MysqlInstanceManager::bootstrap_member(self, input, recovery, attempt).await
+    }
+
+    async fn join_member(
+        &mut self,
+        input: FreshJoinInput,
+        recovery: &ControlCredential,
+        attempt: &AttemptContext,
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        MysqlInstanceManager::join_member(self, input, recovery, attempt).await
+    }
+
+    async fn read_member_view(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<MemberNativeEvidence, MemberTransitionError> {
+        MysqlInstanceManager::read_member_view(self, authority, attempt).await
+    }
+
+    async fn transfer_primary(
+        &mut self,
+        input: PrimaryTransferInput,
+        attempt: &AttemptContext,
+    ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+        MysqlInstanceManager::transfer_primary(self, input, attempt).await
+    }
+
+    async fn terminate_backend_connection(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        connection: BackendConnectionId,
+        attempt: &AttemptContext,
+    ) -> Result<BackendConnectionReceipt, MemberTransitionError> {
+        MysqlInstanceManager::terminate_backend_connection(self, authority, connection, attempt)
+            .await
+    }
+
+    fn contain_member(&mut self) -> Result<(), MysqlInstanceError> {
+        self.contain()
+    }
+}
+
+async fn poll_member_receipt(
+    target: OwnedControlTarget,
+    kind: MemberEffectKind,
+    authority: MemberMutationAuthority,
+    predecessor: Option<MemberNativeEvidence>,
+    attempt: &AttemptContext,
+    cleanup: AttemptCleanupState,
+    deadline: &NativeControlDeadline,
+) -> Result<MemberEffectReceipt, MemberTransitionError> {
+    loop {
+        attempt
+            .admit_work()
+            .map_err(member_attempt_admission_error)?;
+        let evidence =
+            crate::service::control::read_member_view(target.clone(), &authority, deadline).await?;
+        match MemberEffectReceipt::new(
+            kind.clone(),
+            authority.clone(),
+            predecessor.clone(),
+            evidence,
+            attempt,
+            cleanup,
+        ) {
+            Ok(receipt) => return Ok(receipt),
+            Err(MemberTransitionError::Receipt(
+                crate::service::MemberReceiptError::SuccessorMismatch,
+            ))
+            | Err(MemberTransitionError::View(
+                crate::service::MemberViewError::MemberNotOnline
+                | crate::service::MemberViewError::MemberRoleMismatch,
+            )) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn member_attempt_admission_error(error: AttemptAdmissionError) -> MemberTransitionError {
+    match error {
+        AttemptAdmissionError::Cancelled => MemberTransitionError::Cancelled,
+        AttemptAdmissionError::CleanupReserve => {
+            MemberTransitionError::Deadline(AttemptDeadlineState::CleanupReserve)
+        }
+        AttemptAdmissionError::Expired => {
+            MemberTransitionError::Deadline(AttemptDeadlineState::Expired)
+        }
+    }
+}
+
+struct MemberEffectCancellationContainment<'a> {
+    instance: &'a mut MysqlInstanceManager,
+    armed: bool,
+}
+
+impl<'a> MemberEffectCancellationContainment<'a> {
+    fn new(instance: &'a mut MysqlInstanceManager) -> Self {
+        Self {
+            instance,
+            armed: true,
+        }
+    }
+
+    fn finish<T>(
+        mut self,
+        result: Result<T, MemberTransitionError>,
+    ) -> Result<T, MemberTransitionError> {
+        match result {
+            Ok(value) => {
+                self.armed = false;
+                Ok(value)
+            }
+            Err(primary) => {
+                self.armed = false;
+                match self.instance.contain() {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(MemberTransitionError::Cleanup {
+                        primary: Box::new(primary),
+                        cleanup: Box::new(cleanup),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MemberEffectCancellationContainment<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.instance.contain();
+        }
     }
 }
 

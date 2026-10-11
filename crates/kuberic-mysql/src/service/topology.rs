@@ -17,7 +17,9 @@ use crate::core::{
     ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, UnsupportedReason, ViewId,
 };
 use crate::service::{
-    ControlStage, MemberCleanupFailure, MysqlInstanceConfig, MysqlInstanceError,
+    CanonicalViewId, ControlStage, FreshBootstrapInput, FreshJoinInput, MemberCleanupFailure,
+    MemberMutationAuthority, MemberNativeEvidence, MemberPeer, MemberSourceBoundary,
+    MemberTransitionError, MemberViewError, MysqlInstanceConfig, MysqlInstanceError,
     MysqlInstanceManager, MysqlMemberIndex, MysqlTopologyError, MysqlTopologyManagerError,
     TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError, TopologyNativeStateError,
     TopologyStateError,
@@ -118,64 +120,6 @@ impl TopologyInstant {
     pub const fn tick(self) -> u64 {
         self.0
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QualifiedXcomView {
-    fixed: u64,
-    monotonic: u32,
-}
-
-impl QualifiedXcomView {
-    fn parse(view_id: &ViewId) -> Result<Self, MysqlTopologyError> {
-        let Some((fixed, monotonic)) = view_id.as_str().split_once(':') else {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::MalformedViewId,
-            ));
-        };
-        if fixed.is_empty()
-            || monotonic.is_empty()
-            || monotonic.contains(':')
-            || !canonical_decimal(fixed)
-            || !canonical_decimal(monotonic)
-        {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::MalformedViewId,
-            ));
-        }
-        Ok(Self {
-            fixed: fixed.parse().map_err(|_| {
-                MysqlTopologyError::TopologyState(TopologyStateError::MalformedViewId)
-            })?,
-            monotonic: monotonic.parse().map_err(|_| {
-                MysqlTopologyError::TopologyState(TopologyStateError::MalformedViewId)
-            })?,
-        })
-    }
-
-    fn require_successor(self, successor: Self) -> Result<(), MysqlTopologyError> {
-        if successor.fixed != self.fixed {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::ViewFixedPartChanged,
-            ));
-        }
-        let expected = self
-            .monotonic
-            .checked_add(1)
-            .ok_or(MysqlTopologyError::TopologyState(
-                TopologyStateError::ViewSequenceOverflow,
-            ))?;
-        if successor.monotonic != expected {
-            return Err(MysqlTopologyError::TopologyState(
-                TopologyStateError::ViewSequenceNotSuccessor,
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn canonical_decimal(value: &str) -> bool {
-    value.bytes().all(|byte| byte.is_ascii_digit()) && (value == "0" || !value.starts_with('0'))
 }
 
 /// One positive process-monotonic native-control deadline bound to an attempt.
@@ -774,6 +718,18 @@ impl NativeIdentityEnrollment {
     pub(crate) fn recovery_username(&self) -> &str {
         &self.recovery_username
     }
+
+    #[cfg(test)]
+    pub(super) fn qualification_rebind(&self, binding: MemberControlBinding) -> Self {
+        Self {
+            binding,
+            server_uuid: self.server_uuid.clone(),
+            member_id: self.member_id.clone(),
+            observer_username: self.observer_username.clone(),
+            recovery_username: self.recovery_username.clone(),
+            steps: self.steps.clone(),
+        }
+    }
 }
 
 /// Single issued bootstrap capability.
@@ -785,6 +741,17 @@ pub struct BootstrapCapability {
 }
 
 impl BootstrapCapability {
+    /// Narrows topology authorization to exact local member mutation
+    /// authority without transferring peer process ownership.
+    pub fn member_input(&self) -> Result<FreshBootstrapInput, MemberTransitionError> {
+        MemberMutationAuthority::new(
+            self.attempt.id.clone(),
+            self.attempt.group_name.clone(),
+            self.target.clone(),
+        )
+        .map(FreshBootstrapInput::new)
+    }
+
     /// Records the exact effect trace. Bootstrap-off proof is mandatory.
     pub fn record_effect(
         self,
@@ -882,6 +849,59 @@ pub struct JoinCapability {
 }
 
 impl JoinCapability {
+    /// Narrows sequential topology authorization to local join authority plus
+    /// immutable predecessor evidence.
+    pub fn member_input(&self) -> Result<FreshJoinInput, MemberTransitionError> {
+        let target_authority = MemberMutationAuthority::new(
+            self.attempt.id.clone(),
+            self.attempt.group_name.clone(),
+            self.target.clone(),
+        )?;
+        let source_authority = MemberMutationAuthority::new(
+            self.attempt.id.clone(),
+            self.attempt.group_name.clone(),
+            self.boundary.source.clone(),
+        )?;
+        let members = self
+            .predecessor
+            .members
+            .iter()
+            .map(|enrollment| {
+                NativeMember::new(
+                    enrollment.member_id.clone(),
+                    enrollment.binding.member_address.clone(),
+                    if enrollment.binding.member == self.attempt.designated_bootstrap {
+                        MemberRole::Primary
+                    } else {
+                        MemberRole::Secondary
+                    },
+                    MemberState::Online,
+                )
+            })
+            .collect();
+        let view = crate::core::NativeView::new(
+            self.attempt.group_name.clone(),
+            self.predecessor.view_id.clone(),
+            members,
+        )
+        .map_err(|_| {
+            MemberTransitionError::View(crate::service::MemberViewError::IncoherentReadback)
+        })?;
+        let evidence =
+            MemberNativeEvidence::new(source_authority, view, self.boundary.executed.clone())?;
+        let source = MemberSourceBoundary::new(
+            MemberPeer::from_enrollment(&self.boundary.source),
+            evidence,
+        )?;
+        let peers = self
+            .predecessor
+            .members
+            .iter()
+            .map(MemberPeer::from_enrollment)
+            .collect();
+        FreshJoinInput::new(target_authority, source, peers)
+    }
+
     /// Fresh source boundary authorized for this exact join.
     #[must_use]
     pub const fn boundary(&self) -> &SourceGtidBoundary {
@@ -2974,10 +2994,13 @@ fn validate_transition(
         ));
     }
     validate_local_binding(target, &evidence.local)?;
-    let post_view = QualifiedXcomView::parse(&evidence.view_id)?;
+    let post_view = CanonicalViewId::parse(&evidence.view_id).map_err(map_member_view_error)?;
     if let Some(predecessor) = predecessor {
-        let predecessor_view = QualifiedXcomView::parse(&predecessor.view_id)?;
-        predecessor_view.require_successor(post_view)?;
+        let predecessor_view =
+            CanonicalViewId::parse(&predecessor.view_id).map_err(map_member_view_error)?;
+        predecessor_view
+            .require_successor(post_view)
+            .map_err(map_member_view_error)?;
     }
 
     let mut expected = predecessor.map_or_else(Vec::new, |credit| credit.members.clone());
@@ -3036,6 +3059,17 @@ fn validate_transition(
         members: expected,
         executed: evidence.executed.clone(),
     }))
+}
+
+fn map_member_view_error(error: MemberViewError) -> MysqlTopologyError {
+    let state = match error {
+        MemberViewError::MalformedViewId => TopologyStateError::MalformedViewId,
+        MemberViewError::ViewFixedPartChanged => TopologyStateError::ViewFixedPartChanged,
+        MemberViewError::ViewSequenceNotSuccessor => TopologyStateError::ViewSequenceNotSuccessor,
+        MemberViewError::ViewSequenceOverflow => TopologyStateError::ViewSequenceOverflow,
+        _ => TopologyStateError::InvalidTransition,
+    };
+    MysqlTopologyError::TopologyState(state)
 }
 
 fn validate_local_binding(

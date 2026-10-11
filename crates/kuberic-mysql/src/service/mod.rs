@@ -32,26 +32,39 @@
 //! [`MysqlInstanceConfig::new`] retains the original single-instance profile;
 //! topology members require [`MysqlInstanceConfig::new_topology_member`].
 
+mod attempt;
 mod config;
 mod control;
 mod error;
 mod instance;
+mod member;
 mod process;
 #[cfg(test)]
 mod qualification;
 mod topology;
 
+pub use attempt::{
+    AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState, AttemptContext,
+    AttemptDeadlineState, PairedAttemptOutcome,
+};
 pub use config::{
     MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts,
     MysqlOwnedPathKind, MysqlRuntimePaths, MysqlTopologyConfig,
 };
 pub use error::{
-    ConfigError, ControlStage, LifecycleOperation, MemberCleanupFailure, MysqlInstanceError,
+    ConfigError, ControlStage, LifecycleOperation, MemberAuthorityError, MemberCleanupFailure,
+    MemberReceiptError, MemberTransitionError, MemberViewError, MysqlInstanceError,
     MysqlTopologyError, MysqlTopologyManagerError, OwnershipError, ProductError,
     TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError, TopologyNativeStateError,
     TopologyStateError,
 };
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
+pub use member::{
+    BackendConnectionId, BackendConnectionReceipt, CanonicalViewId, FreshBootstrapInput,
+    FreshJoinInput, MemberEffectKind, MemberEffectReceipt, MemberMutationAuthority,
+    MemberNativeEvidence, MemberPeer, MemberSourceBoundary, MysqlMemberEffectBoundary,
+    PrimaryTransferInput,
+};
 pub use topology::{
     AcceptedMysqlTopology, AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect,
     ControlCredential, ControlCredentialRole, ControlStep, CredentialError, JoinCapability,

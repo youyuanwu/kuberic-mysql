@@ -5,7 +5,8 @@ use std::io::ErrorKind;
 
 use crate::adapter::RequestError;
 use crate::service::{
-    MysqlInstanceState, MysqlMemberIndex, MysqlOwnedPathKind, MysqlTopologyState,
+    AttemptDeadlineState, MysqlInstanceState, MysqlMemberIndex, MysqlOwnedPathKind,
+    MysqlTopologyState,
 };
 
 /// Configuration validation failure.
@@ -168,8 +169,121 @@ pub enum ControlStage {
     ProveBootstrapDisabled,
     /// Discovering the current native view identity.
     DiscoverView,
+    /// Reading one bracketed coherent native membership view.
+    ReadMembership,
+    /// Reading structured executed GTID history for a member view.
+    ReadExecutedHistory,
+    /// Transferring the native primary role to one exact member UUID.
+    TransferPrimary,
+    /// Terminating one exact native backend connection.
+    TerminateConnection,
+    /// Proving one exact native backend connection is absent.
+    ProveConnectionAbsent,
     /// Explicit connected-session teardown.
     Disconnect,
+}
+
+/// Why member-scoped mutation authority was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberAuthorityError {
+    /// The authority belongs to another attempt.
+    AttemptMismatch,
+    /// The authority names another local member binding.
+    LocalBindingMismatch,
+    /// A peer evidence value was substituted for local mutation authority.
+    AuthoritySubstitution,
+    /// The selected source was not the exact locally owned source.
+    SourceMismatch,
+    /// The transfer target was absent, local, or otherwise not exact.
+    WrongTransferTarget,
+}
+
+/// Why coherent member/view evidence was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberViewError {
+    /// A bracketed native read changed before it closed.
+    IncoherentReadback,
+    /// The supplied predecessor evidence was stale or changed.
+    StaleView,
+    /// A view identity was not canonical `<u64>:<u32>`.
+    MalformedViewId,
+    /// A successor changed the fixed XCom component.
+    ViewFixedPartChanged,
+    /// A successor did not advance by exactly one.
+    ViewSequenceNotSuccessor,
+    /// The predecessor monotonic component could not advance.
+    ViewSequenceOverflow,
+    /// A required member was absent.
+    RequiredMemberMissing,
+    /// An unapproved member was present.
+    UnexpectedMember,
+    /// A member address differed from its immutable peer input.
+    MemberAddressMismatch,
+    /// Native membership did not contain exactly one primary.
+    PrimaryCardinality,
+    /// A required member was not online.
+    MemberNotOnline,
+    /// A required member had the wrong role.
+    MemberRoleMismatch,
+    /// Structured history contained a non-group source.
+    NonGroupSource,
+    /// Successor history did not contain the predecessor boundary.
+    SourceBoundaryNotContained,
+}
+
+/// Why a typed member effect receipt was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberReceiptError {
+    /// Receipt identity did not match the admitted authority.
+    BindingMismatch,
+    /// Receipt predecessor evidence did not match the exact source boundary.
+    PredecessorMismatch,
+    /// Receipt successor evidence did not prove the requested effect.
+    SuccessorMismatch,
+    /// The attempt was cancelled before receipt credit.
+    Cancelled,
+    /// The receipt was created outside the primary-work budget.
+    Deadline(AttemptDeadlineState),
+    /// Mandatory cleanup did not complete.
+    CleanupIncomplete,
+}
+
+/// One secret-free member-local native effect failure.
+#[derive(Debug)]
+pub enum MemberTransitionError {
+    /// Member-scoped mutation authority was invalid.
+    Authority(MemberAuthorityError),
+    /// Native membership or view evidence was invalid.
+    View(MemberViewError),
+    /// The shared attempt was cancelled.
+    Cancelled,
+    /// The attempt was outside its primary-work budget.
+    Deadline(AttemptDeadlineState),
+    /// A typed effect receipt was inconsistent.
+    Receipt(MemberReceiptError),
+    /// Native control failed after local ownership validation.
+    Native(MysqlTopologyError),
+    /// Primary failure plus local-only containment failure.
+    Cleanup {
+        /// Original member effect failure.
+        primary: Box<Self>,
+        /// Exact local cleanup failure.
+        cleanup: Box<MysqlInstanceError>,
+    },
+}
+
+impl fmt::Display for MemberTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL member transition failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MemberTransitionError {}
+
+impl From<MysqlTopologyError> for MemberTransitionError {
+    fn from(error: MysqlTopologyError) -> Self {
+        Self::Native(error)
+    }
 }
 
 /// Why a topology capability was rejected.
