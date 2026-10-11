@@ -1335,6 +1335,21 @@ fn exact_path_absent(
 }
 
 impl MysqlProxyControlBoundary for MysqlInstanceManager {
+    fn contain_proxy_preparation(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        let containment = self
+            .contain_member_exact(authority, attempt)
+            .map_err(|_| MysqlProxyError::InvalidState)?;
+        if containment.is_complete() {
+            Ok(())
+        } else {
+            Err(MysqlProxyError::InvalidState)
+        }
+    }
+
     fn proxy_backend_socket(
         &mut self,
         authority: &MemberMutationAuthority,

@@ -80,7 +80,9 @@ unsupported outcome; generic peer build/removal execution is not delivered.
 Successful close and abort retain their exact terminal outcome for idempotent
 retry. Changed retries conflict, unrelated post-terminal work rejects, and an
 unsettled abort remains terminal without claiming complete containment. Abort
-also contains an owned member that was prepared but not opened.
+also contains an owned member that was prepared but not opened. Exact retries
+of a completed access publication return the retained endpoint and outcome
+before one-time handoff prerequisites are reconsidered.
 
 Qualified scalar progress is now a production boundary. Empty structured GTID
 history maps to `0`; otherwise only one untagged configured group source with
@@ -100,7 +102,9 @@ completes only after proxy counts are zero and native absence is proved.
 Published listeners and sessions also observe shared attempt cancellation and
 the absolute work cutoff, sealing without a separate caller revoke. Every
 initiated backend is accounted; a connection that never yields an exact native
-ID makes containment unproved. Snapshots and receipts retain bounded
+ID makes containment unproved. The obligation is armed before polling the UDS
+connect, so cancellation or future drop after server acceptance cannot produce
+vacuous absence. Snapshots and receipts retain bounded
 secret-free outcome summaries. Text rows accept SQL `NULL` (`0xfb`) while an
 initial `0xfb` response remains rejected as `LOCAL INFILE`.
 TLS, cold/full authentication, arbitrary accounts or plugins, prepared
@@ -112,8 +116,10 @@ engines for fresh formation and one controlled handoff. The handoff freezes the
 source's structured/scalar boundary only after a normally completed source
 closure and a fresh post-revocation native observation. The source engine
 issues a stable boundary identity binding the revoked generation, closure
-receipt, transfer, newer epoch/configuration, and source terminal receipt. The
-fixture proves fresh exact three-member history after schema DDL, transfers
+receipt, transfer, newer epoch/configuration, and source terminal receipt.
+Rearming or publishing a later source generation invalidates that boundary;
+an obsolete eligible closure cannot authorize transfer or target publication.
+The fixture proves fresh exact three-member history after schema DDL, transfers
 primary, closes and reaps the exact source process, accepts
 the exact two-survivor successor view and frozen history on both survivors, and
 submits one combined proof before a separate target access generation can be

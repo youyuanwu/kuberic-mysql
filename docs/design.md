@@ -237,8 +237,10 @@ ordering; same-role transitions also require a newer epoch. Exact retries are
 idempotent, including retained successful close/abort outcomes. Changed retries
 conflict, unrelated post-terminal operations reject, and an incomplete abort
 remains terminal but returns typed unsettled containment rather than success.
-An owned prepared-but-unopened member can be aborted without manufacturing a
-handoff terminal receipt.
+An exact retry of completed access publication returns the retained endpoint
+before one-time native handoff proof validation; changed publication identity
+or intent still conflicts. An owned prepared-but-unopened member can be aborted
+without manufacturing a handoff terminal receipt.
 
 Native bootstrap, join, coherent view readback, exact primary transfer, backend
 termination, and terminal stop/reap are admitted through a member-local effect
@@ -269,12 +271,13 @@ backend connections, and completes only after proxy session/command counts are
 zero and native absence is proved. Cancellation or ambiguity can establish
 containment but never handoff eligibility.
 The published accept/session path observes shared attempt cancellation and the
-work cutoff and seals without a separate revoke call. Every initiated UDS
-backend is tracked before greeting; missing identity makes native absence
-unproved. Bounded diagnostics preserve authentication rejection,
-pre-dispatch rejection, normal completion, cancellation, ambiguity, deadline,
-and cleanup classes without secrets. In text rows `0xfb` is SQL `NULL`; only
-an initial response `0xfb` is `LOCAL INFILE`.
+work cutoff and seals without a separate revoke call. An unidentified-backend
+obligation is armed before the UDS connect future is polled and is cleared only
+for definitive non-creation or replaced by the exact greeting identity; missing
+identity makes native absence unproved. Bounded diagnostics preserve
+authentication rejection, pre-dispatch rejection, normal completion,
+cancellation, ambiguity, deadline, and cleanup classes without secrets. In text
+rows `0xfb` is SQL `NULL`; only an initial response `0xfb` is `LOCAL INFILE`.
 
 The account receives only DML grants on the fixed qualification schema.
 Creation, grants, and removal run with session binary logging disabled and
@@ -299,6 +302,9 @@ combined source/target/remaining proof before a separate target generation is
 published only after a fresh native target view/history read. Failure,
 deadline, cancellation, stale evidence, peer loss/view change, changed
 authority, missing history, or substituted proof keeps target access closed.
+Any source rearm or later publication after freezing invalidates the stored
+boundary, so transfer, terminal proof, and publication cannot reuse an older
+eligible generation after a newer ineligible closure.
 
 ### Proof-of-concept boundary
 

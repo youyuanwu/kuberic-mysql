@@ -38,6 +38,7 @@ enum AuthMode {
     WithheldGreeting,
     DelayedGreeting,
     MalformedGreeting,
+    CancelDuringConnect,
 }
 
 #[derive(Clone)]
@@ -59,6 +60,14 @@ struct FakeControl {
 }
 
 impl MysqlProxyControlBoundary for FakeControl {
+    fn contain_proxy_preparation(
+        &mut self,
+        _authority: &MemberMutationAuthority,
+        _attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        Ok(())
+    }
+
     fn proxy_backend_socket(
         &mut self,
         _authority: &MemberMutationAuthority,
@@ -154,19 +163,27 @@ impl Fixture {
         let socket_path = root.root.join("backend.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let socket = UnixSocketPath::new(&socket_path).unwrap();
-        let commands = Arc::new(Mutex::new(Vec::new()));
-        let backend_commands = Arc::clone(&commands);
-        let settled = Arc::new(AtomicU32::new(0));
-        let backend_settled = Arc::clone(&settled);
-        let backend = tokio::spawn(async move {
-            run_fake_backend(listener, plan, backend_commands, backend_settled).await;
-        });
         let attempt = AttemptContext::new(
             AttemptId::new(format!("{label}-attempt")).unwrap(),
             Instant::now() + total,
             cleanup,
         )
         .unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let backend_commands = Arc::clone(&commands);
+        let settled = Arc::new(AtomicU32::new(0));
+        let backend_settled = Arc::clone(&settled);
+        let backend_attempt = attempt.clone();
+        let backend = tokio::spawn(async move {
+            run_fake_backend(
+                listener,
+                plan,
+                backend_commands,
+                backend_settled,
+                backend_attempt,
+            )
+            .await;
+        });
         let authority = authority(&attempt);
         let mut control = FakeControl {
             socket,
@@ -823,6 +840,48 @@ async fn unidentified_pre_greeting_backends_never_credit_vacuous_native_absence(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn accept_before_connect_completion_cancellation_retains_backend_obligation() {
+    let mut fixture = Fixture::new(
+        "proxy-connect-cancel",
+        BackendPlan {
+            auth: AuthMode::CancelDuringConnect,
+            block_query: false,
+        },
+    )
+    .await;
+    let address = fixture.publish();
+    let _client = TcpStream::connect(address).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.attempt.cancellation_state()
+        == kuberic_mysql::service::AttemptCancellationState::Active
+    {
+        assert!(
+            Instant::now() < deadline,
+            "backend never accepted connection"
+        );
+        tokio::task::yield_now().await;
+    }
+    wait_sessions_zero(&fixture.proxy).await;
+    assert_eq!(fixture.backend_settled.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.proxy.snapshot().unidentified_backends(), 1);
+    assert!(matches!(
+        fixture
+            .proxy
+            .revoke(
+                &mut fixture.control,
+                &fixture.authority,
+                nonzero(1),
+                &fixture.attempt,
+            )
+            .await,
+        Err(MysqlProxyError::UnidentifiedBackend)
+    ));
+    assert!(!fixture.proxy.is_fully_contained());
+    fixture.backend.abort();
+    let _ = fixture.backend.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn idle_and_transaction_holding_sessions_are_terminated_without_ambiguity() {
     let mut fixture = Fixture::new(
         "proxy-idle",
@@ -1023,12 +1082,16 @@ async fn run_fake_backend(
     plan: BackendPlan,
     commands: Arc<Mutex<Vec<u8>>>,
     settled: Arc<AtomicU32>,
+    attempt: AttemptContext,
 ) {
     let next_connection = Arc::new(AtomicU32::new(CONNECTION_ID));
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
+        if matches!(plan.auth, AuthMode::CancelDuringConnect) {
+            attempt.cancel();
+        }
         let plan = plan.clone();
         let commands = Arc::clone(&commands);
         let settled = Arc::clone(&settled);
@@ -1052,6 +1115,11 @@ async fn run_fake_backend(
                 }
                 AuthMode::MalformedGreeting => {
                     write_packet(&mut stream, 0, b"malformed").await;
+                    let mut byte = [0_u8; 1];
+                    let _ = stream.read(&mut byte).await;
+                    return;
+                }
+                AuthMode::CancelDuringConnect => {
                     let mut byte = [0_u8; 1];
                     let _ = stream.read(&mut byte).await;
                     return;
@@ -1080,7 +1148,8 @@ async fn run_fake_backend(
                 }
                 AuthMode::WithheldGreeting
                 | AuthMode::DelayedGreeting
-                | AuthMode::MalformedGreeting => {
+                | AuthMode::MalformedGreeting
+                | AuthMode::CancelDuringConnect => {
                     unreachable!("greeting-only modes returned or continued as fast auth")
                 }
             }

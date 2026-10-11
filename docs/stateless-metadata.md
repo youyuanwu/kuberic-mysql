@@ -664,12 +664,21 @@ defense-in-depth barrier.
 
 The listener and sessions also observe shared attempt cancellation and the
 absolute work cutoff after publication. Every initiated backend is registered
-as identified or unidentified before it can disappear from accounting; an
-unidentified pre-greeting connection prevents native-absence credit. Bounded
+as identified or unidentified before it can disappear from accounting. The
+unidentified obligation is armed before polling UDS connect, so cancellation or
+drop after server acceptance prevents native-absence credit. Bounded
 secret-free diagnostics survive into snapshots and containment receipts.
 Async preparation, revocation, retirement, and terminal cleanup keep ownership
-armed across awaits, and fixture roots are removed only after proxy, account,
-session, and exact member settlement succeeds.
+armed across awaits. A successful account receipt is persisted before socket
+validation, listener binding, or failure cleanup awaits; terminal cleanup must
+remove that account or report/contain the exact member. Fixture roots are
+removed only after proxy, account, session, and exact member settlement
+succeeds.
+
+Fresh-member initialization and startup run as owned blocking work outside the
+async runtime thread. Dropping the async owner cancels and joins that work; a
+same-runtime cancellation task can preempt the longer work cutoff while the
+cleanup reserve remains available for exact-child stop and reap.
 
 The delivered gateway supports only one loopback plaintext profile: the exact
 dedicated pre-warmed `caching_sha2_password` account, the fixed capability

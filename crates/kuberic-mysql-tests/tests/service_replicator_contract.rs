@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use kuberic_mysql::adapter::UnixSocketPath;
@@ -28,9 +29,10 @@ use kuberic_mysql::service::{
     MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
     MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
     MemberTransitionError, MemberViewError, MysqlAccessIntent, MysqlConfigurationOutcome,
-    MysqlHandoffBoundary, MysqlHandoffOutcome, MysqlHandoffPublicationProof, MysqlInstanceConfig,
-    MysqlInstanceError, MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt,
-    MysqlOperationIdentity, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
+    MysqlFreshMemberCredentials, MysqlFreshMemberInput, MysqlHandoffBoundary, MysqlHandoffOutcome,
+    MysqlHandoffPublicationProof, MysqlInstanceConfig, MysqlInstanceError,
+    MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity,
+    MysqlOperationTimeouts, MysqlPeerAuthorityFacts, MysqlPeerOperationIntent,
     MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
     MysqlProxyControlBoundary, MysqlProxyError, MysqlReplicaConfiguration, MysqlReplicaEpoch,
     MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
@@ -580,6 +582,20 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
 }
 
 impl MysqlProxyControlBoundary for ScriptedEffects {
+    fn contain_proxy_preparation(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        let containment = MysqlMemberEffectBoundary::contain_member_exact(self, authority, attempt)
+            .map_err(|_| MysqlProxyError::InvalidState)?;
+        if containment.is_complete() {
+            Ok(())
+        } else {
+            Err(MysqlProxyError::InvalidState)
+        }
+    }
+
     fn proxy_backend_socket(
         &mut self,
         _authority: &MemberMutationAuthority,
@@ -1302,6 +1318,65 @@ async fn formation_receipt_after_work_deadline_is_contained_before_return() {
         ));
         assert_only_local_owner_aborted(member, &engines, &counters);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_member_startup_yields_to_same_runtime_cancellation_and_reaps_owned_child() {
+    let root = TestRoot::new("fresh-cancel");
+    let attempt = AttemptContext::new(
+        AttemptId::new("fresh-same-runtime-cancel").unwrap(),
+        Instant::now() + Duration::from_secs(3),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let config = root.config_for_member_with_initialization_delay(
+        MysqlMemberIndex::First,
+        MysqlOperationTimeouts::new(
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        Duration::from_secs(5),
+    );
+    let cancellation = attempt.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+    });
+    let started = Instant::now();
+    let result = MysqlReplicator::prepare_fresh_member(MysqlFreshMemberInput::new(
+        config,
+        replica_identity("fresh-same-runtime"),
+        ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
+        MysqlFreshMemberCredentials::new(
+            credential(&attempt, ControlCredentialRole::Observer),
+            credential(&attempt, ControlCredentialRole::Recovery),
+            ApplicationCredential::new(
+                attempt.attempt().clone(),
+                CredentialGeneration::new("fresh-application-generation").unwrap(),
+                "fresh_application",
+                "application-secret",
+            )
+            .unwrap(),
+        ),
+        attempt.clone(),
+        nonzero(1),
+    ))
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        attempt.cancellation_state(),
+        kuberic_mysql::service::AttemptCancellationState::Cancelled
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "same-runtime cancellation was starved for {:?}",
+        started.elapsed()
+    );
+    assert!(!root.data.exists());
+    assert!(!root.scratch.exists());
 }
 
 #[tokio::test]
@@ -2285,6 +2360,55 @@ async fn dropped_proxy_lifecycle_futures_retain_or_terminally_contain_ownership(
         .abort(operation("drop-prepare-abort", 5))
         .unwrap();
 
+    let post_account_remove_started = Arc::new(AtomicBool::new(false));
+    let post_account_remove_release = Arc::new(Notify::new());
+    let mut post_account = harness_with_proxy_gates(
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+        ],
+        None,
+        None,
+        Some(Arc::clone(&post_account_remove_started)),
+        Some(Arc::clone(&post_account_remove_release)),
+    );
+    establish(&mut post_account, MysqlReplicaRole::Primary).await;
+    let occupied =
+        std::net::TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+    let occupied_address = occupied.local_addr().unwrap();
+    let credential = ApplicationCredential::new(
+        post_account.attempt.attempt().clone(),
+        CredentialGeneration::new("drop-post-account").unwrap(),
+        "drop_post_account",
+        "application-secret",
+    )
+    .unwrap();
+    let mut prepare = Box::pin(
+        post_account
+            .engine
+            .prepare_client_proxy(occupied_address, credential),
+    );
+    tokio::select! {
+        result = &mut prepare => panic!("post-account prepare unexpectedly completed: {result:?}"),
+        () = wait_flag(&post_account_remove_started) => {}
+    }
+    drop(prepare);
+    assert!(post_account.engine.application_credential_staged());
+    assert!(matches!(
+        post_account
+            .engine
+            .close(operation("drop-post-account-close", 5)),
+        Err(MysqlReplicatorError::AccessRevocationRequired)
+    ));
+    post_account_remove_release.notify_one();
+    post_account
+        .engine
+        .close_with_proxy(operation("drop-post-account-settled-close", 6))
+        .await
+        .unwrap();
+    drop(occupied);
+
     let remove_started = Arc::new(AtomicBool::new(false));
     let remove_release = Arc::new(Notify::new());
     let mut retiring = harness_with_proxy_gates(
@@ -2544,6 +2668,27 @@ async fn exact_fresh_publication_proof_opens_only_the_prepared_target_generation
         .await
         .unwrap();
     assert!(published.is_open());
+    assert_eq!(
+        scenario
+            .target
+            .publish_access(
+                operation("publish-after-proof", 15),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+            )
+            .await
+            .unwrap(),
+        published
+    );
+    assert!(matches!(
+        scenario
+            .target
+            .publish_access(
+                operation("publish-after-proof", 15),
+                MysqlAccessIntent::new(nonzero(3), true, true),
+            )
+            .await,
+        Err(MysqlReplicatorError::OperationConflict)
+    ));
     scenario
         .target
         .revoke_access(
@@ -2561,6 +2706,177 @@ async fn exact_fresh_publication_proof_opens_only_the_prepared_target_generation
         .remaining
         .close(operation("remaining-close", 10))
         .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn later_unproved_source_generation_invalidates_frozen_boundary_before_transfer() {
+    let root = TestRoot::new("obsolete-boundary");
+    let attempt = context("obsolete-boundary");
+    let authorities = [
+        authority_with_attempt(&attempt, MysqlMemberIndex::First),
+        authority_with_attempt(&attempt, MysqlMemberIndex::Second),
+        authority_with_attempt(&attempt, MysqlMemberIndex::Third),
+    ];
+    let identities = [
+        replica_identity("obsolete-source"),
+        replica_identity("obsolete-target"),
+        replica_identity("obsolete-remaining"),
+    ];
+    let targets = [
+        target_from_authority(identities[0].clone(), &authorities[0]),
+        target_from_authority(identities[1].clone(), &authorities[1]),
+        target_from_authority(identities[2].clone(), &authorities[2]),
+    ];
+    let predecessor_roles = [
+        (MysqlMemberIndex::First, MemberRole::Primary),
+        (MysqlMemberIndex::Second, MemberRole::Secondary),
+        (MysqlMemberIndex::Third, MemberRole::Secondary),
+    ];
+    let reads = (0..3)
+        .map(|_| {
+            ReadPlan::Evidence(Box::new(evidence_from_members(
+                authorities[0].clone(),
+                "81:1",
+                &predecessor_roles,
+                &format!("{GROUP_UUID}:1-5"),
+            )))
+        })
+        .collect();
+    let config = root.config_for_member(MysqlMemberIndex::First);
+    let effects = ScriptedEffects::new(config, reads, Vec::new(), CleanupPlan::Completed);
+    let proxy_backend = effects._proxy_listener.try_clone().unwrap();
+    proxy_backend.set_nonblocking(true).unwrap();
+    let backend = tokio::net::UnixListener::from_std(proxy_backend).unwrap();
+    let mut source = MysqlReplicator::new(
+        effects,
+        identities[0].clone(),
+        ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
+        credential(&attempt, ControlCredentialRole::Observer),
+        credential(&attempt, ControlCredentialRole::Recovery),
+        attempt.clone(),
+    )
+    .unwrap();
+    source
+        .open(
+            operation("obsolete-open", 1),
+            MysqlOpenReceipt::new(identities[0].clone(), authorities[0].clone(), nonzero(1)),
+        )
+        .unwrap();
+    source
+        .advance_epoch(operation("obsolete-epoch-1", 2), MysqlReplicaEpoch::new(1))
+        .unwrap();
+    source
+        .observe_role(
+            operation("obsolete-role-1", 3),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Primary,
+        )
+        .await
+        .unwrap();
+    source
+        .observe_configuration(
+            operation("obsolete-configuration-1", 4),
+            MysqlReplicaConfiguration::new(
+                ConfigurationId::new("obsolete-configuration-1").unwrap(),
+                MysqlReplicaEpoch::new(1),
+                targets.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+    let transfer_source = source.source_boundary().unwrap();
+    source
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ApplicationCredential::new(
+                attempt.attempt().clone(),
+                CredentialGeneration::new("obsolete-source-account").unwrap(),
+                "obsolete_source",
+                "application-secret",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    source
+        .publish_access(
+            operation("obsolete-publish-1", 5),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        )
+        .await
+        .unwrap();
+    source
+        .revoke_access(
+            operation("obsolete-revoke-1", 6),
+            MysqlAccessIntent::new(nonzero(3), false, false),
+        )
+        .await
+        .unwrap();
+    let boundary = source
+        .freeze_handoff_boundary(
+            operation("obsolete-freeze", 7),
+            targets[1].clone(),
+            targets[2].clone(),
+        )
+        .await
+        .unwrap();
+    let address = source
+        .rearm_contained_client_proxy(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    source
+        .publish_access(
+            operation("obsolete-publish-2", 8),
+            MysqlAccessIntent::new(nonzero(4), true, true),
+        )
+        .await
+        .unwrap();
+    let backend_active = Arc::new(Notify::new());
+    let backend_active_signal = Arc::clone(&backend_active);
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = backend.accept().await.unwrap();
+        test_write_packet(&mut stream, 0, &test_greeting(491)).await;
+        let _ = test_read_packet(&mut stream).await;
+        test_write_packet(&mut stream, 2, &[0x01, 0x03]).await;
+        test_write_packet(&mut stream, 3, &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]).await;
+        let command = test_read_packet(&mut stream).await;
+        assert_eq!(command.1.first(), Some(&0x03));
+        backend_active_signal.notify_one();
+        let mut byte = [0_u8; 1];
+        let _ = stream.read(&mut byte).await;
+    });
+    let mut client = test_authenticate(address, "obsolete_source").await;
+    test_write_packet(&mut client, 0, b"\x03later_generation").await;
+    backend_active.notified().await;
+    let later_closure = source
+        .revoke_access(
+            operation("obsolete-revoke-2", 9),
+            MysqlAccessIntent::new(nonzero(5), false, false),
+        )
+        .await
+        .unwrap();
+    assert!(!later_closure.containment().unwrap().handoff_eligible());
+    backend_task.await.unwrap();
+    source
+        .advance_epoch(operation("obsolete-epoch-2", 10), MysqlReplicaEpoch::new(2))
+        .unwrap();
+    assert!(matches!(
+        source
+            .transfer_role(
+                operation("obsolete-transfer", 11),
+                MysqlReplicaEpoch::new(2),
+                MysqlReplicaRole::Secondary,
+                transfer_source,
+                targets[1].member().clone(),
+            )
+            .await,
+        Err(MysqlReplicatorError::HandoffProofRequired)
+    ));
+    assert_eq!(boundary.id().revoked_generation(), nonzero(2));
+    assert!(matches!(
+        source.close(operation("obsolete-close", 12)),
+        Err(MysqlReplicatorError::AccessRevocationRequired)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4550,14 +4866,18 @@ fn harness_with_attempt(
         peer_binding.endpoint().clone(),
         peer_binding.storage().clone(),
     );
-    let engine = engine(
-        config,
+    let observer = credential(&attempt, ControlCredentialRole::Observer);
+    let recovery = credential(&attempt, ControlCredentialRole::Recovery);
+    let effects = ScriptedEffects::new(config, reads, receipts, cleanup);
+    let engine = MysqlReplicator::new(
+        effects,
         identity.clone(),
+        ConfiguredGtidLineage::new(GROUP_UUID).unwrap(),
+        observer,
+        recovery,
         attempt.clone(),
-        reads,
-        receipts,
-        cleanup,
-    );
+    )
+    .unwrap();
     Harness {
         _root: root,
         engine,
@@ -4669,6 +4989,67 @@ async fn wait_flag(flag: &AtomicBool) {
         );
         tokio::task::yield_now().await;
     }
+}
+
+fn test_greeting(connection_id: u32) -> Vec<u8> {
+    const CAPABILITIES: u32 = 0x0038_a205;
+    let mut payload = vec![10];
+    payload.extend(b"8.4.11\0");
+    payload.extend(connection_id.to_le_bytes());
+    payload.extend(b"12345678");
+    payload.push(0);
+    payload.extend((CAPABILITIES as u16).to_le_bytes());
+    payload.push(45);
+    payload.extend(2_u16.to_le_bytes());
+    payload.extend(((CAPABILITIES >> 16) as u16).to_le_bytes());
+    payload.push(21);
+    payload.extend([0_u8; 10]);
+    payload.extend(b"abcdefghijkl\0");
+    payload.extend(b"caching_sha2_password\0");
+    payload
+}
+
+async fn test_authenticate(address: SocketAddr, username: &str) -> tokio::net::TcpStream {
+    const CAPABILITIES: u32 = 0x0038_a205;
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    assert_eq!(test_read_packet(&mut stream).await.0, 0);
+    let mut response = Vec::new();
+    response.extend(CAPABILITIES.to_le_bytes());
+    response.extend((1024_u32 * 1024).to_le_bytes());
+    response.push(45);
+    response.extend([0_u8; 23]);
+    response.extend(username.as_bytes());
+    response.push(0);
+    response.push(1);
+    response.push(7);
+    response.extend(b"caching_sha2_password\0");
+    response.push(0);
+    test_write_packet(&mut stream, 1, &response).await;
+    assert_eq!(test_read_packet(&mut stream).await.1, [0x01, 0x03]);
+    assert_eq!(test_read_packet(&mut stream).await.1.first(), Some(&0x00));
+    stream
+}
+
+async fn test_write_packet<W: AsyncWrite + Unpin>(stream: &mut W, sequence: u8, payload: &[u8]) {
+    let length = payload.len() as u32;
+    let header = [
+        length as u8,
+        (length >> 8) as u8,
+        (length >> 16) as u8,
+        sequence,
+    ];
+    stream.write_all(&header).await.unwrap();
+    stream.write_all(payload).await.unwrap();
+}
+
+async fn test_read_packet<R: AsyncRead + Unpin>(stream: &mut R) -> (u8, Vec<u8>) {
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header).await.unwrap();
+    let length =
+        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).await.unwrap();
+    (header[3], payload)
 }
 
 fn engine(

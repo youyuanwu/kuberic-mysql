@@ -14,14 +14,15 @@ use crate::core::{
     ReplicaId, ReplicaIncarnation, ViewId, project_progress,
 };
 use crate::service::{
-    ApplicationCredential, AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState,
-    AttemptContext, AttemptDeadlineState, CanonicalViewId, ControlCredential,
-    ControlCredentialRole, FreshBootstrapInput, FreshJoinInput, MemberConfigurationIntent,
-    MemberConfigurationTarget, MemberContainmentReceipt, MemberEffectKind, MemberEffectReceipt,
-    MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence, MemberOperationIdentity,
-    MemberPeer, MemberSourceBoundary, MysqlClientProxy, MysqlInstanceManager,
-    MysqlMemberEffectBoundary, MysqlProxyContainmentReceipt, MysqlProxyControlBoundary,
-    MysqlReplicatorError, PrimaryTransferInput,
+    ApplicationAccountReceipt, ApplicationCredential, AttemptAdmissionError,
+    AttemptCancellationState, AttemptCleanupState, AttemptContext, AttemptDeadlineState,
+    CanonicalViewId, ControlCredential, ControlCredentialRole, FreshBootstrapInput, FreshJoinInput,
+    MemberConfigurationIntent, MemberConfigurationTarget, MemberContainmentReceipt,
+    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
+    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
+    MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary,
+    MysqlProxyContainmentReceipt, MysqlProxyControlBoundary, MysqlReplicatorError,
+    PrimaryTransferInput,
 };
 
 /// Exact logical identity of one member-local replica incarnation.
@@ -1215,9 +1216,11 @@ where
     progress: Option<MysqlProgressOutcome>,
     access: Option<MysqlAccessIntent>,
     application_credential: Option<ApplicationCredential>,
+    pending_application_account: Option<ApplicationAccountReceipt>,
     proxy: Option<MysqlClientProxy>,
     proxy_containment: Option<MysqlProxyContainmentReceipt>,
     source_handoff: Option<Box<SourceHandoffState>>,
+    source_handoff_invalidated: bool,
     handoff_publication_required: bool,
     handoff_publication_proof: Option<AcceptedHandoffPublicationProof>,
     terminal: Option<MysqlTerminalState>,
@@ -1283,9 +1286,11 @@ where
             progress: None,
             access: None,
             application_credential: None,
+            pending_application_account: None,
             proxy: None,
             proxy_containment: None,
             source_handoff: None,
+            source_handoff_invalidated: false,
             handoff_publication_required: false,
             handoff_publication_proof: None,
             terminal: None,
@@ -1745,6 +1750,7 @@ where
             demoted: false,
             configuration_accepted: false,
         }));
+        self.source_handoff_invalidated = false;
         self.complete(
             index,
             RecordedOutcome::HandoffBoundary(Box::new(boundary.clone())),
@@ -1998,7 +2004,7 @@ where
             Admission::New(index) => index,
         };
         self.require_open_active()?;
-        if self.proxy.is_some() {
+        if self.proxy.is_some() || self.pending_application_account.is_some() {
             self.operations[index].status = OperationStatus::Uncertain;
             return Err(MysqlReplicatorError::AccessRevocationRequired);
         }
@@ -2081,7 +2087,7 @@ where
             Admission::Retry(outcome) => return expect_terminal(outcome),
             Admission::New(index) => index,
         };
-        if self.proxy.is_some() {
+        if self.proxy.is_some() || self.pending_application_account.is_some() {
             self.operations[index].status = OperationStatus::Uncertain;
             return Err(MysqlReplicatorError::AccessRevocationRequired);
         }
@@ -2308,6 +2314,9 @@ where
             RoleEffect::Observe => None,
             RoleEffect::Transfer { source, .. } => Some(source.as_ref().clone()),
         };
+        if self.source_handoff_invalidated && matches!(&effect, RoleEffect::Transfer { .. }) {
+            return self.uncertain_rejection(index, MysqlReplicatorError::HandoffProofRequired);
+        }
         if let Some(handoff) = self.source_handoff.as_ref() {
             let exact_transfer = matches!(
                 &effect,
@@ -2981,6 +2990,12 @@ where
         self.handoff_publication_proof = None;
     }
 
+    fn invalidate_source_handoff(&mut self) {
+        if self.source_handoff.take().is_some() {
+            self.source_handoff_invalidated = true;
+        }
+    }
+
     fn clear_control_credentials(&mut self) {
         self.observer.clear();
         self.recovery.clear();
@@ -2992,6 +3007,107 @@ where
             credential.clear();
         }
     }
+}
+
+type FreshProcessResult = (MysqlInstanceManager, Result<(), MysqlReplicatorError>);
+
+struct FreshProcessWorker {
+    attempt: AttemptContext,
+    receiver: tokio::sync::oneshot::Receiver<FreshProcessResult>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FreshProcessWorker {
+    fn spawn(mut effects: MysqlInstanceManager, attempt: &AttemptContext) -> Self {
+        let worker_attempt = attempt.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let result = prepare_fresh_process(&mut effects, &worker_attempt);
+            let _ = sender.send((effects, result));
+        });
+        Self {
+            attempt: attempt.clone(),
+            receiver,
+            thread: Some(thread),
+        }
+    }
+
+    async fn finish(mut self) -> Result<FreshProcessResult, MysqlReplicatorError> {
+        let received = (&mut self.receiver).await;
+        let joined = self
+            .thread
+            .take()
+            .expect("fresh process worker thread remained owned")
+            .join();
+        match (received, joined) {
+            (Ok(result), Ok(())) => Ok(result),
+            _ => Err(fresh_worker_failure()),
+        }
+    }
+}
+
+impl Drop for FreshProcessWorker {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.attempt.cancel();
+            let _ = thread.join();
+        }
+    }
+}
+
+fn prepare_fresh_process(
+    effects: &mut MysqlInstanceManager,
+    attempt: &AttemptContext,
+) -> Result<(), MysqlReplicatorError> {
+    if let Err(error) = effects.initialize_with_attempt(attempt) {
+        return Err(contain_fresh_process_failure(
+            effects,
+            attempt,
+            MysqlReplicatorError::Instance(error),
+        ));
+    }
+    if let Err(error) = attempt.admit_work() {
+        return Err(contain_fresh_process_failure(
+            effects,
+            attempt,
+            map_admission(error),
+        ));
+    }
+    if let Err(error) = effects.start_with_attempt(attempt) {
+        return Err(contain_fresh_process_failure(
+            effects,
+            attempt,
+            MysqlReplicatorError::Instance(error),
+        ));
+    }
+    if let Err(error) = attempt.admit_work() {
+        return Err(contain_fresh_process_failure(
+            effects,
+            attempt,
+            map_admission(error),
+        ));
+    }
+    Ok(())
+}
+
+fn contain_fresh_process_failure(
+    effects: &mut MysqlInstanceManager,
+    attempt: &AttemptContext,
+    prior: MysqlReplicatorError,
+) -> MysqlReplicatorError {
+    match effects.contain_member(attempt) {
+        Ok(_) => prior,
+        Err(cleanup) => MysqlReplicatorError::FreshPreparationCleanup {
+            prior: Box::new(prior),
+            cleanup: Box::new(cleanup),
+        },
+    }
+}
+
+fn fresh_worker_failure() -> MysqlReplicatorError {
+    MysqlReplicatorError::Instance(crate::service::MysqlInstanceError::Ownership(
+        crate::service::OwnershipError::InspectionFailed,
+    ))
 }
 
 impl MysqlReplicator<MysqlInstanceManager> {
@@ -3035,38 +3151,13 @@ impl MysqlReplicator<MysqlInstanceManager> {
             application.clear();
             return Err(map_admission(error));
         }
-        let mut effects = MysqlInstanceManager::new(config);
-        if let Err(error) = effects.initialize_with_attempt(&attempt) {
+        let worker = FreshProcessWorker::spawn(MysqlInstanceManager::new(config), &attempt);
+        let (mut effects, process_result) = worker.finish().await?;
+        if let Err(error) = process_result {
             observer.clear();
             recovery.clear();
             application.clear();
-            return contain_fresh_failure(
-                &mut effects,
-                &attempt,
-                MysqlReplicatorError::Instance(error),
-            );
-        }
-        if let Err(error) = attempt.admit_work() {
-            observer.clear();
-            recovery.clear();
-            application.clear();
-            return contain_fresh_failure(&mut effects, &attempt, map_admission(error));
-        }
-        if let Err(error) = effects.start_with_attempt(&attempt) {
-            observer.clear();
-            recovery.clear();
-            application.clear();
-            return contain_fresh_failure(
-                &mut effects,
-                &attempt,
-                MysqlReplicatorError::Instance(error),
-            );
-        }
-        if let Err(error) = attempt.admit_work() {
-            observer.clear();
-            recovery.clear();
-            application.clear();
-            return contain_fresh_failure(&mut effects, &attempt, map_admission(error));
+            return Err(error);
         }
         let authority = match effects
             .enroll_local_control_authority(&attempt, &observer, &recovery)
@@ -3110,6 +3201,7 @@ where
         self.application_credential = Some(credential);
         let result = self.prepare_client_proxy_from_staged(listen_address).await;
         if result.is_err()
+            && self.pending_application_account.is_none()
             && let Some(mut credential) = self.application_credential.take()
         {
             credential.clear();
@@ -3128,15 +3220,21 @@ where
             return Err(MysqlReplicatorError::AccessRevocationRequired);
         }
         let authority = self.authority().clone();
-        let proxy = MysqlClientProxy::prepare_staged(
-            &mut self.effects,
-            &authority,
-            listen_address,
-            &mut self.application_credential,
-            &self.attempt,
-        )
-        .await
-        .map_err(MysqlReplicatorError::Proxy)?;
+        let proxy = {
+            let effects = &mut self.effects;
+            let credential = &mut self.application_credential;
+            let account_obligation = &mut self.pending_application_account;
+            MysqlClientProxy::prepare_staged(
+                effects,
+                &authority,
+                listen_address,
+                credential,
+                account_obligation,
+                &self.attempt,
+            )
+            .await
+            .map_err(MysqlReplicatorError::Proxy)?
+        };
         let address = proxy.address();
         self.proxy = Some(proxy);
         self.proxy_containment = None;
@@ -3154,6 +3252,7 @@ where
         }
         let result = self.prepare_client_proxy_from_staged(listen_address).await;
         if result.is_err()
+            && self.pending_application_account.is_none()
             && let Some(mut credential) = self.application_credential.take()
         {
             credential.clear();
@@ -3175,6 +3274,17 @@ where
                 crate::service::MysqlProxyError::BothPermissionsRequired,
             ));
         }
+        let fingerprint = OperationFingerprint::Access(intent);
+        if self
+            .operations
+            .iter()
+            .any(|record| record.operation.id == operation.id)
+        {
+            return match self.begin_operation(operation, fingerprint)? {
+                Admission::Retry(outcome) => expect_access(outcome),
+                Admission::New(_) => unreachable!("known operation identity cannot be new"),
+            };
+        }
         if self.handoff_publication_required {
             let valid = self
                 .handoff_publication_proof
@@ -3186,11 +3296,11 @@ where
                 return Err(error);
             }
         }
-        let fingerprint = OperationFingerprint::Access(intent);
         let index = match self.begin_operation(operation.clone(), fingerprint)? {
             Admission::Retry(outcome) => return expect_access(outcome),
             Admission::New(index) => index,
         };
+        self.invalidate_source_handoff();
         if self
             .access
             .is_some_and(|current| intent.generation <= current.generation)
@@ -3345,6 +3455,7 @@ where
             .await
             .map_err(MysqlReplicatorError::Proxy)?;
         self.proxy_containment = None;
+        self.invalidate_source_handoff();
         self.close_access();
         Ok(address)
     }
@@ -3386,6 +3497,34 @@ where
             .clone()
             .or_else(|| self.owned_authority.clone())
             .ok_or(MysqlReplicatorError::NotOpen)?;
+        if let Some(receipt) = self.pending_application_account.clone() {
+            let cleanup = self
+                .effects
+                .remove_application_account(&authority, &receipt, &self.attempt)
+                .await;
+            match cleanup {
+                Ok(()) => {
+                    self.pending_application_account = None;
+                    if let Some(mut credential) = self.application_credential.take() {
+                        credential.clear();
+                    }
+                }
+                Err(proxy_error) => {
+                    self.close_access();
+                    self.clear_all_credentials();
+                    let containment = self.effects.contain_member(&self.attempt);
+                    self.invalidate_handoff_publication_proof();
+                    self.terminal = Some(MysqlTerminalState::Aborted);
+                    return match containment {
+                        Ok(_) => Err(MysqlReplicatorError::Proxy(proxy_error)),
+                        Err(instance) => Err(MysqlReplicatorError::ProxyCleanup {
+                            proxy: Box::new(proxy_error),
+                            instance: Box::new(instance),
+                        }),
+                    };
+                }
+            }
+        }
         let Some(proxy) = self.proxy.as_mut() else {
             return Ok(());
         };

@@ -283,6 +283,14 @@ impl BackendSessionIdentity {
 /// generation revocation.
 #[allow(async_fn_in_trait)]
 pub trait MysqlProxyControlBoundary {
+    /// Synchronously contains the exact member if account preparation ownership
+    /// is dropped before the proxy or account cleanup takes ownership.
+    fn contain_proxy_preparation(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError>;
+
     /// Returns the currently attested exact private backend UDS.
     fn proxy_backend_socket(
         &mut self,
@@ -577,6 +585,46 @@ impl Shared {
     }
 }
 
+struct AccountPreparationContainment<'a, C: MysqlProxyControlBoundary> {
+    control: &'a mut C,
+    authority: &'a MemberMutationAuthority,
+    attempt: &'a AttemptContext,
+    armed: bool,
+}
+
+impl<'a, C: MysqlProxyControlBoundary> AccountPreparationContainment<'a, C> {
+    fn new(
+        control: &'a mut C,
+        authority: &'a MemberMutationAuthority,
+        attempt: &'a AttemptContext,
+    ) -> Self {
+        Self {
+            control,
+            authority,
+            attempt,
+            armed: true,
+        }
+    }
+
+    fn control(&mut self) -> &mut C {
+        self.control
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<C: MysqlProxyControlBoundary> Drop for AccountPreparationContainment<'_, C> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .control
+                .contain_proxy_preparation(self.authority, self.attempt);
+        }
+    }
+}
+
 /// Prepared loopback-only endpoint for one exact private UDS and account.
 #[must_use = "the proxy requires explicit async revocation and account cleanup"]
 pub struct MysqlClientProxy {
@@ -606,7 +654,16 @@ impl MysqlClientProxy {
         attempt: &AttemptContext,
     ) -> Result<Self, MysqlProxyError> {
         let mut credential = Some(credential);
-        Self::prepare_staged(control, authority, listen_address, &mut credential, attempt).await
+        let mut account_obligation = None;
+        Self::prepare_staged(
+            control,
+            authority,
+            listen_address,
+            &mut credential,
+            &mut account_obligation,
+            attempt,
+        )
+        .await
     }
 
     pub(crate) async fn prepare_staged<C: MysqlProxyControlBoundary>(
@@ -614,6 +671,7 @@ impl MysqlClientProxy {
         authority: &MemberMutationAuthority,
         listen_address: SocketAddr,
         credential: &mut Option<ApplicationCredential>,
+        account_obligation: &mut Option<ApplicationAccountReceipt>,
         attempt: &AttemptContext,
     ) -> Result<Self, MysqlProxyError> {
         let credential_ref = credential
@@ -629,12 +687,19 @@ impl MysqlClientProxy {
         let account = control
             .prepare_application_account(authority, credential_ref, attempt)
             .await?;
-        let backend = match control.proxy_backend_socket(authority) {
+        *account_obligation = Some(account.clone());
+        let mut containment = AccountPreparationContainment::new(control, authority, attempt);
+        let backend = match containment.control().proxy_backend_socket(authority) {
             Ok(backend) => backend,
             Err(primary) => {
-                let cleanup = control
+                let cleanup = containment
+                    .control()
                     .remove_application_account(authority, &account, attempt)
                     .await;
+                if cleanup.is_ok() {
+                    account_obligation.take();
+                    containment.disarm();
+                }
                 return Err(pair_cleanup(primary, cleanup));
             }
         };
@@ -645,9 +710,14 @@ impl MysqlClientProxy {
                     phase: MysqlProxyPhase::Listener,
                     kind: error.kind(),
                 };
-                let cleanup = control
+                let cleanup = containment
+                    .control()
                     .remove_application_account(authority, &account, attempt)
                     .await;
+                if cleanup.is_ok() {
+                    account_obligation.take();
+                    containment.disarm();
+                }
                 return Err(pair_cleanup(primary, cleanup));
             }
         };
@@ -658,9 +728,14 @@ impl MysqlClientProxy {
                     phase: MysqlProxyPhase::Listener,
                     kind: error.kind(),
                 };
-                let cleanup = control
+                let cleanup = containment
+                    .control()
                     .remove_application_account(authority, &account, attempt)
                     .await;
+                if cleanup.is_ok() {
+                    account_obligation.take();
+                    containment.disarm();
+                }
                 return Err(pair_cleanup(primary, cleanup));
             }
         };
@@ -668,6 +743,8 @@ impl MysqlClientProxy {
         let credential = credential
             .take()
             .expect("staged credential remained owned until proxy construction");
+        account_obligation.take();
+        containment.disarm();
         Ok(Self {
             listener: Some(listener),
             address,
@@ -1163,6 +1240,12 @@ impl SessionGuard {
         }
     }
 
+    fn backend_not_created(&self) {
+        if let Some(session) = self.shared.lock().sessions.get_mut(&self.id) {
+            session.backend_initiated = false;
+        }
+    }
+
     fn register_backend(&self, session_identity: BackendSessionIdentity) {
         let mut registry = self.shared.lock();
         if let Some(session) = registry.sessions.get_mut(&self.id) {
@@ -1307,18 +1390,26 @@ async fn run_session_inner(
         GREETING_AUTH_TIMEOUT,
         MysqlProxyPhase::Greeting,
     )?;
-    let mut backend = select_cancel(
+    guard.backend_initiated();
+    let connected = select_cancel(
         cancel,
         authentication_deadline,
         MysqlProxyPhase::Greeting,
         UnixStream::connect(context.backend.as_path()),
     )
-    .await?
-    .map_err(|error| MysqlProxyError::Io {
-        phase: MysqlProxyPhase::Greeting,
-        kind: error.kind(),
-    })?;
-    guard.backend_initiated();
+    .await?;
+    let mut backend = match connected {
+        Ok(backend) => backend,
+        Err(error) => {
+            if definitive_connect_non_creation(error.kind()) {
+                guard.backend_not_created();
+            }
+            return Err(MysqlProxyError::Io {
+                phase: MysqlProxyPhase::Greeting,
+                kind: error.kind(),
+            });
+        }
+    };
     let greeting = read_packet_cancel(
         &mut backend,
         cancel,
@@ -2207,6 +2298,7 @@ where
         .filter(|remaining| !remaining.is_zero())
         .ok_or(MysqlProxyError::Deadline(phase))?;
     tokio::select! {
+        biased;
         changed = cancel.changed() => {
             let _ = changed;
             Err(MysqlProxyError::Cancelled)
@@ -2215,6 +2307,17 @@ where
             result.map_err(|_| MysqlProxyError::Deadline(phase))
         }
     }
+}
+
+fn definitive_connect_non_creation(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::NotFound
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::PermissionDenied
+            | ErrorKind::InvalidInput
+            | ErrorKind::AddrNotAvailable
+    )
 }
 
 fn phase_timeout(
