@@ -497,6 +497,13 @@ pub enum MysqlTopologyManagerError {
         /// Exact member lifecycle failure.
         error: MysqlInstanceError,
     },
+    /// One member-scoped native effect failed with its local cleanup evidence.
+    MemberTransition {
+        /// Exact member whose effect failed.
+        member: MysqlMemberIndex,
+        /// Member-local effect and paired containment failure, when any.
+        error: MemberTransitionError,
+    },
     /// Native control or topology evidence validation failed.
     Topology(MysqlTopologyError),
     /// The manager could not construct an exact observer request.

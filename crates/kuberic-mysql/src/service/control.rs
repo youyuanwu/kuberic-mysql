@@ -14,13 +14,14 @@ use crate::core::{
     ServerUuid, ViewId,
 };
 use crate::service::{
-    AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect, ControlCredential,
-    ControlCredentialRole, ControlStage, JoinCapability, JoinEffect, MemberAuthorityError,
-    MemberControlBinding, MemberMutationAuthority, MemberNativeEvidence, MemberPeer,
-    MemberTransitionError, MemberViewError, MysqlMemberConfig, MysqlMemberIndex,
+    AccountProvisioningEvidence, ControlCredential, ControlCredentialRole, ControlStage,
+    MemberAuthorityError, MemberControlBinding, MemberMutationAuthority, MemberNativeEvidence,
+    MemberPeer, MemberTransitionError, MemberViewError, MysqlMemberConfig, MysqlMemberIndex,
     MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment, TopologyAuthorityError,
     TopologyEvidenceError, TopologyStateError, ViewDiscovery,
 };
+#[cfg(test)]
+use crate::service::{BootstrapCapability, BootstrapEffect, JoinCapability, JoinEffect};
 
 #[derive(Clone)]
 pub(crate) struct OwnedControlTarget {
@@ -463,6 +464,14 @@ impl OwnedControlTarget {
             member,
         }
     }
+
+    pub(crate) fn revalidate_socket(&self) -> Result<(), MemberTransitionError> {
+        self.socket.revalidate().map_err(|_| {
+            MemberTransitionError::Native(MysqlTopologyError::ControlTransport(
+                ControlStage::SocketValidation,
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -768,22 +777,7 @@ async fn enroll_identity_with<C: ControlConnector>(
     disconnect(connection, result, deadline).await
 }
 
-pub(crate) async fn bootstrap(
-    target: OwnedControlTarget,
-    capability: BootstrapCapability,
-    recovery: &ControlCredential,
-    control_deadline: &NativeControlDeadline,
-) -> Result<BootstrapEffect, MysqlTopologyError> {
-    bootstrap_with(
-        &MysqlControlConnector,
-        target,
-        capability,
-        recovery,
-        control_deadline,
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn bootstrap_with<C: ControlConnector>(
     connector: &C,
     target: OwnedControlTarget,
@@ -852,22 +846,6 @@ fn reserve_cleanup_deadline(
     now.checked_add(remaining / 2)
         .filter(|effect_deadline| *effect_deadline < deadline)
         .ok_or(MysqlTopologyError::Deadline(stage))
-}
-
-pub(crate) async fn join(
-    target: OwnedControlTarget,
-    capability: JoinCapability,
-    recovery: &ControlCredential,
-    control_deadline: &NativeControlDeadline,
-) -> Result<JoinEffect, MysqlTopologyError> {
-    join_with(
-        &MysqlControlConnector,
-        target,
-        capability,
-        recovery,
-        control_deadline,
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -999,6 +977,7 @@ pub(super) async fn qualification_mutate_recovery(
     disconnect(connection, result, deadline).await
 }
 
+#[cfg(test)]
 async fn join_with<C: ControlConnector>(
     connector: &C,
     target: OwnedControlTarget,
@@ -1131,6 +1110,7 @@ fn verify_target(
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_capability_target(
     target: &OwnedControlTarget,
     binding: &MemberControlBinding,

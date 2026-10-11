@@ -273,6 +273,13 @@ impl MemberSourceBoundary {
         source: MemberPeer,
         evidence: MemberNativeEvidence,
     ) -> Result<Self, MemberTransitionError> {
+        if source.member_id() != evidence.authority().local().member_id()
+            || source.address() != evidence.authority().local().binding().member_address()
+        {
+            return Err(MemberTransitionError::Authority(
+                MemberAuthorityError::SourceMismatch,
+            ));
+        }
         let member =
             evidence
                 .view()
@@ -484,12 +491,14 @@ impl MemberEffectReceipt {
         authority: MemberMutationAuthority,
         predecessor: Option<MemberNativeEvidence>,
         successor: MemberNativeEvidence,
+        final_binding: &crate::service::MemberControlBinding,
         attempt: &AttemptContext,
         cleanup: AttemptCleanupState,
     ) -> Result<Self, MemberTransitionError> {
         let deadline = attempt.deadline_state();
         let cancellation = attempt.cancellation_state();
         if attempt.attempt() != authority.attempt()
+            || final_binding != authority.local().binding()
             || successor.authority() != &authority
             || predecessor
                 .as_ref()
@@ -602,12 +611,14 @@ impl BackendConnectionReceipt {
     pub fn new(
         authority: MemberMutationAuthority,
         connection: BackendConnectionId,
+        final_binding: &crate::service::MemberControlBinding,
         attempt: &AttemptContext,
         cleanup: AttemptCleanupState,
     ) -> Result<Self, MemberTransitionError> {
         let deadline = attempt.deadline_state();
         let cancellation = attempt.cancellation_state();
-        if attempt.attempt() != authority.attempt() {
+        if attempt.attempt() != authority.attempt() || final_binding != authority.local().binding()
+        {
             return Err(MemberTransitionError::Receipt(
                 MemberReceiptError::BindingMismatch,
             ));
@@ -705,8 +716,12 @@ pub trait MysqlMemberEffectBoundary {
         attempt: &AttemptContext,
     ) -> Result<BackendConnectionReceipt, MemberTransitionError>;
 
-    /// Contains only this exact locally owned member.
-    fn contain_member(&mut self) -> Result<(), MysqlInstanceError>;
+    /// Contains only this exact locally owned member within the attempt's
+    /// cleanup deadline.
+    fn contain_member(
+        &mut self,
+        attempt: &AttemptContext,
+    ) -> Result<AttemptCleanupState, MysqlInstanceError>;
 }
 
 fn validate_attempt(
@@ -724,22 +739,30 @@ fn validate_attempt(
 }
 
 fn validate_peers(view: &NativeView, peers: &[MemberPeer]) -> Result<(), MemberTransitionError> {
-    if peers.len() != view.members().len() {
-        return Err(MemberTransitionError::View(
-            MemberViewError::UnexpectedMember,
-        ));
-    }
-    for peer in peers {
-        let member = view
-            .member(peer.member_id())
-            .ok_or(MemberTransitionError::View(
-                MemberViewError::RequiredMemberMissing,
-            ))?;
+    for member in view.members() {
+        let mut matching = peers.iter().filter(|peer| peer.member_id() == member.id());
+        let peer = matching.next().ok_or(MemberTransitionError::View(
+            MemberViewError::RequiredMemberMissing,
+        ))?;
+        if matching.next().is_some() {
+            return Err(MemberTransitionError::View(
+                MemberViewError::UnexpectedMember,
+            ));
+        }
         if member.address() != peer.address() {
             return Err(MemberTransitionError::View(
                 MemberViewError::MemberAddressMismatch,
             ));
         }
+    }
+    if peers.len() != view.members().len()
+        || peers
+            .iter()
+            .any(|peer| view.member(peer.member_id()).is_none())
+    {
+        return Err(MemberTransitionError::View(
+            MemberViewError::UnexpectedMember,
+        ));
     }
     Ok(())
 }

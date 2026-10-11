@@ -19,8 +19,8 @@ use kuberic_mysql::core::{
     ReplicaIncarnation, ResourceId, ServerUuid, StorageBinding, ViewId,
 };
 use kuberic_mysql::service::{
-    LifecycleOperation, MysqlInstanceError, MysqlInstanceManager, MysqlInstanceState,
-    OwnershipError,
+    AttemptCleanupState, AttemptContext, LifecycleOperation, MysqlInstanceError,
+    MysqlInstanceManager, MysqlInstanceState, MysqlMemberEffectBoundary, OwnershipError,
 };
 
 #[derive(Clone)]
@@ -85,6 +85,44 @@ fn one_generation_transitions_and_removes_only_scratch() {
     assert!(matches!(
         manager.start(),
         Err(MysqlInstanceError::InvalidState { .. })
+    ));
+}
+
+#[test]
+fn member_containment_uses_the_attempt_cleanup_deadline() {
+    let root = TestRoot::new("attempt-containment");
+    let mut manager = MysqlInstanceManager::new(root.config());
+    manager.initialize().unwrap();
+    let socket = provide_socket(
+        manager.config().runtime().pid().to_owned(),
+        manager.config().runtime().socket().to_owned(),
+    );
+    manager.start().unwrap();
+    let attempt = AttemptContext::new(
+        AttemptId::new("attempt-containment").unwrap(),
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    assert_eq!(
+        manager.contain_member(&attempt).unwrap(),
+        AttemptCleanupState::Completed
+    );
+    socket.join().unwrap();
+    assert_eq!(manager.state(), MysqlInstanceState::Stopped);
+    assert!(!root.scratch.exists());
+
+    let expired = AttemptContext::new(
+        AttemptId::new("expired-containment").unwrap(),
+        Instant::now() + Duration::from_millis(20),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(25));
+    let mut configured = MysqlInstanceManager::new(TestRoot::new("expired-cleanup").config());
+    assert!(matches!(
+        configured.contain_member(&expired),
+        Err(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))
     ));
 }
 

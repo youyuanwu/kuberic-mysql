@@ -51,15 +51,15 @@ pub enum AttemptAdmissionError {
 
 /// A primary result paired with its mandatory cleanup result.
 #[derive(Debug)]
-pub struct PairedAttemptOutcome<T, E> {
+pub struct PairedAttemptOutcome<T, E, C = E> {
     primary: Result<T, E>,
-    cleanup: Result<AttemptCleanupState, E>,
+    cleanup: Result<AttemptCleanupState, C>,
 }
 
-impl<T, E> PairedAttemptOutcome<T, E> {
+impl<T, E, C> PairedAttemptOutcome<T, E, C> {
     /// Pairs a primary result with cleanup evidence.
     #[must_use]
-    pub const fn new(primary: Result<T, E>, cleanup: Result<AttemptCleanupState, E>) -> Self {
+    pub const fn new(primary: Result<T, E>, cleanup: Result<AttemptCleanupState, C>) -> Self {
         Self { primary, cleanup }
     }
 
@@ -69,12 +69,12 @@ impl<T, E> PairedAttemptOutcome<T, E> {
     }
 
     /// Cleanup result retained independently from the primary result.
-    pub const fn cleanup(&self) -> &Result<AttemptCleanupState, E> {
+    pub const fn cleanup(&self) -> &Result<AttemptCleanupState, C> {
         &self.cleanup
     }
 
     /// Splits the paired result without discarding either side.
-    pub fn into_parts(self) -> (Result<T, E>, Result<AttemptCleanupState, E>) {
+    pub fn into_parts(self) -> (Result<T, E>, Result<AttemptCleanupState, C>) {
         (self.primary, self.cleanup)
     }
 }
@@ -192,6 +192,16 @@ impl AttemptContext {
             AttemptDeadlineState::Work => Ok(()),
             AttemptDeadlineState::CleanupReserve => Err(AttemptAdmissionError::CleanupReserve),
             AttemptDeadlineState::Expired => Err(AttemptAdmissionError::Expired),
+        }
+    }
+
+    /// Admits mandatory cleanup until the absolute attempt deadline,
+    /// regardless of cancellation or whether the cleanup reserve has begun.
+    pub fn admit_cleanup(&self) -> Result<(), AttemptAdmissionError> {
+        if self.deadline_state() == AttemptDeadlineState::Expired {
+            Err(AttemptAdmissionError::Expired)
+        } else {
+            Ok(())
         }
     }
 

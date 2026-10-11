@@ -163,6 +163,14 @@ pub(crate) fn terminate_and_reap(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<(), MysqlInstanceError> {
+    let deadline = checked_deadline(timeout, LifecycleOperation::Shutdown)?;
+    terminate_and_reap_before(child, deadline)
+}
+
+pub(crate) fn terminate_and_reap_before(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<(), MysqlInstanceError> {
     if child
         .try_wait()
         .map_err(|error| MysqlInstanceError::Io {
@@ -174,11 +182,12 @@ pub(crate) fn terminate_and_reap(
         return Ok(());
     }
     let started = Instant::now();
-    let deadline = started
-        .checked_add(timeout)
+    let remaining = deadline
+        .checked_duration_since(started)
+        .filter(|remaining| !remaining.is_zero())
         .ok_or(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))?;
     let term_deadline = started
-        .checked_add(timeout / 2)
+        .checked_add(remaining / 2)
         .ok_or(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))?;
     let mut signal = Command::new("/bin/kill")
         .arg("-TERM")
@@ -313,6 +322,13 @@ fn kill_and_reap_until(child: &mut Child, deadline: Instant) -> Result<(), Mysql
 
 pub(crate) fn wait_for_absence(path: &Path, timeout: Duration) -> Result<(), MysqlInstanceError> {
     let deadline = checked_deadline(timeout, LifecycleOperation::SocketDisappearance)?;
+    wait_for_absence_before(path, deadline)
+}
+
+pub(crate) fn wait_for_absence_before(
+    path: &Path,
+    deadline: Instant,
+) -> Result<(), MysqlInstanceError> {
     loop {
         if fs::symlink_metadata(path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)

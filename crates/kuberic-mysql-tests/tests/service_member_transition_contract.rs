@@ -99,6 +99,85 @@ fn mutation_authority_rejects_identity_and_member_substitution() {
 }
 
 #[test]
+fn source_boundary_requires_evidence_from_the_exact_source_binding() {
+    let source_authority = authority("source-binding", MysqlMemberIndex::First);
+    let predecessor = evidence(
+        source_authority,
+        "905:1",
+        &[
+            (MysqlMemberIndex::First, MemberRole::Primary),
+            (MysqlMemberIndex::Second, MemberRole::Secondary),
+        ],
+    );
+    let error = MemberSourceBoundary::new(
+        peer("source-binding", MysqlMemberIndex::Second),
+        predecessor,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        MemberTransitionError::Authority(MemberAuthorityError::SourceMismatch)
+    ));
+}
+
+#[test]
+fn join_inputs_require_exact_unique_peer_set_equality() {
+    let predecessor = evidence(
+        authority("peer-set", MysqlMemberIndex::First),
+        "906:1",
+        &[
+            (MysqlMemberIndex::First, MemberRole::Primary),
+            (MysqlMemberIndex::Second, MemberRole::Secondary),
+        ],
+    );
+    let source =
+        MemberSourceBoundary::new(peer("peer-set", MysqlMemberIndex::First), predecessor).unwrap();
+    let target = authority("peer-set", MysqlMemberIndex::Third);
+
+    let duplicate = FreshJoinInput::new(
+        target.clone(),
+        source.clone(),
+        vec![
+            peer("peer-set", MysqlMemberIndex::First),
+            peer("peer-set", MysqlMemberIndex::First),
+        ],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        duplicate,
+        MemberTransitionError::View(MemberViewError::UnexpectedMember)
+    ));
+
+    let omitted = FreshJoinInput::new(
+        target.clone(),
+        source.clone(),
+        vec![peer("peer-set", MysqlMemberIndex::First)],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        omitted,
+        MemberTransitionError::View(MemberViewError::RequiredMemberMissing)
+    ));
+
+    let mixed_binding = FreshJoinInput::new(
+        target,
+        source,
+        vec![
+            MemberPeer::new(
+                member_id(MysqlMemberIndex::First),
+                peer("peer-set", MysqlMemberIndex::Second).address().clone(),
+            ),
+            peer("peer-set", MysqlMemberIndex::Second),
+        ],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        mixed_binding,
+        MemberTransitionError::View(MemberViewError::MemberAddressMismatch)
+    ));
+}
+
+#[test]
 fn transfer_input_preserves_exact_target_and_source_errors() {
     let source_authority = authority("transfer-input", MysqlMemberIndex::First);
     let predecessor = evidence(
@@ -265,6 +344,7 @@ fn receipts_bind_predecessor_successor_deadline_and_cleanup() {
         source_authority.clone(),
         Some(predecessor.clone()),
         successor,
+        source_authority.local().binding(),
         &attempt,
         AttemptCleanupState::NotRequired,
     )
@@ -294,6 +374,7 @@ fn receipts_bind_predecessor_successor_deadline_and_cleanup() {
         source_authority.clone(),
         Some(predecessor.clone()),
         changed_view,
+        source_authority.local().binding(),
         &attempt,
         AttemptCleanupState::NotRequired,
     )
@@ -303,11 +384,13 @@ fn receipts_bind_predecessor_successor_deadline_and_cleanup() {
         MemberTransitionError::Receipt(MemberReceiptError::SuccessorMismatch)
     ));
 
+    let final_binding = source_authority.local().binding().clone();
     let cleanup_error = MemberEffectReceipt::new(
         MemberEffectKind::ViewReadback,
         source_authority,
         None,
         predecessor,
+        &final_binding,
         &attempt,
         AttemptCleanupState::Failed,
     )
@@ -315,6 +398,89 @@ fn receipts_bind_predecessor_successor_deadline_and_cleanup() {
     assert!(matches!(
         cleanup_error,
         MemberTransitionError::Receipt(MemberReceiptError::CleanupIncomplete)
+    ));
+}
+
+#[test]
+fn receipts_reject_changed_or_replaced_final_owner_bindings() {
+    let attempt = context("final-owner");
+    let authority = authority("final-owner", MysqlMemberIndex::First);
+    let successor = evidence(
+        authority.clone(),
+        "1150:1",
+        &[(MysqlMemberIndex::First, MemberRole::Primary)],
+    );
+    let replaced_endpoint = MemberControlBinding::new(
+        authority.attempt().clone(),
+        MysqlMemberIndex::First,
+        authority.local().binding().process_session().clone(),
+        EndpointBinding::new("replacement-socket-object").unwrap(),
+        authority.local().binding().storage().clone(),
+        authority.local().binding().member_address().clone(),
+        authority.local().binding().observer_generation().clone(),
+        authority.local().binding().recovery_generation().clone(),
+    );
+    let effect_error = MemberEffectReceipt::new(
+        MemberEffectKind::Bootstrap,
+        authority.clone(),
+        None,
+        successor.clone(),
+        &replaced_endpoint,
+        &attempt,
+        AttemptCleanupState::Completed,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        effect_error,
+        MemberTransitionError::Receipt(MemberReceiptError::BindingMismatch)
+    ));
+
+    let replaced_storage = MemberControlBinding::new(
+        authority.attempt().clone(),
+        MysqlMemberIndex::First,
+        authority.local().binding().process_session().clone(),
+        authority.local().binding().endpoint().clone(),
+        StorageBinding::new("replacement-storage-root").unwrap(),
+        authority.local().binding().member_address().clone(),
+        authority.local().binding().observer_generation().clone(),
+        authority.local().binding().recovery_generation().clone(),
+    );
+    let storage_error = MemberEffectReceipt::new(
+        MemberEffectKind::Bootstrap,
+        authority.clone(),
+        None,
+        successor,
+        &replaced_storage,
+        &attempt,
+        AttemptCleanupState::Completed,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        storage_error,
+        MemberTransitionError::Receipt(MemberReceiptError::BindingMismatch)
+    ));
+
+    let changed_process = MemberControlBinding::new(
+        authority.attempt().clone(),
+        MysqlMemberIndex::First,
+        ProcessSessionId::new("replacement-process-session").unwrap(),
+        authority.local().binding().endpoint().clone(),
+        authority.local().binding().storage().clone(),
+        authority.local().binding().member_address().clone(),
+        authority.local().binding().observer_generation().clone(),
+        authority.local().binding().recovery_generation().clone(),
+    );
+    let connection_error = BackendConnectionReceipt::new(
+        authority,
+        BackendConnectionId::new(std::num::NonZeroU64::new(44).unwrap()),
+        &changed_process,
+        &attempt,
+        AttemptCleanupState::Completed,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        connection_error,
+        MemberTransitionError::Receipt(MemberReceiptError::BindingMismatch)
     ));
 }
 
@@ -343,6 +509,7 @@ fn join_receipts_require_exact_canonical_successor_and_history() {
         target_authority.clone(),
         Some(predecessor.clone()),
         same_view,
+        target_authority.local().binding(),
         &attempt,
         AttemptCleanupState::NotRequired,
     )
@@ -366,6 +533,7 @@ fn join_receipts_require_exact_canonical_successor_and_history() {
         target_authority.clone(),
         Some(predecessor.clone()),
         missing_history,
+        target_authority.local().binding(),
         &attempt,
         AttemptCleanupState::NotRequired,
     )
@@ -389,6 +557,7 @@ fn join_receipts_require_exact_canonical_successor_and_history() {
         target_authority,
         Some(predecessor),
         accepted,
+        &binding("join-receipt", MysqlMemberIndex::Second),
         &attempt,
         AttemptCleanupState::NotRequired,
     )
@@ -422,6 +591,7 @@ fn attempt_context_separates_work_cleanup_expiry_and_cancellation() {
     let clone = context.clone();
     clone.cancel();
     assert_eq!(context.admit_work(), Err(AttemptAdmissionError::Cancelled));
+    assert_eq!(context.admit_cleanup(), Ok(()));
     assert_eq!(
         context.cancellation_state(),
         AttemptCancellationState::Cancelled
@@ -466,6 +636,7 @@ fn paired_outcome_and_connection_receipt_retain_cleanup_evidence() {
     let receipt = BackendConnectionReceipt::new(
         authority.clone(),
         BackendConnectionId::new(std::num::NonZeroU64::new(42).unwrap()),
+        authority.local().binding(),
         &attempt,
         AttemptCleanupState::Completed,
     )
@@ -476,9 +647,11 @@ fn paired_outcome_and_connection_receipt_retain_cleanup_evidence() {
     assert_eq!(receipt.cleanup_state(), AttemptCleanupState::Completed);
 
     attempt.cancel();
+    let final_binding = authority.local().binding().clone();
     let error = BackendConnectionReceipt::new(
         authority,
         BackendConnectionId::new(std::num::NonZeroU64::new(43).unwrap()),
+        &final_binding,
         &attempt,
         AttemptCleanupState::Completed,
     )
@@ -581,7 +754,7 @@ impl MysqlMemberEffectBoundary for ScriptMember {
         attempt: &AttemptContext,
     ) -> Result<MemberEffectReceipt, MemberTransitionError> {
         if attempt.cancellation_state() == AttemptCancellationState::Cancelled {
-            self.contain_member().unwrap();
+            self.contain_member(attempt).unwrap();
             Err(MemberTransitionError::Cancelled)
         } else {
             unreachable!("this contract always cancels")
@@ -597,9 +770,12 @@ impl MysqlMemberEffectBoundary for ScriptMember {
         unreachable!("not used by this contract")
     }
 
-    fn contain_member(&mut self) -> Result<(), MysqlInstanceError> {
+    fn contain_member(
+        &mut self,
+        _attempt: &AttemptContext,
+    ) -> Result<AttemptCleanupState, MysqlInstanceError> {
         self.containments += 1;
-        Ok(())
+        Ok(AttemptCleanupState::Completed)
     }
 }
 

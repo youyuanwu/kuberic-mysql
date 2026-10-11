@@ -28,8 +28,8 @@ use crate::service::control::OwnedControlTarget;
 #[cfg(test)]
 use crate::service::process::qualification_kill_and_reap;
 use crate::service::process::{
-    attest_child, launcher_command, terminate_and_reap, verify_product, wait_bounded,
-    wait_for_absence,
+    attest_child, launcher_command, terminate_and_reap, terminate_and_reap_before, verify_product,
+    wait_bounded, wait_for_absence, wait_for_absence_before,
 };
 use crate::service::{
     AccountProvisioningEvidence, AttemptAdmissionError, AttemptCleanupState, AttemptContext,
@@ -38,8 +38,8 @@ use crate::service::{
     JoinEffect, LifecycleOperation, MemberAuthorityError, MemberControlBinding, MemberEffectKind,
     MemberEffectReceipt, MemberMutationAuthority, MemberNativeEvidence, MemberTransitionError,
     MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary, MysqlTopologyError,
-    NativeControlDeadline, NativeIdentityEnrollment, PrimaryTransferInput, TopologyStateError,
-    ViewDiscovery,
+    NativeControlDeadline, NativeIdentityEnrollment, PairedAttemptOutcome, PrimaryTransferInput,
+    TopologyStateError, ViewDiscovery,
 };
 
 const READY_POLL: Duration = Duration::from_millis(25);
@@ -368,16 +368,13 @@ impl MysqlInstanceManager {
         &mut self,
         capability: BootstrapCapability,
         recovery: &ControlCredential,
-        deadline: &NativeControlDeadline,
-    ) -> Result<BootstrapEffect, MysqlTopologyError> {
-        let target = self.prepare_control_target()?;
-        let mut containment = BootstrapCancellationContainment::new(self);
-        let result =
-            crate::service::control::bootstrap(target, capability, recovery, deadline).await;
-        if result.is_ok() {
-            containment.disarm();
-        }
-        result
+        attempt: &AttemptContext,
+    ) -> Result<BootstrapEffect, MemberTransitionError> {
+        let input = capability.member_input()?;
+        self.bootstrap_member(input, recovery, attempt).await?;
+        capability
+            .record_effect(BootstrapEffect::required_steps().to_vec())
+            .map_err(MemberTransitionError::Native)
     }
 
     /// Enters one non-bootstrap join with process-memory-only recovery
@@ -386,10 +383,13 @@ impl MysqlInstanceManager {
         &mut self,
         capability: JoinCapability,
         recovery: &ControlCredential,
-        deadline: &NativeControlDeadline,
-    ) -> Result<JoinEffect, MysqlTopologyError> {
-        let target = self.prepare_control_target()?;
-        crate::service::control::join(target, capability, recovery, deadline).await
+        attempt: &AttemptContext,
+    ) -> Result<JoinEffect, MemberTransitionError> {
+        let input = capability.member_input()?;
+        self.join_member(input, recovery, attempt).await?;
+        capability
+            .record_effect(JoinEffect::required_steps().to_vec())
+            .map_err(MemberTransitionError::Native)
     }
 
     /// Discovers a proposed post-effect view without replacing enrollment or
@@ -415,7 +415,7 @@ impl MysqlInstanceManager {
         let deadline = self.member_effect_deadline(input.authority(), attempt)?;
         let target = self.prepare_member_effect_target(input.authority())?;
         let authority = input.authority().clone();
-        let containment = MemberEffectCancellationContainment::new(self);
+        let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
             crate::service::control::member_bootstrap(
                 target.clone(),
@@ -425,12 +425,12 @@ impl MysqlInstanceManager {
             )
             .await?;
             poll_member_receipt(
+                &mut containment,
                 target,
                 MemberEffectKind::Bootstrap,
                 authority,
                 None,
                 attempt,
-                AttemptCleanupState::Completed,
                 &deadline,
             )
             .await
@@ -451,17 +451,17 @@ impl MysqlInstanceManager {
         let target = self.prepare_member_effect_target(input.authority())?;
         let authority = input.authority().clone();
         let predecessor = input.source().evidence().clone();
-        let containment = MemberEffectCancellationContainment::new(self);
+        let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
             crate::service::control::member_join(target.clone(), &authority, recovery, &deadline)
                 .await?;
             poll_member_receipt(
+                &mut containment,
                 target,
                 MemberEffectKind::Join,
                 authority,
                 Some(predecessor),
                 attempt,
-                AttemptCleanupState::NotRequired,
                 &deadline,
             )
             .await
@@ -494,7 +494,7 @@ impl MysqlInstanceManager {
         let authority = input.authority().clone();
         let predecessor = input.source().evidence().clone();
         let transfer_target = input.target().clone();
-        let containment = MemberEffectCancellationContainment::new(self);
+        let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
             let current =
                 crate::service::control::read_member_view(target.clone(), &authority, &deadline)
@@ -512,6 +512,7 @@ impl MysqlInstanceManager {
             )
             .await?;
             poll_member_receipt(
+                &mut containment,
                 target,
                 MemberEffectKind::PrimaryTransfer {
                     target: transfer_target.member_id().clone(),
@@ -519,7 +520,6 @@ impl MysqlInstanceManager {
                 authority,
                 Some(predecessor),
                 attempt,
-                AttemptCleanupState::NotRequired,
                 &deadline,
             )
             .await
@@ -539,19 +539,24 @@ impl MysqlInstanceManager {
         let deadline = self.member_effect_deadline(authority, attempt)?;
         let target = self.prepare_member_effect_target(authority)?;
         let authority = authority.clone();
-        let containment = MemberEffectCancellationContainment::new(self);
+        let mut containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = async {
             crate::service::control::terminate_backend_connection(
-                target,
+                target.clone(),
                 &authority,
                 std::num::NonZeroU64::new(connection.get())
                     .expect("BackendConnectionId is nonzero"),
                 &deadline,
             )
             .await?;
+            crate::service::control::read_member_view(target.clone(), &authority, &deadline)
+                .await?;
+            let final_binding = containment.revalidate_binding(&authority)?;
+            target.revalidate_socket()?;
             BackendConnectionReceipt::new(
                 authority,
                 connection,
+                &final_binding,
                 attempt,
                 AttemptCleanupState::Completed,
             )
@@ -583,6 +588,14 @@ impl MysqlInstanceManager {
         authority: &MemberMutationAuthority,
     ) -> Result<OwnedControlTarget, MemberTransitionError> {
         let target = self.prepare_control_target()?;
+        self.revalidate_member_effect_binding(authority)?;
+        Ok(target)
+    }
+
+    fn revalidate_member_effect_binding(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<MemberControlBinding, MemberTransitionError> {
         let binding = self.topology_binding(
             authority.attempt().clone(),
             authority.local().binding().observer_generation().clone(),
@@ -598,7 +611,7 @@ impl MysqlInstanceManager {
                 MemberAuthorityError::LocalBindingMismatch,
             ));
         }
-        Ok(target)
+        Ok(binding)
     }
 
     /// Attests, terminates, and reaps the exact retained child, proves socket
@@ -1006,6 +1019,51 @@ impl MysqlInstanceManager {
         Ok(())
     }
 
+    fn contain_with_attempt(
+        &mut self,
+        attempt: &AttemptContext,
+    ) -> Result<AttemptCleanupState, MysqlInstanceError> {
+        attempt
+            .admit_cleanup()
+            .map_err(|_| MysqlInstanceError::Timeout(LifecycleOperation::Shutdown))?;
+        self.contain_before(attempt.deadline())?;
+        Ok(AttemptCleanupState::Completed)
+    }
+
+    fn contain_before(&mut self, deadline: Instant) -> Result<(), MysqlInstanceError> {
+        match self.state {
+            MysqlInstanceState::Configured | MysqlInstanceState::Stopped => return Ok(()),
+            MysqlInstanceState::Running
+            | MysqlInstanceState::Initialized
+            | MysqlInstanceState::Faulted => {}
+        }
+        ensure_cleanup_deadline(deadline, LifecycleOperation::Shutdown)?;
+        if self.child.is_none() && self.data_root.is_none() && self.scratch_root.is_none() {
+            self.state = MysqlInstanceState::Stopped;
+            return Ok(());
+        }
+        self.revalidate_roots()?;
+        if let Some(child) = self.child.as_mut() {
+            attest_child(child, &self.config)?;
+            terminate_and_reap_before(child, deadline)?;
+            self.child = None;
+            wait_for_absence_before(self.config.runtime().socket(), deadline)?;
+        }
+        self.revalidate_roots()?;
+        if self.cleanup_quarantined {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::RootMismatch,
+            ));
+        }
+        ensure_cleanup_deadline(deadline, LifecycleOperation::ScratchCleanup)?;
+        if let Some(scratch) = self.scratch_root.as_ref() {
+            remove_owned_root(scratch, LifecycleOperation::ScratchCleanup)?;
+            self.scratch_root = None;
+        }
+        self.state = MysqlInstanceState::Stopped;
+        Ok(())
+    }
+
     fn cleanup_all_roots(&mut self) -> Result<(), MysqlInstanceError> {
         let roots = [self.data_root.clone(), self.scratch_root.clone()]
             .into_iter()
@@ -1069,31 +1127,42 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
             .await
     }
 
-    fn contain_member(&mut self) -> Result<(), MysqlInstanceError> {
-        self.contain()
+    fn contain_member(
+        &mut self,
+        attempt: &AttemptContext,
+    ) -> Result<AttemptCleanupState, MysqlInstanceError> {
+        self.contain_with_attempt(attempt)
     }
 }
 
 async fn poll_member_receipt(
+    containment: &mut MemberEffectCancellationContainment<'_>,
     target: OwnedControlTarget,
     kind: MemberEffectKind,
     authority: MemberMutationAuthority,
     predecessor: Option<MemberNativeEvidence>,
     attempt: &AttemptContext,
-    cleanup: AttemptCleanupState,
     deadline: &NativeControlDeadline,
 ) -> Result<MemberEffectReceipt, MemberTransitionError> {
+    let cleanup = if kind == MemberEffectKind::Bootstrap {
+        AttemptCleanupState::Completed
+    } else {
+        AttemptCleanupState::NotRequired
+    };
     loop {
         attempt
             .admit_work()
             .map_err(member_attempt_admission_error)?;
         let evidence =
             crate::service::control::read_member_view(target.clone(), &authority, deadline).await?;
+        let final_binding = containment.revalidate_binding(&authority)?;
+        target.revalidate_socket()?;
         match MemberEffectReceipt::new(
             kind.clone(),
             authority.clone(),
             predecessor.clone(),
             evidence,
+            &final_binding,
             attempt,
             cleanup,
         ) {
@@ -1126,15 +1195,24 @@ fn member_attempt_admission_error(error: AttemptAdmissionError) -> MemberTransit
 
 struct MemberEffectCancellationContainment<'a> {
     instance: &'a mut MysqlInstanceManager,
+    attempt: AttemptContext,
     armed: bool,
 }
 
 impl<'a> MemberEffectCancellationContainment<'a> {
-    fn new(instance: &'a mut MysqlInstanceManager) -> Self {
+    fn new(instance: &'a mut MysqlInstanceManager, attempt: &AttemptContext) -> Self {
         Self {
             instance,
+            attempt: attempt.clone(),
             armed: true,
         }
+    }
+
+    fn revalidate_binding(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<MemberControlBinding, MemberTransitionError> {
+        self.instance.revalidate_member_effect_binding(authority)
     }
 
     fn finish<T>(
@@ -1148,12 +1226,21 @@ impl<'a> MemberEffectCancellationContainment<'a> {
             }
             Err(primary) => {
                 self.armed = false;
-                match self.instance.contain() {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => Err(MemberTransitionError::Cleanup {
+                let paired =
+                    PairedAttemptOutcome::<T, MemberTransitionError, MysqlInstanceError>::new(
+                        Err(primary),
+                        self.instance.contain_with_attempt(&self.attempt),
+                    );
+                match paired.into_parts() {
+                    (Err(primary), Ok(AttemptCleanupState::Completed)) => Err(primary),
+                    (Err(primary), Err(cleanup)) => Err(MemberTransitionError::Cleanup {
                         primary: Box::new(primary),
                         cleanup: Box::new(cleanup),
                     }),
+                    (Err(_), Ok(_)) => {
+                        unreachable!("attempt containment only returns completed cleanup")
+                    }
+                    (Ok(_), _) => unreachable!("failure containment retains a primary error"),
                 }
             }
         }
@@ -1163,33 +1250,7 @@ impl<'a> MemberEffectCancellationContainment<'a> {
 impl Drop for MemberEffectCancellationContainment<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.instance.contain();
-        }
-    }
-}
-
-struct BootstrapCancellationContainment<'a> {
-    instance: &'a mut MysqlInstanceManager,
-    armed: bool,
-}
-
-impl<'a> BootstrapCancellationContainment<'a> {
-    fn new(instance: &'a mut MysqlInstanceManager) -> Self {
-        Self {
-            instance,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for BootstrapCancellationContainment<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.instance.contain();
+            let _ = self.instance.contain_with_attempt(&self.attempt);
         }
     }
 }
@@ -1211,6 +1272,17 @@ fn checked_deadline(
     Instant::now()
         .checked_add(timeout)
         .ok_or(MysqlInstanceError::Timeout(operation))
+}
+
+fn ensure_cleanup_deadline(
+    deadline: Instant,
+    operation: LifecycleOperation,
+) -> Result<(), MysqlInstanceError> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(MysqlInstanceError::Timeout(operation))
+    }
 }
 
 fn cleanup_claimed_roots(roots: &[OwnedRoot]) -> Result<(), MysqlInstanceError> {

@@ -694,17 +694,29 @@ impl<'a> MysqlNativeQualification<'a> {
                 .iter()
                 .find(|enrollment| enrollment.binding().member() == member)
                 .ok_or_else(|| "admitted topology lacked an expected member".to_owned())?;
-            if snapshots[member.as_usize()].server_uuid != admitted.server_uuid().as_str()
-                || binding.attempt() != admitted.binding().attempt()
-                || binding.endpoint() != admitted.binding().endpoint()
-                || binding.storage() != admitted.binding().storage()
-                || binding.member_address() != admitted.binding().member_address()
-                || binding.observer_generation() != admitted.binding().observer_generation()
-                || binding.recovery_generation() != admitted.binding().recovery_generation()
+            let drift = if snapshots[member.as_usize()].server_uuid
+                != admitted.server_uuid().as_str()
             {
+                Some("native identity")
+            } else if binding.attempt() != admitted.binding().attempt() {
+                Some("attempt")
+            } else if binding.endpoint() != admitted.binding().endpoint() {
+                Some("endpoint")
+            } else if binding.storage() != admitted.binding().storage() {
+                Some("storage")
+            } else if binding.member_address() != admitted.binding().member_address() {
+                Some("member address")
+            } else if binding.observer_generation() != admitted.binding().observer_generation() {
+                Some("observer generation")
+            } else if binding.recovery_generation() != admitted.binding().recovery_generation() {
+                Some("recovery generation")
+            } else {
+                None
+            };
+            if let Some(drift) = drift {
                 return Err(format!(
-                    "member {} drifted from admitted native/storage binding",
-                    member.as_usize() + 1
+                    "member {} drifted from admitted {drift} binding",
+                    member.as_usize() + 1,
                 ));
             }
             let mut connection = self.root_connection(member).await?;
