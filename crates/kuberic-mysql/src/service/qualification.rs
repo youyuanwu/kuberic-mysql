@@ -1283,20 +1283,21 @@ impl<'a> MysqlNativeQualification<'a> {
             .await
             .map_err(|_| "secondary read-only release failed".to_owned())?;
         lock_connection
-            .query_drop("START TRANSACTION")
+            .query_drop("LOCK TABLES kuberic_native_qualification.tokens WRITE")
             .await
-            .map_err(|_| "secondary lock transaction failed".to_owned())?;
+            .map_err(|_| "secondary table lock failed".to_owned())?;
         let locked_value = lock_connection
             .exec_first::<u64, _, _>(
                 "SELECT token_value FROM kuberic_native_qualification.tokens \
-                         WHERE token_name = ? FOR UPDATE",
+                         WHERE token_name = ?",
                 (lock_token.clone(),),
             )
             .await
-            .map_err(|_| "secondary row lock failed".to_owned())?
-            .ok_or_else(|| "secondary row lock found no exact token".to_owned())?;
+            .map_err(|_| "secondary locked-row read failed".to_owned())?
+            .ok_or_else(|| "secondary locked-row read found no exact token".to_owned())?;
         if locked_value != baseline.token_value {
-            return Err("secondary row lock found an unexpected token value".to_owned());
+            restore_secondary_blocker(&mut lock_connection).await?;
+            return Err("secondary locked-row read found an unexpected token value".to_owned());
         }
 
         let mut workload = self.root_connection(primary).await?;
@@ -1329,7 +1330,7 @@ impl<'a> MysqlNativeQualification<'a> {
         {
             Ok(gtid) => gtid,
             Err(error) => {
-                restore_secondary_lock(&mut lock_connection).await?;
+                restore_secondary_blocker(&mut lock_connection).await?;
                 let (connection, result) = update.join().await?;
                 let _ = connection.disconnect().await;
                 result
@@ -1338,16 +1339,16 @@ impl<'a> MysqlNativeQualification<'a> {
             }
         };
         if update.is_finished() {
-            restore_secondary_lock(&mut lock_connection).await?;
+            restore_secondary_blocker(&mut lock_connection).await?;
             let (connection, _) = update.join().await?;
             let _ = connection.disconnect().await;
             return Err("client completed before the applier barrier".to_owned());
         }
         if !update.abort_and_join().await {
-            restore_secondary_lock(&mut lock_connection).await?;
+            restore_secondary_blocker(&mut lock_connection).await?;
             return Err("workload completed before cancellation could prove disconnect".to_owned());
         }
-        restore_secondary_lock(&mut lock_connection).await?;
+        restore_secondary_blocker(&mut lock_connection).await?;
 
         let after = self.wait_common_tail(baseline.transaction_tail + 1).await?;
         let after_tail = compatible_common_tail(&after, self.attempt.group_name().as_str())?;
@@ -1838,11 +1839,11 @@ fn decode_binary_log_inventory(rows: &[mysql_async::Row]) -> Result<Vec<String>,
         .collect()
 }
 
-async fn restore_secondary_lock(connection: &mut Conn) -> Result<(), String> {
+async fn restore_secondary_blocker(connection: &mut Conn) -> Result<(), String> {
     connection
-        .query_drop("ROLLBACK")
+        .query_drop("UNLOCK TABLES")
         .await
-        .map_err(|_| "secondary lock rollback failed".to_owned())?;
+        .map_err(|_| "secondary table unlock failed".to_owned())?;
     connection
         .query_drop("SET GLOBAL read_only = ON")
         .await
