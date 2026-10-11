@@ -9,6 +9,105 @@ use crate::service::{
     MysqlOwnedPathKind, MysqlTopologyState,
 };
 
+/// Bounded client-gateway protocol phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MysqlProxyPhase {
+    /// Loopback listener preparation or acceptance.
+    Listener,
+    /// Backend private-UDS connection and greeting.
+    Greeting,
+    /// Client handshake response and server authentication exchange.
+    Authentication,
+    /// One complete client command packet.
+    ClientCommand,
+    /// One bounded server response.
+    ServerResponse,
+    /// Generation revocation and native absence proof.
+    Revocation,
+    /// Application-account creation, cache preparation, or removal.
+    AccountLifecycle,
+}
+
+/// Stable reason a Classic Protocol exchange was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MysqlProxyProtocolError {
+    /// Packet header or payload ended before the declared boundary.
+    IncompletePacket,
+    /// A packet exceeded the one-mebibyte payload limit.
+    PacketTooLarge,
+    /// A continuation-sized packet was observed.
+    ContinuationPacket,
+    /// Packet sequence did not match the exact bounded state.
+    SequenceMismatch,
+    /// Server greeting was not protocol version 10 or was malformed.
+    InvalidGreeting,
+    /// An advertised or requested capability was outside the fixed profile.
+    UnsupportedCapability,
+    /// The client username was not the dedicated application identity.
+    UsernameMismatch,
+    /// The authentication plugin or exchange was outside warmed fast auth.
+    UnsupportedAuthentication,
+    /// The command was not query, ping, or quit.
+    UnsupportedCommand,
+    /// A local-infile request was observed.
+    LocalInfile,
+    /// A result used a nonlegacy or otherwise unsupported termination mode.
+    UnsupportedResult,
+    /// A response advertised additional results.
+    MoreResults,
+}
+
+/// Secret-free application gateway failure.
+#[derive(Debug)]
+pub enum MysqlProxyError {
+    /// Listener input was not an exact loopback address or the account input
+    /// was invalid.
+    InvalidConfiguration,
+    /// The requested transition was incompatible with current proxy state.
+    InvalidState,
+    /// Stage 2 requires both read and write permission.
+    BothPermissionsRequired,
+    /// The supplied generation was stale or did not own the active endpoint.
+    GenerationMismatch,
+    /// A listener or transport operation failed.
+    Io {
+        /// Protocol phase being performed.
+        phase: MysqlProxyPhase,
+        /// Stable operating-system error category.
+        kind: ErrorKind,
+    },
+    /// Bounded protocol validation failed.
+    Protocol {
+        /// Protocol phase being performed.
+        phase: MysqlProxyPhase,
+        /// Stable rejection reason.
+        reason: MysqlProxyProtocolError,
+    },
+    /// A fixed phase deadline expired.
+    Deadline(MysqlProxyPhase),
+    /// The shared attempt was cancelled.
+    Cancelled,
+    /// Private-UDS account lifecycle failed.
+    Account(MysqlTopologyError),
+    /// Exact native backend termination or absence proof failed.
+    Native(MemberTransitionError),
+    /// Cleanup failed after a primary proxy failure.
+    Cleanup {
+        /// Original proxy failure.
+        primary: Box<Self>,
+        /// Mandatory cleanup failure.
+        cleanup: Box<Self>,
+    },
+}
+
+impl fmt::Display for MysqlProxyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MySQL client proxy failure: {self:?}")
+    }
+}
+
+impl std::error::Error for MysqlProxyError {}
+
 /// Configuration validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -147,6 +246,14 @@ pub enum ControlStage {
     CreateRecovery,
     /// Granting the exact distributed-recovery privileges.
     GrantRecovery,
+    /// Creating the dedicated local application account.
+    CreateApplication,
+    /// Granting exact qualification-schema DML privileges.
+    GrantApplicationDml,
+    /// Removing the dedicated local application account.
+    DropApplication,
+    /// Warming the dedicated account's `caching_sha2_password` cache.
+    WarmApplicationAuthentication,
     /// Restoring the original session binary-log switch.
     RestoreBinaryLogging,
     /// Proving the session binary-log switch was restored.
@@ -319,6 +426,8 @@ pub enum MysqlReplicatorError {
     InvalidConfiguration,
     /// An access generation was stale or conflicting.
     StaleAccessGeneration,
+    /// Published gateway authority must be revoked and contained first.
+    AccessRevocationRequired,
     /// A typed member receipt or observation did not match the admitted operation.
     ReceiptMismatch,
     /// A typed receipt arrived after cancellation or outside primary-work time.
@@ -340,6 +449,15 @@ pub enum MysqlReplicatorError {
     Terminal,
     /// The member-local effect failed or completed uncertainly.
     MemberTransition(MemberTransitionError),
+    /// Account, listener, protocol, generation, or gateway containment failed.
+    Proxy(MysqlProxyError),
+    /// Gateway cleanup failed and local process containment also failed.
+    ProxyCleanup {
+        /// Original gateway cleanup failure.
+        proxy: Box<MysqlProxyError>,
+        /// Exact local containment failure.
+        instance: Box<MysqlInstanceError>,
+    },
     /// Exact local containment failed.
     Instance(MysqlInstanceError),
 }

@@ -2,8 +2,10 @@
 //!
 //! The engine owns one injected member-effect boundary. Production uses
 //! [`MysqlInstanceManager`]; deterministic contracts may inject scripted
-//! effects. It stores no peer process owner and grants no client endpoint.
+//! effects. It stores no peer process owner; client publication is available
+//! only through the generation-fenced bounded proxy.
 
+use std::net::SocketAddr;
 use std::num::NonZeroU64;
 
 use crate::core::{
@@ -11,12 +13,14 @@ use crate::core::{
     MemberRole, ProgressProjection, ReplicaId, ReplicaIncarnation, project_progress,
 };
 use crate::service::{
-    AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState, AttemptContext,
-    AttemptDeadlineState, ControlCredential, ControlCredentialRole, FreshBootstrapInput,
-    FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget, MemberEffectKind,
-    MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
-    MemberOperationIdentity, MemberPeer, MemberSourceBoundary, MysqlInstanceManager,
-    MysqlMemberEffectBoundary, MysqlReplicatorError, PrimaryTransferInput,
+    ApplicationCredential, AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState,
+    AttemptContext, AttemptDeadlineState, ControlCredential, ControlCredentialRole,
+    FreshBootstrapInput, FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget,
+    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
+    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
+    MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary,
+    MysqlProxyContainmentReceipt, MysqlProxyControlBoundary, MysqlReplicatorError,
+    PrimaryTransferInput,
 };
 
 /// Exact logical identity of one member-local replica incarnation.
@@ -528,23 +532,37 @@ impl MysqlAccessIntent {
     }
 }
 
-/// Closed Phase 3 access state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Generation-bound publication or containment outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlAccessOutcome {
     intent: MysqlAccessIntent,
+    endpoint: Option<SocketAddr>,
+    containment: Option<MysqlProxyContainmentReceipt>,
 }
 
 impl MysqlAccessOutcome {
     /// Recorded access intent.
     #[must_use]
-    pub const fn intent(self) -> MysqlAccessIntent {
+    pub const fn intent(&self) -> MysqlAccessIntent {
         self.intent
     }
 
-    /// Phase 3 never publishes an application endpoint.
+    /// Published loopback application endpoint, when this outcome opened one.
     #[must_use]
-    pub const fn is_open(self) -> bool {
-        false
+    pub const fn is_open(&self) -> bool {
+        self.endpoint.is_some()
+    }
+
+    /// Published loopback endpoint.
+    #[must_use]
+    pub const fn endpoint(&self) -> Option<SocketAddr> {
+        self.endpoint
+    }
+
+    /// Generation-containment receipt for a closure outcome.
+    #[must_use]
+    pub const fn containment(&self) -> Option<&MysqlProxyContainmentReceipt> {
+        self.containment.as_ref()
     }
 }
 
@@ -705,6 +723,8 @@ where
     native_evidence: Option<MemberNativeEvidence>,
     progress: Option<MysqlProgressOutcome>,
     access: Option<MysqlAccessIntent>,
+    proxy: Option<MysqlClientProxy>,
+    proxy_containment: Option<MysqlProxyContainmentReceipt>,
     terminal: Option<MysqlTerminalState>,
     last_operation_generation: u64,
     operations: Vec<OperationRecord>,
@@ -748,6 +768,8 @@ where
             native_evidence: None,
             progress: None,
             access: None,
+            proxy: None,
+            proxy_containment: None,
             terminal: None,
             last_operation_generation: 0,
             operations: Vec::new(),
@@ -851,6 +873,7 @@ where
         epoch: MysqlReplicaEpoch,
     ) -> Result<MysqlEpochOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
         self.admit_work()?;
         let fingerprint = OperationFingerprint::Epoch(epoch);
         match self.begin_operation(operation, fingerprint)? {
@@ -994,6 +1017,7 @@ where
         intent: MysqlAccessIntent,
     ) -> Result<MysqlAccessOutcome, MysqlReplicatorError> {
         self.require_current_configuration()?;
+        self.ensure_proxy_not_published()?;
         self.admit_work()?;
         let fingerprint = OperationFingerprint::Access(intent);
         match self.begin_operation(operation, fingerprint)? {
@@ -1008,8 +1032,12 @@ where
             return Err(MysqlReplicatorError::StaleAccessGeneration);
         }
         self.access = Some(intent);
-        let outcome = MysqlAccessOutcome { intent };
-        self.complete_last(RecordedOutcome::Access(outcome));
+        let outcome = MysqlAccessOutcome {
+            intent,
+            endpoint: None,
+            containment: None,
+        };
+        self.complete_last(RecordedOutcome::Access(outcome.clone()));
         Ok(outcome)
     }
 
@@ -1035,6 +1063,9 @@ where
         operation: MysqlOperationIdentity,
     ) -> Result<MysqlTerminalOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
+        if self.proxy.is_some() {
+            return Err(MysqlReplicatorError::AccessRevocationRequired);
+        }
         self.attempt
             .admit_cleanup()
             .map_err(map_cleanup_admission)?;
@@ -1071,6 +1102,9 @@ where
         operation: MysqlOperationIdentity,
     ) -> Result<MysqlTerminalOutcome, MysqlReplicatorError> {
         self.ensure_not_terminal()?;
+        if self.proxy.is_some() {
+            return Err(MysqlReplicatorError::AccessRevocationRequired);
+        }
         let fingerprint = OperationFingerprint::Abort;
         let _ = self.begin_operation(operation, fingerprint)?;
         self.close_access();
@@ -1132,6 +1166,7 @@ where
         effect: RoleEffect,
     ) -> Result<MysqlRoleOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
         self.admit_work()?;
         let request_operation = operation.clone();
         let fingerprint = OperationFingerprint::Role(epoch, role, effect.clone());
@@ -1206,6 +1241,7 @@ where
         effect: ConfigurationEffect,
     ) -> Result<MysqlConfigurationOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
         self.admit_work()?;
         let request_operation = operation.clone();
         let fingerprint =
@@ -1555,6 +1591,16 @@ where
         }
     }
 
+    fn ensure_proxy_not_published(&self) -> Result<(), MysqlReplicatorError> {
+        if let Some(proxy) = self.proxy.as_ref() {
+            let snapshot = proxy.snapshot();
+            if snapshot.accepting() || snapshot.sessions() != 0 || !proxy.is_fully_contained() {
+                return Err(MysqlReplicatorError::AccessRevocationRequired);
+            }
+        }
+        Ok(())
+    }
+
     fn admit_work(&self) -> Result<(), MysqlReplicatorError> {
         self.attempt.admit_work().map_err(map_admission)
     }
@@ -1698,6 +1744,12 @@ where
     }
 
     fn close_access(&mut self) {
+        if let Some(proxy) = self.proxy.as_ref() {
+            let snapshot = proxy.snapshot();
+            if snapshot.accepting() || snapshot.sessions() != 0 || !proxy.is_fully_contained() {
+                proxy.seal_now();
+            }
+        }
         if let Some(access) = self.access.as_mut() {
             access.read = false;
             access.write = false;
@@ -1707,6 +1759,222 @@ where
     fn clear_credentials(&mut self) {
         self.observer.clear();
         self.recovery.clear();
+    }
+}
+
+impl<E> MysqlReplicator<E>
+where
+    E: MysqlMemberEffectBoundary + MysqlProxyControlBoundary,
+{
+    /// Creates the dedicated account, warms its native authentication cache,
+    /// and binds an unpublished loopback gateway.
+    pub async fn prepare_client_proxy(
+        &mut self,
+        listen_address: SocketAddr,
+        credential: ApplicationCredential,
+    ) -> Result<SocketAddr, MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        self.ensure_proxy_not_published()?;
+        self.admit_work()?;
+        if self.proxy.is_some() {
+            return Err(MysqlReplicatorError::AccessRevocationRequired);
+        }
+        let authority = self.authority().clone();
+        let proxy = MysqlClientProxy::prepare(
+            &mut self.effects,
+            &authority,
+            listen_address,
+            credential,
+            &self.attempt,
+        )
+        .await
+        .map_err(MysqlReplicatorError::Proxy)?;
+        let address = proxy.address();
+        self.proxy = Some(proxy);
+        self.proxy_containment = None;
+        Ok(address)
+    }
+
+    /// Explicitly publishes the prepared endpoint for one newer all-or-nothing
+    /// access generation.
+    pub fn publish_access(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        intent: MysqlAccessIntent,
+    ) -> Result<MysqlAccessOutcome, MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        self.admit_work()?;
+        if !intent.read || !intent.write {
+            return Err(MysqlReplicatorError::Proxy(
+                crate::service::MysqlProxyError::BothPermissionsRequired,
+            ));
+        }
+        let fingerprint = OperationFingerprint::Access(intent);
+        let index = match self.begin_operation(operation, fingerprint)? {
+            Admission::Retry(outcome) => return expect_access(outcome),
+            Admission::New(index) => index,
+        };
+        if self
+            .access
+            .is_some_and(|current| intent.generation <= current.generation)
+        {
+            self.discard_last();
+            return Err(MysqlReplicatorError::StaleAccessGeneration);
+        }
+        let proxy = self.proxy.as_mut().ok_or(MysqlReplicatorError::Proxy(
+            crate::service::MysqlProxyError::InvalidState,
+        ))?;
+        let endpoint =
+            match proxy.publish(intent.generation, intent.read, intent.write, &self.attempt) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    self.operations[index].status = OperationStatus::Uncertain;
+                    return Err(MysqlReplicatorError::Proxy(error));
+                }
+            };
+        self.access = Some(intent);
+        self.proxy_containment = None;
+        let outcome = MysqlAccessOutcome {
+            intent,
+            endpoint: Some(endpoint),
+            containment: None,
+        };
+        self.complete(index, RecordedOutcome::Access(outcome.clone()));
+        Ok(outcome)
+    }
+
+    /// Revokes the current generation and returns only after listener,
+    /// command, proxy-session, and exact native-session containment.
+    pub async fn revoke_access(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        intent: MysqlAccessIntent,
+    ) -> Result<MysqlAccessOutcome, MysqlReplicatorError> {
+        self.require_open_active()?;
+        let fingerprint = OperationFingerprint::Access(intent);
+        let index = match self.begin_operation(operation, fingerprint)? {
+            Admission::Retry(outcome) => return expect_access(outcome),
+            Admission::New(index) => index,
+        };
+        let current = self.access.ok_or(MysqlReplicatorError::NotOpen)?;
+        if intent.generation <= current.generation {
+            self.discard_last();
+            return Err(MysqlReplicatorError::StaleAccessGeneration);
+        }
+        if intent.read && intent.write {
+            self.discard_last();
+            return Err(MysqlReplicatorError::AccessRevocationRequired);
+        }
+        let authority = self.authority().clone();
+        let proxy = self.proxy.as_mut().ok_or(MysqlReplicatorError::Proxy(
+            crate::service::MysqlProxyError::InvalidState,
+        ))?;
+        let containment = match proxy
+            .revoke(
+                &mut self.effects,
+                &authority,
+                current.generation,
+                &self.attempt,
+            )
+            .await
+        {
+            Ok(containment) => containment,
+            Err(error) => {
+                self.operations[index].status = OperationStatus::Uncertain;
+                self.close_access();
+                return Err(MysqlReplicatorError::Proxy(error));
+            }
+        };
+        self.access = Some(intent);
+        self.proxy_containment = Some(containment.clone());
+        let outcome = MysqlAccessOutcome {
+            intent,
+            endpoint: None,
+            containment: Some(containment),
+        };
+        self.complete(index, RecordedOutcome::Access(outcome.clone()));
+        Ok(outcome)
+    }
+
+    /// Last completed proxy containment receipt.
+    #[must_use]
+    pub const fn proxy_containment(&self) -> Option<&MysqlProxyContainmentReceipt> {
+        self.proxy_containment.as_ref()
+    }
+
+    /// Current proxy registry snapshot.
+    #[must_use]
+    pub fn proxy_snapshot(&self) -> Option<crate::service::MysqlProxySnapshot> {
+        self.proxy.as_ref().map(MysqlClientProxy::snapshot)
+    }
+
+    /// Removes the account and contains the local member before terminal close.
+    pub async fn close_with_proxy(
+        &mut self,
+        operation: MysqlOperationIdentity,
+    ) -> Result<MysqlTerminalOutcome, MysqlReplicatorError> {
+        self.terminal_proxy_cleanup().await?;
+        self.close(operation)
+    }
+
+    /// Immediately seals the endpoint, removes the account where possible,
+    /// and contains the local member before returning terminal abort.
+    pub async fn abort_with_proxy(
+        &mut self,
+        operation: MysqlOperationIdentity,
+    ) -> Result<MysqlTerminalOutcome, MysqlReplicatorError> {
+        self.terminal_proxy_cleanup().await?;
+        self.abort(operation)
+    }
+
+    async fn terminal_proxy_cleanup(&mut self) -> Result<(), MysqlReplicatorError> {
+        let Some(mut proxy) = self.proxy.take() else {
+            return Ok(());
+        };
+        let authority = self.authority().clone();
+        let revocation = if proxy.is_fully_contained() {
+            Ok(self.proxy_containment.clone())
+        } else {
+            let generation = proxy
+                .published_generation()
+                .ok_or(MysqlReplicatorError::NotOpen)?;
+            proxy
+                .revoke(&mut self.effects, &authority, generation, &self.attempt)
+                .await
+                .map(Some)
+        };
+        let account = proxy
+            .cleanup_account(&mut self.effects, &authority, &self.attempt)
+            .await;
+        let proxy_result = match (revocation, account) {
+            (Ok(containment), Ok(())) => {
+                if let Some(containment) = containment {
+                    self.proxy_containment = Some(containment);
+                }
+                Ok(())
+            }
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(primary), Err(cleanup)) => Err(crate::service::MysqlProxyError::Cleanup {
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            }),
+        };
+        if let Err(proxy_error) = proxy_result {
+            self.close_access();
+            self.clear_credentials();
+            let containment = self.effects.contain_member(&self.attempt);
+            self.terminal = Some(MysqlTerminalState::Aborted);
+            return match containment {
+                Ok(_) => Err(MysqlReplicatorError::Proxy(proxy_error)),
+                Err(instance) => Err(MysqlReplicatorError::ProxyCleanup {
+                    proxy: Box::new(proxy_error),
+                    instance: Box::new(instance),
+                }),
+            };
+        }
+        self.close_access();
+        Ok(())
     }
 }
 

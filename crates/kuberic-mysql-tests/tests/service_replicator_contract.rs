@@ -2,27 +2,32 @@
 mod service_common;
 
 use std::collections::VecDeque;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU64;
+use std::os::unix::net::UnixListener;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use kuberic_mysql::adapter::UnixSocketPath;
 use kuberic_mysql::core::{
     AttemptId, AuthorityGeneration, ConfigurationId, CredentialGeneration, EndpointBinding,
     GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState, NativeMember, NativeView,
     ProcessSessionId, ReplicaId, ReplicaIncarnation, ServerUuid, StorageBinding, ViewId,
 };
 use kuberic_mysql::service::{
-    AccountProvisioningEvidence, AttemptCleanupState, AttemptContext, BackendConnectionId,
-    BackendConnectionReceipt, ControlCredential, ControlCredentialRole, FreshBootstrapInput,
-    FreshJoinInput, LifecycleOperation, MemberConfigurationIntent, MemberControlBinding,
-    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
-    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
-    MemberTransitionError, MysqlAccessIntent, MysqlInstanceConfig, MysqlInstanceError,
-    MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity,
-    MysqlPeerAuthorityFacts, MysqlPeerOperationIntent, MysqlPeerOperationKind,
-    MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason, MysqlReplicaConfiguration,
-    MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
-    MysqlReplicatorError, MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
+    AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential,
+    AttemptCleanupState, AttemptContext, BackendConnectionId, BackendConnectionReceipt,
+    ControlCredential, ControlCredentialRole, FreshBootstrapInput, FreshJoinInput,
+    LifecycleOperation, MemberConfigurationIntent, MemberControlBinding, MemberEffectKind,
+    MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
+    MemberOperationIdentity, MemberPeer, MemberSourceBoundary, MemberTransitionError,
+    MysqlAccessIntent, MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary,
+    MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts,
+    MysqlPeerOperationIntent, MysqlPeerOperationKind, MysqlPeerOperationOutcome,
+    MysqlPeerUnsupportedReason, MysqlProxyControlBoundary, MysqlProxyError,
+    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
+    MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError, MysqlTerminalState,
+    NativeIdentityEnrollment, PrimaryTransferInput,
 };
 use service_common::{GROUP_UUID, TestRoot};
 
@@ -62,6 +67,8 @@ enum CleanupPlan {
 
 struct ScriptedEffects {
     config: MysqlInstanceConfig,
+    _proxy_listener: UnixListener,
+    proxy_socket: UnixSocketPath,
     reads: VecDeque<ReadPlan>,
     receipts: VecDeque<ReceiptPlan>,
     cleanup: CleanupPlan,
@@ -75,8 +82,17 @@ impl ScriptedEffects {
         receipts: Vec<ReceiptPlan>,
         cleanup: CleanupPlan,
     ) -> Self {
+        let socket_path = config
+            .data_root()
+            .parent()
+            .expect("test data root has a parent")
+            .join("proxy-backend.sock");
+        let proxy_listener = UnixListener::bind(&socket_path).unwrap();
+        let proxy_socket = UnixSocketPath::new(&socket_path).unwrap();
         Self {
             config,
+            _proxy_listener: proxy_listener,
+            proxy_socket,
             reads: reads.into(),
             receipts: receipts.into(),
             cleanup,
@@ -272,6 +288,43 @@ impl MysqlMemberEffectBoundary for ScriptedEffects {
             CleanupPlan::NotRequired => Ok(AttemptCleanupState::NotRequired),
             CleanupPlan::Failed => Err(MysqlInstanceError::Timeout(LifecycleOperation::Shutdown)),
         }
+    }
+}
+
+impl MysqlProxyControlBoundary for ScriptedEffects {
+    fn proxy_backend_socket(
+        &mut self,
+        _authority: &MemberMutationAuthority,
+    ) -> Result<UnixSocketPath, MysqlProxyError> {
+        Ok(self.proxy_socket.clone())
+    }
+
+    async fn prepare_application_account(
+        &mut self,
+        _authority: &MemberMutationAuthority,
+        credential: &ApplicationCredential,
+        _attempt: &AttemptContext,
+    ) -> Result<ApplicationAccountReceipt, MysqlProxyError> {
+        Ok(ApplicationAccountReceipt::new(credential))
+    }
+
+    async fn remove_application_account(
+        &mut self,
+        _authority: &MemberMutationAuthority,
+        _receipt: &ApplicationAccountReceipt,
+        _attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        Ok(())
+    }
+
+    async fn terminate_proxy_backend(
+        &mut self,
+        _authority: &MemberMutationAuthority,
+        _connection: BackendConnectionId,
+        _attempt: &AttemptContext,
+        _deadline: Instant,
+    ) -> Result<(), MysqlProxyError> {
+        Ok(())
     }
 }
 
@@ -1211,6 +1264,62 @@ async fn access_stays_closed_credentials_clear_and_close_requires_settlement() {
         Err(MysqlReplicatorError::CloseUnsettled)
     ));
     assert_eq!(unsettled.engine.terminal_state(), None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn proxy_publication_requires_explicit_native_backed_revocation_before_lifecycle_progress() {
+    let mut harness = harness(vec![
+        exact(MysqlReplicaRole::Primary),
+        exact(MysqlReplicaRole::Primary),
+    ]);
+    establish(&mut harness, MysqlReplicaRole::Primary).await;
+    let credential = ApplicationCredential::new(
+        harness.attempt.attempt().clone(),
+        CredentialGeneration::new("application-generation").unwrap(),
+        "application_local",
+        "application-secret",
+    )
+    .unwrap();
+    let address = harness
+        .engine
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            credential,
+        )
+        .await
+        .unwrap();
+    assert!(address.ip().is_loopback());
+    let published = harness
+        .engine
+        .publish_access(
+            operation("publish", 5),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+        )
+        .unwrap();
+    assert_eq!(published.endpoint(), Some(address));
+    assert!(published.is_open());
+    assert!(matches!(
+        harness
+            .engine
+            .advance_epoch(operation("blocked-epoch", 6), MysqlReplicaEpoch::new(2)),
+        Err(MysqlReplicatorError::AccessRevocationRequired)
+    ));
+    let closed = harness
+        .engine
+        .revoke_access(
+            operation("revoke", 6),
+            MysqlAccessIntent::new(nonzero(3), false, false),
+        )
+        .await
+        .unwrap();
+    assert!(!closed.is_open());
+    assert!(closed.containment().unwrap().handoff_eligible());
+    let terminal = harness
+        .engine
+        .close_with_proxy(operation("proxy-close", 7))
+        .await
+        .unwrap();
+    assert_eq!(terminal.state(), MysqlTerminalState::Closed);
 }
 
 #[test]

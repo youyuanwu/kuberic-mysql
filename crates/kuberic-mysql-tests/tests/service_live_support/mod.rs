@@ -37,7 +37,13 @@ pub fn preflight_oracle_mysql_8_4_11() -> Result<(), String> {
 
 pub fn fresh_fixture_root(label: &str) -> Result<PathBuf, String> {
     let short_label = &label[..label.len().min(12)];
-    let root = std::env::temp_dir().join(format!("km-{short_label}-{}", std::process::id()));
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "resolve workspace root".to_owned())?;
+    let root = workspace
+        .join("target")
+        .join(format!("km-{short_label}-{}", std::process::id()));
     if root.exists() {
         fs::remove_dir_all(&root)
             .map_err(|error| format!("remove stale fixture {}: {error}", root.display()))?;

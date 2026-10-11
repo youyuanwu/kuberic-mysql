@@ -32,14 +32,16 @@ use crate::service::process::{
     wait_bounded, wait_for_absence, wait_for_absence_before,
 };
 use crate::service::{
-    AccountProvisioningEvidence, AttemptAdmissionError, AttemptCleanupState, AttemptContext,
-    AttemptDeadlineState, BackendConnectionId, BackendConnectionReceipt, BootstrapCapability,
-    BootstrapEffect, ControlCredential, FreshBootstrapInput, FreshJoinInput, JoinCapability,
-    JoinEffect, LifecycleOperation, MemberAuthorityError, MemberControlBinding, MemberEffectKind,
+    AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential,
+    AttemptAdmissionError, AttemptCleanupState, AttemptContext, AttemptDeadlineState,
+    BackendConnectionId, BackendConnectionReceipt, BootstrapCapability, BootstrapEffect,
+    ControlCredential, FreshBootstrapInput, FreshJoinInput, JoinCapability, JoinEffect,
+    LifecycleOperation, MemberAuthorityError, MemberControlBinding, MemberEffectKind,
     MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
     MemberTransitionError, MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary,
-    MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment, PairedAttemptOutcome,
-    PrimaryTransferInput, TopologyStateError, ViewDiscovery,
+    MysqlProxyControlBoundary, MysqlProxyError, MysqlProxyPhase, MysqlTopologyError,
+    NativeControlDeadline, NativeIdentityEnrollment, PairedAttemptOutcome, PrimaryTransferInput,
+    TopologyStateError, ViewDiscovery,
 };
 
 const READY_POLL: Duration = Duration::from_millis(25);
@@ -349,6 +351,42 @@ impl MysqlInstanceManager {
         let target = self.prepare_control_target()?;
         crate::service::control::provision_accounts(target, binding, observer, recovery, deadline)
             .await
+    }
+
+    /// Provisions the existing private observer/recovery identities and
+    /// enrolls this exact running generation without starting Group
+    /// Replication. This is the one-member control preparation used by the
+    /// bounded proxy compatibility gate.
+    pub async fn enroll_local_control_authority(
+        &mut self,
+        attempt: &AttemptContext,
+        observer: &ControlCredential,
+        recovery: &ControlCredential,
+    ) -> Result<MemberMutationAuthority, MemberTransitionError> {
+        attempt
+            .admit_work()
+            .map_err(member_attempt_admission_error)?;
+        let binding = self.topology_binding(
+            attempt.attempt().clone(),
+            observer.generation().clone(),
+            recovery.generation().clone(),
+        )?;
+        let deadline = attempt
+            .native_deadline()
+            .map_err(MemberTransitionError::Native)?;
+        let accounts = self
+            .provision_topology_accounts(binding.clone(), observer, recovery, &deadline)
+            .await?;
+        let enrollment = self
+            .enroll_topology_identity(binding, &accounts, &deadline)
+            .await?;
+        MemberMutationAuthority::new(
+            attempt.attempt().clone(),
+            GroupName::new(self.config.member().group_uuid().to_owned()).map_err(|_| {
+                MemberTransitionError::Native(MysqlTopologyError::OwnershipContextLoss)
+            })?,
+            enrollment,
+        )
     }
 
     /// Enrolls `@@server_uuid` before this member enters any topology effect.
@@ -1169,6 +1207,114 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
         attempt: &AttemptContext,
     ) -> Result<AttemptCleanupState, MysqlInstanceError> {
         self.contain_with_attempt(attempt)
+    }
+}
+
+impl MysqlProxyControlBoundary for MysqlInstanceManager {
+    fn proxy_backend_socket(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<UnixSocketPath, MysqlProxyError> {
+        let target = self
+            .prepare_control_target()
+            .map_err(MysqlProxyError::Account)?;
+        self.revalidate_member_effect_binding(authority)
+            .map_err(MysqlProxyError::Native)?;
+        target
+            .revalidate_socket()
+            .map_err(MysqlProxyError::Native)?;
+        Ok(target.socket())
+    }
+
+    async fn prepare_application_account(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        credential: &ApplicationCredential,
+        attempt: &AttemptContext,
+    ) -> Result<ApplicationAccountReceipt, MysqlProxyError> {
+        attempt.admit_work().map_err(|error| match error {
+            AttemptAdmissionError::Cancelled => MysqlProxyError::Cancelled,
+            AttemptAdmissionError::CleanupReserve | AttemptAdmissionError::Expired => {
+                MysqlProxyError::Deadline(MysqlProxyPhase::AccountLifecycle)
+            }
+        })?;
+        let target = self
+            .prepare_member_effect_target(authority, attempt)
+            .map_err(MysqlProxyError::Native)?;
+        crate::service::control::prepare_application_account(
+            target,
+            authority,
+            credential,
+            attempt.work_deadline(),
+        )
+        .await
+        .map_err(MysqlProxyError::Account)
+    }
+
+    async fn remove_application_account(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        receipt: &ApplicationAccountReceipt,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        attempt
+            .admit_cleanup()
+            .map_err(|_| MysqlProxyError::Deadline(MysqlProxyPhase::AccountLifecycle))?;
+        let target = self
+            .prepare_control_target()
+            .map_err(MysqlProxyError::Account)?;
+        self.revalidate_member_effect_binding(authority)
+            .map_err(MysqlProxyError::Native)?;
+        let deadline = cleanup_deadline(attempt, MysqlProxyPhase::AccountLifecycle)?;
+        crate::service::control::remove_application_account(target, authority, receipt, deadline)
+            .await
+            .map_err(MysqlProxyError::Account)
+    }
+
+    async fn terminate_proxy_backend(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        connection: BackendConnectionId,
+        attempt: &AttemptContext,
+        revocation_deadline: Instant,
+    ) -> Result<(), MysqlProxyError> {
+        attempt
+            .admit_cleanup()
+            .map_err(|_| MysqlProxyError::Deadline(MysqlProxyPhase::Revocation))?;
+        let target = self
+            .prepare_control_target()
+            .map_err(MysqlProxyError::Account)?;
+        self.revalidate_member_effect_binding(authority)
+            .map_err(MysqlProxyError::Native)?;
+        let deadline =
+            cleanup_deadline(attempt, MysqlProxyPhase::Revocation)?.min(revocation_deadline);
+        if deadline <= Instant::now() {
+            return Err(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation));
+        }
+        crate::service::control::terminate_backend_connection_before(
+            target,
+            authority,
+            std::num::NonZeroU64::new(connection.get()).expect("BackendConnectionId is nonzero"),
+            deadline,
+        )
+        .await
+        .map_err(MysqlProxyError::Native)
+    }
+}
+
+fn cleanup_deadline(
+    attempt: &AttemptContext,
+    phase: MysqlProxyPhase,
+) -> Result<Instant, MysqlProxyError> {
+    let now = Instant::now();
+    let local = now
+        .checked_add(Duration::from_secs(20))
+        .ok_or(MysqlProxyError::Deadline(phase))?;
+    let deadline = local.min(attempt.deadline());
+    if deadline <= now {
+        Err(MysqlProxyError::Deadline(phase))
+    } else {
+        Ok(deadline)
     }
 }
 
