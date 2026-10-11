@@ -730,6 +730,23 @@ where
     operations: Vec<OperationRecord>,
 }
 
+impl<E> Drop for MysqlReplicator<E>
+where
+    E: MysqlMemberEffectBoundary,
+{
+    fn drop(&mut self) {
+        let Some(proxy) = self.proxy.as_ref() else {
+            return;
+        };
+        proxy.seal_now();
+        self.attempt.cancel();
+        let _ = self.effects.contain_member(&self.attempt);
+        self.terminal = Some(MysqlTerminalState::Aborted);
+        self.observer.clear();
+        self.recovery.clear();
+    }
+}
+
 impl<E> MysqlReplicator<E>
 where
     E: MysqlMemberEffectBoundary,

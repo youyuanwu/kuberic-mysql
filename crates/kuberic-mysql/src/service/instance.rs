@@ -1246,6 +1246,7 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
             authority,
             credential,
             attempt.work_deadline(),
+            attempt.deadline(),
         )
         .await
         .map_err(MysqlProxyError::Account)
@@ -1274,7 +1275,7 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
     async fn terminate_proxy_backend(
         &mut self,
         authority: &MemberMutationAuthority,
-        connection: BackendConnectionId,
+        session: &crate::service::BackendSessionIdentity,
         attempt: &AttemptContext,
         revocation_deadline: Instant,
     ) -> Result<(), MysqlProxyError> {
@@ -1291,11 +1292,8 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         if deadline <= Instant::now() {
             return Err(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation));
         }
-        crate::service::control::terminate_backend_connection_before(
-            target,
-            authority,
-            std::num::NonZeroU64::new(connection.get()).expect("BackendConnectionId is nonzero"),
-            deadline,
+        crate::service::control::terminate_proxy_backend_before(
+            target, authority, session, deadline,
         )
         .await
         .map_err(MysqlProxyError::Native)

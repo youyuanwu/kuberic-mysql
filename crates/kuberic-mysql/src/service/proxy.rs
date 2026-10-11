@@ -55,6 +55,7 @@ const REQUIRED_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_SECURE_CONNECTION
     | CLIENT_PLUGIN_AUTH;
 const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
+const COLUMN_DEFINITION_FIXED_FIELDS: u64 = 0x0c;
 
 /// Dedicated application credential whose secret is always redacted and
 /// explicitly zeroed.
@@ -76,6 +77,9 @@ impl ApplicationCredential {
         let username = username.into();
         let password = password.into();
         if !valid_account_component(&username, 32)
+            || !valid_marker_component(attempt.as_str())
+            || !valid_marker_component(generation.as_str())
+            || attempt.as_str().len() + generation.as_str().len() + username.len() > 245
             || password.is_empty()
             || password.len() > 128
             || password
@@ -152,6 +156,12 @@ fn valid_account_component(value: &str, maximum: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+fn valid_marker_component(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 /// Secret-free proof that the exact application account exists, has only the
 /// fixed schema DML grants, and completed one private-UDS cache-warming login.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +170,7 @@ pub struct ApplicationAccountReceipt {
     generation: CredentialGeneration,
     username: String,
     schema: &'static str,
+    marker: String,
 }
 
 impl ApplicationAccountReceipt {
@@ -171,6 +182,11 @@ impl ApplicationAccountReceipt {
             generation: credential.generation.clone(),
             username: credential.username.clone(),
             schema: APPLICATION_QUALIFICATION_SCHEMA,
+            marker: application_account_marker(
+                credential.attempt.as_str(),
+                credential.generation.as_str(),
+                &credential.username,
+            ),
         }
     }
 
@@ -196,6 +212,70 @@ impl ApplicationAccountReceipt {
     #[must_use]
     pub const fn schema(&self) -> &'static str {
         self.schema
+    }
+
+    pub(crate) fn marker(&self) -> &str {
+        &self.marker
+    }
+
+    pub(crate) fn matches_credential(&self, credential: &ApplicationCredential) -> bool {
+        self.attempt == credential.attempt
+            && self.generation == credential.generation
+            && self.username == credential.username
+    }
+}
+
+fn application_account_marker(attempt: &str, generation: &str, username: &str) -> String {
+    format!("kuberic:{attempt}:{generation}:{username}")
+}
+
+/// Secret-free exact native session identity captured before any application
+/// command can be dispatched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendSessionIdentity {
+    connection: BackendConnectionId,
+    account: ApplicationAccountReceipt,
+    authority: MemberMutationAuthority,
+    socket: UnixSocketPath,
+}
+
+impl BackendSessionIdentity {
+    pub(crate) fn new(
+        connection: BackendConnectionId,
+        account: ApplicationAccountReceipt,
+        authority: MemberMutationAuthority,
+        socket: UnixSocketPath,
+    ) -> Self {
+        Self {
+            connection,
+            account,
+            authority,
+            socket,
+        }
+    }
+
+    /// Numeric native connection identifier.
+    #[must_use]
+    pub const fn connection(&self) -> BackendConnectionId {
+        self.connection
+    }
+
+    /// Exact dedicated application-account generation.
+    #[must_use]
+    pub const fn account(&self) -> &ApplicationAccountReceipt {
+        &self.account
+    }
+
+    /// Exact admitted member, process, storage, and endpoint authority.
+    #[must_use]
+    pub const fn authority(&self) -> &MemberMutationAuthority {
+        &self.authority
+    }
+
+    /// Exact private socket object used for this backend session.
+    #[must_use]
+    pub const fn socket(&self) -> &UnixSocketPath {
+        &self.socket
     }
 }
 
@@ -230,7 +310,7 @@ pub trait MysqlProxyControlBoundary {
     async fn terminate_proxy_backend(
         &mut self,
         authority: &MemberMutationAuthority,
-        connection: BackendConnectionId,
+        session: &BackendSessionIdentity,
         attempt: &AttemptContext,
         deadline: Instant,
     ) -> Result<(), MysqlProxyError>;
@@ -354,7 +434,7 @@ enum SessionCommandState {
 #[derive(Clone, Debug)]
 struct SessionRecord {
     generation: NonZeroU64,
-    backend: Option<BackendConnectionId>,
+    backend: Option<BackendSessionIdentity>,
     command: SessionCommandState,
 }
 
@@ -364,7 +444,7 @@ struct Registry {
     generation: Option<NonZeroU64>,
     next_session: u64,
     sessions: BTreeMap<u64, SessionRecord>,
-    retired_backends: BTreeSet<u64>,
+    retired_backends: BTreeMap<u64, BackendSessionIdentity>,
     active_commands: usize,
     cancelled_commands: bool,
     ambiguous_effect: bool,
@@ -380,7 +460,12 @@ impl Registry {
             backend_connections: self
                 .sessions
                 .values()
-                .filter_map(|session| session.backend)
+                .filter_map(|session| {
+                    session
+                        .backend
+                        .as_ref()
+                        .map(BackendSessionIdentity::connection)
+                })
                 .collect(),
         }
     }
@@ -397,17 +482,21 @@ impl Shared {
 }
 
 /// Prepared loopback-only endpoint for one exact private UDS and account.
+#[must_use = "the proxy requires explicit async revocation and account cleanup"]
 pub struct MysqlClientProxy {
     listener: Option<TcpListener>,
     address: SocketAddr,
     backend: UnixSocketPath,
     account: ApplicationAccountReceipt,
+    authority: MemberMutationAuthority,
     credential: ApplicationCredential,
     shared: Arc<Shared>,
     cancel: watch::Sender<bool>,
     accept_task: Option<JoinHandle<()>>,
     published_generation: Option<NonZeroU64>,
     contained_generation: Option<NonZeroU64>,
+    tasks_joined: bool,
+    native_absence_proved: bool,
     account_active: bool,
 }
 
@@ -471,6 +560,7 @@ impl MysqlClientProxy {
             address,
             backend,
             account,
+            authority: authority.clone(),
             credential,
             shared: Arc::new(Shared {
                 registry: Mutex::new(Registry {
@@ -478,7 +568,7 @@ impl MysqlClientProxy {
                     generation: None,
                     next_session: 1,
                     sessions: BTreeMap::new(),
-                    retired_backends: BTreeSet::new(),
+                    retired_backends: BTreeMap::new(),
                     active_commands: 0,
                     cancelled_commands: false,
                     ambiguous_effect: false,
@@ -488,6 +578,8 @@ impl MysqlClientProxy {
             accept_task: None,
             published_generation: None,
             contained_generation: None,
+            tasks_joined: true,
+            native_absence_proved: true,
             account_active: true,
         })
     }
@@ -538,23 +630,29 @@ impl MysqlClientProxy {
         }
         let shared = Arc::clone(&self.shared);
         let backend = self.backend.clone();
-        let username = self.account.username.clone();
+        let account = self.account.clone();
+        let authority = self.authority.clone();
         let cancel = self.cancel.subscribe();
         let work_deadline = attempt.work_deadline();
         self.accept_task = Some(tokio::spawn(async move {
             accept_loop(
                 listener,
-                shared,
-                backend,
-                username,
-                generation,
+                AcceptContext {
+                    shared,
+                    backend,
+                    account,
+                    authority,
+                    generation,
+                    work_deadline,
+                },
                 cancel,
-                work_deadline,
             )
             .await;
         }));
         self.published_generation = Some(generation);
         self.contained_generation = None;
+        self.tasks_joined = false;
+        self.native_absence_proved = false;
         Ok(self.address)
     }
 
@@ -563,7 +661,6 @@ impl MysqlClientProxy {
     pub fn seal_now(&self) {
         let mut registry = self.shared.lock();
         registry.accepting = false;
-        registry.generation = None;
         drop(registry);
         let _ = self.cancel.send(true);
     }
@@ -577,43 +674,53 @@ impl MysqlClientProxy {
         generation: NonZeroU64,
         attempt: &AttemptContext,
     ) -> Result<MysqlProxyContainmentReceipt, MysqlProxyError> {
-        let current = self.shared.lock().generation;
-        if current.is_some_and(|current| current != generation) {
+        if self.published_generation != Some(generation)
+            || self.shared.lock().generation != Some(generation)
+        {
             return Err(MysqlProxyError::GenerationMismatch);
         }
         self.seal_now();
         self.listener.take();
         let deadline = bounded_deadline(attempt.deadline(), REVOCATION_TIMEOUT)
             .ok_or(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation))?;
+        if let Some(mut task) = self.accept_task.take() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation))?;
+            match tokio::time::timeout(remaining, &mut task).await {
+                Ok(joined) => joined.map_err(|_| MysqlProxyError::InvalidState)?,
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    return Err(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation));
+                }
+            }
+        }
+        self.tasks_joined = true;
         let mut proved = BTreeSet::new();
         loop {
             let pending = {
                 let registry = self.shared.lock();
                 registry
-                    .sessions
-                    .values()
-                    .filter_map(|session| session.backend)
-                    .map(BackendConnectionId::get)
-                    .chain(registry.retired_backends.iter().copied())
-                    .filter(|connection| !proved.contains(connection))
-                    .collect::<BTreeSet<_>>()
+                    .retired_backends
+                    .iter()
+                    .filter(|(connection, _)| !proved.contains(*connection))
+                    .map(|(_, session)| session.clone())
+                    .collect::<Vec<_>>()
             };
-            for connection in pending {
-                let id = BackendConnectionId::new(
-                    NonZeroU64::new(connection)
-                        .expect("registered backend connection IDs are nonzero"),
-                );
+            for session in pending {
                 control
-                    .terminate_proxy_backend(authority, id, attempt, deadline)
+                    .terminate_proxy_backend(authority, &session, attempt, deadline)
                     .await?;
-                proved.insert(connection);
+                proved.insert(session.connection().get());
             }
             let snapshot = self.snapshot();
             let all_known_proved = {
                 let registry = self.shared.lock();
                 registry
                     .retired_backends
-                    .iter()
+                    .keys()
                     .all(|connection| proved.contains(connection))
             };
             if snapshot.sessions == 0 && snapshot.active_commands == 0 && all_known_proved {
@@ -624,9 +731,6 @@ impl MysqlClientProxy {
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
-        if let Some(task) = self.accept_task.take() {
-            task.await.map_err(|_| MysqlProxyError::InvalidState)?;
-        }
         let registry = self.shared.lock();
         let receipt = MysqlProxyContainmentReceipt {
             generation,
@@ -634,12 +738,13 @@ impl MysqlClientProxy {
             commands_zero: registry.active_commands == 0,
             native_absence: registry
                 .retired_backends
-                .iter()
+                .keys()
                 .all(|connection| proved.contains(connection)),
             cancelled_commands: registry.cancelled_commands,
             ambiguous_effect: registry.ambiguous_effect,
             cleanup_complete: true,
         };
+        self.native_absence_proved = receipt.native_absence;
         self.contained_generation = Some(generation);
         Ok(receipt)
     }
@@ -651,7 +756,16 @@ impl MysqlClientProxy {
         authority: &MemberMutationAuthority,
         attempt: &AttemptContext,
     ) -> Result<(), MysqlProxyError> {
-        if !self.shared.lock().sessions.is_empty() {
+        let cleanup_ready = {
+            let registry = self.shared.lock();
+            !registry.accepting
+                && registry.sessions.is_empty()
+                && registry.active_commands == 0
+                && self.tasks_joined
+                && self.native_absence_proved
+                && self.is_fully_contained()
+        };
+        if !cleanup_ready {
             return Err(MysqlProxyError::InvalidState);
         }
         self.listener.take();
@@ -676,7 +790,9 @@ impl MysqlClientProxy {
     #[must_use]
     pub fn is_fully_contained(&self) -> bool {
         self.published_generation.is_none()
-            || self.published_generation == self.contained_generation
+            || (self.published_generation == self.contained_generation
+                && self.tasks_joined
+                && self.native_absence_proved)
     }
 
     /// Generation that was published through this prepared listener.
@@ -693,6 +809,9 @@ impl Drop for MysqlClientProxy {
         if let Some(task) = self.accept_task.take() {
             task.abort();
         }
+        self.contained_generation = None;
+        self.tasks_joined = false;
+        self.native_absence_proved = false;
         self.credential.clear();
     }
 }
@@ -724,54 +843,74 @@ fn bounded_deadline(attempt_deadline: Instant, duration: Duration) -> Option<Ins
     (deadline > now).then_some(deadline)
 }
 
-async fn accept_loop(
-    listener: TcpListener,
+struct AcceptContext {
     shared: Arc<Shared>,
     backend: UnixSocketPath,
-    username: String,
+    account: ApplicationAccountReceipt,
+    authority: MemberMutationAuthority,
     generation: NonZeroU64,
-    mut cancel: watch::Receiver<bool>,
     work_deadline: Instant,
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    context: AcceptContext,
+    mut cancel: watch::Receiver<bool>,
 ) {
+    let mut sessions = tokio::task::JoinSet::new();
     loop {
+        if *cancel.borrow() {
+            break;
+        }
         tokio::select! {
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
-                    return;
+                    break;
+                }
+            }
+            completed = sessions.join_next(), if !sessions.is_empty() => {
+                if completed.is_some_and(|result| result.is_err()) {
+                    context.shared.lock().ambiguous_effect = true;
                 }
             }
             accepted = listener.accept() => {
                 let Ok((client, _)) = accepted else {
-                    return;
+                    break;
                 };
                 let session_id = {
-                    let mut registry = shared.lock();
-                    if !registry.accepting || registry.generation != Some(generation) {
+                    let mut registry = context.shared.lock();
+                    if !registry.accepting || registry.generation != Some(context.generation) {
                         drop(client);
                         continue;
                     }
                     let id = registry.next_session;
                     registry.next_session = registry.next_session.saturating_add(1);
                     registry.sessions.insert(id, SessionRecord {
-                        generation,
+                        generation: context.generation,
                         backend: None,
                         command: SessionCommandState::Idle,
                     });
                     id
                 };
-                tokio::spawn(run_session(
+                sessions.spawn(run_session(
                     client,
                     SessionContext {
-                        shared: Arc::clone(&shared),
-                        backend: backend.clone(),
-                        username: username.clone(),
-                        generation,
+                        shared: Arc::clone(&context.shared),
+                        backend: context.backend.clone(),
+                        account: context.account.clone(),
+                        authority: context.authority.clone(),
+                        generation: context.generation,
                         session_id,
-                        work_deadline,
+                        work_deadline: context.work_deadline,
                     },
                     cancel.clone(),
                 ));
             }
+        }
+    }
+    while let Some(result) = sessions.join_next().await {
+        if result.is_err() {
+            context.shared.lock().ambiguous_effect = true;
         }
     }
 }
@@ -782,10 +921,10 @@ struct SessionGuard {
 }
 
 impl SessionGuard {
-    fn register_backend(&self, connection: BackendConnectionId) {
+    fn register_backend(&self, session_identity: BackendSessionIdentity) {
         let mut registry = self.shared.lock();
         if let Some(session) = registry.sessions.get_mut(&self.id) {
-            session.backend = Some(connection);
+            session.backend = Some(session_identity);
         }
     }
 
@@ -822,7 +961,9 @@ impl Drop for SessionGuard {
         let mut registry = self.shared.lock();
         if let Some(session) = registry.sessions.remove(&self.id) {
             if let Some(connection) = session.backend {
-                registry.retired_backends.insert(connection.get());
+                registry
+                    .retired_backends
+                    .insert(connection.connection().get(), connection);
             }
             if session.command == SessionCommandState::Active {
                 registry.active_commands = registry.active_commands.saturating_sub(1);
@@ -838,7 +979,8 @@ impl Drop for SessionGuard {
 struct SessionContext {
     shared: Arc<Shared>,
     backend: UnixSocketPath,
-    username: String,
+    account: ApplicationAccountReceipt,
+    authority: MemberMutationAuthority,
     generation: NonZeroU64,
     session_id: u64,
     work_deadline: Instant,
@@ -900,7 +1042,12 @@ async fn run_session_inner(
         ));
     }
     let (connection, filtered) = filter_greeting(&greeting.payload)?;
-    guard.register_backend(connection);
+    guard.register_backend(BackendSessionIdentity::new(
+        connection,
+        context.account.clone(),
+        context.authority.clone(),
+        context.backend.clone(),
+    ));
     write_packet(
         client,
         greeting.sequence,
@@ -923,7 +1070,7 @@ async fn run_session_inner(
             MysqlProxyProtocolError::SequenceMismatch,
         ));
     }
-    validate_handshake_response(&response.payload, &context.username)?;
+    validate_handshake_response(&response.payload, context.account.username())?;
     write_packet(
         &mut backend,
         response.sequence,
@@ -1076,7 +1223,7 @@ async fn forward_ping_response(
     }
     match packet.payload.first() {
         Some(0x00) => validate_ok_packet(&packet.payload)?,
-        Some(0xff) => {}
+        Some(0xff) => validate_err_packet(&packet.payload)?,
         Some(0xfb) => {
             return Err(protocol(
                 MysqlProxyPhase::ServerResponse,
@@ -1127,6 +1274,7 @@ async fn forward_query_response(
             .await;
         }
         Some(0xff) => {
+            validate_err_packet(&first.payload)?;
             return write_packet(
                 client,
                 first.sequence,
@@ -1164,6 +1312,7 @@ async fn forward_query_response(
         let column =
             read_packet_cancel(backend, cancel, deadline, MysqlProxyPhase::ServerResponse).await?;
         require_sequence(&column, sequence)?;
+        validate_column_definition(&column.payload)?;
         write_packet(
             client,
             column.sequence,
@@ -1200,6 +1349,8 @@ async fn forward_query_response(
         let complete = row.payload.first() == Some(&0xfe) && row.payload.len() < 9;
         if complete {
             validate_eof_packet(&row.payload)?;
+        } else {
+            validate_text_row(&row.payload, columns)?;
         }
         write_packet(
             client,
@@ -1237,6 +1388,13 @@ fn validate_ok_packet(payload: &[u8]) -> Result<(), MysqlProxyError> {
     let (_, next) = decode_lenenc(payload, 1)?;
     let (_, next) = decode_lenenc(payload, next)?;
     let status = read_u16(payload, next)?;
+    let warnings_offset = next.checked_add(2).ok_or_else(|| {
+        protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        )
+    })?;
+    let _warnings = read_u16(payload, warnings_offset)?;
     if status & SERVER_MORE_RESULTS_EXISTS != 0 {
         Err(protocol(
             MysqlProxyPhase::ServerResponse,
@@ -1247,8 +1405,40 @@ fn validate_ok_packet(payload: &[u8]) -> Result<(), MysqlProxyError> {
     }
 }
 
+fn validate_err_packet(payload: &[u8]) -> Result<(), MysqlProxyError> {
+    if payload.first() != Some(&0xff) {
+        return Err(protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::UnsupportedResult,
+        ));
+    }
+    let _error_code = read_u16(payload, 1)?;
+    if payload.get(3) != Some(&b'#') {
+        return Err(protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::UnsupportedResult,
+        ));
+    }
+    let sql_state = payload.get(4..9).ok_or_else(|| {
+        protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        )
+    })?;
+    if !sql_state
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::UnsupportedResult,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_eof_packet(payload: &[u8]) -> Result<(), MysqlProxyError> {
-    if payload.len() < 5 || payload.first() != Some(&0xfe) || payload.len() >= 9 {
+    if payload.len() != 5 || payload.first() != Some(&0xfe) {
         return Err(protocol(
             MysqlProxyPhase::ServerResponse,
             MysqlProxyProtocolError::UnsupportedResult,
@@ -1262,6 +1452,99 @@ fn validate_eof_packet(payload: &[u8]) -> Result<(), MysqlProxyError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn validate_column_definition(payload: &[u8]) -> Result<(), MysqlProxyError> {
+    let mut offset = 0;
+    for _ in 0..6 {
+        offset = skip_lenenc_bytes(payload, offset)?;
+    }
+    let (fixed_length, next) = decode_lenenc(payload, offset)?;
+    if fixed_length != COLUMN_DEFINITION_FIXED_FIELDS {
+        return Err(protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::UnsupportedResult,
+        ));
+    }
+    let end = next
+        .checked_add(COLUMN_DEFINITION_FIXED_FIELDS as usize)
+        .ok_or_else(|| {
+            protocol(
+                MysqlProxyPhase::ServerResponse,
+                MysqlProxyProtocolError::IncompletePacket,
+            )
+        })?;
+    if end != payload.len() {
+        return Err(protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::UnsupportedResult,
+        ));
+    }
+    let _character_set = read_u16(payload, next)?;
+    let _column_length = read_u32(payload, next + 2)?;
+    let _column_type = payload.get(next + 6).ok_or_else(|| {
+        protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        )
+    })?;
+    let _flags = read_u16(payload, next + 7)?;
+    let _decimals = payload.get(next + 9).ok_or_else(|| {
+        protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        )
+    })?;
+    let _filler = payload.get(next + 10..next + 12).ok_or_else(|| {
+        protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_text_row(payload: &[u8], columns: u64) -> Result<(), MysqlProxyError> {
+    let mut offset = 0;
+    for _ in 0..columns {
+        if payload.get(offset) == Some(&0xfb) {
+            offset += 1;
+        } else {
+            offset = skip_lenenc_bytes(payload, offset)?;
+        }
+    }
+    if offset == payload.len() {
+        Ok(())
+    } else {
+        Err(protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::UnsupportedResult,
+        ))
+    }
+}
+
+fn skip_lenenc_bytes(payload: &[u8], offset: usize) -> Result<usize, MysqlProxyError> {
+    let (length, next) = decode_lenenc(payload, offset)?;
+    let length = usize::try_from(length).map_err(|_| {
+        protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        )
+    })?;
+    let end = next.checked_add(length).ok_or_else(|| {
+        protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        )
+    })?;
+    if end > payload.len() {
+        Err(protocol(
+            MysqlProxyPhase::ServerResponse,
+            MysqlProxyProtocolError::IncompletePacket,
+        ))
+    } else {
+        Ok(end)
     }
 }
 
@@ -1500,6 +1783,24 @@ fn read_u16(payload: &[u8], offset: usize) -> Result<u16, MysqlProxyError> {
         })
 }
 
+fn read_u32(payload: &[u8], offset: usize) -> Result<u32, MysqlProxyError> {
+    payload
+        .get(offset..offset + 4)
+        .map(|bytes| {
+            u32::from_le_bytes(
+                bytes
+                    .try_into()
+                    .expect("validated four-byte little-endian value"),
+            )
+        })
+        .ok_or_else(|| {
+            protocol(
+                MysqlProxyPhase::ServerResponse,
+                MysqlProxyProtocolError::IncompletePacket,
+            )
+        })
+}
+
 fn protocol(phase: MysqlProxyPhase, reason: MysqlProxyProtocolError) -> MysqlProxyError {
     MysqlProxyError::Protocol { phase, reason }
 }
@@ -1610,6 +1911,9 @@ async fn select_cancel<F, T>(
 where
     F: core::future::Future<Output = T>,
 {
+    if *cancel.borrow() {
+        return Err(MysqlProxyError::Cancelled);
+    }
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())

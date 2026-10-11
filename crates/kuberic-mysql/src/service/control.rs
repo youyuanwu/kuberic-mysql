@@ -15,11 +15,11 @@ use crate::core::{
 };
 use crate::service::{
     APPLICATION_QUALIFICATION_SCHEMA, AccountProvisioningEvidence, ApplicationAccountReceipt,
-    ApplicationCredential, ControlCredential, ControlCredentialRole, ControlStage,
-    MemberAuthorityError, MemberControlBinding, MemberMutationAuthority, MemberNativeEvidence,
-    MemberPeer, MemberTransitionError, MemberViewError, MysqlMemberConfig, MysqlMemberIndex,
-    MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment, TopologyAuthorityError,
-    TopologyEvidenceError, TopologyStateError, ViewDiscovery,
+    ApplicationCredential, BackendSessionIdentity, ControlCredential, ControlCredentialRole,
+    ControlStage, MemberAuthorityError, MemberControlBinding, MemberMutationAuthority,
+    MemberNativeEvidence, MemberPeer, MemberTransitionError, MemberViewError, MysqlMemberConfig,
+    MysqlMemberIndex, MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment,
+    TopologyAuthorityError, TopologyEvidenceError, TopologyStateError, ViewDiscovery,
 };
 #[cfg(test)]
 use crate::service::{BootstrapCapability, BootstrapEffect, JoinCapability, JoinEffect};
@@ -220,8 +220,7 @@ pub(crate) async fn terminate_backend_connection_before(
                 ControlStage::TerminateConnection,
             ));
         }
-        let count = backend_connection_count(&mut connection, connection_id, deadline).await?;
-        if count != 0 {
+        if backend_connection_count(&mut connection, connection_id, deadline).await? != 0 {
             execute(
                 &mut connection,
                 &format!("KILL CONNECTION {}", connection_id.get()),
@@ -241,6 +240,100 @@ pub(crate) async fn terminate_backend_connection_before(
     disconnect(connection, result, deadline)
         .await
         .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn terminate_proxy_backend_before(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    session: &BackendSessionIdentity,
+    deadline: Instant,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    if session.authority() != authority || session.socket() != &target.socket {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AuthoritySubstitution,
+        ));
+    }
+    session.socket().revalidate().map_err(|_| {
+        MemberTransitionError::Native(MysqlTopologyError::ControlTransport(
+            ControlStage::SocketValidation,
+        ))
+    })?;
+    let connection_id =
+        NonZeroU64::new(session.connection().get()).expect("BackendConnectionId is nonzero");
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_application_account(
+            &mut connection,
+            session.account(),
+            deadline,
+            ControlStage::InspectApplicationAccount,
+        )
+        .await?;
+        let control_connection: u64 = query_one(
+            &mut connection,
+            "SELECT CONNECTION_ID()",
+            deadline,
+            ControlStage::TerminateConnection,
+        )
+        .await?;
+        if control_connection == connection_id.get() {
+            return Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::TerminateConnection,
+            ));
+        }
+        let (total, exact) = backend_connection_identity_counts(
+            &mut connection,
+            connection_id,
+            session.account().username(),
+            deadline,
+        )
+        .await?;
+        if !validate_backend_identity_counts(total, exact)? {
+            execute(
+                &mut connection,
+                &format!("KILL CONNECTION {}", connection_id.get()),
+                deadline,
+                ControlStage::TerminateConnection,
+            )
+            .await?;
+        }
+        loop {
+            let (total, exact) = backend_connection_identity_counts(
+                &mut connection,
+                connection_id,
+                session.account().username(),
+                deadline,
+            )
+            .await?;
+            if validate_backend_identity_counts(total, exact)? {
+                prove_application_account(
+                    &mut connection,
+                    session.account(),
+                    deadline,
+                    ControlStage::InspectApplicationAccount,
+                )
+                .await?;
+                return Ok(());
+            }
+            bounded_sleep(deadline, ControlStage::ProveConnectionAbsent).await?;
+        }
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+fn validate_backend_identity_counts(total: u64, exact: u64) -> Result<bool, MysqlTopologyError> {
+    if total != exact || total > 1 {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::InspectConnectionIdentity,
+        ))
+    } else {
+        Ok(total == 0)
+    }
 }
 
 async fn read_member_view_connected(
@@ -419,6 +512,170 @@ async fn backend_connection_count(
         ControlStage::ProveConnectionAbsent,
     )
     .await
+}
+
+async fn backend_connection_identity_counts(
+    session: &mut MysqlControlSession,
+    connection_id: NonZeroU64,
+    username: &str,
+    deadline: Instant,
+) -> Result<(u64, u64), MysqlTopologyError> {
+    let sql = format!(
+        "SELECT COUNT(*), COALESCE(SUM( \
+         PROCESSLIST_USER = '{}' AND TYPE = 'FOREGROUND' \
+         AND NAME = 'thread/sql/one_connection'), 0) \
+         FROM performance_schema.threads WHERE PROCESSLIST_ID = {}",
+        username,
+        connection_id.get(),
+    );
+    query_one_mysql(
+        &mut session.connection,
+        &sql,
+        deadline,
+        ControlStage::InspectConnectionIdentity,
+    )
+    .await
+}
+
+async fn application_backend_connection_ids(
+    session: &mut MysqlControlSession,
+    username: &str,
+    deadline: Instant,
+) -> Result<Vec<NonZeroU64>, MysqlTopologyError> {
+    let sql = format!(
+        "SELECT PROCESSLIST_ID FROM performance_schema.threads \
+         WHERE PROCESSLIST_USER = '{}' AND TYPE = 'FOREGROUND' \
+         AND NAME = 'thread/sql/one_connection' ORDER BY PROCESSLIST_ID",
+        username
+    );
+    let ids: Vec<u64> = bounded(
+        deadline,
+        ControlStage::InspectConnectionIdentity,
+        session.connection.query_map(sql, |id: u64| id),
+    )
+    .await?;
+    ids.into_iter()
+        .map(|id| {
+            NonZeroU64::new(id).ok_or(MysqlTopologyError::ControlProtocol(
+                ControlStage::InspectConnectionIdentity,
+            ))
+        })
+        .collect()
+}
+
+async fn application_account_presence_count(
+    session: &mut impl ControlSession,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<u64, MysqlTopologyError> {
+    query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost'",
+            receipt.username()
+        ),
+        deadline,
+        ControlStage::ProveApplicationAccountAbsent,
+    )
+    .await
+}
+
+async fn prove_application_account_ownership(
+    session: &mut impl ControlSession,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+    stage: ControlStage,
+) -> Result<(), MysqlTopologyError> {
+    let count: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.user AS u \
+             JOIN information_schema.user_attributes AS a \
+             ON a.USER = u.User AND a.HOST = u.Host \
+             WHERE u.User = '{}' AND u.Host = 'localhost' \
+             AND u.plugin = 'caching_sha2_password' \
+             AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+            receipt.username(),
+            receipt.marker()
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    if count == 1 {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(stage))
+    }
+}
+
+async fn prove_application_account(
+    session: &mut impl ControlSession,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+    stage: ControlStage,
+) -> Result<(), MysqlTopologyError> {
+    prove_application_account_ownership(session, receipt, deadline, stage).await?;
+    let grantee = format!("'''{}''@''localhost'''", receipt.username());
+    let exact: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.schema_privileges \
+             WHERE GRANTEE = {grantee} \
+             AND TABLE_SCHEMA = '{}' \
+             AND PRIVILEGE_TYPE IN ('SELECT','INSERT','UPDATE','DELETE')",
+            receipt.schema()
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let total: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.schema_privileges \
+             WHERE GRANTEE = {grantee}"
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let global: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.user_privileges \
+             WHERE GRANTEE = {grantee} AND PRIVILEGE_TYPE <> 'USAGE'"
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let table: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.table_privileges \
+             WHERE GRANTEE = {grantee}"
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    let routine: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.procs_priv \
+             WHERE User = '{}' AND Host = 'localhost'",
+            receipt.username()
+        ),
+        deadline,
+        stage,
+    )
+    .await?;
+    if exact == 4 && total == 4 && global == 0 && table == 0 && routine == 0 {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(stage))
+    }
 }
 
 async fn bounded_sleep(deadline: Instant, stage: ControlStage) -> Result<(), MysqlTopologyError> {
@@ -709,7 +966,8 @@ pub(crate) async fn prepare_application_account(
     target: OwnedControlTarget,
     authority: &MemberMutationAuthority,
     credential: &ApplicationCredential,
-    deadline: Instant,
+    work_deadline: Instant,
+    cleanup_deadline: Instant,
 ) -> Result<ApplicationAccountReceipt, MysqlTopologyError> {
     verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
     if credential.attempt() != authority.attempt() || credential.is_cleared() {
@@ -717,69 +975,95 @@ pub(crate) async fn prepare_application_account(
             TopologyAuthorityError::CredentialGenerationMismatch,
         ));
     }
-    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
-    let mut created = false;
-    let provisioned = async {
-        validate_member_product(&mut connection, authority, deadline).await?;
-        let original = disable_binary_logging(&mut connection, deadline).await?;
-        let mut create = SecretStatement::new(format!(
-            "CREATE USER '{}'@'localhost' IDENTIFIED WITH caching_sha2_password BY '{}'",
-            credential.username(),
-            credential.password()
-        ));
-        let primary = match execute(
-            &mut connection,
-            create.as_str(),
-            deadline,
-            ControlStage::CreateApplication,
-        )
-        .await
-        {
-            Ok(()) => {
-                created = true;
-                create.clear();
-                execute(
-                    &mut connection,
-                    &format!(
-                        "GRANT SELECT, INSERT, UPDATE, DELETE ON \
-                         `{APPLICATION_QUALIFICATION_SCHEMA}`.* TO '{}'@'localhost'",
-                        credential.username()
-                    ),
-                    deadline,
-                    ControlStage::GrantApplicationDml,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        create.clear();
-        let restore = restore_binary_logging(&mut connection, original, deadline).await;
-        combine_primary_cleanup(primary, restore)
-    }
+    let receipt = ApplicationAccountReceipt::new(credential);
+    let mut connection = MysqlControlConnector
+        .connect(&target, work_deadline)
+        .await?;
+    let provisioned = provision_application_account_connected(
+        &mut connection,
+        authority,
+        credential,
+        &receipt,
+        work_deadline,
+    )
     .await;
-    if let Err(prior) = disconnect(connection, provisioned, deadline).await {
-        if created {
-            let cleanup = remove_application_account_by_name(
-                target,
-                authority,
-                credential.username(),
-                deadline,
-            )
-            .await;
-            return combine_primary_cleanup(Err(prior), cleanup)
-                .map(|()| ApplicationAccountReceipt::new(credential));
-        }
-        return Err(prior);
+    if let Err(prior) = disconnect(connection, provisioned, work_deadline).await {
+        let cleanup =
+            remove_application_account_exact(target.clone(), authority, &receipt, cleanup_deadline)
+                .await;
+        return combine_primary_cleanup(Err(prior), cleanup).map(|()| receipt);
     }
-    let warmed = warm_application_account(&target, authority, credential, deadline).await;
+    let warmed = warm_application_account(
+        &target,
+        authority,
+        credential,
+        &receipt,
+        work_deadline,
+        cleanup_deadline,
+    )
+    .await;
     if let Err(prior) = warmed {
         let cleanup =
-            remove_application_account_by_name(target, authority, credential.username(), deadline)
-                .await;
-        return combine_primary_cleanup(Err(prior), cleanup)
-            .map(|()| ApplicationAccountReceipt::new(credential));
+            remove_application_account_exact(target, authority, &receipt, cleanup_deadline).await;
+        return combine_primary_cleanup(Err(prior), cleanup).map(|()| receipt);
     }
-    Ok(ApplicationAccountReceipt::new(credential))
+    Ok(receipt)
+}
+
+async fn provision_application_account_connected<S: ControlSession>(
+    connection: &mut S,
+    authority: &MemberMutationAuthority,
+    credential: &ApplicationCredential,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    validate_member_product(connection, authority, deadline).await?;
+    let original = disable_binary_logging(connection, deadline).await?;
+    let mut create = SecretStatement::new(format!(
+        "CREATE USER '{}'@'localhost' IDENTIFIED WITH caching_sha2_password BY '{}' COMMENT '{}'",
+        credential.username(),
+        credential.password(),
+        receipt.marker()
+    ));
+    let primary = match execute(
+        connection,
+        create.as_str(),
+        deadline,
+        ControlStage::CreateApplication,
+    )
+    .await
+    {
+        Ok(()) => {
+            create.clear();
+            let granted = execute(
+                connection,
+                &format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON \
+                     `{APPLICATION_QUALIFICATION_SCHEMA}`.* TO '{}'@'localhost'",
+                    credential.username()
+                ),
+                deadline,
+                ControlStage::GrantApplicationDml,
+            )
+            .await;
+            match granted {
+                Ok(()) => {
+                    prove_application_account(
+                        connection,
+                        receipt,
+                        deadline,
+                        ControlStage::InspectApplicationAccount,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    create.clear();
+    let restore = restore_binary_logging(connection, original, deadline).await;
+    combine_primary_cleanup(primary, restore)
 }
 
 pub(crate) async fn remove_application_account(
@@ -793,40 +1077,86 @@ pub(crate) async fn remove_application_account(
             TopologyAuthorityError::AttemptMismatch,
         ));
     }
-    remove_application_account_by_name(target, authority, receipt.username(), deadline).await
+    remove_application_account_exact(target, authority, receipt, deadline).await
 }
 
-async fn remove_application_account_by_name(
+async fn remove_application_account_exact(
     target: OwnedControlTarget,
     authority: &MemberMutationAuthority,
-    username: &str,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    let primary =
+        remove_application_account_once(target.clone(), authority, receipt, deadline).await;
+    if primary.is_ok() {
+        return primary;
+    }
+    let cleanup = remove_application_account_once(target, authority, receipt, deadline).await;
+    combine_primary_cleanup(primary, cleanup)
+}
+
+async fn remove_application_account_once(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
     deadline: Instant,
 ) -> Result<(), MysqlTopologyError> {
     verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
     let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
-    let result = async {
-        validate_member_product(&mut connection, authority, deadline).await?;
-        let original = disable_binary_logging(&mut connection, deadline).await?;
-        let primary = execute(
-            &mut connection,
-            &format!("DROP USER IF EXISTS '{username}'@'localhost'"),
-            deadline,
-            ControlStage::DropApplication,
-        )
-        .await;
-        let restore = restore_binary_logging(&mut connection, original, deadline).await;
-        combine_primary_cleanup(primary, restore)
-    }
-    .await;
+    let result =
+        remove_application_account_connected(&mut connection, authority, receipt, deadline).await;
     disconnect(connection, result, deadline).await
+}
+
+async fn remove_application_account_connected<S: ControlSession>(
+    connection: &mut S,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    validate_member_product(connection, authority, deadline).await?;
+    if application_account_presence_count(connection, receipt, deadline).await? == 0 {
+        return Ok(());
+    }
+    prove_application_account_ownership(
+        connection,
+        receipt,
+        deadline,
+        ControlStage::InspectApplicationAccount,
+    )
+    .await?;
+    let original = disable_binary_logging(connection, deadline).await?;
+    let primary = execute(
+        connection,
+        &format!("DROP USER '{}'@'localhost'", receipt.username()),
+        deadline,
+        ControlStage::DropApplication,
+    )
+    .await;
+    let restore = restore_binary_logging(connection, original, deadline).await;
+    combine_primary_cleanup(primary, restore)?;
+    if application_account_presence_count(connection, receipt, deadline).await? == 0 {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::ProveApplicationAccountAbsent,
+        ))
+    }
 }
 
 async fn warm_application_account(
     target: &OwnedControlTarget,
     authority: &MemberMutationAuthority,
     credential: &ApplicationCredential,
-    deadline: Instant,
+    receipt: &ApplicationAccountReceipt,
+    work_deadline: Instant,
+    cleanup_deadline: Instant,
 ) -> Result<(), MysqlTopologyError> {
+    if !receipt.matches_credential(credential) {
+        return Err(MysqlTopologyError::Authority(
+            TopologyAuthorityError::CredentialGenerationMismatch,
+        ));
+    }
     target
         .socket
         .revalidate()
@@ -844,40 +1174,126 @@ async fn warm_application_account(
         ))
         .user(Some(credential.username().to_owned()))
         .pass(Some(credential.password().to_owned()));
-    let mut application = bounded(
-        deadline,
+    let application = bounded(
+        work_deadline,
         ControlStage::WarmApplicationAuthentication,
         Conn::new(options),
     )
-    .await?;
-    let connection_id = NonZeroU64::new(u64::from(application.id())).ok_or(
-        MysqlTopologyError::ControlProtocol(ControlStage::WarmApplicationAuthentication),
-    )?;
+    .await;
+    let mut application = match application {
+        Ok(application) => application,
+        Err(primary) => {
+            let settlement = terminate_application_account_sessions_before(
+                target.clone(),
+                authority,
+                receipt,
+                cleanup_deadline,
+            )
+            .await
+            .map_err(member_error_as_topology);
+            return combine_primary_cleanup(Err(primary), settlement);
+        }
+    };
+    let Some(connection_id) = NonZeroU64::new(u64::from(application.id())) else {
+        let primary = Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::WarmApplicationAuthentication,
+        ));
+        let disconnected = bounded(
+            cleanup_deadline,
+            ControlStage::Disconnect,
+            application.disconnect(),
+        )
+        .await;
+        let settlement = terminate_application_account_sessions_before(
+            target.clone(),
+            authority,
+            receipt,
+            cleanup_deadline,
+        )
+        .await
+        .map_err(member_error_as_topology);
+        return settle_application_warm(primary, disconnected, settlement);
+    };
     let primary = bounded(
-        deadline,
+        work_deadline,
         ControlStage::WarmApplicationAuthentication,
         application.query_drop("DO 1"),
     )
     .await;
     let disconnected = bounded(
-        deadline,
+        work_deadline,
         ControlStage::WarmApplicationAuthentication,
         application.disconnect(),
     )
     .await;
-    combine_primary_cleanup(primary, disconnected)?;
-    let mut control = MysqlControlConnector.connect(target, deadline).await?;
+    let session = BackendSessionIdentity::new(
+        crate::service::BackendConnectionId::new(connection_id),
+        receipt.clone(),
+        authority.clone(),
+        target.socket(),
+    );
+    let settlement =
+        terminate_proxy_backend_before(target.clone(), authority, &session, cleanup_deadline)
+            .await
+            .map_err(member_error_as_topology);
+    settle_application_warm(primary, disconnected, settlement)
+}
+
+fn settle_application_warm(
+    primary: Result<(), MysqlTopologyError>,
+    disconnected: Result<(), MysqlTopologyError>,
+    settlement: Result<(), MysqlTopologyError>,
+) -> Result<(), MysqlTopologyError> {
+    combine_primary_cleanup(combine_primary_cleanup(primary, disconnected), settlement)
+}
+
+async fn terminate_application_account_sessions_before(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &ApplicationAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
     let result = async {
-        validate_member_product(&mut control, authority, deadline).await?;
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_application_account(
+            &mut connection,
+            receipt,
+            deadline,
+            ControlStage::InspectApplicationAccount,
+        )
+        .await?;
         loop {
-            if backend_connection_count(&mut control, connection_id, deadline).await? == 0 {
+            let sessions =
+                application_backend_connection_ids(&mut connection, receipt.username(), deadline)
+                    .await?;
+            if sessions.is_empty() {
+                prove_application_account(
+                    &mut connection,
+                    receipt,
+                    deadline,
+                    ControlStage::InspectApplicationAccount,
+                )
+                .await?;
                 return Ok(());
+            }
+            for session in sessions {
+                execute(
+                    &mut connection,
+                    &format!("KILL CONNECTION {}", session.get()),
+                    deadline,
+                    ControlStage::TerminateConnection,
+                )
+                .await?;
             }
             bounded_sleep(deadline, ControlStage::ProveConnectionAbsent).await?;
         }
     }
     .await;
-    disconnect(control, result, deadline).await
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
 }
 
 async fn disable_binary_logging<S: ControlSession>(
@@ -1498,7 +1914,10 @@ impl ControlSession for MysqlControlSession {
             )),
             ControlStage::InspectExistingGroup
             | ControlStage::TerminateConnection
-            | ControlStage::ProveConnectionAbsent => Ok(ControlQueryResult::Unsigned64(
+            | ControlStage::ProveConnectionAbsent
+            | ControlStage::InspectConnectionIdentity
+            | ControlStage::InspectApplicationAccount
+            | ControlStage::ProveApplicationAccountAbsent => Ok(ControlQueryResult::Unsigned64(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
             ControlStage::InspectExistingHistory
@@ -2037,6 +2456,191 @@ mod tests {
                  @@version_compile_os, @@GLOBAL.server_uuid",
             product(server_uuid),
         )
+    }
+
+    fn application_identity() -> (
+        TopologyAttempt,
+        MemberMutationAuthority,
+        ApplicationCredential,
+        ApplicationAccountReceipt,
+    ) {
+        let attempt = test_attempt();
+        let authority = MemberMutationAuthority::new(
+            attempt.id().clone(),
+            GroupName::new(GROUP_UUID).unwrap(),
+            test_enrollment(&attempt, MysqlMemberIndex::First),
+        )
+        .unwrap();
+        let credential = ApplicationCredential::new(
+            attempt.id().clone(),
+            CredentialGeneration::new("application-generation").unwrap(),
+            "application_local",
+            "application-secret",
+        )
+        .unwrap();
+        let receipt = ApplicationAccountReceipt::new(&credential);
+        (attempt, authority, credential, receipt)
+    }
+
+    fn application_provision_actions(
+        credential: &ApplicationCredential,
+        receipt: &ApplicationAccountReceipt,
+    ) -> Vec<ScriptAction> {
+        let grantee = format!("'''{}''@''localhost'''", receipt.username());
+        vec![
+            product_query(MEMBER_UUIDS[0]),
+            query_action(
+                ControlStage::ReadBinaryLogging,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+            execute_action(
+                ControlStage::DisableBinaryLogging,
+                "SET SESSION sql_log_bin = OFF",
+            ),
+            execute_action(
+                ControlStage::CreateApplication,
+                format!(
+                    "CREATE USER '{}'@'localhost' IDENTIFIED WITH caching_sha2_password BY '{}' COMMENT '{}'",
+                    credential.username(),
+                    credential.password(),
+                    receipt.marker()
+                ),
+            ),
+            execute_action(
+                ControlStage::GrantApplicationDml,
+                format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON \
+                     `{APPLICATION_QUALIFICATION_SCHEMA}`.* TO '{}'@'localhost'",
+                    credential.username()
+                ),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user AS u \
+                     JOIN information_schema.user_attributes AS a \
+                     ON a.USER = u.User AND a.HOST = u.Host \
+                     WHERE u.User = '{}' AND u.Host = 'localhost' \
+                     AND u.plugin = 'caching_sha2_password' \
+                     AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+                    receipt.username(),
+                    receipt.marker()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.schema_privileges \
+                     WHERE GRANTEE = {grantee} \
+                     AND TABLE_SCHEMA = '{}' \
+                     AND PRIVILEGE_TYPE IN ('SELECT','INSERT','UPDATE','DELETE')",
+                    receipt.schema()
+                ),
+                ControlQueryResult::Unsigned64(4),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.schema_privileges \
+                     WHERE GRANTEE = {grantee}"
+                ),
+                ControlQueryResult::Unsigned64(4),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.user_privileges \
+                     WHERE GRANTEE = {grantee} AND PRIVILEGE_TYPE <> 'USAGE'"
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.table_privileges \
+                     WHERE GRANTEE = {grantee}"
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.procs_priv \
+                     WHERE User = '{}' AND Host = 'localhost'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+            execute_action(
+                ControlStage::RestoreBinaryLogging,
+                "SET SESSION sql_log_bin = ON",
+            ),
+            query_action(
+                ControlStage::ProveBinaryLoggingRestored,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+        ]
+    }
+
+    fn application_removal_actions(receipt: &ApplicationAccountReceipt) -> Vec<ScriptAction> {
+        vec![
+            product_query(MEMBER_UUIDS[0]),
+            query_action(
+                ControlStage::ProveApplicationAccountAbsent,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::InspectApplicationAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user AS u \
+                     JOIN information_schema.user_attributes AS a \
+                     ON a.USER = u.User AND a.HOST = u.Host \
+                     WHERE u.User = '{}' AND u.Host = 'localhost' \
+                     AND u.plugin = 'caching_sha2_password' \
+                     AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+                    receipt.username(),
+                    receipt.marker()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::ReadBinaryLogging,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+            execute_action(
+                ControlStage::DisableBinaryLogging,
+                "SET SESSION sql_log_bin = OFF",
+            ),
+            execute_action(
+                ControlStage::DropApplication,
+                format!("DROP USER '{}'@'localhost'", receipt.username()),
+            ),
+            execute_action(
+                ControlStage::RestoreBinaryLogging,
+                "SET SESSION sql_log_bin = ON",
+            ),
+            query_action(
+                ControlStage::ProveBinaryLoggingRestored,
+                "SELECT @@SESSION.sql_log_bin",
+                ControlQueryResult::Unsigned8(1),
+            ),
+            query_action(
+                ControlStage::ProveApplicationAccountAbsent,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = 'localhost'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(0),
+            ),
+        ]
     }
 
     fn test_attempt() -> TopologyAttempt {
@@ -2841,6 +3445,313 @@ mod tests {
         assert!(!format!("{actual:?}").contains("recovery-secret"));
         assert_closed(&authority, 0);
         connector.assert_complete(0, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_provisioning_validates_exact_readback_and_restores_logging() {
+        let socket = SocketFixture::new("application-account");
+        let (_attempt, authority, credential, receipt) = application_identity();
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let connector = ScriptConnector::new(
+            &socket.path,
+            application_provision_actions(&credential, &receipt),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        provision_application_account_connected(
+            &mut session,
+            &authority,
+            &credential,
+            &receipt,
+            deadline,
+        )
+        .await
+        .unwrap();
+        connector.assert_complete(0, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_provisioning_faults_preserve_primary_and_restoration_failures() {
+        for (label, boundary) in [
+            ("application-create", ControlStage::CreateApplication),
+            ("application-grant", ControlStage::GrantApplicationDml),
+            (
+                "application-readback",
+                ControlStage::InspectApplicationAccount,
+            ),
+            ("application-restore", ControlStage::RestoreBinaryLogging),
+        ] {
+            let socket = SocketFixture::new(label);
+            let (_attempt, authority, credential, receipt) = application_identity();
+            let target = test_target(&socket, MysqlMemberIndex::First);
+            let mut actions = application_provision_actions(&credential, &receipt);
+            match boundary {
+                ControlStage::CreateApplication => {
+                    actions[3] = failed_execute(
+                        boundary,
+                        match &actions[3] {
+                            ScriptAction::Execute { sql, .. } => sql.clone(),
+                            _ => unreachable!(),
+                        },
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.drain(4..11);
+                }
+                ControlStage::GrantApplicationDml => {
+                    actions[4] = failed_execute(
+                        boundary,
+                        match &actions[4] {
+                            ScriptAction::Execute { sql, .. } => sql.clone(),
+                            _ => unreachable!(),
+                        },
+                        MysqlTopologyError::ControlPermission(boundary),
+                    );
+                    actions.drain(5..11);
+                }
+                ControlStage::InspectApplicationAccount => {
+                    let sql = match &actions[5] {
+                        ScriptAction::Query { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[5] = ScriptAction::Query {
+                        stage: boundary,
+                        sql,
+                        result: Err(MysqlTopologyError::ControlProtocol(boundary)),
+                    };
+                    actions.drain(6..11);
+                }
+                ControlStage::RestoreBinaryLogging => {
+                    let sql = match &actions[11] {
+                        ScriptAction::Execute { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[11] = failed_execute(
+                        boundary,
+                        sql,
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.truncate(12);
+                }
+                _ => unreachable!(),
+            }
+            let connector = ScriptConnector::new(&socket.path, actions);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut session = connector.connect(&target, deadline).await.unwrap();
+            let error = provision_application_account_connected(
+                &mut session,
+                &authority,
+                &credential,
+                &receipt,
+                deadline,
+            )
+            .await
+            .unwrap_err();
+            match boundary {
+                ControlStage::CreateApplication => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlTransport(ControlStage::CreateApplication)
+                )),
+                ControlStage::GrantApplicationDml => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlPermission(ControlStage::GrantApplicationDml)
+                )),
+                ControlStage::InspectApplicationAccount => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlProtocol(ControlStage::InspectApplicationAccount)
+                )),
+                ControlStage::RestoreBinaryLogging => assert!(matches!(
+                    error,
+                    MysqlTopologyError::ControlTransport(ControlStage::RestoreBinaryLogging)
+                )),
+                _ => unreachable!(),
+            }
+            connector.assert_complete(0, 0);
+        }
+
+        let socket = SocketFixture::new("application-paired");
+        let (_attempt, authority, credential, receipt) = application_identity();
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let mut actions = application_provision_actions(&credential, &receipt);
+        let create_sql = match &actions[3] {
+            ScriptAction::Execute { sql, .. } => sql.clone(),
+            _ => unreachable!(),
+        };
+        let restore_sql = match &actions[11] {
+            ScriptAction::Execute { sql, .. } => sql.clone(),
+            _ => unreachable!(),
+        };
+        actions[3] = failed_execute(
+            ControlStage::CreateApplication,
+            create_sql,
+            MysqlTopologyError::ControlTransport(ControlStage::CreateApplication),
+        );
+        actions.drain(4..11);
+        actions[4] = failed_execute(
+            ControlStage::RestoreBinaryLogging,
+            restore_sql,
+            MysqlTopologyError::ControlTransport(ControlStage::RestoreBinaryLogging),
+        );
+        actions.truncate(5);
+        let connector = ScriptConnector::new(&socket.path, actions);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        let error = provision_application_account_connected(
+            &mut session,
+            &authority,
+            &credential,
+            &receipt,
+            deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, MysqlTopologyError::PairedControl { .. }));
+        connector.assert_complete(0, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_removal_requires_exact_generation_and_proves_absence() {
+        let socket = SocketFixture::new("application-remove");
+        let (_attempt, authority, _credential, receipt) = application_identity();
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let connector = ScriptConnector::new(&socket.path, application_removal_actions(&receipt));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        remove_application_account_connected(&mut session, &authority, &receipt, deadline)
+            .await
+            .unwrap();
+        connector.assert_complete(0, 0);
+
+        let socket = SocketFixture::new("application-substitute");
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let mut actions = application_removal_actions(&receipt);
+        if let ScriptAction::Query { result, .. } = &mut actions[2] {
+            *result = Ok(ControlQueryResult::Unsigned64(0));
+        } else {
+            unreachable!();
+        }
+        actions.truncate(3);
+        let connector = ScriptConnector::new(&socket.path, actions);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        assert!(matches!(
+            remove_application_account_connected(&mut session, &authority, &receipt, deadline)
+                .await,
+            Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::InspectApplicationAccount
+            ))
+        ));
+        connector.assert_complete(0, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_removal_faults_do_not_skip_restore_or_absence_readback() {
+        for (label, boundary) in [
+            ("application-drop", ControlStage::DropApplication),
+            (
+                "application-remove-restore",
+                ControlStage::RestoreBinaryLogging,
+            ),
+            (
+                "application-remove-readback",
+                ControlStage::ProveApplicationAccountAbsent,
+            ),
+        ] {
+            let socket = SocketFixture::new(label);
+            let (_attempt, authority, _credential, receipt) = application_identity();
+            let target = test_target(&socket, MysqlMemberIndex::First);
+            let mut actions = application_removal_actions(&receipt);
+            match boundary {
+                ControlStage::DropApplication => {
+                    let sql = match &actions[5] {
+                        ScriptAction::Execute { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[5] = failed_execute(
+                        boundary,
+                        sql,
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.truncate(8);
+                }
+                ControlStage::RestoreBinaryLogging => {
+                    let sql = match &actions[6] {
+                        ScriptAction::Execute { sql, .. } => sql.clone(),
+                        _ => unreachable!(),
+                    };
+                    actions[6] = failed_execute(
+                        boundary,
+                        sql,
+                        MysqlTopologyError::ControlTransport(boundary),
+                    );
+                    actions.truncate(7);
+                }
+                ControlStage::ProveApplicationAccountAbsent => {
+                    if let ScriptAction::Query { result, .. } = &mut actions[8] {
+                        *result = Ok(ControlQueryResult::Unsigned64(1));
+                    } else {
+                        unreachable!();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let connector = ScriptConnector::new(&socket.path, actions);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut session = connector.connect(&target, deadline).await.unwrap();
+            let error =
+                remove_application_account_connected(&mut session, &authority, &receipt, deadline)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MysqlTopologyError::ControlTransport(stage)
+                        if stage == boundary
+                ) || matches!(
+                    error,
+                    MysqlTopologyError::ControlProtocol(
+                        ControlStage::ProveApplicationAccountAbsent
+                    )
+                )
+            );
+            connector.assert_complete(0, 0);
+        }
+    }
+
+    #[test]
+    fn application_cache_warm_preserves_query_disconnect_and_exact_settlement_failures() {
+        let error = settle_application_warm(
+            Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::WarmApplicationAuthentication,
+            )),
+            Err(MysqlTopologyError::ControlTransport(
+                ControlStage::Disconnect,
+            )),
+            Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::InspectConnectionIdentity,
+            )),
+        )
+        .unwrap_err();
+        let MysqlTopologyError::PairedControl { prior, cleanup } = error else {
+            panic!("warm settlement did not retain its paired failures");
+        };
+        assert!(matches!(*prior, MysqlTopologyError::PairedControl { .. }));
+        assert!(matches!(
+            *cleanup,
+            MysqlTopologyError::ControlProtocol(ControlStage::InspectConnectionIdentity)
+        ));
+    }
+
+    #[test]
+    fn backend_identity_rejects_connection_id_reuse_and_account_substitution() {
+        assert!(validate_backend_identity_counts(0, 0).unwrap());
+        assert!(!validate_backend_identity_counts(1, 1).unwrap());
+        for (total, exact) in [(1, 0), (2, 1), (2, 2)] {
+            assert!(matches!(
+                validate_backend_identity_counts(total, exact),
+                Err(MysqlTopologyError::ControlProtocol(
+                    ControlStage::InspectConnectionIdentity
+                ))
+            ));
+        }
     }
 
     #[test]

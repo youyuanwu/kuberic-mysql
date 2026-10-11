@@ -17,17 +17,17 @@ use kuberic_mysql::core::{
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential,
     AttemptCleanupState, AttemptContext, BackendConnectionId, BackendConnectionReceipt,
-    ControlCredential, ControlCredentialRole, FreshBootstrapInput, FreshJoinInput,
-    LifecycleOperation, MemberConfigurationIntent, MemberControlBinding, MemberEffectKind,
-    MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
-    MemberOperationIdentity, MemberPeer, MemberSourceBoundary, MemberTransitionError,
-    MysqlAccessIntent, MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary,
-    MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity, MysqlPeerAuthorityFacts,
-    MysqlPeerOperationIntent, MysqlPeerOperationKind, MysqlPeerOperationOutcome,
-    MysqlPeerUnsupportedReason, MysqlProxyControlBoundary, MysqlProxyError,
-    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
-    MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError, MysqlTerminalState,
-    NativeIdentityEnrollment, PrimaryTransferInput,
+    BackendSessionIdentity, ControlCredential, ControlCredentialRole, FreshBootstrapInput,
+    FreshJoinInput, LifecycleOperation, MemberConfigurationIntent, MemberControlBinding,
+    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
+    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
+    MemberTransitionError, MysqlAccessIntent, MysqlInstanceConfig, MysqlInstanceError,
+    MysqlMemberEffectBoundary, MysqlMemberIndex, MysqlOpenReceipt, MysqlOperationIdentity,
+    MysqlPeerAuthorityFacts, MysqlPeerOperationIntent, MysqlPeerOperationKind,
+    MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason, MysqlProxyControlBoundary,
+    MysqlProxyError, MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity,
+    MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError,
+    MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
 };
 use service_common::{GROUP_UUID, TestRoot};
 
@@ -320,7 +320,7 @@ impl MysqlProxyControlBoundary for ScriptedEffects {
     async fn terminate_proxy_backend(
         &mut self,
         _authority: &MemberMutationAuthority,
-        _connection: BackendConnectionId,
+        _session: &BackendSessionIdentity,
         _attempt: &AttemptContext,
         _deadline: Instant,
     ) -> Result<(), MysqlProxyError> {

@@ -73,7 +73,8 @@ pub use member::{
 };
 pub use proxy::{
     APPLICATION_QUALIFICATION_SCHEMA, ApplicationAccountReceipt, ApplicationCredential,
-    MysqlClientProxy, MysqlProxyContainmentReceipt, MysqlProxyControlBoundary, MysqlProxySnapshot,
+    BackendSessionIdentity, MysqlClientProxy, MysqlProxyContainmentReceipt,
+    MysqlProxyControlBoundary, MysqlProxySnapshot,
 };
 pub use replicator::{
     MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,

@@ -15,7 +15,7 @@ use kuberic_mysql::core::{
 };
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential, AttemptContext,
-    BackendConnectionId, ControlCredential, ControlCredentialRole, MemberControlBinding,
+    BackendSessionIdentity, ControlCredential, ControlCredentialRole, MemberControlBinding,
     MemberMutationAuthority, MysqlClientProxy, MysqlMemberIndex, MysqlProxyControlBoundary,
     MysqlProxyError, NativeIdentityEnrollment,
 };
@@ -31,7 +31,9 @@ const CONNECTION_ID: u32 = 91;
 #[derive(Clone, Copy)]
 enum AuthMode {
     Fast,
-    Cold,
+    Full,
+    Switch,
+    Rsa,
 }
 
 #[derive(Clone)]
@@ -45,6 +47,9 @@ struct FakeControl {
     prepared: usize,
     removed: usize,
     terminated: BTreeSet<u64>,
+    fail_socket: bool,
+    fail_remove: bool,
+    fail_terminate: bool,
 }
 
 impl MysqlProxyControlBoundary for FakeControl {
@@ -52,7 +57,11 @@ impl MysqlProxyControlBoundary for FakeControl {
         &mut self,
         _authority: &MemberMutationAuthority,
     ) -> Result<UnixSocketPath, MysqlProxyError> {
-        Ok(self.socket.clone())
+        if self.fail_socket {
+            Err(MysqlProxyError::InvalidState)
+        } else {
+            Ok(self.socket.clone())
+        }
     }
 
     async fn prepare_application_account(
@@ -72,17 +81,31 @@ impl MysqlProxyControlBoundary for FakeControl {
         _attempt: &AttemptContext,
     ) -> Result<(), MysqlProxyError> {
         self.removed += 1;
-        Ok(())
+        if self.fail_remove {
+            Err(MysqlProxyError::InvalidState)
+        } else {
+            Ok(())
+        }
     }
 
     async fn terminate_proxy_backend(
         &mut self,
-        _authority: &MemberMutationAuthority,
-        connection: BackendConnectionId,
+        authority: &MemberMutationAuthority,
+        session: &BackendSessionIdentity,
         _attempt: &AttemptContext,
         _deadline: Instant,
     ) -> Result<(), MysqlProxyError> {
-        self.terminated.insert(connection.get());
+        if self.fail_terminate {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        assert_eq!(session.authority(), authority);
+        assert_eq!(session.socket(), &self.socket);
+        assert_eq!(session.account().username(), "application_local");
+        assert_eq!(
+            session.account().generation().as_str(),
+            "application-generation"
+        );
+        self.terminated.insert(session.connection().get());
         Ok(())
     }
 }
@@ -135,6 +158,9 @@ impl Fixture {
             prepared: 0,
             removed: 0,
             terminated: BTreeSet::new(),
+            fail_socket: false,
+            fail_remove: false,
+            fail_terminate: false,
         };
         let credential = ApplicationCredential::new(
             attempt.attempt().clone(),
@@ -250,7 +276,7 @@ async fn exact_username_capabilities_and_warmed_auth_fail_closed() {
             "proxy-cold",
             "application_local",
             CLIENT_CAPABILITIES,
-            AuthMode::Cold,
+            AuthMode::Full,
         ),
     ] {
         let mut fixture = Fixture::new(
@@ -293,6 +319,29 @@ async fn exact_username_capabilities_and_warmed_auth_fail_closed() {
     wait_sessions_zero(&plugin.proxy).await;
     assert!(plugin.revoke().await.handoff_eligible());
     plugin.cleanup().await;
+
+    for (label, auth) in [
+        ("proxy-auth-switch", AuthMode::Switch),
+        ("proxy-auth-rsa", AuthMode::Rsa),
+    ] {
+        let mut fixture = Fixture::new(
+            label,
+            BackendPlan {
+                auth,
+                block_query: false,
+            },
+        )
+        .await;
+        let address = fixture.publish();
+        assert!(
+            try_authenticate(address, "application_local", CLIENT_CAPABILITIES)
+                .await
+                .is_err()
+        );
+        wait_sessions_zero(&fixture.proxy).await;
+        assert!(fixture.revoke().await.handoff_eligible());
+        fixture.cleanup().await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -318,10 +367,63 @@ async fn unsupported_command_and_oversized_packet_never_dispatch() {
         .unwrap();
     assert_eq!(oversized.read(&mut [0_u8; 1]).await.unwrap(), 0);
     wait_sessions_zero(&fixture.proxy).await;
+
+    for bytes in [
+        vec![0xff, 0xff, 0xff, 0x00],
+        vec![0x02, 0x00],
+        vec![0x04, 0x00, 0x00, 0x00, 0x03],
+    ] {
+        let mut client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+        client.write_all(&bytes).await.unwrap();
+        client.shutdown().await.unwrap();
+        wait_sessions_zero(&fixture.proxy).await;
+    }
+
+    let mut maximum = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    let mut payload = vec![0_u8; 1024 * 1024];
+    payload[0] = 0x16;
+    write_packet(&mut maximum, 0, &payload).await;
+    assert_eq!(maximum.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    wait_sessions_zero(&fixture.proxy).await;
     let receipt = fixture.revoke().await;
     assert!(receipt.handoff_eligible());
     assert!(fixture.backend_commands.lock().unwrap().is_empty());
     fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ssl_compression_local_file_multi_statement_and_multi_result_capabilities_are_rejected() {
+    for (label, capability) in [
+        ("proxy-cap-ssl", 0x0000_0800),
+        ("proxy-cap-compress", 0x0000_0020),
+        ("proxy-cap-local-file", 0x0000_0080),
+        ("proxy-cap-multi-statement", 0x0001_0000),
+        ("proxy-cap-multi-result", 0x0002_0000),
+        ("proxy-cap-prepared-result", 0x0004_0000),
+    ] {
+        let mut fixture = Fixture::new(
+            label,
+            BackendPlan {
+                auth: AuthMode::Fast,
+                block_query: false,
+            },
+        )
+        .await;
+        let address = fixture.publish();
+        assert!(
+            try_authenticate(
+                address,
+                "application_local",
+                CLIENT_CAPABILITIES | capability,
+            )
+            .await
+            .is_err()
+        );
+        wait_sessions_zero(&fixture.proxy).await;
+        assert!(fixture.revoke().await.handoff_eligible());
+        assert!(fixture.backend_commands.lock().unwrap().is_empty());
+        fixture.cleanup().await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -343,6 +445,137 @@ async fn all_partial_permission_modes_are_rejected() {
         ));
         fixture.cleanup().await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_preserves_primary_and_account_cleanup_failures() {
+    let root = TestRoot::new("proxy-prepare-cleanup");
+    let socket_path = root.root.join("backend.sock");
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+    let attempt = AttemptContext::new(
+        AttemptId::new("proxy-prepare-cleanup-attempt").unwrap(),
+        Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let authority = authority(&attempt);
+    let mut control = FakeControl {
+        socket: UnixSocketPath::new(&socket_path).unwrap(),
+        prepared: 0,
+        removed: 0,
+        terminated: BTreeSet::new(),
+        fail_socket: true,
+        fail_remove: true,
+        fail_terminate: false,
+    };
+    let credential = ApplicationCredential::new(
+        attempt.attempt().clone(),
+        CredentialGeneration::new("application-generation").unwrap(),
+        "application_local",
+        "secret-value",
+    )
+    .unwrap();
+    let error = match MysqlClientProxy::prepare(
+        &mut control,
+        &authority,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        credential,
+        &attempt,
+    )
+    .await
+    {
+        Ok(_) => panic!("preparation unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MysqlProxyError::Cleanup { .. }));
+    assert_eq!(control.prepared, 1);
+    assert_eq!(control.removed, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn account_removal_requires_full_containment_and_can_be_retried_after_failure() {
+    let mut fixture = Fixture::new(
+        "proxy-cleanup-order",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    fixture.publish();
+    assert!(matches!(
+        fixture
+            .proxy
+            .cleanup_account(&mut fixture.control, &fixture.authority, &fixture.attempt)
+            .await,
+        Err(MysqlProxyError::InvalidState)
+    ));
+    fixture.proxy.seal_now();
+    assert!(matches!(
+        fixture
+            .proxy
+            .cleanup_account(&mut fixture.control, &fixture.authority, &fixture.attempt)
+            .await,
+        Err(MysqlProxyError::InvalidState)
+    ));
+    assert!(fixture.revoke().await.handoff_eligible());
+    fixture.control.fail_remove = true;
+    assert!(
+        fixture
+            .proxy
+            .cleanup_account(&mut fixture.control, &fixture.authority, &fixture.attempt)
+            .await
+            .is_err()
+    );
+    assert!(fixture.proxy.credential_cleared());
+    fixture.control.fail_remove = false;
+    fixture
+        .proxy
+        .cleanup_account(&mut fixture.control, &fixture.authority, &fixture.attempt)
+        .await
+        .unwrap();
+    assert_eq!(fixture.control.removed, 2);
+    fixture.backend.abort();
+    let _ = fixture.backend.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_termination_failure_never_credits_containment_and_is_retryable() {
+    let mut fixture = Fixture::new(
+        "proxy-kill-failure",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    let address = fixture.publish();
+    let _client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    await_session_count(&fixture.proxy, 1).await;
+    fixture.control.fail_terminate = true;
+    assert!(
+        fixture
+            .proxy
+            .revoke(
+                &mut fixture.control,
+                &fixture.authority,
+                nonzero(1),
+                &fixture.attempt,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!fixture.proxy.is_fully_contained());
+    assert!(matches!(
+        fixture
+            .proxy
+            .cleanup_account(&mut fixture.control, &fixture.authority, &fixture.attempt)
+            .await,
+        Err(MysqlProxyError::InvalidState)
+    ));
+    fixture.control.fail_terminate = false;
+    assert!(fixture.revoke().await.handoff_eligible());
+    fixture.cleanup().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -457,10 +690,52 @@ async fn local_infile_more_results_and_sequence_errors_are_ambiguous_and_ineligi
         let mut command = vec![0x03];
         command.extend(query);
         write_packet(&mut client, 0, &command).await;
-        assert_eq!(client.read(&mut [0_u8; 1]).await.unwrap(), 0);
+        let mut discarded = Vec::new();
+        client.read_to_end(&mut discarded).await.unwrap();
         wait_sessions_zero(&fixture.proxy).await;
         let receipt = fixture.revoke().await;
         assert!(receipt.ambiguous_effect());
+        assert!(!receipt.handoff_eligible());
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_ok_err_column_eof_and_row_packets_are_ambiguous_and_ineligible() {
+    for (index, query) in [
+        b"ok-short".as_slice(),
+        b"ok-lenenc".as_slice(),
+        b"err-short".as_slice(),
+        b"err-marker".as_slice(),
+        b"column-count".as_slice(),
+        b"column-short".as_slice(),
+        b"metadata-eof".as_slice(),
+        b"metadata-more".as_slice(),
+        b"row-short".as_slice(),
+        b"row-extra".as_slice(),
+        b"row-more".as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut fixture = Fixture::new(
+            &format!("proxy-malformed-{index}"),
+            BackendPlan {
+                auth: AuthMode::Fast,
+                block_query: false,
+            },
+        )
+        .await;
+        let address = fixture.publish();
+        let mut client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+        let mut command = vec![0x03];
+        command.extend(query);
+        write_packet(&mut client, 0, &command).await;
+        let mut discarded = Vec::new();
+        client.read_to_end(&mut discarded).await.unwrap();
+        wait_sessions_zero(&fixture.proxy).await;
+        let receipt = fixture.revoke().await;
+        assert!(receipt.ambiguous_effect(), "{index} was credited as normal");
         assert!(!receipt.handoff_eligible());
         fixture.cleanup().await;
     }
@@ -486,6 +761,29 @@ async fn listener_revocation_race_admits_no_late_backend_command() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn drop_fallback_seals_listener_and_cancels_owned_session_work() {
+    let mut fixture = Fixture::new(
+        "proxy-drop",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: true,
+        },
+    )
+    .await;
+    let address = fixture.publish();
+    let mut client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    write_packet(&mut client, 0, b"\x03block").await;
+    wait_active_command(&fixture.proxy).await;
+    let Fixture { proxy, backend, .. } = fixture;
+    drop(proxy);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(TcpStream::connect(address).await.is_err());
+    assert_eq!(client.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    backend.abort();
+    let _ = backend.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn stale_generation_cannot_revoke_or_replace_the_published_listener() {
     let mut fixture = Fixture::new(
         "proxy-generation",
@@ -502,6 +800,19 @@ async fn stale_generation_cannot_revoke_or_replace_the_published_listener() {
             .publish(nonzero(2), true, true, &fixture.attempt),
         Err(MysqlProxyError::InvalidState)
     ));
+    assert!(matches!(
+        fixture
+            .proxy
+            .revoke(
+                &mut fixture.control,
+                &fixture.authority,
+                nonzero(2),
+                &fixture.attempt,
+            )
+            .await,
+        Err(MysqlProxyError::GenerationMismatch)
+    ));
+    fixture.proxy.seal_now();
     assert!(matches!(
         fixture
             .proxy
@@ -554,13 +865,23 @@ async fn run_fake_backend(
                     authentication.extend(packet(3, &ok_packet()));
                     stream.write_all(&authentication).await.unwrap();
                 }
-                AuthMode::Cold => {
+                AuthMode::Full => {
                     write_packet(&mut stream, 2, &[0x01, 0x04]).await;
+                    return;
+                }
+                AuthMode::Switch => {
+                    write_packet(&mut stream, 2, b"\xfecaching_sha2_password\0challenge").await;
+                    return;
+                }
+                AuthMode::Rsa => {
+                    write_packet(&mut stream, 2, b"\x01-----BEGIN PUBLIC KEY-----").await;
                     return;
                 }
             }
             loop {
-                let command = read_packet(&mut stream).await;
+                let Ok(command) = read_packet_result(&mut stream).await else {
+                    return;
+                };
                 let byte = command.1[0];
                 commands.lock().unwrap().push(byte);
                 match byte {
@@ -579,12 +900,50 @@ async fn run_fake_backend(
                             write_packet(&mut stream, 1, &more).await;
                         } else if sql == b"sequence" {
                             write_packet(&mut stream, 2, &ok_packet()).await;
+                        } else if sql == b"ok-short" {
+                            write_packet(&mut stream, 1, &[0x00, 0x00, 0x00, 0x02, 0x00]).await;
+                        } else if sql == b"ok-lenenc" {
+                            write_packet(&mut stream, 1, &[0x00, 0xfc, 0x01]).await;
                         } else if sql == b"err" {
+                            write_packet(&mut stream, 1, b"\xff\x28\x04#HY000error").await;
+                        } else if sql == b"err-short" {
                             write_packet(&mut stream, 1, &[0xff, 0x28, 0x04]).await;
+                        } else if sql == b"err-marker" {
+                            write_packet(&mut stream, 1, b"\xff\x28\x04!HY000").await;
+                        } else if sql == b"column-count" {
+                            write_packet(&mut stream, 1, &[0x01, 0x00]).await;
+                        } else if sql == b"column-short" {
+                            write_packet(&mut stream, 1, &[0x01]).await;
+                            write_packet(&mut stream, 2, b"\x03def").await;
+                        } else if matches!(
+                            sql,
+                            b"metadata-eof"
+                                | b"metadata-more"
+                                | b"row-short"
+                                | b"row-extra"
+                                | b"row-more"
+                        ) {
+                            write_packet(&mut stream, 1, &[0x01]).await;
+                            write_packet(&mut stream, 2, &column_definition()).await;
+                            let metadata = if sql == b"metadata-eof" {
+                                vec![0xfe, 0x00, 0x00, 0x02]
+                            } else if sql == b"metadata-more" {
+                                vec![0xfe, 0x00, 0x00, 0x0a, 0x00]
+                            } else {
+                                eof_packet()
+                            };
+                            write_packet(&mut stream, 3, &metadata).await;
+                            if sql == b"row-short" {
+                                write_packet(&mut stream, 4, &[0x02, b'x']).await;
+                            } else if sql == b"row-extra" {
+                                write_packet(&mut stream, 4, &[0x01, b'x', b'y']).await;
+                            } else if sql == b"row-more" {
+                                write_packet(&mut stream, 4, &[0xfe, 0x00, 0x00, 0x0a, 0x00]).await;
+                            }
                         } else if sql == b"rows" {
                             for (sequence, payload) in [
                                 (1, vec![1]),
-                                (2, b"column".to_vec()),
+                                (2, column_definition()),
                                 (3, eof_packet()),
                                 (4, vec![1, b'x']),
                                 (5, eof_packet()),
@@ -627,6 +986,29 @@ fn ok_packet() -> Vec<u8> {
 
 fn eof_packet() -> Vec<u8> {
     vec![0xfe, 0x00, 0x00, 0x02, 0x00]
+}
+
+fn column_definition() -> Vec<u8> {
+    let mut payload = Vec::new();
+    for value in [
+        b"def".as_slice(),
+        b"db",
+        b"table",
+        b"table",
+        b"name",
+        b"name",
+    ] {
+        payload.push(value.len() as u8);
+        payload.extend(value);
+    }
+    payload.push(0x0c);
+    payload.extend(45_u16.to_le_bytes());
+    payload.extend(1024_u32.to_le_bytes());
+    payload.push(0xfd);
+    payload.extend(0_u16.to_le_bytes());
+    payload.push(0);
+    payload.extend([0_u8; 2]);
+    payload
 }
 
 async fn authenticate(address: SocketAddr, username: &str, capabilities: u32) -> TcpStream {

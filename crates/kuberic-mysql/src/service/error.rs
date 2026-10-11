@@ -254,6 +254,10 @@ pub enum ControlStage {
     DropApplication,
     /// Warming the dedicated account's `caching_sha2_password` cache.
     WarmApplicationAuthentication,
+    /// Reading back the exact application-account generation and grants.
+    InspectApplicationAccount,
+    /// Proving the exact application account is absent.
+    ProveApplicationAccountAbsent,
     /// Restoring the original session binary-log switch.
     RestoreBinaryLogging,
     /// Proving the session binary-log switch was restored.
@@ -286,6 +290,8 @@ pub enum ControlStage {
     TerminateConnection,
     /// Proving one exact native backend connection is absent.
     ProveConnectionAbsent,
+    /// Reading back the exact native backend account identity.
+    InspectConnectionIdentity,
     /// Explicit connected-session teardown.
     Disconnect,
 }
