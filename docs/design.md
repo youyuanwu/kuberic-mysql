@@ -736,6 +736,10 @@ containment/equality; the scalar never replaces the set or authorizes access by
 itself. Cross-restart or cross-lineage scalar comparison remains unsupported
 until a durable public history context exists.
 
+The external MySQL HA comparison and the decision to retain this qualified
+projection are recorded in
+[`mysql-election-progress.md`](mysql-election-progress.md).
+
 The projection remains role-sensitive. A primary reports only the highest
 eligible tail proven committed under the exact installed public configuration
 and qualified native commit profile, never a merely local executed tail. An
