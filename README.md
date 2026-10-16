@@ -272,7 +272,8 @@ Repository development and CI require Oracle MySQL Community Server 8.4.11 on
 Linux x86-64. The supported package is
 `mysql-community-server-core=8.4.11-1ubuntu24.04` from `repo.mysql.com`'s
 `mysql-8.4-lts` component. `/usr/sbin/mysqld` and `/usr/bin/aa-exec` must be
-installed, and the system `mysql.service` must remain stopped. Install the
+installed, `protoc` must be available for the pinned Kuberic runtime build, and
+the system `mysql.service` must remain stopped. Install the
 repository-pinned, checksum-verified `cargo-nextest` binary with:
 
 ```bash
