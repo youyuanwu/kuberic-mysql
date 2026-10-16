@@ -26,11 +26,14 @@
 //!
 //! [`MysqlReplicator`] may publish one bounded loopback Classic Protocol
 //! gateway for an explicit all-or-nothing access generation and proves proxy
-//! zero plus exact native-session absence before revocation completes. It does
-//! not implement Kuberic callbacks, switchover, failover, repair, or restart
-//! continuation. Member-local setup and bounded native control use a separate
-//! root session over the currently owned private socket. Observation remains
-//! delegated unchanged to [`crate::adapter::MysqlObserver`].
+//! zero plus exact native-session absence before revocation completes.
+//! [`kuberic`] translates the pinned Kuberic Public V1 callback bundle into
+//! this member-local engine for fresh bootstrap and
+//! already-formed planned transitions. Build/reseed, removal, data loss,
+//! automated failover, repair, and restart continuation remain unsupported.
+//! Member-local setup and bounded native control use a separate root session
+//! over the currently owned private socket. Observation remains delegated
+//! unchanged to [`crate::adapter::MysqlObserver`].
 //! [`MysqlInstanceConfig::new`] retains the original single-instance profile;
 //! topology members require [`MysqlInstanceConfig::new_topology_member`].
 
@@ -39,6 +42,7 @@ mod config;
 mod control;
 mod error;
 mod instance;
+pub mod kuberic;
 mod member;
 mod process;
 mod proxy;
@@ -64,6 +68,13 @@ pub use error::{
     TopologyNativeStateError, TopologyStateError,
 };
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
+pub use kuberic::{
+    CallbackOperationLedger, EpochTranslator, KubericTranslationError, MysqlPublicV1Replicator,
+    MysqlPublicV1ReplicatorFactory, MysqlPublicV1Service, MysqlPublicV1ServiceConfig,
+    ReplicationEndpoint, TranslationResult, translate_process_session_id,
+    translate_replica_identity, translate_replica_information, translate_replica_set_configuration,
+    translate_role, translate_storage_binding,
+};
 pub use member::{
     BackendConnectionId, BackendConnectionReceipt, CanonicalViewId, FreshBootstrapInput,
     FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget, MemberContainmentReceipt,
@@ -73,7 +84,7 @@ pub use member::{
 };
 pub use proxy::{
     APPLICATION_QUALIFICATION_SCHEMA, ApplicationAccountReceipt, ApplicationCredential,
-    BackendSessionIdentity, MysqlClientProxy, MysqlProxyContainmentReceipt,
+    BackendSessionIdentity, MysqlClientProxy, MysqlProxyAccessGuard, MysqlProxyContainmentReceipt,
     MysqlProxyControlBoundary, MysqlProxyDiagnostics, MysqlProxySnapshot,
 };
 pub use replicator::{
@@ -85,7 +96,8 @@ pub use replicator::{
     MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
     MysqlProgressOutcome, MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity,
     MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator, MysqlRoleOutcome,
-    MysqlSourceTerminalReceipt, MysqlTerminalOutcome, MysqlTerminalState,
+    MysqlRuntimeAccessAuthority, MysqlSourceTerminalReceipt, MysqlTerminalOutcome,
+    MysqlTerminalState,
 };
 pub use topology::{
     AcceptedMysqlTopology, AccountProvisioningEvidence, BootstrapCapability, BootstrapEffect,

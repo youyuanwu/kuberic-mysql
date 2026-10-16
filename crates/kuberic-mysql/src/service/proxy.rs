@@ -2,22 +2,24 @@
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::num::NonZeroU64;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::adapter::UnixSocketPath;
 use crate::core::{AttemptId, CredentialGeneration};
 use crate::service::{
-    AttemptContext, BackendConnectionId, MemberMutationAuthority, MysqlProxyError, MysqlProxyPhase,
-    MysqlProxyProtocolError, MysqlProxySettlementReason,
+    AttemptCancellationState, AttemptContext, BackendConnectionId, MemberMutationAuthority,
+    MysqlProxyError, MysqlProxyPhase, MysqlProxyProtocolError, MysqlProxySettlementReason,
 };
 
 /// Exact schema receiving the Stage 2 application's minimum DML grants.
@@ -322,6 +324,29 @@ pub trait MysqlProxyControlBoundary {
         attempt: &AttemptContext,
         deadline: Instant,
     ) -> Result<(), MysqlProxyError>;
+}
+
+/// Runtime-neutral, dynamically dispatched access fence for the client path.
+///
+/// A denial applies only to the session or command being checked. It does not
+/// settle the published proxy generation because runtime access may be granted
+/// again after an external operation completes.
+pub trait MysqlProxyAccessGuard: Send + Sync {
+    /// Returns true only while both effective read and write access are granted.
+    fn access_granted(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+}
+
+#[derive(Debug)]
+struct GrantedProxyAccess;
+
+impl MysqlProxyAccessGuard for GrantedProxyAccess {
+    fn access_granted(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
+    }
+}
+
+pub(crate) fn granted_proxy_access() -> Arc<dyn MysqlProxyAccessGuard> {
+    Arc::new(GrantedProxyAccess)
 }
 
 /// Current observable proxy counts and exact backend identities.
@@ -650,12 +675,13 @@ impl<C: MysqlProxyControlBoundary> Drop for AccountPreparationContainment<'_, C>
 /// Prepared loopback-only endpoint for one exact private UDS and account.
 #[must_use = "the proxy requires explicit async revocation and account cleanup"]
 pub struct MysqlClientProxy {
-    listener: Option<TcpListener>,
+    listener: Arc<Mutex<Option<StdTcpListener>>>,
     address: SocketAddr,
     backend: UnixSocketPath,
     account: ApplicationAccountReceipt,
     authority: MemberMutationAuthority,
     credential: ApplicationCredential,
+    access_guard: Arc<dyn MysqlProxyAccessGuard>,
     shared: Arc<Shared>,
     settlement: watch::Sender<Option<MysqlProxySettlementReason>>,
     accept_task: Option<JoinHandle<()>>,
@@ -683,6 +709,7 @@ impl MysqlClientProxy {
             listen_address,
             &mut credential,
             &mut account_obligation,
+            granted_proxy_access(),
             attempt,
         )
         .await
@@ -694,6 +721,7 @@ impl MysqlClientProxy {
         listen_address: SocketAddr,
         credential: &mut Option<ApplicationCredential>,
         account_obligation: &mut Option<ApplicationAccountReceipt>,
+        access_guard: Arc<dyn MysqlProxyAccessGuard>,
         attempt: &AttemptContext,
     ) -> Result<Self, MysqlProxyError> {
         let credential_ref = credential
@@ -725,7 +753,7 @@ impl MysqlClientProxy {
                 return Err(pair_cleanup(primary, cleanup));
             }
         };
-        let listener = match TcpListener::bind(listen_address).await {
+        let listener = match StdTcpListener::bind(listen_address) {
             Ok(listener) => listener,
             Err(error) => {
                 let primary = MysqlProxyError::Io {
@@ -743,6 +771,21 @@ impl MysqlClientProxy {
                 return Err(pair_cleanup(primary, cleanup));
             }
         };
+        if let Err(error) = listener.set_nonblocking(true) {
+            let primary = MysqlProxyError::Io {
+                phase: MysqlProxyPhase::Listener,
+                kind: error.kind(),
+            };
+            let cleanup = containment
+                .control()
+                .remove_application_account(authority, &account, attempt)
+                .await;
+            if cleanup.is_ok() {
+                account_obligation.take();
+                containment.disarm();
+            }
+            return Err(pair_cleanup(primary, cleanup));
+        }
         let address = match listener.local_addr() {
             Ok(address) => address,
             Err(error) => {
@@ -768,12 +811,13 @@ impl MysqlClientProxy {
         account_obligation.take();
         containment.disarm();
         Ok(Self {
-            listener: Some(listener),
+            listener: Arc::new(Mutex::new(Some(listener))),
             address,
             backend,
             account,
             authority: authority.clone(),
             credential,
+            access_guard,
             shared: Arc::new(Shared {
                 registry: Mutex::new(Registry {
                     accepting: false,
@@ -817,6 +861,21 @@ impl MysqlClientProxy {
         self.shared.lock().snapshot()
     }
 
+    /// Binds the effective runtime access fence before publication.
+    pub fn bind_access_guard(
+        &mut self,
+        access_guard: Arc<dyn MysqlProxyAccessGuard>,
+    ) -> Result<(), MysqlProxyError> {
+        if self.published_generation.is_some()
+            || self.accept_task.is_some()
+            || self.snapshot().generation().is_some()
+        {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        self.access_guard = access_guard;
+        Ok(())
+    }
+
     /// Publishes exactly one generation. Both permissions are mandatory.
     pub fn publish(
         &mut self,
@@ -832,7 +891,9 @@ impl MysqlClientProxy {
         if self.accept_task.is_some() || !self.account_active {
             return Err(MysqlProxyError::InvalidState);
         }
-        let listener = self.listener.take().ok_or(MysqlProxyError::InvalidState)?;
+        if !self.listener_is_bound() {
+            return Err(MysqlProxyError::InvalidState);
+        }
         {
             let mut registry = self.shared.lock();
             if registry.generation.is_some() || !registry.sessions.is_empty() {
@@ -845,9 +906,11 @@ impl MysqlClientProxy {
             registry.ambiguous_effect = false;
         }
         let shared = Arc::clone(&self.shared);
+        let listener = Arc::clone(&self.listener);
         let backend = self.backend.clone();
         let account = self.account.clone();
         let authority = self.authority.clone();
+        let access_guard = Arc::clone(&self.access_guard);
         let settlement = self.settlement.subscribe();
         let settlement_sender = self.settlement.clone();
         let attempt = attempt.clone();
@@ -859,6 +922,7 @@ impl MysqlClientProxy {
                     backend,
                     account,
                     authority,
+                    access_guard,
                     generation,
                     attempt,
                 },
@@ -877,6 +941,7 @@ impl MysqlClientProxy {
     /// Atomically stops acceptance and all later command dispatch. Native
     /// absence proof remains required through [`Self::revoke`].
     pub fn seal_now(&self) {
+        self.close_listener_now();
         self.settle_now(MysqlProxySettlementReason::TerminalSeal);
     }
 
@@ -904,7 +969,7 @@ impl MysqlClientProxy {
             .map(settlement_from_admission)
             .unwrap_or(MysqlProxySettlementReason::ExplicitRevocation);
         self.settle_now(reason);
-        self.listener.take();
+        self.close_listener_now();
         let deadline = bounded_deadline(attempt.deadline(), REVOCATION_TIMEOUT)
             .ok_or(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation))?;
         if let Some(task) = self.accept_task.as_mut() {
@@ -999,6 +1064,44 @@ impl MysqlClientProxy {
         Ok(receipt)
     }
 
+    /// Contains a listener and account that were prepared but never published.
+    pub(crate) fn contain_prepared(
+        &mut self,
+        generation: NonZeroU64,
+        attempt: &AttemptContext,
+    ) -> Result<MysqlProxyContainmentReceipt, MysqlProxyError> {
+        attempt.admit_work().map_err(map_attempt_admission)?;
+        let snapshot = self.snapshot();
+        if self.published_generation.is_some()
+            || snapshot.accepting()
+            || snapshot.generation().is_some()
+            || snapshot.sessions() != 0
+            || snapshot.active_commands() != 0
+            || !snapshot.backend_connections().is_empty()
+            || self.accept_task.is_some()
+            || !self.account_active
+        {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        self.close_listener_now();
+        self.settle_now(MysqlProxySettlementReason::ExplicitRevocation);
+        self.tasks_joined = true;
+        self.native_absence_proved = true;
+        self.contained_generation = Some(generation);
+        Ok(MysqlProxyContainmentReceipt {
+            generation,
+            settlement_reason: MysqlProxySettlementReason::ExplicitRevocation,
+            sessions_zero: true,
+            commands_zero: true,
+            native_absence: true,
+            cancelled_commands: false,
+            ambiguous_effect: false,
+            cleanup_complete: true,
+            unidentified_backends: 0,
+            diagnostics: snapshot.diagnostics(),
+        })
+    }
+
     /// Binds a fresh unpublished listener after complete containment while
     /// retaining the exact prepared account and credential.
     pub async fn rearm(
@@ -1019,12 +1122,16 @@ impl MysqlClientProxy {
             return Err(MysqlProxyError::InvalidState);
         }
         let listener =
-            TcpListener::bind(listen_address)
-                .await
-                .map_err(|error| MysqlProxyError::Io {
-                    phase: MysqlProxyPhase::Listener,
-                    kind: error.kind(),
-                })?;
+            StdTcpListener::bind(listen_address).map_err(|error| MysqlProxyError::Io {
+                phase: MysqlProxyPhase::Listener,
+                kind: error.kind(),
+            })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| MysqlProxyError::Io {
+                phase: MysqlProxyPhase::Listener,
+                kind: error.kind(),
+            })?;
         let address = listener.local_addr().map_err(|error| MysqlProxyError::Io {
             phase: MysqlProxyPhase::Listener,
             kind: error.kind(),
@@ -1044,7 +1151,7 @@ impl MysqlClientProxy {
         }
         let (settlement, _) = watch::channel(None);
         self.settlement = settlement;
-        self.listener = Some(listener);
+        *self.listener.lock().expect("proxy listener mutex poisoned") = Some(listener);
         self.address = address;
         self.published_generation = None;
         self.contained_generation = None;
@@ -1073,7 +1180,7 @@ impl MysqlClientProxy {
         if !cleanup_ready {
             return Err(MysqlProxyError::InvalidState);
         }
-        self.listener.take();
+        self.close_listener_now();
         let result = control
             .remove_application_account(authority, &self.account, attempt)
             .await;
@@ -1114,6 +1221,20 @@ impl MysqlClientProxy {
         self.published_generation
     }
 
+    fn listener_is_bound(&self) -> bool {
+        self.listener
+            .lock()
+            .expect("proxy listener mutex poisoned")
+            .is_some()
+    }
+
+    fn close_listener_now(&self) {
+        self.listener
+            .lock()
+            .expect("proxy listener mutex poisoned")
+            .take();
+    }
+
     fn record_cleanup_failure(&self) {
         let mut registry = self.shared.lock();
         registry.diagnostics.cleanup_failures =
@@ -1124,7 +1245,6 @@ impl MysqlClientProxy {
 impl Drop for MysqlClientProxy {
     fn drop(&mut self) {
         self.seal_now();
-        self.listener.take();
         if let Some(task) = self.accept_task.take() {
             task.abort();
         }
@@ -1181,12 +1301,13 @@ struct AcceptContext {
     backend: UnixSocketPath,
     account: ApplicationAccountReceipt,
     authority: MemberMutationAuthority,
+    access_guard: Arc<dyn MysqlProxyAccessGuard>,
     generation: NonZeroU64,
     attempt: AttemptContext,
 }
 
 async fn accept_loop(
-    listener: TcpListener,
+    listener: Arc<Mutex<Option<StdTcpListener>>>,
     context: AcceptContext,
     settlement_sender: watch::Sender<Option<MysqlProxySettlementReason>>,
     mut settlement: watch::Receiver<Option<MysqlProxySettlementReason>>,
@@ -1206,6 +1327,7 @@ async fn accept_loop(
             break;
         }
         tokio::select! {
+            biased;
             changed = settlement.changed() => {
                 if changed.is_err() || settlement.borrow().is_some() {
                     break;
@@ -1236,10 +1358,56 @@ async fn accept_loop(
                         registry.diagnostics.ambiguities.saturating_add(1);
                 }
             }
-            accepted = listener.accept() => {
-                let Ok((client, _)) = accepted else {
-                    break;
+            () = tokio::time::sleep(POLL_INTERVAL) => {
+                let accepted = {
+                    let listener = listener.lock().expect("proxy listener mutex poisoned");
+                    match listener.as_ref() {
+                        Some(listener) => listener.accept(),
+                        None => break,
+                    }
                 };
+                let client = match accepted {
+                    Ok((client, _)) => {
+                        if client.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        match TcpStream::from_std(client) {
+                            Ok(client) => client,
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                };
+                let access_deadline = match phase_timeout(
+                    context.attempt.work_deadline(),
+                    CLIENT_COMMAND_TIMEOUT,
+                    MysqlProxyPhase::Listener,
+                ) {
+                    Ok(deadline) => deadline,
+                    Err(_) => {
+                        drop(client);
+                        break;
+                    }
+                };
+                match require_access(
+                    context.access_guard.as_ref(),
+                    &mut settlement,
+                    access_deadline,
+                    MysqlProxyPhase::Listener,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(MysqlProxyError::AccessDenied) => {
+                        drop(client);
+                        continue;
+                    }
+                    Err(_) => {
+                        drop(client);
+                        break;
+                    }
+                }
                 let session_id = {
                     let mut registry = context.shared.lock();
                     if !registry.accepting
@@ -1275,6 +1443,7 @@ async fn accept_loop(
                         backend: context.backend.clone(),
                         account: context.account.clone(),
                         authority: context.authority.clone(),
+                        access_guard: Arc::clone(&context.access_guard),
                         generation: context.generation,
                         session_id,
                         attempt: context.attempt.clone(),
@@ -1284,6 +1453,10 @@ async fn accept_loop(
             }
         }
     }
+    listener
+        .lock()
+        .expect("proxy listener mutex poisoned")
+        .take();
     while let Some(result) = sessions.join_next().await {
         if result.is_err() {
             let mut registry = context.shared.lock();
@@ -1316,6 +1489,7 @@ fn settle_registry(
 struct SessionGuard {
     shared: Arc<Shared>,
     id: u64,
+    attempt: AttemptContext,
 }
 
 impl SessionGuard {
@@ -1450,7 +1624,10 @@ impl Drop for SessionGuard {
                 registry.ambiguous_effect = true;
                 registry.diagnostics.ambiguities =
                     registry.diagnostics.ambiguities.saturating_add(1);
-                if !registry.accepting {
+                if !registry.accepting
+                    || self.attempt.cancellation_state() == AttemptCancellationState::Cancelled
+                    || Instant::now() >= self.attempt.work_deadline()
+                {
                     registry.cancelled_commands = true;
                 }
             }
@@ -1463,6 +1640,7 @@ struct SessionContext {
     backend: UnixSocketPath,
     account: ApplicationAccountReceipt,
     authority: MemberMutationAuthority,
+    access_guard: Arc<dyn MysqlProxyAccessGuard>,
     generation: NonZeroU64,
     session_id: u64,
     attempt: AttemptContext,
@@ -1476,6 +1654,7 @@ async fn run_session(
     let guard = SessionGuard {
         shared: Arc::clone(&context.shared),
         id: context.session_id,
+        attempt: context.attempt.clone(),
     };
     let result = run_session_inner(&mut client, &guard, &context, &mut settlement).await;
     guard.record_result(&result);
@@ -1648,6 +1827,13 @@ async fn run_session_inner(
                 ));
             }
         }
+        require_access(
+            context.access_guard.as_ref(),
+            settlement,
+            command_deadline,
+            MysqlProxyPhase::ClientCommand,
+        )
+        .await?;
         guard.begin_command(context.generation, &context.attempt)?;
         if let Some(reason) = *settlement.borrow() {
             return Err(MysqlProxyError::Settled(reason));
@@ -1696,9 +1882,23 @@ async fn run_session_inner(
             MysqlProxyPhase::ServerResponse,
         )?;
         if command_byte == 0x0e {
-            forward_ping_response(&mut backend, client, settlement, response_deadline).await?;
+            forward_ping_response(
+                &mut backend,
+                client,
+                context.access_guard.as_ref(),
+                settlement,
+                response_deadline,
+            )
+            .await?;
         } else {
-            forward_query_response(&mut backend, client, settlement, response_deadline).await?;
+            forward_query_response(
+                &mut backend,
+                client,
+                context.access_guard.as_ref(),
+                settlement,
+                response_deadline,
+            )
+            .await?;
         }
         guard.complete_command();
     }
@@ -1707,6 +1907,7 @@ async fn run_session_inner(
 async fn forward_ping_response(
     backend: &mut UnixStream,
     client: &mut TcpStream,
+    access_guard: &dyn MysqlProxyAccessGuard,
     settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
     deadline: Instant,
 ) -> Result<(), MysqlProxyError> {
@@ -1739,8 +1940,10 @@ async fn forward_ping_response(
             ));
         }
     }
-    write_packet(
+    write_response_packet(
         client,
+        access_guard,
+        settlement,
         packet.sequence,
         &packet.payload,
         deadline,
@@ -1752,6 +1955,7 @@ async fn forward_ping_response(
 async fn forward_query_response(
     backend: &mut UnixStream,
     client: &mut TcpStream,
+    access_guard: &dyn MysqlProxyAccessGuard,
     settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
     deadline: Instant,
 ) -> Result<(), MysqlProxyError> {
@@ -1771,8 +1975,10 @@ async fn forward_query_response(
     match first.payload.first() {
         Some(0x00) => {
             validate_ok_packet(&first.payload)?;
-            return write_packet(
+            return write_response_packet(
                 client,
+                access_guard,
+                settlement,
                 first.sequence,
                 &first.payload,
                 deadline,
@@ -1782,8 +1988,10 @@ async fn forward_query_response(
         }
         Some(0xff) => {
             validate_err_packet(&first.payload)?;
-            return write_packet(
+            return write_response_packet(
                 client,
+                access_guard,
+                settlement,
                 first.sequence,
                 &first.payload,
                 deadline,
@@ -1806,8 +2014,10 @@ async fn forward_query_response(
             MysqlProxyProtocolError::UnsupportedResult,
         ));
     }
-    write_packet(
+    write_response_packet(
         client,
+        access_guard,
+        settlement,
         first.sequence,
         &first.payload,
         deadline,
@@ -1825,8 +2035,10 @@ async fn forward_query_response(
         .await?;
         require_sequence(&column, sequence)?;
         validate_column_definition(&column.payload)?;
-        write_packet(
+        write_response_packet(
             client,
+            access_guard,
+            settlement,
             column.sequence,
             &column.payload,
             deadline,
@@ -1844,8 +2056,10 @@ async fn forward_query_response(
     .await?;
     require_sequence(&metadata_end, sequence)?;
     validate_eof_packet(&metadata_end.payload)?;
-    write_packet(
+    write_response_packet(
         client,
+        access_guard,
+        settlement,
         metadata_end.sequence,
         &metadata_end.payload,
         deadline,
@@ -1868,8 +2082,10 @@ async fn forward_query_response(
         } else {
             validate_text_row(&row.payload, columns)?;
         }
-        write_packet(
+        write_response_packet(
             client,
+            access_guard,
+            settlement,
             row.sequence,
             &row.payload,
             deadline,
@@ -2395,6 +2611,32 @@ async fn write_packet<W: AsyncWrite + Unpin>(
     timeout_io(deadline, phase, writer.write_all(&header)).await?;
     timeout_io(deadline, phase, writer.write_all(payload)).await?;
     timeout_io(deadline, phase, writer.flush()).await
+}
+
+async fn write_response_packet<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    access_guard: &dyn MysqlProxyAccessGuard,
+    settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
+    sequence: u8,
+    payload: &[u8],
+    deadline: Instant,
+    phase: MysqlProxyPhase,
+) -> Result<(), MysqlProxyError> {
+    require_access(access_guard, settlement, deadline, phase).await?;
+    write_packet(writer, sequence, payload, deadline, phase).await
+}
+
+async fn require_access(
+    access_guard: &dyn MysqlProxyAccessGuard,
+    settlement: &mut watch::Receiver<Option<MysqlProxySettlementReason>>,
+    deadline: Instant,
+    phase: MysqlProxyPhase,
+) -> Result<(), MysqlProxyError> {
+    if select_cancel(settlement, deadline, phase, access_guard.access_granted()).await? {
+        Ok(())
+    } else {
+        Err(MysqlProxyError::AccessDenied)
+    }
 }
 
 async fn timeout_io<F>(

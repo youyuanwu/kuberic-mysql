@@ -9,9 +9,12 @@ data/disposable scratch roots. It composes both the older fixed three-member
 bootstrap/join gate and a newer test-owned composition of three independent
 member-local lifecycle engines. The latter publishes a bounded application
 gateway and completes one controlled handoff while the same host retains exact
-ownership and attempt context. It does not claim restart continuation, durable
-effect recovery, survivor adoption, automated failover, repair, or Kubernetes
-integration.
+ownership and attempt context. The normal crate surface translates the exact
+pinned public callback bundle into one such member-local
+engine for fresh initial-primary bootstrap and already-formed planned
+transitions. It does not claim restart continuation, durable effect recovery,
+survivor adoption, Build/reseed, Kuberic-created three-member formation,
+automated failover, repair, or Kubernetes integration.
 
 The delivered `kuberic_mysql::adapter` module already satisfies the
 application-state part of this proposal: it accepts one observation request,
@@ -27,12 +30,13 @@ acceptances, terminal receipts, credentials, and transition credit remain in
 memory. Loss of engine ownership or attempt context requires closed-access
 fixture reset even if surviving MySQL state appears healthy.
 
-Future Kuberic integration translates stabilized public SF-shaped values and
-operations into the delivered one-member MySQL engine per replica. The fixed
-three-member manager and three-engine handoff fixture remain qualification
-infrastructure. Runtime correctness must not depend on a private MySQL
-lifecycle, observation, access, evidence, or receipt capability; future signed
-authorization and durable public completion remain external.
+The delivered adapter translates public replica/process/storage/epoch/role/
+configuration/progress/access values from `kuberic-runtime` commit
+`ceec5887ad97d71222117610428ce715b782777e` into the one-member MySQL engine.
+The fixed three-member manager and three-engine handoff fixture remain
+qualification infrastructure. Runtime correctness does not depend on a
+private MySQL lifecycle, observation, access, evidence, or receipt capability;
+signed Build/peer authorization and durable public completion remain external.
 
 The fresh-topology manager owns its monotonic clock and one absolute attempt
 deadline. Callers cannot replay, regress, or independently extend operation
@@ -116,7 +120,7 @@ records with typed MySQL evidence.
 
 ## Goals
 
-1. Keep the MySQL adapter and future lifecycle replicator restart-stateless.
+1. Keep the MySQL adapters and lifecycle replicator restart-stateless.
 2. Make the MySQL data directory the sole local durable authority for native
    database identity, contents, GTID history, and engine-owned recovery state.
 3. Make the Kuberic controller and generic agent the durable authority for
@@ -434,18 +438,29 @@ valid only for their exact operation, immutable inputs, authority,
 `HistoryContext`, storage incarnation, and process generation. Signed
 build/peer authorization cannot be substituted across sessions or epochs.
 
-Until the SF-aligned Kuberic value types and operation ordering are available,
-the delivered MySQL engine accepts explicit Kuberic-neutral identity,
-operation, epoch, role, configuration, access-generation, progress, and
-terminal values. In-process native effects complete only from exact
-request-bound receipts; those receipts bind local authority, predecessor and
-successor evidence, deadline/cancellation state, and cleanup state. They are
-not durable records and are not exposed as a private Kuberic capability.
-Successful terminal outcomes remain in process memory for exact retry. An
-unsettled abort remains terminal and is not converted into successful
-containment; drop and emergency ownership stay armed until the exact member is
-contained.
-Future signed authorization and public value translation remain external.
+The feature-gated adapter accepts the pinned SF-aligned Kuberic values and
+retains their translation into Kuberic-neutral identity, operation, epoch,
+role, configuration, access-generation, progress, and terminal values only in
+memory. Its callback ledger gives an exact in-process retry the same native
+operation identity and rejects changed reuse. Its epoch mapping and pre-epoch
+source boundary/progress/role cache are also process-local. Runtime
+configuration carries exact remote peers only; the local target is synthesized
+from separately bound/enrolled identity, process-session, storage, endpoint,
+UDS/inode, and process authority. In-process native
+effects complete only from exact request-bound receipts; those receipts bind
+local authority, predecessor and successor evidence, deadline/cancellation
+state, and cleanup state. They are not durable records and are not exposed as
+a private Kuberic capability. Successful terminal outcomes remain in process
+memory for exact retry. An unsettled abort remains terminal and is not
+converted into successful containment; drop and emergency ownership stay armed
+until the exact member is contained.
+
+Loss of the adapter process loses the callback ledger, epoch mapping,
+pre-epoch cache, proxy registry, and native owner. `OpenMode::Existing` is
+therefore rejected rather than reconstructing authority from a data root or
+replication endpoint. Kuberic may replay this stage only by retiring/resetting
+the fresh attempt; no callback is credited from surviving `mysqld` state.
+Signed authorization, Build/reseed, and durable continuation remain external.
 MySQL must not emulate missing public fields or durable completion proof with
 an application-owned store, a private runtime capability, or a compatibility
 progress marker.
@@ -649,11 +664,25 @@ closed. Opening requires:
 - no conflicting or incomplete generic effect; and
 - successful endpoint and credential validation.
 
+For the Public V1 path, runtime access authority binds only the exact accepted
+epoch, Primary role, and configuration identity. It is not durable MySQL
+metadata and is not sufficient by itself: publication performs a fresh
+request-bound local native view read, revalidates role and configured
+membership, and requires projectable local history. A wrong runtime value,
+stale/substituted receipt, non-projectable history, or local-evidence mismatch
+leaves the proxy closed. The older fixture's combined handoff proof remains a
+separate in-memory path and is not serialized into Kuberic state.
+
 The externally returned address belongs to an application-owned
-MySQL-compatible proxy, not the raw `mysqld` listener. The proxy checks the
-current access generation before dispatching every command and owns all
-externally reachable sessions. Revocation rejects new commands, closes the
-listener, settles or terminates in-flight work under a fixed policy, closes
+MySQL-compatible proxy, not the raw `mysqld` listener. Successful
+local-primary configuration completion may publish the fixed listener before a
+runtime grant, but the neutral guard checks retained Public V1 read and write
+statuses before session admission, before dispatching every command, and after
+backend execution before forwarding each response packet. Both must be
+`Granted`. Denial closes only the affected session/command, never globally
+settles the generation, and suppresses success for a write fenced during
+execution. Revocation still rejects new commands, closes the listener, settles
+or terminates in-flight work under a fixed policy, closes
 idle/transaction-holding sessions, terminates every exact registered native
 backend connection, and proves zero proxy work plus native absence for that
 generation before a source GTID boundary is frozen. A containment receipt
@@ -826,17 +855,23 @@ effective while disconnected.
    GTID/scalar context, native-backed proxy closure, exact source terminal
    containment, both survivor acceptances, combined publication proof, and
    delayed target generation publication. This is delivered in the
-   repository-owned live fixture; it is not Kuberic adapter wiring.
-5. Permit component replacement only while a surviving fixture host retains
+   repository-owned live fixture.
+5. Translate the pinned Public V1 trait bundle into one fresh member owner,
+   including exact public fence translation, initial-primary bootstrap,
+   pre-epoch boundary caching, already-formed planned-transition callbacks,
+   and runtime-authority publication with fresh local revalidation. This is
+   part of the normal adapter surface; it does not implement Build/reseed or
+   create the other members.
+6. Permit component replacement only while a surviving fixture host retains
    exact ownership context and proves effective closure and that no mutation is
    pending. This remains unsupported; the delivered engine does not adopt or
    resume a survivor.
-6. If that host context is lost, treat the interruption as a closed-access
+7. If that host context is lost, treat the interruption as a closed-access
    fixture reset regardless of apparently healthy MySQL state.
 
-Items 1 through 4 and the reset rule in item 6 are delivered for the bounded
-host-local fixtures. Component replacement in item 5, Kuberic public adapter
-wiring, and restart-resumable effect continuation remain future work.
+Items 1 through 5 and the reset rule in item 7 are delivered for the bounded
+host-local stage. Component replacement in item 6, native Build/reseed, signed
+peer execution, and restart-resumable effect continuation remain future work.
 
 ### Phase 3: Generic durable continuation
 
@@ -863,6 +898,42 @@ metadata store or private runtime-to-Replicator capability.
 
 No metadata migration is required today because this repository has not
 implemented a MySQL-specific durable store.
+
+The delivered adapter makes no claim that its in-memory callback ledger,
+mapped epoch ordinal, opaque replication endpoint, cached pre-epoch boundary,
+proxy address, native receipt, or terminal outcome can be replayed after
+process loss. It makes no claim of `OpenMode::Existing`, fresh secondary
+admission, Build/reseed, Remove, data-loss recovery, non-projectable catch-up,
+automated failover, or Kuberic-created three-member formation. None of those
+gaps authorizes a MySQL-private durable metadata file.
+
+Ordinary formed lifecycle programs complete Epoch -> Role -> Configuration.
+Controller-composed source swap completes Revoke -> Epoch -> refreshed
+Configuration staging -> CatchUp -> Role/native transfer -> application Role,
+without inventing a previous-configuration callback. Target pre-source
+Epoch -> Primary Role -> Configuration is retained as fenced intent and remains
+pending until a later native view proves the external transfer. Identical
+configuration replay refreshes peer progress without changing the original
+native-effect identity, but a refreshed local Primary also retries its separate
+fixed-port proxy publication obligation before success; already-published
+state is idempotent. Every catch-up wait with a current engine
+configuration captures a fresh qualified boundary; only the deliberate
+post-epoch gap reuses its cached pre-epoch observation. A newer epoch first
+physically revokes any prepared or published proxy generation. Its pre-epoch
+observation validates exact authority, membership, receipt, deadline,
+cancellation, and structured GTID projection while tolerating a target whose
+native role already changed before the callback; ordinary progress remains
+role-strict, and only a recorded source Primary retains a transfer boundary.
+The exact driver also serves as a progress-only `StateProvider`: successful
+fresh `OpenMode::New` retains qualified `0` only from the freshly initialized,
+closed-access owner proof, then `current_progress` and `last_committed_lsn`
+return that same observation. Unknown pre-configuration progress still fails;
+later exact progress is retained similarly. The provider exposes no copy bytes
+or private durable state. Synchronous abort closes the shared listener and
+contains the exact native member even when an async
+callback lease is dropped; task abortion is owned but not claimed to be
+synchronously joined. Dropped service Open attempts cancel and settle opening
+state so Close waiters are notified.
 
 ## Validation Strategy
 
@@ -896,6 +967,20 @@ The architecture is accepted only when tests demonstrate:
 - unexpected views, identities, histories, or oversized evidence fail closed;
 - Stage 2 resets the fixture after ownership-context loss rather than inferring
   quiescence or claiming resume from MySQL state; and
+- the Public V1 adapter's external contracts pin the exact runtime API,
+  preserve independent replica/process/storage/endpoint fences, retain exact
+  retries, reject changed/stale callbacks, accept runtime-shaped remote-only
+  configurations including an empty fresh peer list, classify only fresh empty
+  storage as eligible input, and reject unsupported roles, progress, and
+  configurations;
+- runtime-authority access publication rejects wrong epoch/role/configuration,
+  non-projectable progress, and wrong local evidence while the effective guard
+  rejects pre-dispatch access and suppresses post-effect success without
+  preventing later regrant;
+- callback-order helpers cover ordinary role-before-configuration, planned
+  source staging/catch-up, stale old-role retries, synchronous proxy-bearing
+  abort, and dropped-Open settlement while the legacy combined handoff-proof
+  path keeps its existing contract; and
 - later resumable stages recover solely from generic records plus fresh MySQL
   state.
 

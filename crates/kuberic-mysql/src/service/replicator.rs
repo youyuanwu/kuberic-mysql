@@ -20,7 +20,7 @@ use crate::service::{
     MemberConfigurationIntent, MemberConfigurationTarget, MemberContainmentReceipt,
     MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
     MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
-    MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary,
+    MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary, MysqlProxyAccessGuard,
     MysqlProxyContainmentReceipt, MysqlProxyControlBoundary, MysqlReplicatorError,
     PrimaryTransferInput,
 };
@@ -610,6 +610,52 @@ impl MysqlAccessIntent {
     }
 }
 
+/// Exact runtime-owned authority for publishing one primary access generation.
+///
+/// This is the neutral adapter seam for runtimes that durably own cross-member
+/// lifecycle ordering. It does not replace local native role, configuration,
+/// view, or progress validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MysqlRuntimeAccessAuthority {
+    epoch: MysqlReplicaEpoch,
+    role: MysqlReplicaRole,
+    configuration: ConfigurationId,
+}
+
+impl MysqlRuntimeAccessAuthority {
+    /// Binds runtime access authority to the exact accepted primary state.
+    #[must_use]
+    pub const fn new(
+        epoch: MysqlReplicaEpoch,
+        role: MysqlReplicaRole,
+        configuration: ConfigurationId,
+    ) -> Self {
+        Self {
+            epoch,
+            role,
+            configuration,
+        }
+    }
+
+    /// Exact lifecycle epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> MysqlReplicaEpoch {
+        self.epoch
+    }
+
+    /// Exact lifecycle role.
+    #[must_use]
+    pub const fn role(&self) -> MysqlReplicaRole {
+        self.role
+    }
+
+    /// Exact current configuration identity.
+    #[must_use]
+    pub const fn configuration(&self) -> &ConfigurationId {
+        &self.configuration
+    }
+}
+
 /// Generation-bound publication or containment outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlAccessOutcome {
@@ -1095,13 +1141,22 @@ enum ConfigurationEffect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum AccessPublicationAuthority {
+    IntentOnly,
+    HandoffProof,
+    Runtime(MysqlRuntimeAccessAuthority),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum OperationFingerprint {
     Open(MysqlReplicaIdentity, NonZeroU64),
     Epoch(MysqlReplicaEpoch),
     FormationRole(MysqlReplicaEpoch, MysqlReplicaRole),
     Role(MysqlReplicaEpoch, MysqlReplicaRole, RoleEffect),
     Configuration(MysqlReplicaConfiguration, ConfigurationEffect),
-    Progress,
+    Progress {
+        require_recorded_native_role: bool,
+    },
     HandoffFreeze(
         Box<(
             MysqlReplicaTarget,
@@ -1111,7 +1166,7 @@ enum OperationFingerprint {
     ),
     HandoffSuccessor(Box<MysqlHandoffBoundary>),
     HandoffPublication(Box<MysqlHandoffPublicationProof>),
-    Access(MysqlAccessIntent),
+    Access(MysqlAccessIntent, AccessPublicationAuthority),
     Peer(MysqlPeerOperationKind, Box<MysqlPeerOperationIntent>),
     Close,
     Abort,
@@ -1218,6 +1273,7 @@ where
     application_credential: Option<ApplicationCredential>,
     pending_application_account: Option<ApplicationAccountReceipt>,
     proxy: Option<MysqlClientProxy>,
+    proxy_access_guard: std::sync::Arc<dyn MysqlProxyAccessGuard>,
     proxy_containment: Option<MysqlProxyContainmentReceipt>,
     source_handoff: Option<Box<SourceHandoffState>>,
     source_handoff_invalidated: bool,
@@ -1225,6 +1281,7 @@ where
     handoff_publication_proof: Option<AcceptedHandoffPublicationProof>,
     terminal: Option<MysqlTerminalState>,
     terminal_outcome: Option<Box<MysqlTerminalOutcome>>,
+    fresh_prepared_owner: bool,
     last_operation_generation: u64,
     operations: Vec<OperationRecord>,
 }
@@ -1288,6 +1345,7 @@ where
             application_credential: None,
             pending_application_account: None,
             proxy: None,
+            proxy_access_guard: super::proxy::granted_proxy_access(),
             proxy_containment: None,
             source_handoff: None,
             source_handoff_invalidated: false,
@@ -1295,6 +1353,7 @@ where
             handoff_publication_proof: None,
             terminal: None,
             terminal_outcome: None,
+            fresh_prepared_owner: false,
             last_operation_generation: 0,
             operations: Vec::new(),
         })
@@ -1304,6 +1363,12 @@ where
     #[must_use]
     pub const fn identity(&self) -> &MysqlReplicaIdentity {
         &self.identity
+    }
+
+    /// Exact shared attempt context governing this engine.
+    #[must_use]
+    pub const fn attempt(&self) -> &AttemptContext {
+        &self.attempt
     }
 
     /// Current accepted epoch.
@@ -1448,6 +1513,32 @@ where
         Ok(outcome)
     }
 
+    /// Returns the qualified empty-history progress proved by fresh member
+    /// preparation after exact open and before any lifecycle mutation.
+    pub(crate) fn fresh_open_progress(&self) -> Result<QualifiedProgress, MysqlReplicatorError> {
+        self.require_open_active()?;
+        let access_closed = self
+            .access
+            .is_some_and(|intent| !intent.read() && !intent.write());
+        if !self.fresh_prepared_owner
+            || self.owned_authority.as_ref() != self.authority.as_ref()
+            || !access_closed
+            || self.epoch.is_some()
+            || self.role.is_some()
+            || self.configuration.is_some()
+            || self.native_evidence.is_some()
+            || self.progress.is_some()
+        {
+            return Err(MysqlReplicatorError::InvalidConfiguration);
+        }
+        match project_progress(&self.lineage, &GtidSet::empty()) {
+            ProgressProjection::Projectable(progress) => Ok(progress),
+            ProgressProjection::NonProjectable(_) => {
+                unreachable!("empty structured history is always projectable")
+            }
+        }
+    }
+
     /// Accepts one strictly newer epoch barrier.
     pub fn advance_epoch(
         &mut self,
@@ -1525,7 +1616,23 @@ where
         epoch: MysqlReplicaEpoch,
         role: MysqlReplicaRole,
     ) -> Result<MysqlRoleOutcome, MysqlReplicatorError> {
-        self.apply_role(operation, epoch, role, RoleEffect::Observe)
+        self.apply_role(operation, epoch, role, RoleEffect::Observe, false)
+            .await
+            .map(|outcome| outcome.expect("strict role observation cannot remain pending"))
+    }
+
+    /// Observes a role only when the current native view already reports it.
+    ///
+    /// A coherent view with another role returns `None` and releases the
+    /// operation identity for a later retry. No lifecycle credit or terminal
+    /// state is recorded for that pending external transfer.
+    pub async fn observe_role_if_ready(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        epoch: MysqlReplicaEpoch,
+        role: MysqlReplicaRole,
+    ) -> Result<Option<MysqlRoleOutcome>, MysqlReplicatorError> {
+        self.apply_role(operation, epoch, role, RoleEffect::Observe, true)
             .await
     }
 
@@ -1546,8 +1653,10 @@ where
                 source: Box::new(source),
                 target,
             },
+            false,
         )
         .await
+        .map(|outcome| outcome.expect("native transfer cannot remain pending"))
     }
 
     /// Accepts configuration from an exact coherent observation.
@@ -1594,10 +1703,32 @@ where
         &mut self,
         operation: MysqlOperationIdentity,
     ) -> Result<MysqlProgressOutcome, MysqlReplicatorError> {
+        self.read_progress_observation(operation, true).await
+    }
+
+    /// Reads a request-bound pre-epoch progress/view observation while allowing
+    /// the native role to have changed before the runtime role callback.
+    ///
+    /// Exact authority, current configuration membership, receipt, deadline,
+    /// cancellation, and structured history projection remain mandatory.
+    pub async fn observe_transition_progress(
+        &mut self,
+        operation: MysqlOperationIdentity,
+    ) -> Result<MysqlProgressOutcome, MysqlReplicatorError> {
+        self.read_progress_observation(operation, false).await
+    }
+
+    async fn read_progress_observation(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        require_recorded_native_role: bool,
+    ) -> Result<MysqlProgressOutcome, MysqlReplicatorError> {
         self.require_current_configuration()?;
         self.admit_work()?;
         let request = self.current_effect_request(&operation, None)?;
-        let fingerprint = OperationFingerprint::Progress;
+        let fingerprint = OperationFingerprint::Progress {
+            require_recorded_native_role,
+        };
         let index = match self.begin_operation(operation.clone(), fingerprint)? {
             Admission::Retry(outcome) => return expect_progress(outcome),
             Admission::New(index) => index,
@@ -1611,10 +1742,16 @@ where
             Err(error) => return self.uncertain_member(index, error),
         };
         self.validate_after_effect(index)?;
-        if let Err(error) = self
+        let validation = self
             .validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)
-            .and_then(|()| self.require_current_evidence(receipt.successor()))
-        {
+            .and_then(|()| {
+                if require_recorded_native_role {
+                    self.require_current_evidence(receipt.successor())
+                } else {
+                    self.require_transition_evidence(receipt.successor())
+                }
+            });
+        if let Err(error) = validation {
             return self.uncertain_rejection(index, error);
         }
         let evidence = receipt.successor().clone();
@@ -1955,7 +2092,8 @@ where
         self.require_current_configuration()?;
         self.ensure_proxy_not_published()?;
         self.admit_work()?;
-        let fingerprint = OperationFingerprint::Access(intent);
+        let fingerprint =
+            OperationFingerprint::Access(intent, AccessPublicationAuthority::IntentOnly);
         match self.begin_operation(operation, fingerprint)? {
             Admission::Retry(outcome) => return expect_access(outcome),
             Admission::New(_) => {}
@@ -2082,14 +2220,45 @@ where
         &mut self,
         operation: MysqlOperationIdentity,
     ) -> Result<MysqlTerminalOutcome, MysqlReplicatorError> {
+        self.abort_inner(operation, false)
+    }
+
+    /// Synchronously closes any client listener, aborts the owned proxy task
+    /// tree, clears secret-bearing obligations, and then completes exact local
+    /// member containment.
+    ///
+    /// This is the terminal fallback for callers whose async callback future
+    /// may be dropped while it owns the engine. It starts no detached work and
+    /// does not depend on a later `close` callback. It proves synchronous
+    /// listener closure and native containment, not synchronous Tokio task
+    /// join completion after abortion.
+    pub fn abort_with_proxy_sync(
+        &mut self,
+        operation: MysqlOperationIdentity,
+    ) -> Result<MysqlTerminalOutcome, MysqlReplicatorError> {
+        self.abort_inner(operation, true)
+    }
+
+    fn abort_inner(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        discard_proxy: bool,
+    ) -> Result<MysqlTerminalOutcome, MysqlReplicatorError> {
         let fingerprint = OperationFingerprint::Abort;
         let index = match self.begin_terminal_operation(operation.clone(), fingerprint)? {
             Admission::Retry(outcome) => return expect_terminal(outcome),
             Admission::New(index) => index,
         };
-        if self.proxy.is_some() || self.pending_application_account.is_some() {
+        if !discard_proxy && (self.proxy.is_some() || self.pending_application_account.is_some()) {
             self.operations[index].status = OperationStatus::Uncertain;
             return Err(MysqlReplicatorError::AccessRevocationRequired);
+        }
+        if discard_proxy {
+            if let Some(proxy) = self.proxy.take() {
+                proxy.seal_now();
+                drop(proxy);
+            }
+            self.proxy_containment = None;
         }
         let identity = self.identity.clone();
         let opened = self.authority.is_some();
@@ -2147,6 +2316,7 @@ where
             cleanup,
             receipt,
         };
+        self.pending_application_account = None;
         self.terminal_outcome = Some(Box::new(outcome.clone()));
         self.complete(index, RecordedOutcome::Terminal(Box::new(outcome.clone())));
         Ok(outcome)
@@ -2296,14 +2466,15 @@ where
         epoch: MysqlReplicaEpoch,
         role: MysqlReplicaRole,
         effect: RoleEffect,
-    ) -> Result<MysqlRoleOutcome, MysqlReplicatorError> {
+        pending_on_native_mismatch: bool,
+    ) -> Result<Option<MysqlRoleOutcome>, MysqlReplicatorError> {
         self.require_open_active()?;
         self.ensure_proxy_not_published()?;
         self.admit_work()?;
         let request_operation = operation.clone();
         let fingerprint = OperationFingerprint::Role(epoch, role, effect.clone());
         let index = match self.begin_operation(operation, fingerprint)? {
-            Admission::Retry(outcome) => return expect_role(outcome),
+            Admission::Retry(outcome) => return expect_role(outcome).map(Some),
             Admission::New(index) => index,
         };
         if self.epoch != Some(epoch) || self.role_epoch == Some(epoch) {
@@ -2367,10 +2538,16 @@ where
             }
         };
         self.validate_after_effect(index)?;
-        if let Err(error) = self
-            .validate_evidence(&evidence)
-            .and_then(|()| self.require_native_role(&evidence, role))
-        {
+        if let Err(error) = self.validate_evidence(&evidence) {
+            return self.uncertain_rejection(index, error);
+        }
+        if let Err(error) = self.require_native_role(&evidence, role) {
+            if pending_on_native_mismatch
+                && matches!(error, MysqlReplicatorError::NativeRoleMismatch)
+            {
+                self.discard_last();
+                return Ok(None);
+            }
             return self.uncertain_rejection(index, error);
         }
         self.role = Some(role);
@@ -2388,7 +2565,7 @@ where
         self.close_access();
         let outcome = MysqlRoleOutcome { epoch, role };
         self.complete(index, RecordedOutcome::Role(outcome));
-        Ok(outcome)
+        Ok(Some(outcome))
     }
 
     async fn apply_configuration(
@@ -2741,6 +2918,18 @@ where
             .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
         self.validate_evidence(evidence)
             .and_then(|()| self.require_native_role(evidence, role))
+            .and_then(|()| self.require_configuration_evidence(configuration, evidence))
+    }
+
+    fn require_transition_evidence(
+        &self,
+        evidence: &MemberNativeEvidence,
+    ) -> Result<(), MysqlReplicatorError> {
+        let configuration = self
+            .configuration
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
+        self.validate_evidence(evidence)
             .and_then(|()| self.require_configuration_evidence(configuration, evidence))
     }
 
@@ -3180,6 +3369,7 @@ impl MysqlReplicator<MysqlInstanceManager> {
             .expect("fresh-member inputs were validated before process preparation");
         engine.owned_authority = Some(authority);
         engine.application_credential = Some(application);
+        engine.fresh_prepared_owner = true;
         Ok((engine, receipt))
     }
 }
@@ -3230,6 +3420,7 @@ where
                 listen_address,
                 credential,
                 account_obligation,
+                std::sync::Arc::clone(&self.proxy_access_guard),
                 &self.attempt,
             )
             .await
@@ -3260,12 +3451,61 @@ where
         result
     }
 
+    /// Binds a runtime access guard before a proxy can be prepared or published.
+    pub fn bind_proxy_access_guard(
+        &mut self,
+        access_guard: std::sync::Arc<dyn MysqlProxyAccessGuard>,
+    ) -> Result<(), MysqlReplicatorError> {
+        if self.proxy.is_some() {
+            return Err(MysqlReplicatorError::Proxy(
+                crate::service::MysqlProxyError::InvalidState,
+            ));
+        }
+        self.proxy_access_guard = access_guard;
+        Ok(())
+    }
+
     /// Explicitly publishes the prepared endpoint for one newer all-or-nothing
     /// access generation.
     pub async fn publish_access(
         &mut self,
         operation: MysqlOperationIdentity,
         intent: MysqlAccessIntent,
+    ) -> Result<MysqlAccessOutcome, MysqlReplicatorError> {
+        self.publish_access_with_authority(
+            operation,
+            intent,
+            AccessPublicationAuthority::HandoffProof,
+        )
+        .await
+    }
+
+    /// Publishes one primary generation from exact runtime-owned lifecycle
+    /// authority plus fresh local native evidence.
+    ///
+    /// Unlike [`Self::publish_access`], this path does not consume the
+    /// repository fixture's combined cross-member handoff proof. It is intended
+    /// for a public runtime whose durable operation ordering and access grant
+    /// are external to this restart-stateless engine.
+    pub async fn publish_access_with_runtime_authority(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        intent: MysqlAccessIntent,
+        authority: MysqlRuntimeAccessAuthority,
+    ) -> Result<MysqlAccessOutcome, MysqlReplicatorError> {
+        self.publish_access_with_authority(
+            operation,
+            intent,
+            AccessPublicationAuthority::Runtime(authority),
+        )
+        .await
+    }
+
+    async fn publish_access_with_authority(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        intent: MysqlAccessIntent,
+        publication: AccessPublicationAuthority,
     ) -> Result<MysqlAccessOutcome, MysqlReplicatorError> {
         self.require_current_configuration()?;
         self.admit_work()?;
@@ -3274,7 +3514,20 @@ where
                 crate::service::MysqlProxyError::BothPermissionsRequired,
             ));
         }
-        let fingerprint = OperationFingerprint::Access(intent);
+        if let AccessPublicationAuthority::Runtime(authority) = &publication {
+            let configuration = self
+                .configuration
+                .as_ref()
+                .expect("current configuration was required");
+            if authority.epoch != self.epoch.expect("current configuration has an epoch")
+                || authority.role != MysqlReplicaRole::Primary
+                || self.role != Some(authority.role)
+                || authority.configuration != configuration.id
+            {
+                return Err(MysqlReplicatorError::HandoffProofRequired);
+            }
+        }
+        let fingerprint = OperationFingerprint::Access(intent, publication.clone());
         if self
             .operations
             .iter()
@@ -3285,7 +3538,9 @@ where
                 Admission::New(_) => unreachable!("known operation identity cannot be new"),
             };
         }
-        if self.handoff_publication_required {
+        if self.handoff_publication_required
+            && matches!(publication, AccessPublicationAuthority::HandoffProof)
+        {
             let valid = self
                 .handoff_publication_proof
                 .as_ref()
@@ -3308,7 +3563,9 @@ where
             self.discard_last();
             return Err(MysqlReplicatorError::StaleAccessGeneration);
         }
-        if self.handoff_publication_required {
+        if self.handoff_publication_required
+            && matches!(publication, AccessPublicationAuthority::HandoffProof)
+        {
             let request = self.current_effect_request(&operation, None)?;
             let receipt = match self
                 .effects
@@ -3335,6 +3592,34 @@ where
             self.native_evidence = Some(receipt.successor().clone());
             self.progress = Some(MysqlProgressOutcome {
                 progress: project_progress(&self.lineage, receipt.successor().executed()),
+                catch_up: CatchUpCapabilityResult::retained_evidence_unavailable(),
+            });
+        } else if matches!(publication, AccessPublicationAuthority::Runtime(_)) {
+            let request = self.current_effect_request(&operation, None)?;
+            let receipt = match self
+                .effects
+                .read_member_view(request.clone(), &self.attempt)
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => return self.uncertain_member(index, error),
+            };
+            self.validate_after_effect(index)?;
+            if let Err(error) =
+                self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)
+            {
+                return self.uncertain_rejection(index, error);
+            }
+            if let Err(error) = self.require_current_evidence(receipt.successor()) {
+                return self.uncertain_rejection(index, error);
+            }
+            let progress = project_progress(&self.lineage, receipt.successor().executed());
+            if !matches!(progress, ProgressProjection::Projectable(_)) {
+                return self.uncertain_rejection(index, MysqlReplicatorError::HandoffProofRequired);
+            }
+            self.native_evidence = Some(receipt.successor().clone());
+            self.progress = Some(MysqlProgressOutcome {
+                progress,
                 catch_up: CatchUpCapabilityResult::retained_evidence_unavailable(),
             });
         }
@@ -3368,7 +3653,8 @@ where
         intent: MysqlAccessIntent,
     ) -> Result<MysqlAccessOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
-        let fingerprint = OperationFingerprint::Access(intent);
+        let fingerprint =
+            OperationFingerprint::Access(intent, AccessPublicationAuthority::HandoffProof);
         let index = match self.begin_operation(operation, fingerprint)? {
             Admission::Retry(outcome) => return expect_access(outcome),
             Admission::New(index) => index,
@@ -3386,15 +3672,18 @@ where
         let proxy = self.proxy.as_mut().ok_or(MysqlReplicatorError::Proxy(
             crate::service::MysqlProxyError::InvalidState,
         ))?;
-        let containment = match proxy
-            .revoke(
-                &mut self.effects,
-                &authority,
-                current.generation,
-                &self.attempt,
-            )
-            .await
-        {
+        let containment = match if proxy.published_generation().is_some() {
+            proxy
+                .revoke(
+                    &mut self.effects,
+                    &authority,
+                    current.generation,
+                    &self.attempt,
+                )
+                .await
+        } else {
+            proxy.contain_prepared(intent.generation, &self.attempt)
+        } {
             Ok(containment) => containment,
             Err(error) => {
                 self.operations[index].status = OperationStatus::Uncertain;

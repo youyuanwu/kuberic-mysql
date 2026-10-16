@@ -5,8 +5,8 @@
 //!
 //! - [`core`] models identity, GTID history, native views, and authority.
 //! - [`adapter`] observes one exact Oracle MySQL instance over a private UDS.
-//! - [`service`] owns fresh local processes and one fixed, closed-access
-//!   three-member bootstrap/join attempt.
+//! - [`service`] owns fresh local processes, member-local lifecycle and proxy
+//!   control, and the feature-gated Kuberic Public V1 adapter.
 
 pub mod adapter;
 pub mod core;

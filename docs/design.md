@@ -1,25 +1,28 @@
 # MySQL/Kuberic High-Level Design
 
 This document defines the safety and lifecycle contract for integrating Oracle
-MySQL with Kuberic. It distinguishes delivered MySQL-owned behavior from future
-Kuberic adapter, resumability, failover, and deployment work.
+MySQL with Kuberic. It distinguishes the delivered bounded Public V1 adapter
+and MySQL-owned behavior from future resumability, Build/reseed, failover, and
+deployment work.
 
 ## Status and Target Profile
 
 ### Current repository status
 
 This repository delivers Stage 0 documentation, the Stage 1 deterministic
-safety core, the native-observation and bounded process/topology slices, and
-the MySQL-owned Stage 2 integration foundation. The publish-disabled
-`kuberic-mysql` crate exposes these as the `core`, `adapter`, and `service`
-modules. The adapter observes exactly one caller-selected Oracle MySQL
-Community Server 8.4.11 through a private Unix-domain socket. The service owns
-one fresh, restart-stateless process generation, composes exactly three fresh
-generations for the older topology qualification gate, and now exposes one
-member-local `MysqlReplicator` plus a generation-fenced application gateway.
-The separate `kuberic-mysql-tests` package owns integration contracts, protocol
-simulators, shared fixtures, three-engine formation, and the live controlled
-handoff qualification.
+safety core, the native-observation and bounded process/topology slices, the
+MySQL-owned Stage 2 integration foundation, and a bounded Kuberic Public V1
+adapter. The publish-disabled `kuberic-mysql` crate exposes these as the
+`core`, `adapter`, and `service` modules, including the public
+service/factory/replicator bundle against `kuberic-runtime` pinned exactly to
+`ceec5887ad97d71222117610428ce715b782777e`. The native adapter observes exactly
+one caller-selected Oracle MySQL Community Server 8.4.11 through a private
+Unix-domain socket. The service owns one fresh, restart-stateless process
+generation, composes exactly three fresh generations for the older topology
+qualification gate, and exposes one member-local `MysqlReplicator` plus a
+generation-fenced application gateway. The separate `kuberic-mysql-tests`
+package owns integration contracts, protocol simulators, shared fixtures,
+three-engine formation, and the live controlled handoff qualification.
 
 Future lifecycle work follows the
 [restart-stateless metadata design](stateless-metadata.md): the MySQL adapter
@@ -27,14 +30,13 @@ and lifecycle component own no private durable recovery store. Durable
 operation records are application-neutral Kuberic controller or generic-agent
 records, not a MySQL-specific metadata file or database.
 
-It targets Kuberic's SF-aligned public-only contract in the sibling
-repository's `service-fabric-api-semantics.md`,
-`service-fabric-alignment.md`, and `stateless-default-replicator.md`. The
-delivered fixed three-member manager and three-engine harness are qualification
-boundaries, not production topology owners. The delivered MySQL component shape is one
-member-local lifecycle engine per replica with no private Kuberic managed
-lifecycle, observation, access, or receipt attachment. The actual Kuberic
-adapter and its stabilized public value translation are still external.
+It implements the pinned SF-aligned public-only contract without modifying the
+sibling Kuberic repository. The delivered fixed three-member manager and
+three-engine harness are qualification boundaries, not production topology
+owners. The delivered MySQL component shape is one member-local lifecycle
+engine per replica with no private Kuberic managed lifecycle, observation,
+access, or receipt attachment. The Public V1 adapter translates only public
+values and callback ordering into that engine.
 
 Words such as **must** and **requires** below remain requirements for stages
 whose delivery gates have not passed; they do not imply that broader lifecycle
@@ -257,8 +259,9 @@ accepts only empty history or one untagged configured source with one
 contiguous interval beginning at `1`; all other parsed shapes are typed
 non-projectable. Catch-up capability is evaluated separately and remains
 unsupported or unproved when retained donor/binlog evidence is absent. The
-future Kuberic `HistoryContext` translation and comparison policy are not
-implemented here.
+pinned Public V1 adapter returns only this qualified scalar and keeps
+unsupported catch-up at `INVALID_LSN`; it does not infer donor retention from
+current progress.
 
 The application-facing endpoint is a plaintext loopback MySQL Classic Protocol
 gateway backed by the exact private UDS. It preserves the native
@@ -313,14 +316,18 @@ pure identity, GTID-set, view, observation, and stale-authority contracts
 without starting or contacting MySQL. The separately delivered adapter
 contacts one exact server. The bounded service owns individual fresh local processes and proves both the
 older topology bootstrap/join gate and the newer member-local Stage 2
-foundation, bounded gateway, fresh formation, and one controlled handoff. It
-does not supply the Kuberic adapter, restart resumability, automated failover,
-or a production lifecycle.
+foundation, bounded gateway, fresh formation, and one controlled handoff. The
+feature-gated Public V1 adapter adds fresh initial-primary bootstrap and
+already-formed planned-transition callback translation. It does not supply
+Build/reseed, restart resumability, automated failover, or a production
+lifecycle, and it does not claim Kuberic-created three-member formation.
 
 The first executable **server-integration** milestone is the Stage 2 PoC. Its
-purpose is to prove that Kuberic can own three local `mysqld` processes, observe
-Group Replication and GTID state, drive one member-local public SF-shaped
-Replicator per replica, and complete a controlled primary handoff.
+purpose is to prove three independent member-local owners, observe Group
+Replication and GTID state, exercise the public SF-shaped Replicator bundle for
+fresh initial-primary and already-formed transitions, and complete a controlled
+primary handoff. The repository fixture, not Kuberic Build, creates the
+three-member group.
 
 The PoC includes:
 
@@ -369,10 +376,10 @@ This document uses three labels:
   delivery and test gates pass.
 
 MySQL-native details named here must be checked against the exact pinned 8.4
-release during implementation. The SF-aligned Kuberic values and sequencing
-remain roadmap dependencies until implemented; this design does not treat
-planned capabilities, signed authorization, or public value shapes as already
-available.
+release during implementation. The delivered adapter uses only the Public V1
+values and sequencing pinned above; later signed authorization, durable
+continuation, Build/reseed, and repair capabilities remain roadmap
+dependencies.
 
 ## Authority and Ownership
 
@@ -443,11 +450,10 @@ production fence receipt.
 
 The target Kuberic runtime follows the Service Fabric V1 ordering and evidence
 model. The delivered MySQL-owned engine models the intended order with
-Kuberic-neutral values; a future adapter must translate stabilized public
+Kuberic-neutral values; the feature-gated adapter translates the pinned public
 `Replicator` and `PrimaryReplicator` calls into those values. Successful
-completion of an exact future public call remains the runtime-visible
-evidence; the runtime must not fetch a second private MySQL receipt or native
-snapshot.
+completion of an exact public call is the runtime-visible evidence; the
+runtime must not fetch a second private MySQL receipt or native snapshot.
 
 The runtime persists operation intent before invoking MySQL and owns the exact
 task, cancellation, supersession, durable revision, process session, and final
@@ -466,10 +472,12 @@ The delivered MySQL-owned admission order is:
 6. Revalidate the full ordered operation and publish access separately.
 7. Settle close or synchronously contain abort as a terminal boundary.
 
-The future Kuberic adapter remains responsible for persisting public operation
-intent, invoking the corresponding MySQL operation in this order, committing
-public completion, and projecting partition access separately. Data-loss
-callback execution and generic build/removal completion are not delivered.
+The Kuberic runtime remains responsible for persisting public operation intent,
+invoking the adapter in its public callback order, committing public
+completion, and projecting partition access separately. The adapter supplies
+the order translation and native postcondition checks but no durable store.
+Data-loss callback execution and generic build/removal completion are not
+delivered.
 
 A secondary that remains secondary across a newer epoch still receives
 `update_epoch`. That call must invalidate predecessor work and peer admission;
@@ -572,44 +580,99 @@ identity and prove the old incarnation is contained.
 
 ### SF-aligned public interface mapping
 
-The delivered database-owned shape is one member-local `MysqlReplicator` per
-future Kuberic replica. It is not yet an implementation of Kuberic's Rust
-traits; the future adapter translates stabilized public values and operations
-into this seam. The three-process `MysqlTopologyManager` and three-engine live
-harness remain qualification fixtures, not production runtime owners.
+The delivered database-owned shape is one member-local `MysqlReplicator`
+behind the pinned Kuberic Rust traits. The adapter serializes callbacks
+through one owner and translates public values
+into the neutral engine seam. The three-process `MysqlTopologyManager` and
+three-engine live harness remain qualification fixtures, not production
+runtime owners.
 
-| Kuberic surface | Proposed MySQL responsibility |
+| Kuberic surface | Delivered bounded MySQL responsibility |
 |---|---|
-| `StatefulServiceReplica.open` | Validate resource/partition/storage identity, create one member-local process host and `MysqlReplicator`, select its factory, create one coherent public interface bundle, and return that bundle's control `Replicator` |
-| `ReplicatorFactory.create_replicator` | Return the same control/primary object with immutable capabilities and settings; omit `StateReplicator` and `StateProvider` because MySQL owns replication, recovery, and application bytes |
-| application `change_role` | Converge the application role and return the role-specific MySQL proxy service address; address retention/publication remains runtime-owned and access status remains separate |
-| application `close` / `abort` | Close the service proxy first, cancel and drain exact work, then stop/reap or quarantine the owned process; abort is synchronous containment |
-| `Replicator.open` | Bind the application-owned replication/control endpoint and return its published address only after exact process/native identity validation; failed open leaves no listener |
-| `Replicator::change_role` | Establish the native role postcondition under the supplied epoch while access remains closed; initial primary may perform the one authorized bootstrap without requiring a prior primary configuration callback |
-| `Replicator::update_epoch` | Fence predecessor callbacks, build sessions, peer authorization, and native traffic before accepting newer-epoch work, including same-role secondary transitions |
-| `Replicator::close` | Cancel and drain Replicator-owned role/configuration/catch-up/build work, stop its replication/control endpoint and native peer sessions, and leave no descendant task or listener |
-| `Replicator::abort` | Synchronously fence new work, invalidate peer/build authorization, stop the replication/control endpoint, and contain owned native work as far as possible |
-| `current_progress` | Translate the delivered qualified scalar projection only after the future adapter supplies the required public history/authority context; never return a configuration generation or transaction count |
-| `catch_up_capability` | Translate the delivered typed unsupported/unproved result until exact retained donor/binlog proof is implemented; never substitute current progress |
-| current/joint configuration | Accept only remote active secondaries, exact process sessions, `must_catchup`, signed peer authorization, and meaningful or invalid public progress; exclude the local primary and every idle/build target |
-| catch-up quorum | Capture an internal structured GTID boundary and complete only when the requested public predicate is true for the exact installed configuration; initially support the conservative `All` mode |
-| `build_replica` | The delivered seam validates primary/configuration/target/operation/retry binding and returns typed unsupported. Future execution must present signed one-attempt authorization and prove recovery to the internal build boundary |
-| `remove_replica` | The delivered seam validates the same ordering and exact retry constraints and returns typed unsupported. Future execution must first exclude configured members and settle exact build/session resources |
-| `on_data_loss` | Run only under typed controller authorization, revalidate structured GTID history internally, and use `ReplaceOnAmbiguity`; unsupported or incompatible history returns rebuild-required and keeps access closed |
+| `StatefulServiceReplica.open` | Accept only `OpenMode::New`, validate the exact partition and public replica identity before process mutation, consume one fresh member input, prepare one `MysqlReplicator`, install the pinned factory, and return that bundle's control `Replicator`. `OpenMode::Existing` fails closed. |
+| `ReplicatorFactory.create_replicator` | Require the exact same driver allocation as the supplied `StateProvider`, verify it with `Arc::ptr_eq`, bind that driver to the exact public replica identity, process session, immutable replication endpoint, and object-safe access guard backed by the retained factory context, and return one control/primary object with conservative capabilities and no `StateReplicator`. |
+| application `change_role` | Revoke before every non-primary return. For Primary, return the fixed proxy endpoint even when the later standalone Configuration callback has not run. Successful local-primary configuration completion prepares and publishes the listener; the access guard still denies effective use until both runtime statuses are `Granted`. |
+| application `close` / `abort` | Cancel opening or callback work, contain the proxy and native owner, and retain terminal failure rather than claiming containment. Dropped Open attempts settle opening state and notify Close waiters. Abort synchronously closes the listener, aborts owned proxy/session tasks, and completes native process containment; it does not claim that an already-aborted Tokio task was synchronously joined. |
+| `Replicator.open` | Complete the already-prepared fresh owner open and return the versioned non-secret replication endpoint. For this service-only `OpenMode::New` path, retain qualified progress `0` only after proving the freshly initialized owner is still pre-epoch/pre-role/pre-configuration with access closed; generic unknown pre-configuration progress has no zero fallback. |
+| `Replicator::change_role` | Support fresh initial Primary intent and already-formed transitions. Ordinary formed callbacks observe Role after Epoch and leave Configuration for its later callback. Controller-composed source demotion consumes the already-staged refreshed configuration and catch-up proof, then transfers natively to its configured target before observing configuration. A target Secondary -> Primary callback received before source transfer is a fenced intent: a non-terminal native-role probe returns pending without consuming its operation identity, and later credit occurs only after the native view reports Primary. Fresh ActiveSecondary admission fails closed because it requires Build/reseed. |
+| `Replicator::update_epoch` | Map lexicographic public epochs to retained monotonic native ordinals. Before any newer-epoch engine mutation, physically revoke/contain every prepared or published proxy generation through the native-backed engine path. Then capture request-bound exact-authority/configuration/view/GTID progress and the prior intended role before clearing configuration. This transition observation intentionally tolerates a native target already changed from recorded Secondary to Primary; ordinary progress remains role-strict. Cache a source boundary only for a recorded Primary, where later source transfer needs it. |
+| `current_progress` | Before configuration, return qualified `0` only from the retained fresh-open proof, or return the retained pre-epoch scalar while access is closed. With current configuration, return only the strict fresh native scalar projection. Unknown/non-projectable history fails closed. |
+| `StateProvider` | Retain the fresh-open or exact scalar returned by `current_progress` and return that same observation from `last_committed_lsn`, allowing the pinned host's applied-equals-committed projection without a generic zero fallback. Validate exact epoch/tail inputs and reject copy/data-loss methods; expose no application operation bytes or private durable state. |
+| `catch_up_capability` | Return `INVALID_LSN`; no retained donor/binlog capability is claimed. |
+| current/joint configuration | Strictly validate canonical content, exact active roles, and exact remote-peer `ReplicaInformation` (`members = replicas + local`). Synthesize the local member only from the separately bound/enrolled MySQL identity, process session, storage, endpoint, UDS/inode, and process authority. Initial configuration must be exactly the local Primary with zero peer entries. Later configurations describe an already-formed topology. |
+| catch-up quorum | Evaluate only the pinned scalar predicate against the staged remote peers plus the synthesized local boundary. Capture a fresh qualified boundary for every wait while the engine still has a current configuration; reuse the cached pre-epoch boundary only during the intentional post-epoch configuration gap. Clear obsolete caches after configuration completion. Missing/invalid progress or an unproved new Primary remains pending. |
+| `build_replica` | Return explicit unsupported; native Build/reseed is the next lifecycle stage needed for fresh secondary admission and Kuberic-created multi-member formation. |
+| `remove_replica` | Return explicit unsupported. |
+| `on_data_loss` | Return explicit unsupported and keep access closed. |
 
-The future custom bundle uses no private managed lifecycle, observation,
-access, or receipt capability. The delivered MySQL engine keeps structured
-observations, effect receipts, and operation state in memory so it can validate
-the database postcondition, but Kuberic integration correctness must depend
-only on exact public completion plus agent-owned identity, configuration,
-history context, signed authorization, and access ordering.
+Kuberic public fences and native MySQL fences are deliberately separate.
+Public replica incarnation, process session, storage incarnation,
+configuration, epoch, callback operation identity, and access status cannot be
+substituted for the enrolled native UDS path/inode, exact owned process,
+`server_uuid`, member UUID/address, Group Replication view, or complete GTID
+history. The adapter validates both domains at their boundary; neither inherits
+authority merely because a string or address is reused.
 
-Graceful teardown first revokes access and cancels/drains exact outstanding
-operations, then closes the Replicator, then closes the application
-replica/proxy and stops or quarantines `mysqld`. A failed Replicator close is
-contained through Replicator abort before application close continues.
-Ungraceful teardown invokes Replicator abort before application abort, and both
-abort paths are synchronous.
+The opaque replication endpoint is encoded as a canonical versioned sequence
+of length-prefixed fields containing the native member UUID, SQL member
+address, and Group Replication address. It carries no credential, storage
+authority, process session, or access grant. The local process/session/storage
+fences come from factory binding and enrolled MySQL ownership, not from a
+callback-supplied local `ReplicaInformation`.
+
+Kuberic and the neutral engine expose different callback order. Ordinary
+formed programs are Epoch -> Role -> Configuration, so the adapter observes
+role before configuration. A controller-composed source swap is Revoke ->
+Epoch -> RefreshedConfiguration -> CatchUp -> Role -> ApplicationRole; the
+refreshed configuration is staged before role, no nonexistent `previous`
+configuration is required, and source transfer targets its configured new
+primary before configuration observation. Before that source program, the
+controller may send the target Epoch -> Primary Role -> Configuration. The
+adapter stages that target intent and peer progress but does not credit Primary
+or invoke another configuration effect until the post-transfer native view
+reports Primary. Reinstalling an already accepted identical configuration,
+including catch-up recovery replay, only refreshes peer progress and preserves
+the original Bootstrap/Observe effect identity. Configuration acceptance and
+proxy publication remain separate obligations: when the refreshed local role
+is Primary, both current and catch-up replay retry fixed-port preparation/rearm
+and publication before returning. This repairs a prior publication failure;
+an already `Published` state returns the retained endpoint without creating a
+new generation. The application may receive its Primary service address before
+the standalone Configuration callback. The adapter therefore publishes the
+fixed listener at successful local-primary configuration completion.
+
+For that final publication, `MysqlRuntimeAccessAuthority` carries only the
+exact accepted native epoch, Primary role, and configuration identity supplied
+by the durable public runtime ordering. The engine still performs a fresh
+request-bound local view read, verifies the current native role and configured
+membership, and requires projectable local history before opening the proxy.
+Wrong runtime epoch/role/configuration, stale or substituted receipts,
+non-projectable history, or local evidence mismatch keeps access closed. This
+runtime path does not alter the repository fixture's legacy combined
+handoff-publication proof path.
+
+Publication is not effective access by itself. The proxy's neutral async guard
+uses retained `ReplicatorFactoryContext::read_status` and `write_status` and
+requires both to be `Granted` before session admission, before every command,
+and after the backend response before forwarding any packet. Denial closes the
+affected session without settling the generation, allowing the runtime to
+regrant after operation completion. A write fenced during execution cannot
+receive an OK/result success response.
+
+The bundle uses no private managed lifecycle, observation, access, or receipt
+capability. Structured observations, effect receipts, callback retry ledgers,
+pre-epoch cache, and access generations remain in process memory only. Kuberic
+integration correctness depends on exact public completion and runtime-owned
+ordering; this bounded stage does not claim restart replay.
+
+Graceful teardown revokes access and closes the Replicator-owned proxy/native
+owner. Ungraceful teardown cancels current work and invokes synchronous abort.
+The listener is retained in a shared mutex-protected slot; the accept task uses
+bounded nonblocking polling and never owns the socket exclusively. Seal, drop,
+revoke, and abort can therefore take and close it synchronously. Synchronous
+abort also completes native process containment before return, while task
+abortion is ownership containment rather than a claim of synchronous Tokio
+join completion. Neither path adopts surviving state after process loss.
 
 ### Data-loss callback and replay disposition
 
@@ -629,32 +692,31 @@ and invalidates incompatible peer/build evidence before access.
 
 ### Public value and authorization dependencies
 
-The SF-aligned Kuberic design keeps the protected public method sets but adds
-immutable value semantics around them:
+The exact pinned Kuberic commit supplies the protected Public V1 method sets
+and immutable replica identity, process-session, storage-incarnation, epoch,
+role, configuration, progress, settings, and operation values used by the
+adapter. It also defines `INVALID_LSN = -1`, `must_catchup`, and the public
+factory/service bundle.
 
-- `ReplicatorCapabilities`, initially including catch-up-specific-quorum
-  support and the data-loss replay disposition;
-- `HistoryContext`, which scopes scalar progress comparison to one resource,
-  protocol generation, opaque history identity, and data-loss number;
-- `must_catchup` on an active remote replica description;
-- `INVALID_LSN = -1` for unknown target or Replicator-owned progress;
-- signed `BuildAuthorization` for one exact source/target/build attempt; and
-- signed `PeerSessionAuthorization` for one exact active primary-secondary
-  process-session pair and current/previous configuration.
+The bounded adapter deliberately does not invent missing durable context or
+authorization. Broader lifecycle activation still requires:
 
-These target values are roadmap dependencies until their Kuberic
-implementation lands. MySQL must not bind production code to the current
-pre-alignment value shapes or recreate missing fields through a private
-runtime channel.
+- a history context that scopes scalar comparison to one resource/protocol
+  lineage and data-loss generation;
+- signed Build authorization for one exact source/target/build attempt; and
+- signed peer-session authorization for one exact active
+  primary-secondary process-session pair and configuration transition.
 
-Two MySQL-specific compatibility gates must pass before public-only activation.
+MySQL must not recreate those missing fields through a private runtime channel.
+The following MySQL-specific compatibility gates bound current and later
+activation.
 
 #### Scalar GTID projection
 
-The delivered core now implements the scalar projection consumed by the
-member-local engine, while future public progress methods return `i64` under a
-Kuberic `HistoryContext`. MySQL history remains a structured GTID set. A
-scalar projection is eligible only for the exact qualified profile:
+The delivered core implements the scalar projection consumed by both the
+member-local engine and Public V1 `i64` progress methods. MySQL history remains
+a structured GTID set. A scalar projection is eligible only for the exact
+qualified profile:
 
 1. every accepted GTID has the configured Group Replication UUID as its source;
 2. no transaction tag is present;
@@ -667,11 +729,12 @@ scalar projection is eligible only for the exact qualified profile:
 
 For an eligible non-empty history, the interval tail is the qualified signed
 scalar; empty history is `0`. Every other parsed shape returns a deterministic
-typed non-projectable reason. A future adapter may translate that result to
-`INVALID_LSN` or rebuild-required and compare it only within the same
-`HistoryContext`. Internally, every native safety decision continues to use
-complete GTID-set containment/equality; the scalar never replaces the set or
-authorizes access by itself.
+typed non-projectable reason. The adapter fails the current progress/publication
+operation or reports unsupported catch-up rather than flattening that shape.
+Internally, every native safety decision continues to use complete GTID-set
+containment/equality; the scalar never replaces the set or authorizes access by
+itself. Cross-restart or cross-lineage scalar comparison remains unsupported
+until a durable public history context exists.
 
 The projection remains role-sensitive. A primary reports only the highest
 eligible tail proven committed under the exact installed public configuration
@@ -992,9 +1055,10 @@ access receipt.
 
 The production service address must not expose the raw `mysqld` listener
 directly. The application role change returns an application-owned
-MySQL-compatible proxy endpoint. The proxy checks the current Kuberic access
-generation before dispatching every MySQL command, keeps the native SQL
-listener private, and owns all externally reachable client sessions.
+MySQL-compatible proxy endpoint. The proxy checks the current generation and both Kuberic access statuses before
+session admission and every MySQL command, then checks both statuses again
+after backend execution before forwarding each response packet. It keeps the
+native SQL listener private and owns all externally reachable client sessions.
 Revocation atomically rejects new command dispatch, closes the listener,
 settles or terminates in-flight commands according to the fixed policy, closes
 idle and transaction-holding sessions, and proves zero commands/sessions for
@@ -1112,9 +1176,8 @@ be exact and verifiable.
 
 ### PoC controlled handoff
 
-The delivered PoC implements only a reachable-source handoff through the
-MySQL-owned intended-order seam. It does not claim a Kuberic catch-up callback
-or specific-quorum implementation:
+The delivered fixture implements only a reachable-source handoff through the
+MySQL-owned intended-order seam and its combined publication proof:
 
 1. Revoke the source access generation and complete a handoff-eligible closure
    receipt: no listener admission, proxy session, active command, cancelled or
@@ -1146,6 +1209,18 @@ or specific-quorum implementation:
 Failure at any step leaves writes closed. Restart during this sequence is not
 resumed automatically in the PoC; the exact fixture is reset. The old source
 may be restarted and rejoined only through a new explicit fixture operation.
+
+The Public V1 adapter translates the corresponding already-formed planned
+swap without importing the fixture's combined proof object into Kuberic. It
+retains the qualified source boundary before the public epoch callback clears
+the old configuration, stages the controller-composed refreshed configuration
+without requiring a `previous` value, evaluates the pinned catch-up predicate,
+demotes the source through native transfer, and later observes target promotion
+and remaining-member transitions under ordinary Epoch -> Role -> Configuration
+programs. Final proxy publication uses the exact runtime
+epoch/Primary/configuration authority plus a fresh local view/progress read and
+the effective access guard. This does not support an unplanned primary change
+or create the secondaries that make the topology already formed.
 
 ### Later durable handoff
 
@@ -1450,18 +1525,18 @@ stage.
 |---|---|---|---|---|
 | 0. Design | No prior stage. Deliver this design and concise README with current/future claims separated. | Spec, plan, cross-artifact, implementation, and final reviews pass with no unresolved safety finding. | Intended contract is documented. | No executable MySQL support. |
 | 1. Server-free core | Stage 0 passed. Add typed identities, GTID relations, views, observation decoding, and minimal fail-closed state machines without a server dependency. | Deterministic tests pass for malformed, stale, partial, divergent, and stale-authority cases. | Core identity/history decisions do not flatten GTIDs or accept stale work. | No process, SQL, topology mutation, TLS, or recovery automation. |
-| 2. Host-local Kuberic PoC | Stage 1 passed and the exact MySQL patch is pinned. Deliver the MySQL-owned member-local lifecycle/effect seam, qualified scalar projection, bounded gateway, fresh three-engine formation, and controlled handoff; later add the stabilized Kuberic adapter plus signed build/peer admission. | Delivered gates prove intended role-before-configuration ordering, same-role epoch fencing, exact identity/view/GTID receipts, typed unsupported build/removal admission, gateway closure/native absence, source stop/reap, combined successor proof, and delayed target publication. Full Kuberic activation additionally requires public-value translation and signed authorization gates. | The MySQL-owned foundation can form a fresh host-local group and complete one controlled handoff through repository-owned intended-order inputs. | No current Kuberic adapter, signed build/peer execution, restart recovery, TLS, Clone/reseed, automated failover, independent fence provider, cross-host, Kubernetes, or production claim. |
+| 2. Host-local Kuberic PoC | Stage 1 passed and the exact MySQL patch is pinned. Deliver the MySQL-owned member-local lifecycle/effect seam, qualified scalar projection, bounded gateway, fresh three-engine formation, controlled handoff, and bounded Public V1 adapter. | Delivered gates prove intended role-before-configuration ordering, same-role epoch fencing, exact identity/view/GTID receipts, strict public translation/retry contracts, fresh initial-primary bootstrap, already-formed planned-transition translation, runtime-authority local revalidation, typed unsupported Build/Remove/data loss, gateway closure/native absence, source stop/reap, combined successor proof, and delayed target publication. | The MySQL-owned foundation and pinned adapter can open one fresh local Primary and translate an already-formed controlled handoff while access remains separately fenced. | No Kuberic-created three-member formation, signed build/peer execution, restart recovery, TLS, Clone/reseed, automated failover, independent fence provider, cross-host, Kubernetes, or production claim. |
 | 3. Resumable lifecycle and repair | Stage 2 passed. Add generic durable effect records, ambiguous-effect recovery, Clone/reseed, replacement, cleanup recovery, and destructive approvals. | Restart and fault gates prove effects are recovered, retried only when idempotent, or left safely closed. | Host-local lifecycle survives interrupted provisioning and replacement without a MySQL-specific metadata store. | No automated writable failover or production security claim. |
 | 4. Automated failover and independent fencing | Stage 3 passed; the pinned native commit invariant and an independent fence provider are validated. Add lossless-boundary derivation, continuing fence dependencies, unplanned failover, and quorum recovery. | Old-primary survival, direct-client, provider-loss, divergent-history, and quorum-loss gates pass with no premature write publication. | Controlled automated failover for the exact validated environment. | No portable cross-host or Kubernetes claim. |
 | 5. Secure cross-host qualification | Stage 4 passed. Add separate principals, secure secret handling, native TLS or an explicitly qualified equivalent network profile, real fault domains, and a production-candidate fence backend. | Cross-host network, trust rotation, host loss, storage, direct-client, and fence-lifetime gates pass. | Only the named cross-host security and infrastructure profile that passed. | No generic CNI, mesh, cloud, or cross-region assumption. |
 | 6. Kubernetes qualification | Stage 5 passed; named Kubernetes/provider versions, images, secrets, storage, routing, and platform fence integrations are fixed. | The Kubernetes gate matrix passes lifecycle, faults, storage reuse, routing, trust rotation, controller restart, old-primary survival, and exact fence/release scenarios. | Only the named Kubernetes, storage, network, and fence-provider matrix. | No generic Kubernetes or provider portability. |
 
 Stages 0 and 1, the native observation and process/topology slices, the native
-feasibility gate, and the MySQL-owned Stage 2 member-local
-lifecycle/progress/gateway/controlled-handoff foundation are delivered. The
-Kuberic adapter, signed build/peer execution, restart-resumable effects, and
-every later stage remain delivery contracts rather than current feature
-claims.
+feasibility gate, the MySQL-owned Stage 2 member-local
+lifecycle/progress/gateway/controlled-handoff foundation, and the bounded
+Public V1 adapter are delivered. Signed build/peer execution,
+Kuberic-created multi-member formation, restart-resumable effects, and every
+later stage remain delivery contracts rather than current feature claims.
 
 ## Test Strategy
 
@@ -1560,11 +1635,27 @@ The delivered test-only native feasibility matrix additionally includes:
   stop/rejoin experiments that leave credential-bound session revocation
   unproved.
 
+The delivered Public V1 server-free matrix additionally includes:
+
+- strict endpoint, identity, process-session, storage, epoch, role,
+  remote-only configuration, progress, and retry/conflict translation against
+  the exact pinned public API, including a fresh singleton with no peer entries;
+- public trait/factory/service bundle conformance and feature-gated production
+  compilation;
+- fresh-only service classification, fresh local-primary formation rules, and
+  explicit unsupported idle/fresh-secondary inputs;
+- runtime access authority mismatch, non-projectable progress, and fresh local
+  evidence failure cases;
+- ordinary Epoch -> Role -> Configuration state ordering, planned-swap staging,
+  catch-up boundary authority, and stale old-role retry rejection;
+- access-guard pre-dispatch denial, regrant, and post-effect success
+  suppression, synchronous proxy-bearing abort, and dropped-Open settlement;
+  and
+- preservation of the separate combined handoff-proof publication contracts.
+
 The remaining Kuberic activation matrix includes:
 
-- stabilized SF-aligned Kuberic value translation and public operation
-  dispatch into the delivered member-local seam;
-- `HistoryContext` scoping and public progress/error translation;
+- durable history-context scoping and replay-safe public progress comparison;
 - signed build authorization and active peer-session authorization;
 - generic build/removal execution and public catch-up callback semantics;
 - durable public completion/access projection without private receipt
@@ -1604,7 +1695,7 @@ must define their exact inputs and pass conditions.
 | Single-process host | Exact Oracle MySQL 8.4.11, `aa-exec`, fresh distinct roots | One child is initialized, launched, attested, observed as fail-closed inactive membership, stopped, reaped, and its UDS proven absent; scratch is removed and data retained | One restart-stateless local process generation with private-UDS observation | No topology, callbacks, access publication, survivor adoption, or restart continuation |
 | Fresh topology bootstrap/join | Exactly three fresh owned instances, loopback Group Replication, retained in-memory attempt authority | One designated bootstrap and two sequential joins receive exact fresh identity/view/GTID credit; access stays closed; every process and scratch root is contained | Bounded fresh three-member bootstrap/join for the exact qualified local profile | No callbacks, access publication, switchover, failover, repair, survivor adoption, or restart continuation |
 | Native Stage 2 feasibility | The exact fresh topology plus the pinned setting tuple and test-only internal runner | Full GTID evidence stays one untagged group source and contiguous through the exercised transitions; normal acknowledgement, exact ambiguous-disconnect inclusion, and post-ack primary SIGKILL/restart pass; source-wait and peer revocation gaps return explicit negative results | The named Oracle 8.4.11 native profile, ambiguous transaction inclusion, and acknowledged-primary crash behavior are feasible inputs to the delivered scalar and handoff foundation | No retained catch-up capability, credential-bound peer revocation, secondary-loss-during-`AFTER`, automated failover, or production durability claim |
-| MySQL-owned Stage 2 lifecycle and handoff | Three fresh member-local owners, loopback Group Replication, intended-order repository values, one bounded gateway per member | Lifecycle/effect conformance, scalar projection, gateway profile/closure, formation, handoff fault matrix, and live handoff pass; source access closes and exact process stop/reap plus both successor acceptances are combined before target publication | Controlled host-local MySQL-owned lifecycle foundation and one planned handoff | No Kuberic adapter, signed build/peer execution, generic catch-up/build/removal, Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
+| MySQL-owned Stage 2 lifecycle and handoff | Three fresh member-local owners, loopback Group Replication, intended-order repository values, one bounded gateway per member, and the exact pinned Public V1 dependency | Lifecycle/effect conformance, public translation/trait contracts, scalar projection, runtime access revalidation, gateway profile/closure, formation, handoff fault matrix, and live handoff pass; source access closes and exact process stop/reap plus both successor acceptances are combined before target publication | Controlled host-local lifecycle foundation, fresh initial-primary Public V1 bootstrap, and already-formed planned handoff translation | No Kuberic-created three-member formation, signed build/peer execution, generic catch-up/build/removal, Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
 | Advanced repair and restart | Stage 3 implementation, generic durable effect records, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Resumable host-local repair for the exercised profile without an application-owned metadata store | No automated writable failover |
 | Advanced failover and fencing | Validated native commit invariant and independent fence provider | Only a candidate containing the required history publishes; old-primary survival, provider loss, quorum loss, and divergent histories remain fail-closed | Automated failover for the exact qualified environment | No portable infrastructure or Kubernetes claim |
 | Secure cross-host and Kubernetes | Named network, TLS or qualified equivalent, separate principals, storage, routing, and fence integration | The environment-specific lifecycle, partition, trust-rotation, direct-client, restart, and replacement matrix passes | Only the exact named deployment matrix | No generic CNI, mesh, cloud, or Kubernetes portability |
@@ -1613,9 +1704,9 @@ must define their exact inputs and pass conditions.
 
 Unless a later validated stage says otherwise, this design does not support:
 
-- a production Kuberic adapter, public callback wiring, signed peer/build
-  execution, or production writable lifecycle beyond the delivered
-  MySQL-owned host-local intended-order and controlled-handoff foundation;
+- Public V1 lifecycle beyond fresh initial-primary bootstrap and
+  already-formed planned-transition translation, signed peer/build execution,
+  or production writable lifecycle;
 - production use or service-level objectives;
 - MySQL releases outside a pinned Oracle MySQL 8.4 LTS patch;
 - MariaDB, Percona Server, cloud-vendor forks, or unqualified managed services;

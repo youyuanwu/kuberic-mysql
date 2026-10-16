@@ -33,7 +33,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install --yes apparmor-utils ca-certificates gnupg wget
+          sudo apt-get install --yes apparmor-utils ca-certificates gnupg protobuf-compiler wget
           wget --quiet https://dev.mysql.com/get/mysql-apt-config_0.8.39-1_all.deb
           echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.4-lts" |
             sudo debconf-set-selections
