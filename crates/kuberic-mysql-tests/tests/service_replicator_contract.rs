@@ -36,14 +36,16 @@ use kuberic_mysql::service::{
     MysqlPeerOperationKind, MysqlPeerOperationOutcome, MysqlPeerUnsupportedReason,
     MysqlProxyControlBoundary, MysqlProxyError, MysqlProxySettlementReason,
     MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
-    MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError, MysqlSourceTerminalReceipt,
-    MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
+    MysqlReplicaTarget, MysqlReplicator, MysqlReplicatorError, MysqlRuntimeAccessAuthority,
+    MysqlSourceTerminalReceipt, MysqlTerminalState, NativeIdentityEnrollment, PrimaryTransferInput,
 };
 use service_common::{GROUP_UUID, TestRoot};
 
 const LOCAL_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const PEER_UUID: &str = "22222222-2222-2222-2222-222222222222";
 const THIRD_UUID: &str = "33333333-3333-3333-3333-333333333333";
+const PROJECTABLE_GTID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc:1";
+const NONPROJECTABLE_GTID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc:1-2:4";
 const MEMBERS: [MysqlMemberIndex; 3] = [
     MysqlMemberIndex::First,
     MysqlMemberIndex::Second,
@@ -782,6 +784,109 @@ async fn same_role_and_changed_role_each_require_a_new_epoch_barrier() {
             .engine
             .advance_epoch(operation("stale-epoch", 11), MysqlReplicaEpoch::new(3)),
         Err(MysqlReplicatorError::StaleEpoch)
+    ));
+}
+
+#[tokio::test]
+async fn pending_native_promotion_releases_the_exact_role_operation_for_retry() {
+    let mut harness = harness(vec![
+        exact(MysqlReplicaRole::Secondary),
+        exact(MysqlReplicaRole::Secondary),
+        exact(MysqlReplicaRole::Secondary),
+        exact(MysqlReplicaRole::Primary),
+    ]);
+    open(&mut harness);
+    harness
+        .engine
+        .advance_epoch(operation("epoch-1", 2), MysqlReplicaEpoch::new(1))
+        .unwrap();
+    harness
+        .engine
+        .observe_role(
+            operation("role-1", 3),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Secondary,
+        )
+        .await
+        .unwrap();
+    harness
+        .engine
+        .observe_configuration(operation("config-1", 4), configuration(&harness, 1))
+        .await
+        .unwrap();
+    harness
+        .engine
+        .advance_epoch(operation("epoch-2", 5), MysqlReplicaEpoch::new(2))
+        .unwrap();
+
+    let role_operation = operation("target-promotion", 6);
+    assert_eq!(
+        harness
+            .engine
+            .observe_role_if_ready(
+                role_operation.clone(),
+                MysqlReplicaEpoch::new(2),
+                MysqlReplicaRole::Primary,
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(harness.engine.role(), Some(MysqlReplicaRole::Secondary));
+
+    let promoted = harness
+        .engine
+        .observe_role_if_ready(
+            role_operation,
+            MysqlReplicaEpoch::new(2),
+            MysqlReplicaRole::Primary,
+        )
+        .await
+        .unwrap()
+        .expect("external native transfer became visible");
+    assert_eq!(promoted.role(), MysqlReplicaRole::Primary);
+    assert_eq!(harness.engine.role(), Some(MysqlReplicaRole::Primary));
+}
+
+#[tokio::test]
+async fn configuration_failure_makes_a_completed_native_role_terminal_on_retry() {
+    let mut harness = harness(vec![exact(MysqlReplicaRole::Secondary), ReadPlan::Error]);
+    open(&mut harness);
+    harness
+        .engine
+        .advance_epoch(operation("epoch", 2), MysqlReplicaEpoch::new(1))
+        .unwrap();
+    let role_operation = operation("role", 3);
+    harness
+        .engine
+        .observe_role(
+            role_operation.clone(),
+            MysqlReplicaEpoch::new(1),
+            MysqlReplicaRole::Secondary,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        harness
+            .engine
+            .observe_configuration(operation("configuration", 4), configuration(&harness, 1))
+            .await,
+        Err(MysqlReplicatorError::MemberTransition(_))
+    ));
+    assert_eq!(
+        harness.engine.terminal_state(),
+        Some(MysqlTerminalState::Aborted)
+    );
+    assert!(matches!(
+        harness
+            .engine
+            .observe_role(
+                role_operation,
+                MysqlReplicaEpoch::new(1),
+                MysqlReplicaRole::Secondary,
+            )
+            .await,
+        Err(MysqlReplicatorError::Terminal)
     ));
 }
 
@@ -2181,6 +2286,136 @@ async fn progress_requires_current_role_configuration_authority_and_binding() {
 }
 
 #[tokio::test]
+async fn transition_progress_accepts_role_change_but_rejects_wrong_membership_or_receipt() {
+    let mut target = configured(
+        MysqlReplicaRole::Secondary,
+        vec![
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+            ReadPlan::Exact {
+                role: MysqlReplicaRole::Primary,
+                executed: PROJECTABLE_GTID,
+            },
+        ],
+    )
+    .await;
+    let observed = target
+        .engine
+        .observe_transition_progress(operation("target-transition-progress", 5))
+        .await
+        .unwrap();
+    assert_eq!(
+        match observed.progress() {
+            kuberic_mysql::core::ProgressProjection::Projectable(progress) => progress.value(),
+            other => panic!("unexpected projection: {other:?}"),
+        },
+        1
+    );
+    assert_eq!(target.engine.role(), Some(MysqlReplicaRole::Secondary));
+    assert_eq!(
+        target
+            .engine
+            .native_evidence()
+            .unwrap()
+            .view()
+            .member(target.authority.local().member_id())
+            .unwrap()
+            .role(),
+        MemberRole::Primary
+    );
+    assert!(matches!(
+        target
+            .engine
+            .read_progress(operation("target-transition-progress", 5))
+            .await,
+        Err(MysqlReplicatorError::OperationConflict)
+    ));
+
+    let mut source = configured(
+        MysqlReplicaRole::Primary,
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+            ReadPlan::Exact {
+                role: MysqlReplicaRole::Primary,
+                executed: PROJECTABLE_GTID,
+            },
+        ],
+    )
+    .await;
+    source
+        .engine
+        .observe_transition_progress(operation("source-transition-progress", 5))
+        .await
+        .unwrap();
+    let source_boundary = source.engine.source_boundary().unwrap();
+    assert_eq!(
+        source_boundary.evidence().executed(),
+        &GtidSet::from_str(PROJECTABLE_GTID).unwrap()
+    );
+    source
+        .engine
+        .advance_epoch(
+            operation("source-transition-epoch", 6),
+            MysqlReplicaEpoch::new(2),
+        )
+        .unwrap();
+    source
+        .engine
+        .transfer_role(
+            operation("source-transition-transfer", 7),
+            MysqlReplicaEpoch::new(2),
+            MysqlReplicaRole::Secondary,
+            source_boundary,
+            source.peer.member().clone(),
+        )
+        .await
+        .unwrap();
+
+    let mut wrong_membership = configured(
+        MysqlReplicaRole::Secondary,
+        vec![
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+            ReadPlan::Evidence(Box::new(single_member_evidence(
+                authority("replicator", MysqlMemberIndex::First),
+                "23:1",
+            ))),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        wrong_membership
+            .engine
+            .observe_transition_progress(operation("wrong-membership-transition", 5))
+            .await,
+        Err(MysqlReplicatorError::ReceiptMismatch)
+    ));
+
+    let mut wrong_receipt = harness_with_receipts(
+        vec![
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Secondary),
+            exact(MysqlReplicaRole::Primary),
+        ],
+        vec![
+            ReceiptPlan::Exact,
+            ReceiptPlan::Exact,
+            ReceiptPlan::CrossConfiguration,
+        ],
+        CleanupPlan::Completed,
+    );
+    establish(&mut wrong_receipt, MysqlReplicaRole::Secondary).await;
+    assert!(matches!(
+        wrong_receipt
+            .engine
+            .observe_transition_progress(operation("wrong-receipt-transition", 5))
+            .await,
+        Err(MysqlReplicatorError::ReceiptMismatch)
+    ));
+}
+
+#[tokio::test]
 async fn access_stays_closed_credentials_clear_and_close_requires_settlement() {
     let mut active = harness(vec![
         exact(MysqlReplicaRole::Primary),
@@ -2326,6 +2561,223 @@ async fn proxy_publication_requires_explicit_native_backed_revocation_before_lif
         .await
         .unwrap();
     assert_eq!(terminal.state(), MysqlTerminalState::Closed);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_access_authority_requires_exact_state_and_fresh_local_revalidation() {
+    let mut harness = configured(
+        MysqlReplicaRole::Primary,
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+            ReadPlan::Exact {
+                role: MysqlReplicaRole::Primary,
+                executed: PROJECTABLE_GTID,
+            },
+        ],
+    )
+    .await;
+    let address = harness
+        .engine
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ApplicationCredential::new(
+                harness.attempt.attempt().clone(),
+                CredentialGeneration::new("runtime-access").unwrap(),
+                "runtime_access",
+                "application-secret",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let intent = MysqlAccessIntent::new(nonzero(2), true, true);
+
+    for (label, authority) in [
+        (
+            "runtime-wrong-epoch",
+            MysqlRuntimeAccessAuthority::new(
+                MysqlReplicaEpoch::new(2),
+                MysqlReplicaRole::Primary,
+                ConfigurationId::new("configuration-1").unwrap(),
+            ),
+        ),
+        (
+            "runtime-wrong-role",
+            MysqlRuntimeAccessAuthority::new(
+                MysqlReplicaEpoch::new(1),
+                MysqlReplicaRole::Secondary,
+                ConfigurationId::new("configuration-1").unwrap(),
+            ),
+        ),
+        (
+            "runtime-wrong-config",
+            MysqlRuntimeAccessAuthority::new(
+                MysqlReplicaEpoch::new(1),
+                MysqlReplicaRole::Primary,
+                ConfigurationId::new("configuration-other").unwrap(),
+            ),
+        ),
+    ] {
+        assert!(matches!(
+            harness
+                .engine
+                .publish_access_with_runtime_authority(operation(label, 5), intent, authority,)
+                .await,
+            Err(MysqlReplicatorError::HandoffProofRequired)
+        ));
+        assert!(!harness.engine.access_intent().unwrap().write());
+    }
+
+    let authority = MysqlRuntimeAccessAuthority::new(
+        MysqlReplicaEpoch::new(1),
+        MysqlReplicaRole::Primary,
+        ConfigurationId::new("configuration-1").unwrap(),
+    );
+    let published = harness
+        .engine
+        .publish_access_with_runtime_authority(
+            operation("runtime-publish", 5),
+            intent,
+            authority.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(published.endpoint(), Some(address));
+    assert_eq!(
+        harness
+            .engine
+            .publish_access_with_runtime_authority(
+                operation("runtime-publish", 5),
+                intent,
+                authority,
+            )
+            .await
+            .unwrap(),
+        published
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_access_authority_rejects_nonprojectable_or_wrong_local_evidence() {
+    for (label, publication_read, wrong_native_role) in [
+        (
+            "runtime-nonprojectable",
+            ReadPlan::Exact {
+                role: MysqlReplicaRole::Primary,
+                executed: NONPROJECTABLE_GTID,
+            },
+            false,
+        ),
+        (
+            "runtime-wrong-native-role",
+            exact(MysqlReplicaRole::Secondary),
+            true,
+        ),
+    ] {
+        let mut harness = configured(
+            MysqlReplicaRole::Primary,
+            vec![
+                exact(MysqlReplicaRole::Primary),
+                exact(MysqlReplicaRole::Primary),
+                publication_read,
+            ],
+        )
+        .await;
+        harness
+            .engine
+            .prepare_client_proxy(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                ApplicationCredential::new(
+                    harness.attempt.attempt().clone(),
+                    CredentialGeneration::new(format!("{label}-credential")).unwrap(),
+                    label.replace('-', "_"),
+                    "application-secret",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = harness
+            .engine
+            .publish_access_with_runtime_authority(
+                operation(label, 5),
+                MysqlAccessIntent::new(nonzero(2), true, true),
+                MysqlRuntimeAccessAuthority::new(
+                    MysqlReplicaEpoch::new(1),
+                    MysqlReplicaRole::Primary,
+                    ConfigurationId::new("configuration-1").unwrap(),
+                ),
+            )
+            .await;
+        if wrong_native_role {
+            assert!(matches!(
+                result,
+                Err(MysqlReplicatorError::NativeRoleMismatch)
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(MysqlReplicatorError::HandoffProofRequired)
+            ));
+        }
+        assert!(!harness.engine.access_intent().unwrap().write());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn synchronous_terminal_abort_contains_a_published_proxy_without_async_cleanup() {
+    let mut harness = configured(
+        MysqlReplicaRole::Primary,
+        vec![
+            exact(MysqlReplicaRole::Primary),
+            exact(MysqlReplicaRole::Primary),
+            ReadPlan::Exact {
+                role: MysqlReplicaRole::Primary,
+                executed: PROJECTABLE_GTID,
+            },
+        ],
+    )
+    .await;
+    harness
+        .engine
+        .prepare_client_proxy(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ApplicationCredential::new(
+                harness.attempt.attempt().clone(),
+                CredentialGeneration::new("sync-abort-proxy").unwrap(),
+                "sync_abort_proxy",
+                "application-secret",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    harness
+        .engine
+        .publish_access_with_runtime_authority(
+            operation("sync-abort-publish", 5),
+            MysqlAccessIntent::new(nonzero(2), true, true),
+            MysqlRuntimeAccessAuthority::new(
+                MysqlReplicaEpoch::new(1),
+                MysqlReplicaRole::Primary,
+                ConfigurationId::new("configuration-1").unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let terminal = harness
+        .engine
+        .abort_with_proxy_sync(operation("sync-abort", 6))
+        .unwrap();
+    assert_eq!(terminal.state(), MysqlTerminalState::Aborted);
+    assert_eq!(
+        harness.engine.terminal_state(),
+        Some(MysqlTerminalState::Aborted)
+    );
+    assert!(harness.engine.proxy_snapshot().is_none());
+    assert!(harness.engine.credentials_cleared());
 }
 
 #[tokio::test(flavor = "current_thread")]

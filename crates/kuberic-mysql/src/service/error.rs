@@ -82,6 +82,8 @@ pub enum MysqlProxyError {
     BothPermissionsRequired,
     /// The supplied generation was stale or did not own the active endpoint.
     GenerationMismatch,
+    /// The runtime access authority did not currently grant both reads and writes.
+    AccessDenied,
     /// A listener or transport operation failed.
     Io {
         /// Protocol phase being performed.

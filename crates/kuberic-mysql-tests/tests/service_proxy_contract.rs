@@ -1,9 +1,11 @@
 #[path = "service_common/mod.rs"]
 mod service_common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU64;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,8 +18,9 @@ use kuberic_mysql::core::{
 use kuberic_mysql::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential, AttemptContext,
     BackendSessionIdentity, ControlCredential, ControlCredentialRole, MemberControlBinding,
-    MemberMutationAuthority, MysqlClientProxy, MysqlMemberIndex, MysqlProxyControlBoundary,
-    MysqlProxyError, MysqlProxySettlementReason, NativeIdentityEnrollment,
+    MemberMutationAuthority, MysqlClientProxy, MysqlMemberIndex, MysqlProxyAccessGuard,
+    MysqlProxyControlBoundary, MysqlProxyError, MysqlProxySettlementReason,
+    NativeIdentityEnrollment,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
@@ -28,6 +31,24 @@ use service_common::{GROUP_UUID, TestRoot};
 const CAPABILITIES: u32 = 0x0038_a20d;
 const CLIENT_CAPABILITIES: u32 = CAPABILITIES & !0x0000_0008;
 const CONNECTION_ID: u32 = 91;
+
+struct ScriptedAccessGuard {
+    decisions: Mutex<VecDeque<bool>>,
+}
+
+impl ScriptedAccessGuard {
+    fn new(decisions: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            decisions: Mutex::new(decisions.into_iter().collect()),
+        }
+    }
+}
+
+impl MysqlProxyAccessGuard for ScriptedAccessGuard {
+    fn access_granted(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { self.decisions.lock().unwrap().pop_front().unwrap_or(true) })
+    }
+}
 
 #[derive(Clone, Copy)]
 enum AuthMode {
@@ -275,6 +296,7 @@ async fn warmed_fast_auth_query_ping_quit_and_cleanup_are_bounded() {
     for _ in 0..5 {
         let _ = read_packet(&mut client).await;
     }
+
     for query in [b"null-first".as_slice(), b"null-later", b"null-all"] {
         let mut command = vec![0x03];
         command.extend(query);
@@ -304,6 +326,80 @@ async fn warmed_fast_auth_query_ping_quit_and_cleanup_are_bounded() {
         *fixture.backend_commands.lock().unwrap(),
         vec![0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x0e, 0x01]
     );
+    fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_access_guard_denial_is_session_local_and_regrantable() {
+    let mut fixture = Fixture::new(
+        "proxy-access-guard-pre-dispatch",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    fixture
+        .proxy
+        .bind_access_guard(Arc::new(ScriptedAccessGuard::new([
+            false, true, false, true, true, true,
+        ])))
+        .unwrap();
+    let address = fixture.publish();
+
+    let mut denied_session = TcpStream::connect(address).await.unwrap();
+    assert_eq!(denied_session.read(&mut [0_u8; 1]).await.unwrap(), 0);
+
+    let mut denied_command = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    write_packet(&mut denied_command, 0, b"\x03must_not_dispatch").await;
+    assert_eq!(denied_command.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    wait_sessions_zero(&fixture.proxy).await;
+    assert!(fixture.backend_commands.lock().unwrap().is_empty());
+
+    let mut regranted = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    write_packet(&mut regranted, 0, b"\x03ok").await;
+    assert_eq!(read_packet(&mut regranted).await.1[0], 0x00);
+    assert_eq!(*fixture.backend_commands.lock().unwrap(), vec![0x03]);
+
+    let receipt = fixture.revoke().await;
+    assert!(!receipt.ambiguous_effect());
+    assert_eq!(receipt.diagnostics().pre_dispatch_rejections(), 1);
+    fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_access_guard_suppresses_post_effect_success_without_settling_listener() {
+    let mut fixture = Fixture::new(
+        "proxy-access-guard-post-effect",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    fixture
+        .proxy
+        .bind_access_guard(Arc::new(ScriptedAccessGuard::new([
+            true, true, false, true, true, true,
+        ])))
+        .unwrap();
+    let address = fixture.publish();
+
+    let mut fenced = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    write_packet(&mut fenced, 0, b"\x03ok").await;
+    assert_eq!(fenced.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    wait_sessions_zero(&fixture.proxy).await;
+    assert_eq!(*fixture.backend_commands.lock().unwrap(), vec![0x03]);
+    assert!(fixture.proxy.snapshot().accepting());
+
+    let mut regranted = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    write_packet(&mut regranted, 0, b"\x03ok").await;
+    assert_eq!(read_packet(&mut regranted).await.1[0], 0x00);
+    assert_eq!(*fixture.backend_commands.lock().unwrap(), vec![0x03, 0x03]);
+
+    let receipt = fixture.revoke().await;
+    assert!(receipt.ambiguous_effect());
+    assert!(!receipt.handoff_eligible());
     fixture.cleanup().await;
 }
 
@@ -1074,6 +1170,28 @@ async fn listener_revocation_race_admits_no_late_backend_command() {
     assert!(TcpStream::connect(address).await.is_err());
     assert!(fixture.backend_commands.lock().unwrap().is_empty());
     fixture.cleanup().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn published_proxy_drop_synchronously_releases_its_fixed_listener() {
+    let mut fixture = Fixture::new(
+        "proxy-drop-rebind",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    let address = fixture.publish();
+    let Fixture { proxy, backend, .. } = fixture;
+
+    drop(proxy);
+    let rebound = std::net::TcpListener::bind(address)
+        .expect("proxy drop synchronously closed the published listener");
+    drop(rebound);
+
+    backend.abort();
+    let _ = backend.await;
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -137,6 +137,12 @@ impl AttemptContext {
         &self.attempt
     }
 
+    /// Returns whether both handles share the exact cancellation source.
+    #[must_use]
+    pub fn shares_cancellation_source(&self, other: &Self) -> bool {
+        self.attempt == other.attempt && Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
     /// Absolute attempt deadline.
     #[must_use]
     pub const fn deadline(&self) -> Instant {
