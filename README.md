@@ -23,9 +23,8 @@ facilities, while native database facts remain in the MySQL data directory.
 The delivered component shape is one MySQL-owned member-local lifecycle engine
 per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
-infrastructure, not production topology owners. Enabling
-`kuberic-public-v1` compiles the public adapter against `kuberic-runtime`
-pinned exactly to commit
+infrastructure, not production topology owners. The normal crate surface
+includes the public adapter against `kuberic-runtime` pinned exactly to commit
 `ceec5887ad97d71222117610428ce715b782777e`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
@@ -94,9 +93,8 @@ multi-source history is typed non-projectable, and catch-up capability remains
 an independent unsupported/unproved result when retained donor/binlog evidence
 is unavailable.
 
-The `kuberic-public-v1` feature exports
-`MysqlPublicV1Service`, `MysqlPublicV1ReplicatorFactory`, and
-`MysqlPublicV1Replicator` as the pinned Public V1
+The crate exports `MysqlPublicV1Service`,
+`MysqlPublicV1ReplicatorFactory`, and `MysqlPublicV1Replicator` as the pinned Public V1
 `StatefulServiceReplica`/`ReplicatorFactory`/`Replicator`/
 `PrimaryReplicator`/`StateProvider` bundle. The service passes the exact same
 driver allocation as the factory's required progress-only provider; the
@@ -320,11 +318,11 @@ contracts can be checked without launching MySQL:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo check --locked --offline \
-  -p kuberic-mysql --lib --features kuberic-public-v1
+  -p kuberic-mysql --lib
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests --test kuberic_public_v1_contract
 CARGO_BUILD_JOBS=1 cargo clippy --locked --offline \
-  -p kuberic-mysql --lib --features kuberic-public-v1 -- -D warnings
+  -p kuberic-mysql --lib -- -D warnings
 ```
 
 The bounded real-server gateway compatibility gate can be rerun independently:

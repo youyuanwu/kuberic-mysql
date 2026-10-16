@@ -13,9 +13,8 @@ This repository delivers Stage 0 documentation, the Stage 1 deterministic
 safety core, the native-observation and bounded process/topology slices, the
 MySQL-owned Stage 2 integration foundation, and a bounded Kuberic Public V1
 adapter. The publish-disabled `kuberic-mysql` crate exposes these as the
-`core`, `adapter`, and `service` modules; `kuberic-public-v1` additionally
-exports the public service/factory/replicator bundle against `kuberic-runtime`
-pinned exactly to
+`core`, `adapter`, and `service` modules, including the public
+service/factory/replicator bundle against `kuberic-runtime` pinned exactly to
 `ceec5887ad97d71222117610428ce715b782777e`. The native adapter observes exactly
 one caller-selected Oracle MySQL Community Server 8.4.11 through a private
 Unix-domain socket. The service owns one fresh, restart-stateless process
@@ -581,9 +580,9 @@ identity and prove the old incarnation is contained.
 
 ### SF-aligned public interface mapping
 
-With `kuberic-public-v1`, the delivered database-owned shape is one
-member-local `MysqlReplicator` behind the pinned Kuberic Rust traits. The
-adapter serializes callbacks through one owner and translates public values
+The delivered database-owned shape is one member-local `MysqlReplicator`
+behind the pinned Kuberic Rust traits. The adapter serializes callbacks
+through one owner and translates public values
 into the neutral engine seam. The three-process `MysqlTopologyManager` and
 three-engine live harness remain qualification fixtures, not production
 runtime owners.

@@ -9,8 +9,8 @@ data/disposable scratch roots. It composes both the older fixed three-member
 bootstrap/join gate and a newer test-owned composition of three independent
 member-local lifecycle engines. The latter publishes a bounded application
 gateway and completes one controlled handoff while the same host retains exact
-ownership and attempt context. The `kuberic-public-v1` feature additionally
-translates the exact pinned public callback bundle into one such member-local
+ownership and attempt context. The normal crate surface translates the exact
+pinned public callback bundle into one such member-local
 engine for fresh initial-primary bootstrap and already-formed planned
 transitions. It does not claim restart continuation, durable effect recovery,
 survivor adoption, Build/reseed, Kuberic-created three-member formation,
@@ -860,7 +860,7 @@ effective while disconnected.
    including exact public fence translation, initial-primary bootstrap,
    pre-epoch boundary caching, already-formed planned-transition callbacks,
    and runtime-authority publication with fresh local revalidation. This is
-   delivered behind `kuberic-public-v1`; it does not implement Build/reseed or
+   part of the normal adapter surface; it does not implement Build/reseed or
    create the other members.
 6. Permit component replacement only while a surviving fixture host retains
    exact ownership context and proves effective closure and that no mutation is

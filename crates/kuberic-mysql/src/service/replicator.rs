@@ -1281,7 +1281,6 @@ where
     handoff_publication_proof: Option<AcceptedHandoffPublicationProof>,
     terminal: Option<MysqlTerminalState>,
     terminal_outcome: Option<Box<MysqlTerminalOutcome>>,
-    #[cfg_attr(not(feature = "kuberic-public-v1"), allow(dead_code))]
     fresh_prepared_owner: bool,
     last_operation_generation: u64,
     operations: Vec<OperationRecord>,
@@ -1516,7 +1515,6 @@ where
 
     /// Returns the qualified empty-history progress proved by fresh member
     /// preparation after exact open and before any lifecycle mutation.
-    #[cfg(feature = "kuberic-public-v1")]
     pub(crate) fn fresh_open_progress(&self) -> Result<QualifiedProgress, MysqlReplicatorError> {
         self.require_open_active()?;
         let access_closed = self

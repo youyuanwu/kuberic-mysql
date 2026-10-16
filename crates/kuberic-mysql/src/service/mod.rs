@@ -26,9 +26,9 @@
 //!
 //! [`MysqlReplicator`] may publish one bounded loopback Classic Protocol
 //! gateway for an explicit all-or-nothing access generation and proves proxy
-//! zero plus exact native-session absence before revocation completes. With
-//! `kuberic-public-v1`, [`kuberic`] translates the pinned Kuberic Public V1
-//! callback bundle into this member-local engine for fresh bootstrap and
+//! zero plus exact native-session absence before revocation completes.
+//! [`kuberic`] translates the pinned Kuberic Public V1 callback bundle into
+//! this member-local engine for fresh bootstrap and
 //! already-formed planned transitions. Build/reseed, removal, data loss,
 //! automated failover, repair, and restart continuation remain unsupported.
 //! Member-local setup and bounded native control use a separate root session
@@ -42,7 +42,6 @@ mod config;
 mod control;
 mod error;
 mod instance;
-#[cfg(feature = "kuberic-public-v1")]
 pub mod kuberic;
 mod member;
 mod process;
@@ -69,7 +68,6 @@ pub use error::{
     TopologyNativeStateError, TopologyStateError,
 };
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
-#[cfg(feature = "kuberic-public-v1")]
 pub use kuberic::{
     CallbackOperationLedger, EpochTranslator, KubericTranslationError, MysqlPublicV1Replicator,
     MysqlPublicV1ReplicatorFactory, MysqlPublicV1Service, MysqlPublicV1ServiceConfig,
