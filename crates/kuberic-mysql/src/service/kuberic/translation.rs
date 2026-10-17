@@ -352,7 +352,13 @@ where
         let generation = self
             .next_generation
             .ok_or(KubericTranslationError::OperationExhausted)?;
-        let identity = MysqlOperationIdentity::new(self.authority.clone(), generation);
+        let operation_authority = AuthorityGeneration::new(format!(
+            "{}-operation-{}",
+            self.authority.as_str(),
+            generation
+        ))
+        .map_err(KubericTranslationError::from)?;
+        let identity = MysqlOperationIdentity::new(operation_authority, generation);
         self.next_generation = generation.get().checked_add(1).and_then(NonZeroU64::new);
         self.entries.insert(key, (value, identity.clone()));
         Ok(identity)
@@ -444,6 +450,43 @@ pub fn translate_replica_information(
     information: &ReplicaInformation,
 ) -> TranslationResult<MysqlReplicaTarget> {
     translate_replica_information_parts(information).map(|(target, _)| target)
+}
+
+/// Translates the exact idle target shape accepted by a Public V1 Build callback.
+pub fn translate_build_replica_information(
+    information: &ReplicaInformation,
+) -> TranslationResult<(
+    kuberic_runtime::protocol::types::OperationId,
+    MysqlReplicaTarget,
+)> {
+    validate_replica_identity(&information.identity)?;
+    if information.build_id.is_empty() {
+        return Err(KubericTranslationError::InvalidPublicValue(
+            "Build id is empty",
+        ));
+    }
+    if information.role != ReplicaRole::IdleSecondary {
+        return Err(KubericTranslationError::UnsupportedRole(information.role));
+    }
+    if information.current_progress != INVALID_LSN {
+        return Err(KubericTranslationError::InvalidProgress {
+            field: "idle Build current",
+            value: information.current_progress,
+        });
+    }
+    if information.catch_up_capability != INVALID_LSN {
+        return Err(KubericTranslationError::InvalidProgress {
+            field: "idle Build catch-up capability",
+            value: information.catch_up_capability,
+        });
+    }
+    if information.must_catchup {
+        return Err(KubericTranslationError::InvalidPublicValue(
+            "idle Build target must not require catch-up",
+        ));
+    }
+    let (target, _) = translate_replica_target(information)?;
+    Ok((information.build_id.clone(), target))
 }
 
 /// Translates a runtime-shaped remote-peer configuration plus enrolled local authority.
@@ -656,6 +699,12 @@ fn translate_replica_information_parts(
         });
     }
 
+    translate_replica_target(information)
+}
+
+fn translate_replica_target(
+    information: &ReplicaInformation,
+) -> TranslationResult<(MysqlReplicaTarget, ReplicationEndpoint)> {
     let process_session = translate_process_session_id(&information.process_session_id)?;
     let storage = translate_storage_binding(
         information

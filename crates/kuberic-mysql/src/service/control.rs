@@ -13,13 +13,15 @@ use crate::core::{
     GroupName, GtidSet, MemberAddress, MemberId, MemberRole, MemberState, NativeMember, NativeView,
     ServerUuid, ViewId,
 };
+use crate::service::kuberic::build::{BuildRecoveryAccountReceipt, BuildRecoveryCredential};
 use crate::service::{
     APPLICATION_QUALIFICATION_SCHEMA, AccountProvisioningEvidence, ApplicationAccountReceipt,
-    ApplicationCredential, BackendSessionIdentity, ControlCredential, ControlCredentialRole,
-    ControlStage, MemberAuthorityError, MemberControlBinding, MemberMutationAuthority,
-    MemberNativeEvidence, MemberPeer, MemberTransitionError, MemberViewError, MysqlMemberConfig,
-    MysqlMemberIndex, MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment,
-    TopologyAuthorityError, TopologyEvidenceError, TopologyStateError, ViewDiscovery,
+    ApplicationCredential, AttemptAdmissionError, AttemptDeadlineState, BackendSessionIdentity,
+    BuildAttemptContext, ControlCredential, ControlCredentialRole, ControlStage,
+    MemberAuthorityError, MemberControlBinding, MemberMutationAuthority, MemberNativeEvidence,
+    MemberPeer, MemberTransitionError, MemberViewError, MysqlMemberConfig, MysqlMemberIndex,
+    MysqlTopologyError, NativeControlDeadline, NativeIdentityEnrollment, TopologyAuthorityError,
+    TopologyEvidenceError, TopologyStateError, ViewDiscovery,
 };
 #[cfg(test)]
 use crate::service::{BootstrapCapability, BootstrapEffect, JoinCapability, JoinEffect};
@@ -114,6 +116,88 @@ pub(crate) async fn member_join(
         .await;
         start.clear();
         result
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn member_build_join(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    recovery: &BuildRecoveryCredential,
+    build: &BuildAttemptContext,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    if build.parent_attempt() != authority.attempt() || recovery.build() != build.build() {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AttemptMismatch,
+        ));
+    }
+
+    build.admit_work().map_err(|error| match error {
+        AttemptAdmissionError::Cancelled => MemberTransitionError::Cancelled,
+        AttemptAdmissionError::CleanupReserve => {
+            MemberTransitionError::Deadline(AttemptDeadlineState::CleanupReserve)
+        }
+        AttemptAdmissionError::Expired => {
+            MemberTransitionError::Deadline(AttemptDeadlineState::Expired)
+        }
+    })?;
+    let deadline = build.work_deadline();
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_bootstrap_off(&mut connection, deadline).await?;
+        let mut start = start_statement_values(recovery.username(), recovery.password());
+        let result = execute(
+            &mut connection,
+            start.as_str(),
+            deadline,
+            ControlStage::StartGroupReplication,
+        )
+        .await;
+        start.clear();
+        result
+    }
+    .await;
+    disconnect(connection, result, deadline)
+        .await
+        .map_err(MemberTransitionError::Native)
+}
+
+pub(crate) async fn member_build_leave(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    build: &BuildAttemptContext,
+) -> Result<(), MemberTransitionError> {
+    verify_member_authority(&target, authority)?;
+    if build.parent_attempt() != authority.attempt() {
+        return Err(MemberTransitionError::Authority(
+            MemberAuthorityError::AttemptMismatch,
+        ));
+    }
+    build.admit_cleanup().map_err(|error| match error {
+        AttemptAdmissionError::Cancelled => MemberTransitionError::Cancelled,
+        AttemptAdmissionError::CleanupReserve => {
+            MemberTransitionError::Deadline(AttemptDeadlineState::CleanupReserve)
+        }
+        AttemptAdmissionError::Expired => {
+            MemberTransitionError::Deadline(AttemptDeadlineState::Expired)
+        }
+    })?;
+    let deadline = build.deadline();
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        execute(
+            &mut connection,
+            "STOP GROUP_REPLICATION",
+            deadline,
+            ControlStage::StopGroupReplication,
+        )
+        .await
     }
     .await;
     disconnect(connection, result, deadline)
@@ -975,6 +1059,7 @@ pub(crate) async fn prepare_application_account(
             TopologyAuthorityError::CredentialGenerationMismatch,
         ));
     }
+
     let receipt = ApplicationAccountReceipt::new(credential);
     let mut connection = MysqlControlConnector
         .connect(&target, work_deadline)
@@ -1008,6 +1093,342 @@ pub(crate) async fn prepare_application_account(
         return combine_primary_cleanup(Err(prior), cleanup).map(|()| receipt);
     }
     Ok(receipt)
+}
+
+pub(crate) async fn prepare_build_recovery_account(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    credential: &BuildRecoveryCredential,
+    deadline: Instant,
+) -> Result<BuildRecoveryAccountReceipt, MysqlTopologyError> {
+    verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
+    let receipt = BuildRecoveryAccountReceipt::new(credential);
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = prepare_build_recovery_account_connected(
+        &mut connection,
+        authority,
+        credential,
+        &receipt,
+        deadline,
+    )
+    .await;
+    disconnect(connection, result, deadline).await?;
+    Ok(receipt)
+}
+
+/// Freshly proves that an enrolled Build target still has neither native
+/// membership nor transaction history before the source creates any account.
+pub(crate) async fn verify_build_target_fresh(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        let active: u64 = query_one(
+            &mut connection,
+            "SELECT COUNT(*) FROM performance_schema.replication_group_members \
+             WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID <> ''",
+            deadline,
+            ControlStage::InspectExistingGroup,
+        )
+        .await?;
+        let executed: String = query_one(
+            &mut connection,
+            "SELECT @@GLOBAL.gtid_executed",
+            deadline,
+            ControlStage::InspectExistingHistory,
+        )
+        .await?;
+        let executed = crate::core::GtidSet::from_str(&executed).map_err(|_| {
+            MysqlTopologyError::ControlProtocol(ControlStage::InspectExistingHistory)
+        })?;
+        if active == 0 && executed.entries().is_empty() {
+            Ok(())
+        } else {
+            Err(MysqlTopologyError::TopologyState(if active != 0 {
+                TopologyStateError::ExistingGroupState
+            } else {
+                TopologyStateError::ExistingTransactionHistory
+            }))
+        }
+    }
+    .await;
+    disconnect(connection, result, deadline).await
+}
+
+pub(crate) async fn remove_build_recovery_account(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &BuildRecoveryAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result =
+        remove_build_recovery_account_connected(&mut connection, authority, receipt, deadline)
+            .await;
+    disconnect(connection, result, deadline).await
+}
+
+pub(crate) async fn verify_build_recovery_account(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    receipt: &BuildRecoveryAccountReceipt,
+    expected_present: bool,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
+    let expected_bind = target.member.sql_address().ip().to_string();
+    let mut connection = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut connection, authority, deadline).await?;
+        prove_build_recovery_profile(&mut connection, &expected_bind, deadline).await?;
+        let present =
+            build_recovery_account_presence_count(&mut connection, receipt, deadline).await? == 1;
+        if present != expected_present {
+            return Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::InspectBuildRecoveryAccount,
+            ));
+        }
+        if present {
+            prove_build_recovery_account(&mut connection, receipt, deadline).await?;
+            prove_tcp_account_policy(&mut connection, Some(receipt.username()), deadline).await
+        } else {
+            prove_tcp_account_policy(&mut connection, None, deadline).await
+        }
+    }
+    .await;
+    disconnect(connection, result, deadline).await
+}
+
+async fn prove_build_recovery_profile(
+    session: &mut impl ControlSession,
+    expected_bind: &str,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    let skip_name_resolve: u8 = query_one(
+        session,
+        "SELECT @@GLOBAL.skip_name_resolve",
+        deadline,
+        ControlStage::InspectBuildRecoveryNameResolution,
+    )
+    .await?;
+    let bind_address: String = query_one(
+        session,
+        "SELECT @@GLOBAL.bind_address",
+        deadline,
+        ControlStage::InspectBuildRecoveryBindAddress,
+    )
+    .await?;
+    if skip_name_resolve == 1 && bind_address == expected_bind {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::InspectBuildRecoveryBindAddress,
+        ))
+    }
+}
+
+async fn prepare_build_recovery_account_connected(
+    connection: &mut impl ControlSession,
+    authority: &MemberMutationAuthority,
+    credential: &BuildRecoveryCredential,
+    receipt: &BuildRecoveryAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    validate_member_product(connection, authority, deadline).await?;
+    prove_tcp_account_policy(connection, None, deadline).await?;
+    let mut create = SecretStatement::new(format!(
+        "CREATE USER '{}'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY '{}' COMMENT '{}'",
+        credential.username(),
+        credential.password(),
+        receipt.marker()
+    ));
+    let created = execute(
+        connection,
+        create.as_str(),
+        deadline,
+        ControlStage::CreateBuildRecovery,
+    )
+    .await;
+    create.clear();
+    created?;
+    execute(
+        connection,
+        &format!(
+            "GRANT REPLICATION SLAVE, CONNECTION_ADMIN ON *.* TO '{}'@'127.0.0.1'",
+            credential.username()
+        ),
+        deadline,
+        ControlStage::GrantBuildRecovery,
+    )
+    .await?;
+    prove_build_recovery_account(connection, receipt, deadline).await?;
+    prove_tcp_account_policy(connection, Some(receipt.username()), deadline).await
+}
+
+async fn remove_build_recovery_account_connected(
+    connection: &mut impl ControlSession,
+    authority: &MemberMutationAuthority,
+    receipt: &BuildRecoveryAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    validate_member_product(connection, authority, deadline).await?;
+    if build_recovery_account_presence_count(connection, receipt, deadline).await? == 0 {
+        prove_tcp_account_policy(connection, None, deadline).await?;
+        return Ok(());
+    }
+    prove_build_recovery_account(connection, receipt, deadline).await?;
+    execute(
+        connection,
+        &format!("DROP USER '{}'@'127.0.0.1'", receipt.username()),
+        deadline,
+        ControlStage::DropBuildRecovery,
+    )
+    .await?;
+    if build_recovery_account_presence_count(connection, receipt, deadline).await? == 0 {
+        prove_tcp_account_policy(connection, None, deadline).await
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::ProveBuildRecoveryAccountAbsent,
+        ))
+    }
+}
+
+async fn prove_tcp_account_policy(
+    session: &mut impl ControlSession,
+    allowed_build_user: Option<&str>,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    let predicate = allowed_build_user.map_or_else(
+        || "Host <> 'localhost'".to_owned(),
+        |username| {
+            format!(
+                "Host <> 'localhost' \
+                 AND NOT (User = '{}' AND Host = '127.0.0.1')",
+                username
+            )
+        },
+    );
+    let unexpected: u64 = query_one(
+        session,
+        &format!("SELECT COUNT(*) FROM mysql.user WHERE {predicate}"),
+        deadline,
+        ControlStage::InspectBuildRecoveryAccount,
+    )
+    .await?;
+    if unexpected == 0 {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::InspectBuildRecoveryAccount,
+        ))
+    }
+}
+
+async fn build_recovery_account_presence_count(
+    session: &mut impl ControlSession,
+    receipt: &BuildRecoveryAccountReceipt,
+    deadline: Instant,
+) -> Result<u64, MysqlTopologyError> {
+    query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = '127.0.0.1'",
+            receipt.username()
+        ),
+        deadline,
+        ControlStage::ProveBuildRecoveryAccountAbsent,
+    )
+    .await
+}
+
+async fn prove_build_recovery_account(
+    session: &mut impl ControlSession,
+    receipt: &BuildRecoveryAccountReceipt,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    if !receipt.marker_is_well_formed() {
+        return Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::InspectBuildRecoveryAccount,
+        ));
+    }
+    let ownership: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.user AS u \
+             JOIN information_schema.user_attributes AS a \
+             ON a.USER = u.User AND a.HOST = u.Host \
+             WHERE u.User = '{}' AND u.Host = '127.0.0.1' \
+             AND u.plugin = 'caching_sha2_password' \
+             AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+            receipt.username(),
+            receipt.marker()
+        ),
+        deadline,
+        ControlStage::InspectBuildRecoveryAccount,
+    )
+    .await?;
+    let grantee = format!("'''{}''@''127.0.0.1'''", receipt.username());
+    let replication: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.user_privileges \
+             WHERE GRANTEE = {grantee} \
+             AND PRIVILEGE_TYPE = 'REPLICATION SLAVE'"
+        ),
+        deadline,
+        ControlStage::InspectBuildRecoveryAccount,
+    )
+    .await?;
+    let static_total: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.user_privileges \
+             WHERE GRANTEE = {grantee} AND PRIVILEGE_TYPE <> 'USAGE'"
+        ),
+        deadline,
+        ControlStage::InspectBuildRecoveryAccount,
+    )
+    .await?;
+    let connection_admin: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.global_grants \
+             WHERE USER = '{}' AND HOST = '127.0.0.1' \
+             AND PRIV = 'CONNECTION_ADMIN'",
+            receipt.username()
+        ),
+        deadline,
+        ControlStage::InspectBuildRecoveryAccount,
+    )
+    .await?;
+    let dynamic_total: u64 = query_one(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM mysql.global_grants \
+             WHERE USER = '{}' AND HOST = '127.0.0.1'",
+            receipt.username()
+        ),
+        deadline,
+        ControlStage::InspectBuildRecoveryAccount,
+    )
+    .await?;
+    if ownership == 1
+        && replication == 1
+        && static_total == 2
+        && connection_admin == 1
+        && dynamic_total == 1
+    {
+        Ok(())
+    } else {
+        Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::InspectBuildRecoveryAccount,
+        ))
+    }
 }
 
 async fn provision_application_account_connected<S: ControlSession>(
@@ -1909,22 +2330,28 @@ impl ControlSession for MysqlControlSession {
             }
             ControlStage::ReadBinaryLogging
             | ControlStage::ProveBinaryLoggingRestored
-            | ControlStage::ProveBootstrapDisabled => Ok(ControlQueryResult::Unsigned8(
-                query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
-            )),
+            | ControlStage::ProveBootstrapDisabled
+            | ControlStage::InspectBuildRecoveryNameResolution => {
+                Ok(ControlQueryResult::Unsigned8(
+                    query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
+                ))
+            }
             ControlStage::InspectExistingGroup
             | ControlStage::TerminateConnection
             | ControlStage::ProveConnectionAbsent
             | ControlStage::InspectConnectionIdentity
             | ControlStage::InspectApplicationAccount
-            | ControlStage::ProveApplicationAccountAbsent => Ok(ControlQueryResult::Unsigned64(
+            | ControlStage::ProveApplicationAccountAbsent
+            | ControlStage::InspectBuildRecoveryAccount
+            | ControlStage::ProveBuildRecoveryAccountAbsent => Ok(ControlQueryResult::Unsigned64(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
             ControlStage::InspectExistingHistory
             | ControlStage::EnrollIdentity
             | ControlStage::VerifyEnrolledIdentity
             | ControlStage::ReadMembership
-            | ControlStage::ReadExecutedHistory => Ok(ControlQueryResult::Text(
+            | ControlStage::ReadExecutedHistory
+            | ControlStage::InspectBuildRecoveryBindAddress => Ok(ControlQueryResult::Text(
                 query_one_mysql(&mut self.connection, sql, deadline, stage).await?,
             )),
             ControlStage::DiscoverView => {
@@ -2002,11 +2429,14 @@ async fn prove_bootstrap_off<S: ControlSession>(
 }
 
 fn start_statement(recovery: &ControlCredential) -> SecretStatement {
+    start_statement_values(recovery.username(), recovery.password())
+}
+
+fn start_statement_values(username: &str, password: &str) -> SecretStatement {
     SecretStatement::new(format!(
         "START GROUP_REPLICATION USER='{}', PASSWORD='{}', \
          DEFAULT_AUTH='caching_sha2_password'",
-        recovery.username(),
-        recovery.password()
+        username, password
     ))
 }
 
@@ -2480,6 +2910,105 @@ mod tests {
         .unwrap();
         let receipt = ApplicationAccountReceipt::new(&credential);
         (attempt, authority, credential, receipt)
+    }
+
+    fn build_recovery_identity() -> (
+        MemberMutationAuthority,
+        BuildRecoveryCredential,
+        BuildRecoveryAccountReceipt,
+    ) {
+        let attempt = test_attempt();
+        let authority = MemberMutationAuthority::new(
+            attempt.id().clone(),
+            GroupName::new(GROUP_UUID).unwrap(),
+            test_enrollment(&attempt, MysqlMemberIndex::First),
+        )
+        .unwrap();
+        let credential = BuildRecoveryCredential::new(
+            AttemptId::new("build-recovery-test").unwrap(),
+            CredentialGeneration::new("build-generation").unwrap(),
+            "kms_build_test",
+            b"build-recovery-secret".to_vec(),
+        )
+        .unwrap();
+        let receipt = BuildRecoveryAccountReceipt::new(&credential);
+        (authority, credential, receipt)
+    }
+
+    fn build_recovery_ownership_actions(
+        receipt: &BuildRecoveryAccountReceipt,
+    ) -> Vec<ScriptAction> {
+        let grantee = format!("'''{}''@''127.0.0.1'''", receipt.username());
+        vec![
+            query_action(
+                ControlStage::InspectBuildRecoveryAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user AS u \
+                     JOIN information_schema.user_attributes AS a \
+                     ON a.USER = u.User AND a.HOST = u.Host \
+                     WHERE u.User = '{}' AND u.Host = '127.0.0.1' \
+                     AND u.plugin = 'caching_sha2_password' \
+                     AND JSON_UNQUOTE(JSON_EXTRACT(a.ATTRIBUTE, '$.comment')) = '{}'",
+                    receipt.username(),
+                    receipt.marker()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::InspectBuildRecoveryAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.user_privileges \
+                     WHERE GRANTEE = {grantee} \
+                     AND PRIVILEGE_TYPE = 'REPLICATION SLAVE'"
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::InspectBuildRecoveryAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.user_privileges \
+                     WHERE GRANTEE = {grantee} AND PRIVILEGE_TYPE <> 'USAGE'"
+                ),
+                ControlQueryResult::Unsigned64(2),
+            ),
+            query_action(
+                ControlStage::InspectBuildRecoveryAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.global_grants \
+                     WHERE USER = '{}' AND HOST = '127.0.0.1' \
+                     AND PRIV = 'CONNECTION_ADMIN'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+            query_action(
+                ControlStage::InspectBuildRecoveryAccount,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.global_grants \
+                     WHERE USER = '{}' AND HOST = '127.0.0.1'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+        ]
+    }
+
+    fn tcp_policy_action(allowed: Option<&str>) -> ScriptAction {
+        let predicate = allowed.map_or_else(
+            || "Host <> 'localhost'".to_owned(),
+            |username| {
+                format!(
+                    "Host <> 'localhost' \
+                     AND NOT (User = '{}' AND Host = '127.0.0.1')",
+                    username
+                )
+            },
+        );
+        query_action(
+            ControlStage::InspectBuildRecoveryAccount,
+            &format!("SELECT COUNT(*) FROM mysql.user WHERE {predicate}"),
+            ControlQueryResult::Unsigned64(0),
+        )
     }
 
     fn application_provision_actions(
@@ -3134,6 +3663,80 @@ mod tests {
         let authority = TopologyAuthority::new(attempt);
         assert_closed(&authority, 0);
         connector.assert_complete(0, 1);
+    }
+
+    #[tokio::test]
+    async fn build_recovery_account_is_exact_minimum_and_removable() {
+        let socket = SocketFixture::new("build-recovery-account");
+        let target = test_target(&socket, MysqlMemberIndex::First);
+        let (authority, credential, receipt) = build_recovery_identity();
+        let mut actions = vec![
+            product_query(MEMBER_UUIDS[0]),
+            tcp_policy_action(None),
+            execute_action(
+                ControlStage::CreateBuildRecovery,
+                format!(
+                    "CREATE USER '{}'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY '{}' COMMENT '{}'",
+                    credential.username(),
+                    credential.password(),
+                    receipt.marker()
+                ),
+            ),
+            execute_action(
+                ControlStage::GrantBuildRecovery,
+                format!(
+                    "GRANT REPLICATION SLAVE, CONNECTION_ADMIN ON *.* TO '{}'@'127.0.0.1'",
+                    credential.username()
+                ),
+            ),
+        ];
+        actions.extend(build_recovery_ownership_actions(&receipt));
+        actions.push(tcp_policy_action(Some(receipt.username())));
+        let connector = ScriptConnector::new(&socket.path, actions);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        prepare_build_recovery_account_connected(
+            &mut session,
+            &authority,
+            &credential,
+            &receipt,
+            deadline,
+        )
+        .await
+        .unwrap();
+        connector.assert_complete(0, 0);
+
+        let mut actions = vec![
+            product_query(MEMBER_UUIDS[0]),
+            query_action(
+                ControlStage::ProveBuildRecoveryAccountAbsent,
+                &format!(
+                    "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = '127.0.0.1'",
+                    receipt.username()
+                ),
+                ControlQueryResult::Unsigned64(1),
+            ),
+        ];
+        actions.extend(build_recovery_ownership_actions(&receipt));
+        actions.push(execute_action(
+            ControlStage::DropBuildRecovery,
+            format!("DROP USER '{}'@'127.0.0.1'", receipt.username()),
+        ));
+        actions.push(query_action(
+            ControlStage::ProveBuildRecoveryAccountAbsent,
+            &format!(
+                "SELECT COUNT(*) FROM mysql.user WHERE User = '{}' AND Host = '127.0.0.1'",
+                receipt.username()
+            ),
+            ControlQueryResult::Unsigned64(0),
+        ));
+        actions.push(tcp_policy_action(None));
+        let connector = ScriptConnector::new(&socket.path, actions);
+        let mut session = connector.connect(&target, deadline).await.unwrap();
+        remove_build_recovery_account_connected(&mut session, &authority, &receipt, deadline)
+            .await
+            .unwrap();
+        connector.assert_complete(0, 0);
     }
 
     #[tokio::test]

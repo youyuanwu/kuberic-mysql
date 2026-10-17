@@ -5,6 +5,9 @@
 Accepted architectural direction for the qualified Kuberic Public V1
 projection, researched on 2026-10-16. This status records the selected design;
 it does not expand the lifecycle behavior delivered by the current adapter.
+The historical comparison below intentionally retains its reviewed Kuberic
+commit. The delivered adapter is now pinned to
+`f56949996b366b14c925339ac2e859ca2fbaf637`.
 
 ## Question
 
@@ -232,6 +235,26 @@ under exact current authority, role, configuration, process, storage, view, and
 receipt checks. `StateProvider::last_committed_lsn` returns the retained value
 from the preceding accepted progress observation; the adapter does not
 maintain a distinct primary-only commit watermark.
+
+Fresh-secondary Build freezes and proves a complete structured GTID source
+boundary and uses scalar progress only as the pinned Public V1 invocation and
+configuration projection. Scalar equality is never substituted for GTID-set
+containment. At the delivered runtime pin, omitted active-configuration
+progress reuses only an exact retained identity/process-session/storage
+observation; it does not create a new commit watermark.
+
+More precisely, omitted current progress requires an exact retained value for
+the same replica identity, process session, and storage incarnation. Omitted
+catch-up capability reuses exact retained numeric or known-unknown state;
+explicit current progress with `must_catchup=false` may establish known-unknown
+on first acceptance. Required unknown catch-up and every missing or substituted
+binding fail closed. Idle Build targets still require both fields to be
+`INVALID_LSN`.
+
+Current contract sources:
+
+- [Kuberic replication trait contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/f56949996b366b14c925339ac2e859ca2fbaf637/kuberic-runtime/src/replicator/traits.rs)
+- [Kuberic public protocol types at the delivered pin](https://github.com/youyuanwu/kuberic/blob/f56949996b366b14c925339ac2e859ca2fbaf637/kuberic-runtime/src/protocol/types.rs)
 
 The adapter also does not supply durable cross-restart `HistoryContext`,
 restart adoption, incremental catch-up proof, or automatic failover. The

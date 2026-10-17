@@ -17,9 +17,9 @@ use kuberic_mysql::service::{
     EpochTranslator, KubericTranslationError, MemberPeer, MysqlFreshMemberCredentials,
     MysqlMemberIndex, MysqlPublicV1Replicator, MysqlPublicV1ReplicatorFactory,
     MysqlPublicV1Service, MysqlPublicV1ServiceConfig, MysqlReplicaEpoch, MysqlReplicaTarget,
-    ReplicationEndpoint, translate_process_session_id, translate_replica_identity,
-    translate_replica_information, translate_replica_set_configuration, translate_role,
-    translate_storage_binding,
+    ReplicationEndpoint, translate_build_replica_information, translate_process_session_id,
+    translate_replica_identity, translate_replica_information, translate_replica_set_configuration,
+    translate_role, translate_storage_binding,
 };
 use kuberic_runtime::host::ApplicationStorageState;
 use kuberic_runtime::protocol::public_operations::INVALID_LSN;
@@ -184,6 +184,57 @@ fn exported_translation_preserves_independent_public_and_native_fences() {
 }
 
 #[test]
+fn build_translation_accepts_only_exact_idle_target_shape() {
+    let mut idle = information(
+        2,
+        ReplicaRole::IdleSecondary,
+        MEMBER_TWO,
+        "127.0.0.1:33062",
+        "127.0.0.1:43062",
+    );
+    idle.current_progress = INVALID_LSN;
+    idle.catch_up_capability = INVALID_LSN;
+    let (build_id, target) = translate_build_replica_information(&idle).unwrap();
+    assert_eq!(build_id, idle.build_id);
+    assert_eq!(target.process_session().as_str(), "process-2");
+
+    let mut wrong_role = idle.clone();
+    wrong_role.role = ReplicaRole::ActiveSecondary;
+    assert!(matches!(
+        translate_build_replica_information(&wrong_role),
+        Err(KubericTranslationError::UnsupportedRole(
+            ReplicaRole::ActiveSecondary
+        ))
+    ));
+
+    let mut progress = idle.clone();
+    progress.current_progress = 0;
+    assert!(matches!(
+        translate_build_replica_information(&progress),
+        Err(KubericTranslationError::InvalidProgress {
+            field: "idle Build current",
+            value: 0
+        })
+    ));
+
+    let mut catch_up = idle.clone();
+    catch_up.must_catchup = true;
+    assert!(matches!(
+        translate_build_replica_information(&catch_up),
+        Err(KubericTranslationError::InvalidPublicValue(
+            "idle Build target must not require catch-up"
+        ))
+    ));
+
+    let mut no_storage = idle;
+    no_storage.storage_incarnation = None;
+    assert_eq!(
+        translate_build_replica_information(&no_storage),
+        Err(KubericTranslationError::MissingStorage)
+    );
+}
+
+#[test]
 fn exported_configuration_translation_is_complete_canonical_and_fail_closed() {
     let configuration = public_configuration();
     let local = configuration.configuration.members[0].identity.clone();
@@ -314,6 +365,11 @@ fn exported_retry_state_reuses_exact_values_and_rejects_conflicts_or_regression(
         ledger.admit("role", (Epoch::new(1, 2), ReplicaRole::ActiveSecondary)),
         Err(KubericTranslationError::OperationConflict)
     );
+    let second = ledger
+        .admit("progress", (Epoch::new(1, 2), ReplicaRole::Primary))
+        .unwrap();
+    assert_ne!(first.id(), second.id());
+    assert!(second.generation() > first.generation());
 
     let mut epochs = EpochTranslator::new();
     let mapped = epochs.translate(Epoch::new(1, 9)).unwrap();
@@ -398,6 +454,14 @@ fn pinned_public_v1_bundle_and_fresh_only_service_shape_are_exported() {
         MysqlPublicV1ServiceConfig::storage_state(&config).unwrap(),
         ApplicationStorageState::FreshEmpty
     );
+    let rendered = config.instance().render_server_config();
+    assert!(config.instance().build_recovery_networking());
+    assert!(rendered.contains("bind-address=127.0.0.1"));
+    assert!(rendered.contains("skip-name-resolve=ON"));
+    assert!(rendered.contains("loose-group-replication-recovery-get-public-key=ON"));
+    assert!(rendered.contains("loose-group-replication-recovery-use-ssl=OFF"));
+    assert!(!rendered.contains("skip-networking=ON"));
+    assert!(!rendered.contains("clone"));
     fs::create_dir_all(config.instance().data_root()).unwrap();
     fs::write(config.instance().data_root().join("native-state"), b"owned").unwrap();
     assert_eq!(

@@ -25,7 +25,7 @@ per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
 infrastructure, not production topology owners. The normal crate surface
 includes the public adapter against `kuberic-runtime` pinned exactly to commit
-`ceec5887ad97d71222117610428ce715b782777e`; no private managed lifecycle,
+`f56949996b366b14c925339ac2e859ca2fbaf637`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
 ## Status
@@ -75,9 +75,10 @@ that owns one `MysqlInstanceManager` and enforces open, newer epoch, role,
 configuration, access, and terminal ordering. Same-role transitions still
 require an epoch barrier. Native bootstrap, join, coherent view readback, and
 primary transfer receive credit only from exact request-bound member-effect
-receipts. Build and removal entry points validate current primary authority,
-target identity, operation identity, and exact retries, then return a typed
-unsupported outcome; generic peer build/removal execution is not delivered.
+receipts. Its ordinary generic Build and removal entry points validate current
+primary authority, target identity, operation identity, and exact retries,
+then return a typed unsupported outcome; the bounded Public V1 custom-Build
+coordinator described below owns fresh-secondary transfer instead.
 Successful close and abort retain their exact terminal outcome for idempotent
 retry. Changed retries conflict, unrelated post-terminal work rejects, and an
 unsettled abort remains terminal without claiming complete containment. Abort
@@ -109,7 +110,8 @@ copy-state, and data-loss surfaces validate exactly or fail closed without
 application bytes or private durable state. It supports only fresh
 `OpenMode::New` ownership,
 an initial one-member local-primary bootstrap, scalar progress publication,
-same-role epoch transitions, and already-formed planned-swap translation.
+same-role epoch transitions, fresh-secondary Build through the direct custom
+replicator callback, and already-formed planned-swap translation.
 The adapter converts the bound local replica/process session plus runtime
 epoch, role, remote-peer configuration, progress, and access values into
 independent MySQL fences. Public configuration callbacks contain only remote
@@ -118,6 +120,36 @@ enrolled MySQL process/session/storage/endpoint authority. A fresh singleton
 therefore has an empty peer list.
 Its versioned non-secret replication endpoint carries only the native member
 UUID, SQL member address, and Group Replication address.
+
+The custom `PrimaryReplicator::build_replica` implementation transfers one
+fresh idle target through Group Replication distributed recovery. It binds the
+callback to the exact source and target identities, process sessions, storage
+incarnations, endpoint, epoch, configuration, Build ID, and frozen structured
+GTID boundary. The target remains outside the public voting configuration and
+keeps external access closed until later role and configuration callbacks.
+Success requires the exact successor view, target `ONLINE`/`SECONDARY` state,
+and GTID containment; Clone/reseed is not used. Dropping the callback
+synchronously retires the exact target process generation and quarantines
+participants when native effects may have occurred.
+
+At the pinned runtime, active configuration descriptors may use `INVALID_LSN`
+to omit current progress only when the adapter retained that field for the
+exact replica identity, process session, and storage incarnation. Omitted
+catch-up capability follows the same rule after first acceptance; the one
+first-use exception is explicit current progress with `must_catchup=false`,
+which establishes a known-unknown catch-up capability. Required unknown
+catch-up fails closed. Omission never means zero and never reuses another
+incarnation's observation. Idle Build input still requires both progress
+fields to be `INVALID_LSN`.
+
+An exact completed Build retry revalidates and returns its retained terminal
+result. An interrupted target is not reused: partial Group Replication state
+requires reset and a new Build against fresh storage. This intentionally
+differs from PostgreSQL's reproducible frozen-byte retry. Cancellation closes
+application admission immediately, but the temporary native recovery account
+can remain technically authenticatable until its replicated `DROP USER`
+commits; the Build group remains blocked until absence is proved or reset is
+required.
 
 Kuberic callback order is adapted without weakening the native engine order.
 Ordinary formed members complete Epoch, then Role, then Configuration; role is
@@ -128,8 +160,9 @@ captures a fresh qualified local boundary on every wait while a current engine
 configuration exists; only the intentional post-epoch gap reuses its cached
 pre-epoch boundary. Before a newer epoch mutates the engine, any prepared or
 published proxy generation is physically revoked through the native-backed
-containment path. Exact configuration refreshes update peer progress without
-another native configuration effect. If that accepted local configuration is
+containment path. Binding-preserving monotonic progress refresh, including
+omissions that resolve to retained values, avoids another native configuration
+effect; regressions or binding changes conflict. If that accepted local configuration is
 Primary, identical current or catch-up replay also retries the separate
 fixed-port proxy publication obligation; an already published generation is
 an idempotent success. A target's pre-source
@@ -152,12 +185,14 @@ closes only that session/command, suppresses post-effect success, and leaves
 the generation available for a later runtime regrant. Application `None` or
 secondary callbacks retain explicit generation revocation behavior.
 
-This bounded adapter deliberately rejects `OpenMode::Existing`, fresh
-secondary admission, Build/reseed, Remove, data-loss acceptance,
+This bounded adapter deliberately rejects `OpenMode::Existing`, Clone/reseed,
+Remove, data-loss acceptance,
 non-projectable or unproved catch-up, and automated/unplanned failover. It does
-not claim Kuberic-created three-member formation: the only fresh public
-formation is one local Primary; a multi-member configuration must already be
-formed by supported native work outside this stage.
+not claim cross-host, TLS, Kubernetes, durable interrupted-effect recovery, or
+production readiness. Its custom Build path is process-local and follows the
+direct PostgreSQL example shape. Production-controller dispatch into a custom
+replicator remains unsupported because the controller's target inbound
+authority installation uses crate-private runtime control.
 
 The application endpoint is a generation-fenced plaintext loopback MySQL
 Classic Protocol gateway backed by the exact private UDS. It admits one
@@ -320,9 +355,21 @@ contracts can be checked without launching MySQL:
 CARGO_BUILD_JOBS=1 cargo check --locked --offline \
   -p kuberic-mysql --lib
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-tests --test kuberic_public_v1_contract
+  -p kuberic-mysql-tests \
+  --test kuberic_public_v1_contract \
+  --test kuberic_public_v1_build_contract
 CARGO_BUILD_JOBS=1 cargo clippy --locked --offline \
   -p kuberic-mysql --lib -- -D warnings
+```
+
+The resource-conscious live custom-Build gate forms one fresh Primary and
+builds two fresh secondaries. It covers explicit progress, exact retained
+omission, and dropped-Build containment:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-tests \
+  --test kuberic_public_v1_build_live_mysql_8_4_11
 ```
 
 The bounded real-server gateway compatibility gate can be rerun independently:

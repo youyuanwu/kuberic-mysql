@@ -9,10 +9,11 @@ publish.workspace = true
 
 [dependencies]
 async-trait = "0.1"
-kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic", rev = "ceec5887ad97d71222117610428ce715b782777e", default-features = false, features = ["host"] }
+kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic", rev = "f56949996b366b14c925339ac2e859ca2fbaf637", default-features = false, features = ["host"] }
 mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust"] }
 rustix = { version = "1.1.5", features = ["fs"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "sync"] }
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "test-util"] }

@@ -26,6 +26,9 @@ use crate::core::{
 };
 use crate::service::config::OwnedRoot;
 use crate::service::control::OwnedControlTarget;
+use crate::service::kuberic::build::{
+    BuildJoinReceipt, BuildRecoveryAccountReceipt, BuildRecoveryCredential,
+};
 #[cfg(test)]
 use crate::service::process::qualification_kill_and_reap;
 use crate::service::process::{
@@ -37,8 +40,8 @@ use crate::service::{
     AccountProvisioningEvidence, ApplicationAccountReceipt, ApplicationCredential,
     AttemptAdmissionError, AttemptCleanupState, AttemptContext, AttemptDeadlineState,
     BackendConnectionId, BackendConnectionReceipt, BootstrapCapability, BootstrapEffect,
-    ControlCredential, FreshBootstrapInput, FreshJoinInput, JoinCapability, JoinEffect,
-    LifecycleOperation, MemberAuthorityError, MemberControlBinding, MemberEffectKind,
+    BuildAttemptContext, ControlCredential, FreshBootstrapInput, FreshJoinInput, JoinCapability,
+    JoinEffect, LifecycleOperation, MemberAuthorityError, MemberControlBinding, MemberEffectKind,
     MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority, MemberNativeEvidence,
     MemberTransitionError, MysqlInstanceConfig, MysqlInstanceError, MysqlMemberEffectBoundary,
     MysqlProxyControlBoundary, MysqlProxyError, MysqlProxyPhase, MysqlTopologyError,
@@ -48,6 +51,7 @@ use crate::service::{
 
 const READY_POLL: Duration = Duration::from_millis(25);
 static CLEANUP_SERIAL: AtomicU64 = AtomicU64::new(1);
+static INSTANCE_OWNER_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 /// Explicit state of the sole in-memory process generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,20 +85,35 @@ pub struct MysqlInstanceManager {
     child: Option<Child>,
     data_root: Option<OwnedRoot>,
     scratch_root: Option<OwnedRoot>,
+    owner_generation: u64,
     process_generation: u64,
     cleanup_quarantined: bool,
+}
+
+/// Unforgeable in-process ownership token for one exact MySQL child generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MysqlBuildAbortGeneration {
+    process_generation: u64,
+    owner_generation: u64,
+    process_id: Option<u32>,
+    server_id: u32,
+    group_uuid: String,
+    sql_address: std::net::SocketAddr,
+    group_replication_address: std::net::SocketAddr,
+    authority: MemberMutationAuthority,
 }
 
 impl MysqlInstanceManager {
     /// Creates a manager without touching the configured fresh roots.
     #[must_use]
-    pub const fn new(config: MysqlInstanceConfig) -> Self {
+    pub fn new(config: MysqlInstanceConfig) -> Self {
         Self {
             config,
             state: MysqlInstanceState::Configured,
             child: None,
             data_root: None,
             scratch_root: None,
+            owner_generation: INSTANCE_OWNER_SERIAL.fetch_add(1, Ordering::Relaxed),
             process_generation: 0,
             cleanup_quarantined: false,
         }
@@ -457,6 +476,104 @@ impl MysqlInstanceManager {
         )
     }
 
+    pub(crate) async fn prepare_build_recovery_account(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        credential: &BuildRecoveryCredential,
+        build: &BuildAttemptContext,
+    ) -> Result<BuildRecoveryAccountReceipt, MemberTransitionError> {
+        build.admit_work().map_err(member_attempt_admission_error)?;
+        let target = self.prepare_member_effect_target(authority, build.parent_context())?;
+        crate::service::control::prepare_build_recovery_account(
+            target,
+            authority,
+            credential,
+            build.work_deadline(),
+        )
+        .await
+        .map_err(MemberTransitionError::Native)
+    }
+
+    pub(crate) async fn verify_build_target_fresh(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        build: &BuildAttemptContext,
+    ) -> Result<(), MemberTransitionError> {
+        build.admit_work().map_err(member_attempt_admission_error)?;
+        self.revalidate_member_effect_binding(authority)?;
+        let target = self.prepare_control_target()?;
+        crate::service::control::verify_build_target_fresh(target, authority, build.work_deadline())
+            .await
+            .map_err(MemberTransitionError::Native)
+    }
+
+    pub(crate) async fn remove_build_recovery_account(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        receipt: &BuildRecoveryAccountReceipt,
+        build: &BuildAttemptContext,
+        cleanup: bool,
+    ) -> Result<(), MemberTransitionError> {
+        if receipt.build() != build.build() {
+            return Err(MemberTransitionError::Authority(
+                MemberAuthorityError::AttemptMismatch,
+            ));
+        }
+        if cleanup {
+            build
+                .admit_cleanup()
+                .map_err(member_attempt_admission_error)?;
+        } else {
+            build.admit_work().map_err(member_attempt_admission_error)?;
+        }
+        self.revalidate_member_effect_binding(authority)?;
+        let target = self.prepare_control_target()?;
+        crate::service::control::remove_build_recovery_account(
+            target,
+            authority,
+            receipt,
+            if cleanup {
+                build.deadline()
+            } else {
+                build.work_deadline()
+            },
+        )
+        .await
+        .map_err(MemberTransitionError::Native)
+    }
+
+    pub(crate) async fn verify_build_recovery_account(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        receipt: &BuildRecoveryAccountReceipt,
+        expected_present: bool,
+        build: &BuildAttemptContext,
+        cleanup: bool,
+    ) -> Result<(), MemberTransitionError> {
+        if cleanup {
+            build
+                .admit_cleanup()
+                .map_err(member_attempt_admission_error)?;
+        } else {
+            build.admit_work().map_err(member_attempt_admission_error)?;
+        }
+        self.revalidate_member_effect_binding(authority)?;
+        let target = self.prepare_control_target()?;
+        crate::service::control::verify_build_recovery_account(
+            target,
+            authority,
+            receipt,
+            expected_present,
+            if cleanup {
+                build.deadline()
+            } else {
+                build.work_deadline()
+            },
+        )
+        .await
+        .map_err(MemberTransitionError::Native)
+    }
+
     /// Enrolls `@@server_uuid` before this member enters any topology effect.
     pub(crate) async fn enroll_topology_identity(
         &mut self,
@@ -539,8 +656,10 @@ impl MysqlInstanceManager {
                     authority,
                     request,
                     predecessor: None,
+                    build_cross_parent: false,
                 },
                 attempt,
+                None,
                 &deadline,
             )
             .await
@@ -574,14 +693,75 @@ impl MysqlInstanceManager {
                     authority,
                     request,
                     predecessor: Some(predecessor),
+                    build_cross_parent: false,
                 },
                 attempt,
+                None,
                 &deadline,
             )
             .await
         }
         .await;
         containment.finish(result)
+    }
+
+    /// Executes one Build-scoped native join without admitting the later
+    /// Kuberic configuration.
+    pub(crate) async fn join_build_member(
+        &mut self,
+        input: FreshJoinInput,
+        recovery: &BuildRecoveryCredential,
+        build: &BuildAttemptContext,
+        target_generation: u64,
+    ) -> Result<BuildJoinReceipt, MemberTransitionError> {
+        build.admit_work().map_err(member_attempt_admission_error)?;
+        let parent = build.parent_context();
+        let target = self.prepare_member_effect_target(input.authority(), parent)?;
+        let request = input.request().cloned();
+        let authority = input.authority().clone();
+        let predecessor = input.source().evidence().clone();
+        let mut containment = MemberEffectCancellationContainment::new(self, parent);
+        // Build owns a stronger exact-generation outer guard. Do not let this
+        // ordinary lifetime guard run its longer shutdown budget first when
+        // the join future is dropped.
+        containment.disarm();
+        let result = async {
+            let deadline =
+                NativeControlDeadline::new(build.parent_attempt().clone(), build.work_deadline())
+                    .map_err(MemberTransitionError::Native)?;
+            crate::service::control::member_build_join(target.clone(), &authority, recovery, build)
+                .await?;
+            let receipt = poll_member_receipt(
+                &mut containment,
+                target,
+                MemberEffectKind::Join,
+                MemberReceiptContext {
+                    authority,
+                    request,
+                    predecessor: Some(predecessor),
+                    build_cross_parent: true,
+                },
+                parent,
+                Some(build),
+                &deadline,
+            )
+            .await?;
+            build.admit_work().map_err(member_attempt_admission_error)?;
+            BuildJoinReceipt::new(build, target_generation, receipt).map_err(|_| {
+                MemberTransitionError::Authority(MemberAuthorityError::AttemptMismatch)
+            })
+        }
+        .await;
+        containment.finish_deferred(result)
+    }
+
+    pub(crate) async fn leave_build_member(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        build: &BuildAttemptContext,
+    ) -> Result<(), MemberTransitionError> {
+        let target = self.prepare_member_effect_target(authority, build.parent_context())?;
+        crate::service::control::member_build_leave(target, authority, build).await
     }
 
     /// Reads one bracketed coherent native member view after exact local
@@ -662,8 +842,10 @@ impl MysqlInstanceManager {
                     authority,
                     request,
                     predecessor: Some(predecessor),
+                    build_cross_parent: false,
                 },
                 attempt,
+                None,
                 &deadline,
             )
             .await
@@ -1207,6 +1389,141 @@ impl MysqlInstanceManager {
         Ok(())
     }
 
+    /// Arms exact in-process ownership for one Build generation.
+    pub(crate) fn arm_build_abort_generation(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<MysqlBuildAbortGeneration, MysqlInstanceError> {
+        self.revalidate_member_effect_binding(authority)
+            .map_err(map_containment_binding_error)?;
+        Ok(MysqlBuildAbortGeneration {
+            process_generation: self.process_generation,
+            owner_generation: self.owner_generation,
+            process_id: self.child.as_ref().map(Child::id),
+            server_id: self.config.member().server_id(),
+            group_uuid: self.config.member().group_uuid().to_owned(),
+            sql_address: self.config.member().sql_address(),
+            group_replication_address: self.config.member().group_replication_address(),
+            authority: authority.clone(),
+        })
+    }
+
+    /// Mechanically retires the armed generation without consulting an
+    /// operation deadline. Late evidence still receives no lifecycle credit.
+    pub(crate) fn force_retire_owned_generation(
+        &mut self,
+        generation: &MysqlBuildAbortGeneration,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
+        if generation.owner_generation != self.owner_generation
+            || generation.process_generation != self.process_generation
+            || generation.process_id != self.child.as_ref().map(Child::id)
+            || generation.server_id != self.config.member().server_id()
+            || generation.group_uuid != self.config.member().group_uuid()
+            || generation.sql_address != self.config.member().sql_address()
+            || generation.group_replication_address
+                != self.config.member().group_replication_address()
+        {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::RootMismatch,
+            ));
+        }
+
+        let mut complete = true;
+        if let Some(child) = self.child.as_mut() {
+            if terminate_and_reap(child, self.config.timeouts().shutdown()).is_err() {
+                complete = false;
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                self.child = None;
+            } else {
+                complete = false;
+            }
+        }
+
+        let pid_absent =
+            exact_path_absent(self.config.runtime().pid(), LifecycleOperation::Shutdown)
+                .unwrap_or(false);
+        let socket_absent = exact_path_absent(
+            self.config.runtime().socket(),
+            LifecycleOperation::SocketDisappearance,
+        )
+        .unwrap_or(false);
+        if self.child.is_none() {
+            if self.revalidate_roots().is_ok() && !self.cleanup_quarantined {
+                if let Some(scratch) = self.scratch_root.as_ref() {
+                    if remove_owned_root(scratch, LifecycleOperation::ScratchCleanup).is_ok() {
+                        self.scratch_root = None;
+                    } else {
+                        complete = false;
+                    }
+                }
+            } else {
+                complete = false;
+            }
+        }
+        let scratch_removed = self.scratch_root.is_none()
+            && exact_path_absent(
+                self.config.runtime().scratch_root(),
+                LifecycleOperation::ScratchCleanup,
+            )
+            .unwrap_or(false);
+        let process_absent = self.child.is_none();
+        complete &= process_absent && pid_absent && socket_absent && scratch_removed;
+        self.state = if process_absent {
+            MysqlInstanceState::Stopped
+        } else {
+            MysqlInstanceState::Faulted
+        };
+        Ok(crate::service::MemberContainmentReceipt::new(
+            generation.authority.clone(),
+            if complete {
+                AttemptCleanupState::Completed
+            } else {
+                AttemptCleanupState::Failed
+            },
+            process_absent,
+            pid_absent,
+            socket_absent,
+            socket_absent,
+            scratch_removed,
+        )
+        .with_retired_generation(
+            generation.owner_generation,
+            generation.process_generation,
+            generation.process_id,
+        ))
+    }
+
+    fn containment_receipt(
+        &self,
+        authority: &MemberMutationAuthority,
+        cleanup: AttemptCleanupState,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
+        let process_absent = self.child.is_none();
+        let pid_absent =
+            exact_path_absent(self.config.runtime().pid(), LifecycleOperation::Shutdown)?;
+        let socket_absent = exact_path_absent(
+            self.config.runtime().socket(),
+            LifecycleOperation::SocketDisappearance,
+        )?;
+        let scratch_removed = self.scratch_root.is_none()
+            && exact_path_absent(
+                self.config.runtime().scratch_root(),
+                LifecycleOperation::ScratchCleanup,
+            )?;
+        Ok(crate::service::MemberContainmentReceipt::new(
+            authority.clone(),
+            cleanup,
+            process_absent,
+            pid_absent,
+            socket_absent,
+            socket_absent,
+            scratch_removed,
+        ))
+    }
+
     fn cleanup_all_roots(&mut self) -> Result<(), MysqlInstanceError> {
         let roots = [self.data_root.clone(), self.scratch_root.clone()]
             .into_iter()
@@ -1283,41 +1600,23 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
         attempt: &AttemptContext,
     ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
         self.revalidate_member_effect_binding(authority)
-            .map_err(|error| {
-                MysqlInstanceError::Ownership(match error {
-                    MemberTransitionError::Authority(
-                        crate::service::MemberAuthorityError::LocalBindingMismatch
-                        | crate::service::MemberAuthorityError::AttemptMismatch
-                        | crate::service::MemberAuthorityError::AuthoritySubstitution
-                        | crate::service::MemberAuthorityError::SourceMismatch
-                        | crate::service::MemberAuthorityError::WrongTransferTarget,
-                    ) => crate::service::OwnershipError::RootMismatch,
-                    _ => crate::service::OwnershipError::InspectionFailed,
-                })
-            })?;
+            .map_err(map_containment_binding_error)?;
         let cleanup = self.contain_with_attempt(attempt)?;
-        let process_absent = self.child.is_none();
-        let pid_absent =
-            exact_path_absent(self.config.runtime().pid(), LifecycleOperation::Shutdown)?;
-        let socket_absent = exact_path_absent(
-            self.config.runtime().socket(),
-            LifecycleOperation::SocketDisappearance,
-        )?;
-        let scratch_removed = self.scratch_root.is_none()
-            && exact_path_absent(
-                self.config.runtime().scratch_root(),
-                LifecycleOperation::ScratchCleanup,
-            )?;
-        Ok(crate::service::MemberContainmentReceipt::new(
-            authority.clone(),
-            cleanup,
-            process_absent,
-            pid_absent,
-            socket_absent,
-            socket_absent,
-            scratch_removed,
-        ))
+        self.containment_receipt(authority, cleanup)
     }
+}
+
+fn map_containment_binding_error(error: MemberTransitionError) -> MysqlInstanceError {
+    MysqlInstanceError::Ownership(match error {
+        MemberTransitionError::Authority(
+            crate::service::MemberAuthorityError::LocalBindingMismatch
+            | crate::service::MemberAuthorityError::AttemptMismatch
+            | crate::service::MemberAuthorityError::AuthoritySubstitution
+            | crate::service::MemberAuthorityError::SourceMismatch
+            | crate::service::MemberAuthorityError::WrongTransferTarget,
+        ) => crate::service::OwnershipError::RootMismatch,
+        _ => crate::service::OwnershipError::InspectionFailed,
+    })
 }
 
 fn exact_path_absent(
@@ -1462,6 +1761,7 @@ struct MemberReceiptContext {
     authority: MemberMutationAuthority,
     request: Option<MemberEffectRequest>,
     predecessor: Option<MemberNativeEvidence>,
+    build_cross_parent: bool,
 }
 
 async fn poll_member_receipt(
@@ -1470,12 +1770,14 @@ async fn poll_member_receipt(
     kind: MemberEffectKind,
     context: MemberReceiptContext,
     attempt: &AttemptContext,
+    build: Option<&BuildAttemptContext>,
     deadline: &NativeControlDeadline,
 ) -> Result<MemberEffectReceipt, MemberTransitionError> {
     let MemberReceiptContext {
         authority,
         request,
         predecessor,
+        build_cross_parent,
     } = context;
     let cleanup = if kind == MemberEffectKind::Bootstrap {
         AttemptCleanupState::Completed
@@ -1483,14 +1785,32 @@ async fn poll_member_receipt(
         AttemptCleanupState::NotRequired
     };
     loop {
-        attempt
-            .admit_work()
-            .map_err(member_attempt_admission_error)?;
+        if let Some(build) = build {
+            build.admit_work().map_err(member_attempt_admission_error)?;
+        } else {
+            attempt
+                .admit_work()
+                .map_err(member_attempt_admission_error)?;
+        }
         let evidence =
             crate::service::control::read_member_view(target.clone(), &authority, deadline).await?;
         let final_binding = containment.revalidate_binding(&authority)?;
         target.revalidate_socket()?;
-        let receipt = if let Some(request) = request.clone() {
+        let receipt = if build_cross_parent {
+            MemberEffectReceipt::for_build_request(
+                kind.clone(),
+                request.clone().ok_or(MemberTransitionError::Receipt(
+                    crate::service::MemberReceiptError::PredecessorMismatch,
+                ))?,
+                predecessor.clone().ok_or(MemberTransitionError::Receipt(
+                    crate::service::MemberReceiptError::PredecessorMismatch,
+                ))?,
+                evidence,
+                &final_binding,
+                attempt,
+                cleanup,
+            )
+        } else if let Some(request) = request.clone() {
             MemberEffectReceipt::for_request(
                 kind.clone(),
                 request,
@@ -1515,11 +1835,13 @@ async fn poll_member_receipt(
             Ok(receipt) => return Ok(receipt),
             Err(MemberTransitionError::Receipt(
                 crate::service::MemberReceiptError::SuccessorMismatch,
-            ))
-            | Err(MemberTransitionError::View(
+            )) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(MemberTransitionError::View(
                 crate::service::MemberViewError::MemberNotOnline
                 | crate::service::MemberViewError::MemberRoleMismatch,
-            )) => {
+            )) if build.is_none() => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(error) => return Err(error),
@@ -1594,6 +1916,17 @@ impl<'a> MemberEffectCancellationContainment<'a> {
                 }
             }
         }
+    }
+
+    /// Leaves ordinary Build errors to the outer Build owner so it can try a
+    /// bounded graceful leave before exact-generation retirement. A dropped
+    /// future remains synchronously contained by this guard's `Drop`.
+    fn finish_deferred<T>(
+        mut self,
+        result: Result<T, MemberTransitionError>,
+    ) -> Result<T, MemberTransitionError> {
+        self.armed = false;
+        result
     }
 }
 
@@ -1848,10 +2181,13 @@ fn io_error(operation: LifecycleOperation, error: rustix::io::Errno) -> MysqlIns
 mod tests {
     use super::*;
     use crate::service::{
-        MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts, MysqlTopologyConfig,
+        AccountProvisioningEvidence, ControlCredential, ControlCredentialRole,
+        MemberControlBinding, MemberMutationAuthority, MysqlMemberConfig, MysqlMemberIndex,
+        MysqlOperationTimeouts, MysqlTopologyConfig, NativeIdentityEnrollment,
     };
     use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
 
     #[test]
     fn cleanup_remains_bound_to_open_root_when_quarantine_is_replaced() {
@@ -1915,6 +2251,112 @@ mod tests {
         fs::remove_dir_all(roots.data.path()).unwrap();
         fs::remove_file(replacement_file).unwrap();
         fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn force_retirement_reaps_exact_generation_without_deadline_or_root_credit() {
+        let parent = std::env::temp_dir().join(format!(
+            "kms-force-retire-{}-{}",
+            std::process::id(),
+            CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = MysqlInstanceConfig::new_topology_member(
+            "/usr/bin/sleep",
+            "/usr/bin/env",
+            parent.join("data"),
+            parent.join("scratch"),
+            topology(),
+            MysqlMemberIndex::First,
+            MysqlOperationTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let authority = test_authority(&config);
+        let child = Command::new("/usr/bin/sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let mut manager = MysqlInstanceManager::new(config);
+        manager.state = MysqlInstanceState::Running;
+        manager.child = Some(child);
+        manager.process_generation = 1;
+        let generation = MysqlBuildAbortGeneration {
+            process_generation: manager.process_generation,
+            owner_generation: manager.owner_generation,
+            process_id: Some(pid),
+            server_id: manager.config.member().server_id(),
+            group_uuid: manager.config.member().group_uuid().to_owned(),
+            sql_address: manager.config.member().sql_address(),
+            group_replication_address: manager.config.member().group_replication_address(),
+            authority,
+        };
+
+        let receipt = manager.force_retire_owned_generation(&generation).unwrap();
+        assert!(receipt.process_absent());
+        assert_eq!(receipt.retired_process_id(), Some(pid));
+        assert_eq!(receipt.cleanup(), AttemptCleanupState::Failed);
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        fs::remove_dir(parent).unwrap();
+    }
+
+    fn test_authority(config: &MysqlInstanceConfig) -> MemberMutationAuthority {
+        let attempt = AttemptId::new("force-retire-attempt").unwrap();
+        let observer_generation = CredentialGeneration::new("force-observer").unwrap();
+        let recovery_generation = CredentialGeneration::new("force-recovery").unwrap();
+        let binding = MemberControlBinding::new(
+            attempt.clone(),
+            MysqlMemberIndex::First,
+            ProcessSessionId::new("force-process").unwrap(),
+            EndpointBinding::new("force-endpoint").unwrap(),
+            StorageBinding::new("force-storage").unwrap(),
+            MemberAddress::new(config.member().sql_address().to_string()).unwrap(),
+            observer_generation.clone(),
+            recovery_generation.clone(),
+        );
+        let observer = ControlCredential::new(
+            attempt.clone(),
+            observer_generation,
+            ControlCredentialRole::Observer,
+            "force_obs",
+            "ForceObserverA7",
+        )
+        .unwrap();
+        let recovery = ControlCredential::new(
+            attempt.clone(),
+            recovery_generation,
+            ControlCredentialRole::Recovery,
+            "force_rec",
+            "ForceRecoveryB9",
+        )
+        .unwrap();
+        let accounts = AccountProvisioningEvidence::new(
+            binding.clone(),
+            &observer,
+            &recovery,
+            AccountProvisioningEvidence::required_steps().to_vec(),
+        )
+        .unwrap();
+        let enrollment = NativeIdentityEnrollment::new(
+            binding,
+            crate::core::ServerUuid::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            &accounts,
+            true,
+            crate::core::GtidSet::empty(),
+            NativeIdentityEnrollment::required_steps().to_vec(),
+        )
+        .unwrap();
+        MemberMutationAuthority::new(
+            attempt,
+            GroupName::new(config.member().group_uuid()).unwrap(),
+            enrollment,
+        )
+        .unwrap()
     }
 
     fn topology() -> MysqlTopologyConfig {

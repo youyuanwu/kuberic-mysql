@@ -266,6 +266,20 @@ pub enum ControlStage {
     CreateRecovery,
     /// Granting the exact distributed-recovery privileges.
     GrantRecovery,
+    /// Creating one Build-scoped loopback recovery account.
+    CreateBuildRecovery,
+    /// Granting one Build-scoped account only distributed-recovery privileges.
+    GrantBuildRecovery,
+    /// Reading back the exact Build recovery account and grants.
+    InspectBuildRecoveryAccount,
+    /// Removing one Build-scoped recovery account.
+    DropBuildRecovery,
+    /// Proving one Build-scoped recovery account is absent.
+    ProveBuildRecoveryAccountAbsent,
+    /// Proving name resolution is disabled for the Build listener.
+    InspectBuildRecoveryNameResolution,
+    /// Proving the Build listener is bound to exact loopback.
+    InspectBuildRecoveryBindAddress,
     /// Creating the dedicated local application account.
     CreateApplication,
     /// Granting exact qualification-schema DML privileges.
@@ -294,6 +308,8 @@ pub enum ControlStage {
     EnableBootstrap,
     /// Starting Group Replication with in-memory recovery credentials.
     StartGroupReplication,
+    /// Stopping Group Replication during owned Build failure cleanup.
+    StopGroupReplication,
     /// Disabling designated bootstrap mode.
     DisableBootstrap,
     /// Proving that bootstrap mode is disabled.

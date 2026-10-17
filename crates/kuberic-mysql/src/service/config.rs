@@ -387,6 +387,7 @@ pub struct MysqlInstanceConfig {
     runtime: MysqlRuntimePaths,
     topology: Option<MysqlTopologyConfig>,
     member_index: Option<MysqlMemberIndex>,
+    build_recovery_networking: bool,
     timeouts: MysqlOperationTimeouts,
 }
 
@@ -536,8 +537,23 @@ impl MysqlInstanceConfig {
             runtime: MysqlRuntimePaths::new(scratch_root),
             topology,
             member_index,
+            build_recovery_networking: false,
             timeouts,
         })
+    }
+
+    /// Enables the same-process custom-Build recovery listener on owned
+    /// loopback only. Other profiles retain `skip-networking=ON`.
+    #[must_use]
+    pub(crate) fn with_build_recovery_networking(mut self) -> Self {
+        self.build_recovery_networking = true;
+        self
+    }
+
+    /// Whether this member exposes the private Build recovery listener.
+    #[must_use]
+    pub const fn build_recovery_networking(&self) -> bool {
+        self.build_recovery_networking
     }
 
     /// Exact server executable selected by the caller.
@@ -621,6 +637,20 @@ impl MysqlInstanceConfig {
     /// Renders the deterministic exact-target server configuration.
     #[must_use]
     pub fn render_server_config(&self) -> String {
+        let networking_profile = if self.build_recovery_networking {
+            let member = self.member();
+            format!(
+                "bind-address={}\n\
+                 skip-name-resolve=ON\n\
+                 loose-group-replication-recovery-get-public-key=ON\n\
+                 loose-group-replication-recovery-use-ssl=OFF\n\
+                 loose-group-replication-recovery-retry-count=3\n\
+                 loose-group-replication-recovery-reconnect-interval=1\n",
+                member.sql_address.ip(),
+            )
+        } else {
+            "skip-networking=ON\n".to_owned()
+        };
         let (member_profile, group_profile) = self.topology().map_or_else(
             || {
                 (
@@ -669,7 +699,7 @@ impl MysqlInstanceConfig {
              secure-file-priv={}\n\
              log-bin={}\n\
              relay-log={}\n\
-             skip-networking=ON\n\
+             {}\
              mysqlx=OFF\n\
              {}\
              binlog-format=ROW\n\
@@ -690,6 +720,7 @@ impl MysqlInstanceConfig {
             display(&self.runtime.secure_files),
             display(&self.runtime.binary_log),
             display(&self.runtime.relay_log),
+            networking_profile,
             member_profile,
             TOPOLOGY_NATIVE_PROFILE_OPTIONS[..2].join("\n"),
             group_profile,

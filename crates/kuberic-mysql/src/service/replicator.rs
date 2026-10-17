@@ -13,16 +13,19 @@ use crate::core::{
     ConfiguredGtidLineage, GtidSet, MemberRole, MemberState, ProgressProjection, QualifiedProgress,
     ReplicaId, ReplicaIncarnation, ViewId, project_progress,
 };
+use crate::service::kuberic::build::{
+    BuildJoinReceipt, BuildRecoveryAccountReceipt, BuildRecoveryCredential,
+};
 use crate::service::{
     ApplicationAccountReceipt, ApplicationCredential, AttemptAdmissionError,
     AttemptCancellationState, AttemptCleanupState, AttemptContext, AttemptDeadlineState,
-    CanonicalViewId, ControlCredential, ControlCredentialRole, FreshBootstrapInput, FreshJoinInput,
-    MemberConfigurationIntent, MemberConfigurationTarget, MemberContainmentReceipt,
-    MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
-    MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
-    MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary, MysqlProxyAccessGuard,
-    MysqlProxyContainmentReceipt, MysqlProxyControlBoundary, MysqlReplicatorError,
-    PrimaryTransferInput,
+    BuildAttemptContext, CanonicalViewId, ControlCredential, ControlCredentialRole,
+    FreshBootstrapInput, FreshJoinInput, MemberConfigurationIntent, MemberConfigurationTarget,
+    MemberContainmentReceipt, MemberEffectKind, MemberEffectReceipt, MemberEffectRequest,
+    MemberMutationAuthority, MemberNativeEvidence, MemberOperationIdentity, MemberPeer,
+    MemberSourceBoundary, MysqlBuildAbortGeneration, MysqlClientProxy, MysqlInstanceManager,
+    MysqlMemberEffectBoundary, MysqlProxyAccessGuard, MysqlProxyContainmentReceipt,
+    MysqlProxyControlBoundary, MysqlReplicatorError, PrimaryTransferInput,
 };
 
 /// Exact logical identity of one member-local replica incarnation.
@@ -1282,6 +1285,8 @@ where
     terminal: Option<MysqlTerminalState>,
     terminal_outcome: Option<Box<MysqlTerminalOutcome>>,
     fresh_prepared_owner: bool,
+    pending_build: Option<Box<BuildJoinReceipt>>,
+    pending_build_successor: Option<Box<MysqlReplicaConfiguration>>,
     last_operation_generation: u64,
     operations: Vec<OperationRecord>,
 }
@@ -1300,6 +1305,333 @@ where
             self.terminal = Some(MysqlTerminalState::Aborted);
         }
         self.clear_all_credentials();
+    }
+}
+
+impl MysqlReplicator<MysqlInstanceManager> {
+    pub(crate) async fn verify_build_target_fresh(
+        &mut self,
+        build: &BuildAttemptContext,
+    ) -> Result<(), MysqlReplicatorError> {
+        self.require_open_active()?;
+        if self.configuration.is_some()
+            || self.role.is_some()
+            || self.pending_build.is_some()
+            || self.native_evidence.is_some()
+        {
+            return Err(MysqlReplicatorError::InvalidConfiguration);
+        }
+        let authority = self.authority().clone();
+        self.effects
+            .verify_build_target_fresh(&authority, build)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)
+    }
+
+    pub(crate) async fn prepare_build_recovery_account(
+        &mut self,
+        credential: &BuildRecoveryCredential,
+        build: &BuildAttemptContext,
+    ) -> Result<BuildRecoveryAccountReceipt, MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        if self.role != Some(MysqlReplicaRole::Primary) {
+            return Err(MysqlReplicatorError::PrimaryRequired);
+        }
+        let authority = self.authority().clone();
+        self.effects
+            .prepare_build_recovery_account(&authority, credential, build)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)
+    }
+
+    pub(crate) async fn remove_build_recovery_account(
+        &mut self,
+        receipt: &BuildRecoveryAccountReceipt,
+        build: &BuildAttemptContext,
+        cleanup: bool,
+    ) -> Result<(), MysqlReplicatorError> {
+        let authority = self.authority().clone();
+        self.effects
+            .remove_build_recovery_account(&authority, receipt, build, cleanup)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)
+    }
+
+    pub(crate) async fn leave_build_member(
+        &mut self,
+        build: &BuildAttemptContext,
+    ) -> Result<(), MysqlReplicatorError> {
+        let authority = self.authority().clone();
+        self.effects
+            .leave_build_member(&authority, build)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)
+    }
+
+    pub(crate) async fn verify_build_recovery_account(
+        &mut self,
+        receipt: &BuildRecoveryAccountReceipt,
+        expected_present: bool,
+        build: &BuildAttemptContext,
+        cleanup: bool,
+    ) -> Result<(), MysqlReplicatorError> {
+        let authority = self.authority().clone();
+        self.effects
+            .verify_build_recovery_account(&authority, receipt, expected_present, build, cleanup)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)
+    }
+
+    /// Joins an exact fresh target for Build while leaving public
+    /// configuration and role admission pending.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_join(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        configuration: MysqlReplicaConfiguration,
+        source: MemberSourceBoundary,
+        peers: Vec<MemberPeer>,
+        recovery: &BuildRecoveryCredential,
+        build: &BuildAttemptContext,
+        target_generation: u64,
+    ) -> Result<BuildJoinReceipt, MysqlReplicatorError> {
+        self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
+        build.admit_work().map_err(|error| match error {
+            AttemptAdmissionError::Cancelled => MysqlReplicatorError::Cancelled,
+            AttemptAdmissionError::CleanupReserve => {
+                MysqlReplicatorError::Deadline(AttemptDeadlineState::CleanupReserve)
+            }
+            AttemptAdmissionError::Expired => {
+                MysqlReplicatorError::Deadline(AttemptDeadlineState::Expired)
+            }
+        })?;
+        if self.configuration.is_some() || self.role.is_some() || self.pending_build.is_some() {
+            return Err(MysqlReplicatorError::OpenConflict);
+        }
+        let epoch = self
+            .epoch
+            .ok_or(MysqlReplicatorError::EpochBarrierRequired)?;
+        if configuration.epoch != epoch {
+            return Err(MysqlReplicatorError::EpochBarrierRequired);
+        }
+        self.validate_configuration(&configuration)?;
+        let request = MemberEffectRequest::new_for_build(
+            operation.member_identity(),
+            epoch.value(),
+            MysqlReplicaRole::Secondary.native(),
+            Some(configuration.member_intent()),
+            self.authority().clone(),
+            source.clone(),
+        )
+        .map_err(MysqlReplicatorError::MemberTransition)?;
+        let input = FreshJoinInput::for_build_request(request.clone(), source, peers)
+            .map_err(MysqlReplicatorError::MemberTransition)?;
+        let receipt = self
+            .effects
+            .join_build_member(input, recovery, build, target_generation)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)?;
+        self.validate_receipt(receipt.member(), &MemberEffectKind::Join, &request)?;
+        self.validate_evidence(receipt.member().successor())?;
+        self.require_native_role(receipt.member().successor(), MysqlReplicaRole::Secondary)?;
+        self.require_configuration_evidence(&configuration, receipt.member().successor())?;
+        build
+            .admit_work()
+            .map_err(|_| MysqlReplicatorError::Deadline(AttemptDeadlineState::CleanupReserve))?;
+        self.native_evidence = Some(receipt.member().successor().clone());
+        self.pending_build = Some(Box::new(receipt.clone()));
+        self.progress = None;
+        self.close_access();
+        Ok(receipt)
+    }
+
+    pub(crate) fn pending_build(&self) -> Option<&BuildJoinReceipt> {
+        self.pending_build.as_deref()
+    }
+
+    pub(crate) const fn has_pending_build_successor(&self) -> bool {
+        self.pending_build_successor.is_some()
+    }
+
+    pub(crate) async fn refresh_pending_build_progress(
+        &mut self,
+    ) -> Result<MysqlProgressOutcome, MysqlReplicatorError> {
+        let pending = self
+            .pending_build
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?
+            .clone();
+        let joined = pending
+            .member()
+            .request()
+            .cloned()
+            .ok_or(MysqlReplicatorError::ReceiptMismatch)?;
+        let request = MemberEffectRequest::new(
+            joined.operation().clone(),
+            joined.epoch(),
+            joined.role(),
+            joined.configuration().cloned(),
+            joined.authority().clone(),
+            None,
+        )
+        .map_err(MysqlReplicatorError::MemberTransition)?;
+        let receipt = MysqlMemberEffectBoundary::read_member_view(
+            &mut self.effects,
+            request.clone(),
+            &self.attempt,
+        )
+        .await
+        .map_err(MysqlReplicatorError::MemberTransition)?;
+        self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)?;
+        let before = pending.member().successor();
+        let after = receipt.successor();
+        if before.view().members() != after.view().members()
+            || after
+                .view()
+                .member(self.authority().local().member_id())
+                .is_none_or(|member| {
+                    member.role() != MemberRole::Secondary || member.state() != MemberState::Online
+                })
+            || joined
+                .source()
+                .is_some_and(|source| !source.evidence().executed().is_subset_of(after.executed()))
+        {
+            return Err(MysqlReplicatorError::ReceiptMismatch);
+        }
+        let progress = project_progress(&self.lineage, after.executed());
+        if !matches!(progress, ProgressProjection::Projectable(_)) {
+            return Err(MysqlReplicatorError::ReceiptMismatch);
+        }
+        self.native_evidence = Some(after.clone());
+        let outcome = MysqlProgressOutcome {
+            progress,
+            catch_up: CatchUpCapabilityResult::retained_evidence_unavailable(),
+        };
+        self.progress = Some(outcome);
+        Ok(outcome)
+    }
+
+    pub(crate) fn accept_built_secondary_role(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        epoch: MysqlReplicaEpoch,
+    ) -> Result<MysqlRoleOutcome, MysqlReplicatorError> {
+        self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
+        self.admit_work()?;
+        let pending = self
+            .pending_build
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ConfigurationRequired)?
+            .clone();
+        if self.epoch != Some(epoch)
+            || self.role.is_some()
+            || self.role_epoch.is_some()
+            || pending
+                .member()
+                .successor()
+                .view()
+                .member(self.authority().local().member_id())
+                .is_none_or(|member| member.role() != MemberRole::Secondary)
+        {
+            return Err(MysqlReplicatorError::RoleRequired);
+        }
+        let fingerprint = OperationFingerprint::FormationRole(epoch, MysqlReplicaRole::Secondary);
+        let index = match self.begin_operation(operation, fingerprint)? {
+            Admission::Retry(outcome) => return expect_role(outcome),
+            Admission::New(index) => index,
+        };
+        self.role = Some(MysqlReplicaRole::Secondary);
+        self.role_epoch = Some(epoch);
+        let evidence = self
+            .native_evidence
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ReceiptMismatch)?;
+        self.require_native_role(evidence, MysqlReplicaRole::Secondary)?;
+        self.close_access();
+        let outcome = MysqlRoleOutcome {
+            epoch,
+            role: MysqlReplicaRole::Secondary,
+        };
+        self.complete(index, RecordedOutcome::Role(outcome));
+        Ok(outcome)
+    }
+
+    pub(crate) fn accept_built_configuration(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        configuration: MysqlReplicaConfiguration,
+    ) -> Result<MysqlConfigurationOutcome, MysqlReplicatorError> {
+        self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
+        self.admit_work()?;
+        if self.pending_build.is_none() {
+            return Err(MysqlReplicatorError::ConfigurationRequired);
+        }
+        let epoch = self
+            .epoch
+            .ok_or(MysqlReplicatorError::EpochBarrierRequired)?;
+        if configuration.epoch != epoch
+            || self.role != Some(MysqlReplicaRole::Secondary)
+            || self.role_epoch != Some(epoch)
+        {
+            return Err(MysqlReplicatorError::RoleRequired);
+        }
+        self.validate_configuration(&configuration)?;
+        let evidence = self
+            .native_evidence
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ReceiptMismatch)?;
+        self.require_configuration_evidence(&configuration, evidence)?;
+        let fingerprint = OperationFingerprint::Configuration(
+            configuration.clone(),
+            ConfigurationEffect::Observe,
+        );
+        let index = match self.begin_operation(operation, fingerprint)? {
+            Admission::Retry(outcome) => return expect_configuration(outcome),
+            Admission::New(index) => index,
+        };
+        self.configuration = Some(configuration.clone());
+        self.pending_build_successor = None;
+        self.pending_build = None;
+        self.progress = None;
+        self.clear_control_credentials();
+        self.close_access();
+        let outcome = MysqlConfigurationOutcome { configuration };
+        self.complete(index, RecordedOutcome::Configuration(outcome.clone()));
+        Ok(outcome)
+    }
+
+    /// Arms exact ownership for one application Build interruption guard.
+    pub(crate) fn arm_build_abort_generation(
+        &mut self,
+    ) -> Result<MysqlBuildAbortGeneration, MysqlReplicatorError> {
+        let authority = self
+            .authority
+            .clone()
+            .or_else(|| self.owned_authority.clone())
+            .ok_or(MysqlReplicatorError::NotOpen)?;
+        self.effects
+            .arm_build_abort_generation(&authority)
+            .map_err(MysqlReplicatorError::Instance)
+    }
+
+    /// Synchronously retires the exact owned MySQL generation even after an
+    /// operation deadline. This is reserved for an armed application-owned
+    /// Build cleanup guard; it grants no lifecycle completion credit.
+    pub(crate) fn force_retire_owned_generation(
+        &mut self,
+        generation: &MysqlBuildAbortGeneration,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlReplicatorError> {
+        let receipt = self
+            .effects
+            .force_retire_owned_generation(generation)
+            .map_err(MysqlReplicatorError::Instance)?;
+        self.close_access();
+        self.clear_all_credentials();
+        self.terminal = Some(MysqlTerminalState::Aborted);
+        Ok(receipt)
     }
 }
 
@@ -1354,6 +1686,8 @@ where
             terminal: None,
             terminal_outcome: None,
             fresh_prepared_owner: false,
+            pending_build: None,
+            pending_build_successor: None,
             last_operation_generation: 0,
             operations: Vec::new(),
         })
@@ -1369,6 +1703,15 @@ where
     #[must_use]
     pub const fn attempt(&self) -> &AttemptContext {
         &self.attempt
+    }
+
+    pub(crate) fn current_member_authority(
+        &self,
+    ) -> Result<MemberMutationAuthority, MysqlReplicatorError> {
+        self.authority
+            .clone()
+            .or_else(|| self.owned_authority.clone())
+            .ok_or(MysqlReplicatorError::NotOpen)
     }
 
     /// Current accepted epoch.
@@ -1464,6 +1807,24 @@ where
             evidence,
         )
         .map_err(MysqlReplicatorError::MemberTransition)
+    }
+
+    pub(crate) fn retains_complete_build_history(
+        &self,
+        boundary: &MemberSourceBoundary,
+    ) -> Result<(bool, bool), MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        let evidence = self
+            .native_evidence
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ReceiptMismatch)?;
+        Ok((
+            boundary
+                .evidence()
+                .executed()
+                .is_subset_of(evidence.executed()),
+            evidence.purged().entries().is_empty(),
+        ))
     }
 
     /// Credits open only from an exact identity, member, attempt, and credential receipt.
@@ -1696,6 +2057,43 @@ where
             },
         )
         .await
+    }
+
+    /// Observes the exact native successor view created by Build while keeping
+    /// the previously admitted Kuberic configuration current.
+    pub(crate) async fn observe_build_successor(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        successor: MysqlReplicaConfiguration,
+    ) -> Result<(), MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        self.admit_work()?;
+        if self.pending_build_successor.is_some() {
+            if self.pending_build_successor.as_deref() == Some(&successor) {
+                return Ok(());
+            }
+            return Err(MysqlReplicatorError::OperationConflict);
+        }
+        let epoch = self.epoch.expect("current configuration has an epoch");
+        let role = self.role.expect("current configuration has a role");
+        let request = self.effect_request(
+            &operation,
+            epoch,
+            role,
+            Some(successor.member_intent()),
+            None,
+        )?;
+        let receipt = self
+            .effects
+            .read_member_view(request.clone(), &self.attempt)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)?;
+        self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)?;
+        self.require_configuration_evidence(&successor, receipt.successor())?;
+        self.native_evidence = Some(receipt.successor().clone());
+        self.pending_build_successor = Some(Box::new(successor));
+        self.progress = None;
+        Ok(())
     }
 
     /// Reads exact native evidence and projects current progress independently of catch-up.
@@ -2707,6 +3105,7 @@ where
             return self.contain_configuration_failure(Some(index), error);
         }
         self.configuration = Some(configuration.clone());
+        self.pending_build_successor = None;
         if let Some(handoff) = self.source_handoff.as_mut() {
             handoff.configuration_accepted = true;
         }
@@ -2868,8 +3267,9 @@ where
             .role
             .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
         let configuration = self
-            .configuration
-            .as_ref()
+            .pending_build_successor
+            .as_deref()
+            .or(self.configuration.as_ref())
             .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
         self.effect_request(
             operation,
@@ -2913,8 +3313,9 @@ where
             .role
             .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
         let configuration = self
-            .configuration
-            .as_ref()
+            .pending_build_successor
+            .as_deref()
+            .or(self.configuration.as_ref())
             .ok_or(MysqlReplicatorError::ConfigurationRequired)?;
         self.validate_evidence(evidence)
             .and_then(|()| self.require_native_role(evidence, role))

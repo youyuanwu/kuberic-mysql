@@ -13,7 +13,7 @@ ownership and attempt context. The normal crate surface translates the exact
 pinned public callback bundle into one such member-local
 engine for fresh initial-primary bootstrap and already-formed planned
 transitions. It does not claim restart continuation, durable effect recovery,
-survivor adoption, Build/reseed, Kuberic-created three-member formation,
+survivor adoption, Clone/reseed, production-controller custom-Build dispatch,
 automated failover, repair, or Kubernetes integration.
 
 The delivered `kuberic_mysql::adapter` module already satisfies the
@@ -32,11 +32,14 @@ fixture reset even if surviving MySQL state appears healthy.
 
 The delivered adapter translates public replica/process/storage/epoch/role/
 configuration/progress/access values from `kuberic-runtime` commit
-`ceec5887ad97d71222117610428ce715b782777e` into the one-member MySQL engine.
+`f56949996b366b14c925339ac2e859ca2fbaf637` into the one-member MySQL engine.
 The fixed three-member manager and three-engine handoff fixture remain
 qualification infrastructure. Runtime correctness does not depend on a
 private MySQL lifecycle, observation, access, evidence, or receipt capability;
 signed Build/peer authorization and durable public completion remain external.
+The direct custom callback can build a fresh idle secondary while the process
+retains all participants and request authority in memory; interruption after a
+native effect requires reset rather than private effect recovery.
 
 The fresh-topology manager owns its monotonic clock and one absolute attempt
 deadline. Callers cannot replay, regress, or independently extend operation
@@ -45,6 +48,16 @@ deadline is derived beneath the attempt bound. Qualified XCom views are
 accepted only as the exact `<fixed u64>:<monotonic u32 + 1>` successor for a
 join, so foreign join/leave churn or member loss/rejoin cannot receive credit
 merely because final membership looks correct.
+
+The custom Build registry, complete retry ledger, cleanup ownership, retained
+replica progress, and pending-admission state are memory-only. Active
+configuration input may omit current progress only when the exact
+replica/process-session/storage-incarnation observation is retained. Omitted
+catch-up capability normally reuses the exact retained field; explicit current
+progress with `must_catchup=false` may establish a first known-unknown
+capability. Required unknown capability, first-seen omitted current progress,
+and every cross-binding reuse fail closed before admission. Rejected input
+does not mutate retained progress.
 
 Bootstrap cancellation remains restart-stateless but not uncontained. After
 any bootstrap-enable attempt, bootstrap-off and proof are attempted. If the
@@ -460,7 +473,9 @@ pre-epoch cache, proxy registry, and native owner. `OpenMode::Existing` is
 therefore rejected rather than reconstructing authority from a data root or
 replication endpoint. Kuberic may replay this stage only by retiring/resetting
 the fresh attempt; no callback is credited from surviving `mysqld` state.
-Signed authorization, Build/reseed, and durable continuation remain external.
+The delivered direct custom Build is process-local and exact-retry-bound;
+production-controller custom-Build authority, Clone/reseed, and durable
+continuation remain external.
 MySQL must not emulate missing public fields or durable completion proof with
 an application-owned store, a private runtime capability, or a compatibility
 progress marker.
@@ -858,10 +873,10 @@ effective while disconnected.
    repository-owned live fixture.
 5. Translate the pinned Public V1 trait bundle into one fresh member owner,
    including exact public fence translation, initial-primary bootstrap,
-   pre-epoch boundary caching, already-formed planned-transition callbacks,
-   and runtime-authority publication with fresh local revalidation. This is
-   part of the normal adapter surface; it does not implement Build/reseed or
-   create the other members.
+   fresh-secondary direct custom Build, pre-epoch boundary caching,
+   already-formed planned-transition callbacks, and runtime-authority
+   publication with fresh local revalidation. Build uses only Group Replication
+   distributed recovery and keeps membership/access admission separate.
 6. Permit component replacement only while a surviving fixture host retains
    exact ownership context and proves effective closure and that no mutation is
    pending. This remains unsupported; the delivered engine does not adopt or
@@ -870,8 +885,9 @@ effective while disconnected.
    fixture reset regardless of apparently healthy MySQL state.
 
 Items 1 through 5 and the reset rule in item 7 are delivered for the bounded
-host-local stage. Component replacement in item 6, native Build/reseed, signed
-peer execution, and restart-resumable effect continuation remain future work.
+host-local stage. Component replacement in item 6, production-controller
+custom-Build dispatch, Clone/reseed, and restart-resumable effect continuation
+remain future work.
 
 ### Phase 3: Generic durable continuation
 
@@ -903,8 +919,9 @@ The delivered adapter makes no claim that its in-memory callback ledger,
 mapped epoch ordinal, opaque replication endpoint, cached pre-epoch boundary,
 proxy address, native receipt, or terminal outcome can be replayed after
 process loss. It makes no claim of `OpenMode::Existing`, fresh secondary
-admission, Build/reseed, Remove, data-loss recovery, non-projectable catch-up,
-automated failover, or Kuberic-created three-member formation. None of those
+adoption, Clone/reseed, Remove, data-loss recovery, non-projectable catch-up,
+automated failover, controller-dispatched custom Build, or durable interrupted
+Build recovery. None of those
 gaps authorizes a MySQL-private durable metadata file.
 
 Ordinary formed lifecycle programs complete Epoch -> Role -> Configuration.
@@ -912,9 +929,10 @@ Controller-composed source swap completes Revoke -> Epoch -> refreshed
 Configuration staging -> CatchUp -> Role/native transfer -> application Role,
 without inventing a previous-configuration callback. Target pre-source
 Epoch -> Primary Role -> Configuration is retained as fenced intent and remains
-pending until a later native view proves the external transfer. Identical
-configuration replay refreshes peer progress without changing the original
-native-effect identity, but a refreshed local Primary also retries its separate
+pending until a later native view proves the external transfer.
+Binding-preserving monotonic progress refresh, including omissions resolving
+to retained values, preserves the original native-effect identity; regressions
+or binding changes conflict. A refreshed local Primary also retries its separate
 fixed-port proxy publication obligation before success; already-published
 state is idempotent. Every catch-up wait with a current engine
 configuration captures a fresh qualified boundary; only the deliberate
