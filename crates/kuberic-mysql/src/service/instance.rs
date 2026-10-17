@@ -512,22 +512,31 @@ impl MysqlInstanceManager {
         authority: &MemberMutationAuthority,
         receipt: &BuildRecoveryAccountReceipt,
         build: &BuildAttemptContext,
+        cleanup: bool,
     ) -> Result<(), MemberTransitionError> {
         if receipt.build() != build.build() {
             return Err(MemberTransitionError::Authority(
                 MemberAuthorityError::AttemptMismatch,
             ));
         }
-        build
-            .admit_cleanup()
-            .map_err(member_attempt_admission_error)?;
+        if cleanup {
+            build
+                .admit_cleanup()
+                .map_err(member_attempt_admission_error)?;
+        } else {
+            build.admit_work().map_err(member_attempt_admission_error)?;
+        }
         self.revalidate_member_effect_binding(authority)?;
         let target = self.prepare_control_target()?;
         crate::service::control::remove_build_recovery_account(
             target,
             authority,
             receipt,
-            build.deadline(),
+            if cleanup {
+                build.deadline()
+            } else {
+                build.work_deadline()
+            },
         )
         .await
         .map_err(MemberTransitionError::Native)
@@ -539,10 +548,15 @@ impl MysqlInstanceManager {
         receipt: &BuildRecoveryAccountReceipt,
         expected_present: bool,
         build: &BuildAttemptContext,
+        cleanup: bool,
     ) -> Result<(), MemberTransitionError> {
-        build
-            .admit_cleanup()
-            .map_err(member_attempt_admission_error)?;
+        if cleanup {
+            build
+                .admit_cleanup()
+                .map_err(member_attempt_admission_error)?;
+        } else {
+            build.admit_work().map_err(member_attempt_admission_error)?;
+        }
         self.revalidate_member_effect_binding(authority)?;
         let target = self.prepare_control_target()?;
         crate::service::control::verify_build_recovery_account(
@@ -550,7 +564,11 @@ impl MysqlInstanceManager {
             authority,
             receipt,
             expected_present,
-            build.deadline(),
+            if cleanup {
+                build.deadline()
+            } else {
+                build.work_deadline()
+            },
         )
         .await
         .map_err(MemberTransitionError::Native)
@@ -641,6 +659,7 @@ impl MysqlInstanceManager {
                     build_cross_parent: false,
                 },
                 attempt,
+                None,
                 &deadline,
             )
             .await
@@ -677,6 +696,7 @@ impl MysqlInstanceManager {
                     build_cross_parent: false,
                 },
                 attempt,
+                None,
                 &deadline,
             )
             .await
@@ -722,6 +742,7 @@ impl MysqlInstanceManager {
                     build_cross_parent: true,
                 },
                 parent,
+                Some(build),
                 &deadline,
             )
             .await?;
@@ -824,6 +845,7 @@ impl MysqlInstanceManager {
                     build_cross_parent: false,
                 },
                 attempt,
+                None,
                 &deadline,
             )
             .await
@@ -1748,6 +1770,7 @@ async fn poll_member_receipt(
     kind: MemberEffectKind,
     context: MemberReceiptContext,
     attempt: &AttemptContext,
+    build: Option<&BuildAttemptContext>,
     deadline: &NativeControlDeadline,
 ) -> Result<MemberEffectReceipt, MemberTransitionError> {
     let MemberReceiptContext {
@@ -1762,9 +1785,13 @@ async fn poll_member_receipt(
         AttemptCleanupState::NotRequired
     };
     loop {
-        attempt
-            .admit_work()
-            .map_err(member_attempt_admission_error)?;
+        if let Some(build) = build {
+            build.admit_work().map_err(member_attempt_admission_error)?;
+        } else {
+            attempt
+                .admit_work()
+                .map_err(member_attempt_admission_error)?;
+        }
         let evidence =
             crate::service::control::read_member_view(target.clone(), &authority, deadline).await?;
         let final_binding = containment.revalidate_binding(&authority)?;
@@ -1808,11 +1835,13 @@ async fn poll_member_receipt(
             Ok(receipt) => return Ok(receipt),
             Err(MemberTransitionError::Receipt(
                 crate::service::MemberReceiptError::SuccessorMismatch,
-            ))
-            | Err(MemberTransitionError::View(
+            )) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(MemberTransitionError::View(
                 crate::service::MemberViewError::MemberNotOnline
                 | crate::service::MemberViewError::MemberRoleMismatch,
-            )) => {
+            )) if build.is_none() => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(error) => return Err(error),

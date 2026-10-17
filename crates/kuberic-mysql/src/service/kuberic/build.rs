@@ -15,6 +15,7 @@ use zeroize::Zeroize;
 
 use crate::core::AttemptId;
 use crate::core::CredentialGeneration;
+use crate::core::StorageBinding;
 use crate::service::{
     BuildAttemptContext, BuildAttemptGroup, MemberEffectReceipt, MemberMutationAuthority,
     MemberSourceBoundary, MysqlReplicaTarget, MysqlReplicatorError,
@@ -86,6 +87,7 @@ pub(crate) struct BuildSourceBinding {
     pub(crate) identity: ReplicaIdentity,
     pub(crate) process_session: ProcessSessionId,
     pub(crate) replication_address: String,
+    pub(crate) public_storage: StorageBinding,
     pub(crate) native: MysqlReplicaTarget,
 }
 
@@ -97,7 +99,7 @@ pub(crate) struct BuildCallbackKey {
     pub(crate) group_key: String,
     pub(crate) source_identity: ReplicaIdentity,
     pub(crate) source_process_session: ProcessSessionId,
-    pub(crate) source_configuration: ReplicaSetConfiguration,
+    pub(crate) source_configuration: Box<ReplicaSetConfiguration>,
     pub(crate) source_authority: MemberMutationAuthority,
     pub(crate) source_boundary: MemberSourceBoundary,
     pub(crate) source_progress: i64,
@@ -117,6 +119,7 @@ pub(crate) struct BuildBinding {
     pub(crate) configuration: ConfigurationId,
     pub(crate) group_key: String,
     pub(crate) source: BuildSourceBinding,
+    pub(crate) source_configuration: Box<ReplicaSetConfiguration>,
     pub(crate) target: BuildTargetBinding,
     pub(crate) source_authority: MemberMutationAuthority,
     pub(crate) expected_members: Vec<ReplicaIdentity>,
@@ -747,6 +750,14 @@ impl BuildSourceCleanup {
         self.native_effect = true;
     }
 
+    pub(crate) const fn can_replicate_cleanup_after_leave(&self) -> bool {
+        self.predecessor_members >= 2
+    }
+
+    pub(crate) const fn has_native_effect(&self) -> bool {
+        self.native_effect
+    }
+
     pub(crate) fn block_for_reset(&mut self) {
         self.source_generation
             .set(BuildGenerationStatus::CleanupOnly);
@@ -806,7 +817,7 @@ impl Drop for BuildSourceCleanup {
         };
         // One surviving member in a two-member view cannot safely commit the
         // replicated DROP. The fixture remains blocked for reset.
-        if self.predecessor_members < 2 {
+        if self.native_effect && self.predecessor_members < 2 {
             if let Some(permit) = self.permit.as_mut() {
                 permit.block_for_reset();
             }
@@ -846,7 +857,7 @@ impl Drop for BuildSourceCleanup {
                         break;
                     };
                     if let Err(error) = donor
-                        .verify_direct_build_account(&account, false, &group, callback)
+                        .verify_direct_build_account(&account, false, &group, callback, true)
                         .await
                     {
                         result = Err(error);

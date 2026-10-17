@@ -1348,10 +1348,11 @@ impl MysqlReplicator<MysqlInstanceManager> {
         &mut self,
         receipt: &BuildRecoveryAccountReceipt,
         build: &BuildAttemptContext,
+        cleanup: bool,
     ) -> Result<(), MysqlReplicatorError> {
         let authority = self.authority().clone();
         self.effects
-            .remove_build_recovery_account(&authority, receipt, build)
+            .remove_build_recovery_account(&authority, receipt, build, cleanup)
             .await
             .map_err(MysqlReplicatorError::MemberTransition)
     }
@@ -1372,10 +1373,11 @@ impl MysqlReplicator<MysqlInstanceManager> {
         receipt: &BuildRecoveryAccountReceipt,
         expected_present: bool,
         build: &BuildAttemptContext,
+        cleanup: bool,
     ) -> Result<(), MysqlReplicatorError> {
         let authority = self.authority().clone();
         self.effects
-            .verify_build_recovery_account(&authority, receipt, expected_present, build)
+            .verify_build_recovery_account(&authority, receipt, expected_present, build, cleanup)
             .await
             .map_err(MysqlReplicatorError::MemberTransition)
     }
@@ -1516,6 +1518,8 @@ impl MysqlReplicator<MysqlInstanceManager> {
         epoch: MysqlReplicaEpoch,
     ) -> Result<MysqlRoleOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
+        self.ensure_proxy_not_published()?;
+        self.admit_work()?;
         let pending = self
             .pending_build
             .as_ref()
@@ -1540,7 +1544,11 @@ impl MysqlReplicator<MysqlInstanceManager> {
         };
         self.role = Some(MysqlReplicaRole::Secondary);
         self.role_epoch = Some(epoch);
-        self.native_evidence = Some(pending.member().successor().clone());
+        let evidence = self
+            .native_evidence
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ReceiptMismatch)?;
+        self.require_native_role(evidence, MysqlReplicaRole::Secondary)?;
         self.close_access();
         let outcome = MysqlRoleOutcome {
             epoch,
@@ -1556,11 +1564,11 @@ impl MysqlReplicator<MysqlInstanceManager> {
         configuration: MysqlReplicaConfiguration,
     ) -> Result<MysqlConfigurationOutcome, MysqlReplicatorError> {
         self.require_open_active()?;
-        let pending = self
-            .pending_build
-            .as_ref()
-            .ok_or(MysqlReplicatorError::ConfigurationRequired)?
-            .clone();
+        self.ensure_proxy_not_published()?;
+        self.admit_work()?;
+        if self.pending_build.is_none() {
+            return Err(MysqlReplicatorError::ConfigurationRequired);
+        }
         let epoch = self
             .epoch
             .ok_or(MysqlReplicatorError::EpochBarrierRequired)?;
@@ -1571,7 +1579,11 @@ impl MysqlReplicator<MysqlInstanceManager> {
             return Err(MysqlReplicatorError::RoleRequired);
         }
         self.validate_configuration(&configuration)?;
-        self.require_configuration_evidence(&configuration, pending.member().successor())?;
+        let evidence = self
+            .native_evidence
+            .as_ref()
+            .ok_or(MysqlReplicatorError::ReceiptMismatch)?;
+        self.require_configuration_evidence(&configuration, evidence)?;
         let fingerprint = OperationFingerprint::Configuration(
             configuration.clone(),
             ConfigurationEffect::Observe,
@@ -1582,9 +1594,9 @@ impl MysqlReplicator<MysqlInstanceManager> {
         };
         self.configuration = Some(configuration.clone());
         self.pending_build_successor = None;
-        self.native_evidence = Some(pending.member().successor().clone());
         self.pending_build = None;
         self.progress = None;
+        self.clear_control_credentials();
         self.close_access();
         let outcome = MysqlConfigurationOutcome { configuration };
         self.complete(index, RecordedOutcome::Configuration(outcome.clone()));
@@ -1797,13 +1809,22 @@ where
         .map_err(MysqlReplicatorError::MemberTransition)
     }
 
-    pub(crate) fn retains_complete_build_history(&self) -> Result<bool, MysqlReplicatorError> {
+    pub(crate) fn retains_complete_build_history(
+        &self,
+        boundary: &MemberSourceBoundary,
+    ) -> Result<(bool, bool), MysqlReplicatorError> {
         self.require_current_configuration()?;
         let evidence = self
             .native_evidence
             .as_ref()
             .ok_or(MysqlReplicatorError::ReceiptMismatch)?;
-        Ok(evidence.purged().entries().is_empty())
+        Ok((
+            boundary
+                .evidence()
+                .executed()
+                .is_subset_of(evidence.executed()),
+            evidence.purged().entries().is_empty(),
+        ))
     }
 
     /// Credits open only from an exact identity, member, attempt, and credential receipt.

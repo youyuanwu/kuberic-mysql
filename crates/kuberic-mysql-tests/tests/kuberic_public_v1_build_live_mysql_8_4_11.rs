@@ -38,19 +38,38 @@ use live_support::{
 
 const GROUP_UUID: &str = "b5a47b3f-bf9f-4c7c-8420-495d5a52cb09";
 
-#[tokio::test(flavor = "current_thread")]
-async fn custom_primary_builds_two_fresh_secondaries() {
-    run_custom_build_fixture(false, false).await;
+#[test]
+fn custom_primary_builds_two_fresh_secondaries() {
+    run_live_fixture(false, false);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn custom_primary_builds_two_fresh_secondaries_with_omitted_progress() {
-    run_custom_build_fixture(false, true).await;
+#[test]
+fn custom_primary_builds_two_fresh_secondaries_with_omitted_progress() {
+    run_live_fixture(false, true);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn custom_second_build_drop_is_contained() {
-    run_custom_build_fixture(true, false).await;
+#[test]
+fn custom_second_build_drop_is_contained() {
+    run_live_fixture(true, false);
+}
+
+fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
+    std::thread::Builder::new()
+        .name("mysql-public-build-live".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_custom_build_fixture(
+                    interrupt_second,
+                    omit_source_progress,
+                ));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: bool) {
@@ -115,8 +134,18 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
                 .unwrap(),
         );
         assert_tcp_login_rejected(sql[index], "root", None).await;
-        assert_tcp_login_rejected(sql[index], &format!("kms_obs_{index}"), None).await;
-        assert_tcp_login_rejected(sql[index], &format!("kms_rec_{index}"), None).await;
+        assert_tcp_login_rejected(
+            sql[index],
+            &format!("kms_obs_{index}"),
+            Some(&format!("ObserverSecret{index}A7")),
+        )
+        .await;
+        assert_tcp_login_rejected(
+            sql[index],
+            &format!("kms_rec_{index}"),
+            Some(&format!("RecoverySecret{index}B9")),
+        )
+        .await;
         assert_tcp_login_rejected(sql[index], &format!("kms_app_{index}"), None).await;
     }
     drivers[0].update_epoch(epoch).await.unwrap();
@@ -182,6 +211,18 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
             );
             wait_for_build_accounts_removed(&instance_socket(&root, 0)).await;
             wait_for_build_accounts_removed(&instance_socket(&root, 1)).await;
+            let same_request = idle_information(
+                target,
+                OperationId::new(format!("direct-build-{target}")),
+                &drivers,
+                &identities,
+                &sessions,
+                &storage,
+            );
+            assert!(matches!(
+                Box::pin(drivers[0].build_replica(same_request)).await,
+                Err(RuntimeError::InvalidReplication(_))
+            ));
             let retry = idle_information(
                 target,
                 OperationId::new("direct-build-2-retry"),
@@ -191,7 +232,7 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
                 &storage,
             );
             assert!(matches!(
-                drivers[0].build_replica(retry).await,
+                Box::pin(drivers[0].build_replica(retry)).await,
                 Err(RuntimeError::InvalidReplication(_))
             ));
             drivers[1].close().await.unwrap();
@@ -199,10 +240,12 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
             fixture.remove().unwrap();
             return;
         }
-        drivers[0].build_replica(build.clone()).await.unwrap();
+        Box::pin(drivers[0].build_replica(build.clone()))
+            .await
+            .unwrap();
         // A terminal exact retry is served from the retained complete
         // binding, but only after fresh Primary/authority/boundary proof.
-        drivers[0].build_replica(build).await.unwrap();
+        Box::pin(drivers[0].build_replica(build)).await.unwrap();
         let source_gtids = query_gtids(&instance_socket(&root, 0)).await;
         let target_gtids = query_gtids(&instance_socket(&root, target)).await;
         assert!(!source_gtids.entries().is_empty());

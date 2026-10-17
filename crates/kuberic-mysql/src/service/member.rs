@@ -1361,19 +1361,39 @@ fn validate_receipt(
                         .and_then(|after| before.require_successor(after))
                 })
                 .map_err(MemberTransitionError::View)?;
-            if successor.view().members().len() != predecessor.view().members().len() + 1
-                || successor
-                    .view()
-                    .member(authority.local().member_id())
-                    .is_none_or(|member| {
-                        member.address() != authority.local().binding().member_address()
-                            || member.role() != MemberRole::Secondary
-                            || member.state() != MemberState::Online
-                    })
-            {
+            if successor.view().members().len() != predecessor.view().members().len() + 1 {
                 return Err(MemberTransitionError::Receipt(
                     MemberReceiptError::SuccessorMismatch,
                 ));
+            }
+            let local = successor
+                .view()
+                .member(authority.local().member_id())
+                .ok_or(MemberTransitionError::View(
+                    MemberViewError::RequiredMemberMissing,
+                ))?;
+            if local.address() != authority.local().binding().member_address() {
+                return Err(MemberTransitionError::View(
+                    MemberViewError::MemberAddressMismatch,
+                ));
+            }
+            if local.role() != MemberRole::Secondary {
+                return Err(MemberTransitionError::View(
+                    MemberViewError::MemberRoleMismatch,
+                ));
+            }
+            match local.state() {
+                MemberState::Online => {}
+                MemberState::Recovering => {
+                    return Err(MemberTransitionError::Receipt(
+                        MemberReceiptError::SuccessorMismatch,
+                    ));
+                }
+                MemberState::Offline | MemberState::Error | MemberState::Unreachable => {
+                    return Err(MemberTransitionError::View(
+                        MemberViewError::MemberNotOnline,
+                    ));
+                }
             }
             validate_predecessors(predecessor, successor, None)?;
         }

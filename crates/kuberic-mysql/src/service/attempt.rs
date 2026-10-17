@@ -367,7 +367,7 @@ impl BuildAttemptGroup {
         &self,
         parent: AttemptContext,
     ) -> Result<BuildAttemptContext, AttemptAdmissionError> {
-        if self.deadline > parent.deadline() {
+        if self.deadline > parent.deadline() || self.work_deadline > parent.work_deadline() {
             return Err(AttemptAdmissionError::Expired);
         }
 
