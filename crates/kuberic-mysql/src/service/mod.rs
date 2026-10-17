@@ -53,7 +53,7 @@ mod topology;
 
 pub use attempt::{
     AttemptAdmissionError, AttemptCancellationState, AttemptCleanupState, AttemptContext,
-    AttemptDeadlineState, PairedAttemptOutcome,
+    AttemptDeadlineState, BuildAttemptContext, BuildAttemptGroup, PairedAttemptOutcome,
 };
 pub use config::{
     MysqlInstanceConfig, MysqlMemberConfig, MysqlMemberIndex, MysqlOperationTimeouts,
@@ -67,13 +67,14 @@ pub use error::{
     ProductError, TopologyAuthorityError, TopologyEvidenceError, TopologyGtidError,
     TopologyNativeStateError, TopologyStateError,
 };
+pub(crate) use instance::MysqlBuildAbortGeneration;
 pub use instance::{MysqlInstanceManager, MysqlInstanceState};
 pub use kuberic::{
     CallbackOperationLedger, EpochTranslator, KubericTranslationError, MysqlPublicV1Replicator,
     MysqlPublicV1ReplicatorFactory, MysqlPublicV1Service, MysqlPublicV1ServiceConfig,
-    ReplicationEndpoint, TranslationResult, translate_process_session_id,
-    translate_replica_identity, translate_replica_information, translate_replica_set_configuration,
-    translate_role, translate_storage_binding,
+    ReplicationEndpoint, TranslationResult, translate_build_replica_information,
+    translate_process_session_id, translate_replica_identity, translate_replica_information,
+    translate_replica_set_configuration, translate_role, translate_storage_binding,
 };
 pub use member::{
     BackendConnectionId, BackendConnectionReceipt, CanonicalViewId, FreshBootstrapInput,

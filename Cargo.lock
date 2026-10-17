@@ -836,6 +836,7 @@ dependencies = [
  "mysql_async",
  "rustix",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -853,7 +854,7 @@ dependencies = [
 [[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic?rev=ceec5887ad97d71222117610428ce715b782777e#ceec5887ad97d71222117610428ce715b782777e"
+source = "git+https://github.com/youyuanwu/kuberic?rev=9eaac46cac5fa674f17c2082918186a9bafeef67#9eaac46cac5fa674f17c2082918186a9bafeef67"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2035,6 +2036,12 @@ dependencies = [
  "syn 3.0.6",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zerotrie"

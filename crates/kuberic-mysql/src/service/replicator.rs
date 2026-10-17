@@ -20,9 +20,9 @@ use crate::service::{
     MemberConfigurationIntent, MemberConfigurationTarget, MemberContainmentReceipt,
     MemberEffectKind, MemberEffectReceipt, MemberEffectRequest, MemberMutationAuthority,
     MemberNativeEvidence, MemberOperationIdentity, MemberPeer, MemberSourceBoundary,
-    MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary, MysqlProxyAccessGuard,
-    MysqlProxyContainmentReceipt, MysqlProxyControlBoundary, MysqlReplicatorError,
-    PrimaryTransferInput,
+    MysqlBuildAbortGeneration, MysqlClientProxy, MysqlInstanceManager, MysqlMemberEffectBoundary,
+    MysqlProxyAccessGuard, MysqlProxyContainmentReceipt, MysqlProxyControlBoundary,
+    MysqlReplicatorError, PrimaryTransferInput,
 };
 
 /// Exact logical identity of one member-local replica incarnation.
@@ -1300,6 +1300,41 @@ where
             self.terminal = Some(MysqlTerminalState::Aborted);
         }
         self.clear_all_credentials();
+    }
+}
+
+impl MysqlReplicator<MysqlInstanceManager> {
+    /// Arms exact ownership for one application Build interruption guard.
+    #[allow(dead_code)]
+    pub(crate) fn arm_build_abort_generation(
+        &mut self,
+    ) -> Result<MysqlBuildAbortGeneration, MysqlReplicatorError> {
+        let authority = self
+            .authority
+            .clone()
+            .or_else(|| self.owned_authority.clone())
+            .ok_or(MysqlReplicatorError::NotOpen)?;
+        self.effects
+            .arm_build_abort_generation(&authority)
+            .map_err(MysqlReplicatorError::Instance)
+    }
+
+    /// Synchronously retires the exact owned MySQL generation even after an
+    /// operation deadline. This is reserved for an armed application-owned
+    /// Build cleanup guard; it grants no lifecycle completion credit.
+    #[allow(dead_code)]
+    pub(crate) fn force_retire_owned_generation(
+        &mut self,
+        generation: &MysqlBuildAbortGeneration,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlReplicatorError> {
+        let receipt = self
+            .effects
+            .force_retire_owned_generation(generation)
+            .map_err(MysqlReplicatorError::Instance)?;
+        self.close_access();
+        self.clear_all_credentials();
+        self.terminal = Some(MysqlTerminalState::Aborted);
+        Ok(receipt)
     }
 }
 

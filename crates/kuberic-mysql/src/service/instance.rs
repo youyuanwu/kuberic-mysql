@@ -48,6 +48,7 @@ use crate::service::{
 
 const READY_POLL: Duration = Duration::from_millis(25);
 static CLEANUP_SERIAL: AtomicU64 = AtomicU64::new(1);
+static INSTANCE_OWNER_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 /// Explicit state of the sole in-memory process generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,20 +82,35 @@ pub struct MysqlInstanceManager {
     child: Option<Child>,
     data_root: Option<OwnedRoot>,
     scratch_root: Option<OwnedRoot>,
+    owner_generation: u64,
     process_generation: u64,
     cleanup_quarantined: bool,
+}
+
+/// Unforgeable in-process ownership token for one exact MySQL child generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MysqlBuildAbortGeneration {
+    process_generation: u64,
+    owner_generation: u64,
+    process_id: Option<u32>,
+    server_id: u32,
+    group_uuid: String,
+    sql_address: std::net::SocketAddr,
+    group_replication_address: std::net::SocketAddr,
+    authority: MemberMutationAuthority,
 }
 
 impl MysqlInstanceManager {
     /// Creates a manager without touching the configured fresh roots.
     #[must_use]
-    pub const fn new(config: MysqlInstanceConfig) -> Self {
+    pub fn new(config: MysqlInstanceConfig) -> Self {
         Self {
             config,
             state: MysqlInstanceState::Configured,
             child: None,
             data_root: None,
             scratch_root: None,
+            owner_generation: INSTANCE_OWNER_SERIAL.fetch_add(1, Ordering::Relaxed),
             process_generation: 0,
             cleanup_quarantined: false,
         }
@@ -1207,6 +1223,143 @@ impl MysqlInstanceManager {
         Ok(())
     }
 
+    /// Arms exact in-process ownership for one Build generation.
+    #[allow(dead_code)]
+    pub(crate) fn arm_build_abort_generation(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<MysqlBuildAbortGeneration, MysqlInstanceError> {
+        self.revalidate_member_effect_binding(authority)
+            .map_err(map_containment_binding_error)?;
+        Ok(MysqlBuildAbortGeneration {
+            process_generation: self.process_generation,
+            owner_generation: self.owner_generation,
+            process_id: self.child.as_ref().map(Child::id),
+            server_id: self.config.member().server_id(),
+            group_uuid: self.config.member().group_uuid().to_owned(),
+            sql_address: self.config.member().sql_address(),
+            group_replication_address: self.config.member().group_replication_address(),
+            authority: authority.clone(),
+        })
+    }
+
+    /// Mechanically retires the armed generation without consulting an
+    /// operation deadline. Late evidence still receives no lifecycle credit.
+    #[allow(dead_code)]
+    pub(crate) fn force_retire_owned_generation(
+        &mut self,
+        generation: &MysqlBuildAbortGeneration,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
+        if generation.owner_generation != self.owner_generation
+            || generation.process_generation != self.process_generation
+            || generation.process_id != self.child.as_ref().map(Child::id)
+            || generation.server_id != self.config.member().server_id()
+            || generation.group_uuid != self.config.member().group_uuid()
+            || generation.sql_address != self.config.member().sql_address()
+            || generation.group_replication_address
+                != self.config.member().group_replication_address()
+        {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::RootMismatch,
+            ));
+        }
+
+        let mut complete = true;
+        if let Some(child) = self.child.as_mut() {
+            if terminate_and_reap(child, self.config.timeouts().shutdown()).is_err() {
+                complete = false;
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                self.child = None;
+            } else {
+                complete = false;
+            }
+        }
+
+        let pid_absent =
+            exact_path_absent(self.config.runtime().pid(), LifecycleOperation::Shutdown)
+                .unwrap_or(false);
+        let socket_absent = exact_path_absent(
+            self.config.runtime().socket(),
+            LifecycleOperation::SocketDisappearance,
+        )
+        .unwrap_or(false);
+        if self.child.is_none() {
+            if self.revalidate_roots().is_ok() && !self.cleanup_quarantined {
+                if let Some(scratch) = self.scratch_root.as_ref() {
+                    if remove_owned_root(scratch, LifecycleOperation::ScratchCleanup).is_ok() {
+                        self.scratch_root = None;
+                    } else {
+                        complete = false;
+                    }
+                }
+            } else {
+                complete = false;
+            }
+        }
+        let scratch_removed = self.scratch_root.is_none()
+            && exact_path_absent(
+                self.config.runtime().scratch_root(),
+                LifecycleOperation::ScratchCleanup,
+            )
+            .unwrap_or(false);
+        let process_absent = self.child.is_none();
+        complete &= process_absent && pid_absent && socket_absent && scratch_removed;
+        self.state = if process_absent {
+            MysqlInstanceState::Stopped
+        } else {
+            MysqlInstanceState::Faulted
+        };
+        Ok(crate::service::MemberContainmentReceipt::new(
+            generation.authority.clone(),
+            if complete {
+                AttemptCleanupState::Completed
+            } else {
+                AttemptCleanupState::Failed
+            },
+            process_absent,
+            pid_absent,
+            socket_absent,
+            socket_absent,
+            scratch_removed,
+        )
+        .with_retired_generation(
+            generation.owner_generation,
+            generation.process_generation,
+            generation.process_id,
+        ))
+    }
+
+    fn containment_receipt(
+        &self,
+        authority: &MemberMutationAuthority,
+        cleanup: AttemptCleanupState,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
+        let process_absent = self.child.is_none();
+        let pid_absent =
+            exact_path_absent(self.config.runtime().pid(), LifecycleOperation::Shutdown)?;
+        let socket_absent = exact_path_absent(
+            self.config.runtime().socket(),
+            LifecycleOperation::SocketDisappearance,
+        )?;
+        let scratch_removed = self.scratch_root.is_none()
+            && exact_path_absent(
+                self.config.runtime().scratch_root(),
+                LifecycleOperation::ScratchCleanup,
+            )?;
+        Ok(crate::service::MemberContainmentReceipt::new(
+            authority.clone(),
+            cleanup,
+            process_absent,
+            pid_absent,
+            socket_absent,
+            socket_absent,
+            scratch_removed,
+        ))
+    }
+
     fn cleanup_all_roots(&mut self) -> Result<(), MysqlInstanceError> {
         let roots = [self.data_root.clone(), self.scratch_root.clone()]
             .into_iter()
@@ -1283,41 +1436,23 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
         attempt: &AttemptContext,
     ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
         self.revalidate_member_effect_binding(authority)
-            .map_err(|error| {
-                MysqlInstanceError::Ownership(match error {
-                    MemberTransitionError::Authority(
-                        crate::service::MemberAuthorityError::LocalBindingMismatch
-                        | crate::service::MemberAuthorityError::AttemptMismatch
-                        | crate::service::MemberAuthorityError::AuthoritySubstitution
-                        | crate::service::MemberAuthorityError::SourceMismatch
-                        | crate::service::MemberAuthorityError::WrongTransferTarget,
-                    ) => crate::service::OwnershipError::RootMismatch,
-                    _ => crate::service::OwnershipError::InspectionFailed,
-                })
-            })?;
+            .map_err(map_containment_binding_error)?;
         let cleanup = self.contain_with_attempt(attempt)?;
-        let process_absent = self.child.is_none();
-        let pid_absent =
-            exact_path_absent(self.config.runtime().pid(), LifecycleOperation::Shutdown)?;
-        let socket_absent = exact_path_absent(
-            self.config.runtime().socket(),
-            LifecycleOperation::SocketDisappearance,
-        )?;
-        let scratch_removed = self.scratch_root.is_none()
-            && exact_path_absent(
-                self.config.runtime().scratch_root(),
-                LifecycleOperation::ScratchCleanup,
-            )?;
-        Ok(crate::service::MemberContainmentReceipt::new(
-            authority.clone(),
-            cleanup,
-            process_absent,
-            pid_absent,
-            socket_absent,
-            socket_absent,
-            scratch_removed,
-        ))
+        self.containment_receipt(authority, cleanup)
     }
+}
+
+fn map_containment_binding_error(error: MemberTransitionError) -> MysqlInstanceError {
+    MysqlInstanceError::Ownership(match error {
+        MemberTransitionError::Authority(
+            crate::service::MemberAuthorityError::LocalBindingMismatch
+            | crate::service::MemberAuthorityError::AttemptMismatch
+            | crate::service::MemberAuthorityError::AuthoritySubstitution
+            | crate::service::MemberAuthorityError::SourceMismatch
+            | crate::service::MemberAuthorityError::WrongTransferTarget,
+        ) => crate::service::OwnershipError::RootMismatch,
+        _ => crate::service::OwnershipError::InspectionFailed,
+    })
 }
 
 fn exact_path_absent(

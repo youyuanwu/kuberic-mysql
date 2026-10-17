@@ -741,6 +741,9 @@ pub struct MemberContainmentReceipt {
     socket_absent: bool,
     endpoint_absent: bool,
     scratch_removed: bool,
+    retired_owner_generation: Option<u64>,
+    retired_process_generation: Option<u64>,
+    retired_process_id: Option<u32>,
 }
 
 impl MemberContainmentReceipt {
@@ -767,7 +770,24 @@ impl MemberContainmentReceipt {
             socket_absent,
             endpoint_absent,
             scratch_removed,
+            retired_owner_generation: None,
+            retired_process_generation: None,
+            retired_process_id: None,
         }
+    }
+
+    /// Attaches the exact in-process generation retired by a Build Drop guard.
+    #[must_use]
+    pub(crate) fn with_retired_generation(
+        mut self,
+        owner_generation: u64,
+        generation: u64,
+        process_id: Option<u32>,
+    ) -> Self {
+        self.retired_owner_generation = Some(owner_generation);
+        self.retired_process_generation = Some(generation);
+        self.retired_process_id = process_id;
+        self
     }
 
     /// Exact admitted member authority.
@@ -816,6 +836,24 @@ impl MemberContainmentReceipt {
     #[must_use]
     pub const fn scratch_removed(&self) -> bool {
         self.scratch_removed
+    }
+
+    /// Exact manager owner generation that issued the retired child.
+    #[must_use]
+    pub const fn retired_owner_generation(&self) -> Option<u64> {
+        self.retired_owner_generation
+    }
+
+    /// Exact manager-local generation retired by Build interruption.
+    #[must_use]
+    pub const fn retired_process_generation(&self) -> Option<u64> {
+        self.retired_process_generation
+    }
+
+    /// Exact retained child PID captured when the Build guard was armed.
+    #[must_use]
+    pub const fn retired_process_id(&self) -> Option<u32> {
+        self.retired_process_id
     }
 
     /// Whether this receipt proves complete terminal containment.

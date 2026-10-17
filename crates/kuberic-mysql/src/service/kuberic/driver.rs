@@ -33,6 +33,7 @@ use crate::service::{
 
 use super::{
     CallbackOperationLedger, EpochTranslator, KubericTranslationError, ReplicationEndpoint,
+    build::{BuildEndpointRegistration, BuildGeneration, BuildResultLedger, IdleBuildPreparation},
     translate_replica_identity, translate_replica_set_configuration, translate_role,
 };
 
@@ -112,6 +113,11 @@ struct DriverState {
     binding: Option<PublicBinding>,
     epochs: EpochTranslator,
     operations: CallbackOperationLedger<OperationKey, OperationValue>,
+    #[allow(dead_code)]
+    build_results: BuildResultLedger,
+    #[allow(dead_code)]
+    build_generation: Arc<BuildGeneration>,
+    idle_build_preparation: IdleBuildPreparation,
     progress_sequence: u64,
     last_reported_progress: Option<i64>,
     fresh_open_progress: Option<QualifiedProgress>,
@@ -139,9 +145,12 @@ pub struct MysqlPublicV1Replicator {
     callbacks: AsyncMutex<()>,
     state: SyncMutex<Option<DriverState>>,
     attempt: AttemptContext,
+    #[allow(dead_code)]
+    group_key: String,
     endpoint: ReplicationEndpoint,
     proxy_listen_address: SocketAddr,
     abort_requested: AtomicBool,
+    build_registration: SyncMutex<Option<BuildEndpointRegistration>>,
     terminal_failure: SyncMutex<Option<TerminalFailure>>,
 }
 
@@ -221,6 +230,7 @@ impl MysqlPublicV1Replicator {
             ));
         }
         let local = MemberPeer::from_enrollment(open_receipt.authority().local());
+        let group_key = open_receipt.authority().group_name().as_str().to_owned();
         let endpoint = ReplicationEndpoint::new(
             local.member_id().clone(),
             local.address().clone(),
@@ -241,6 +251,9 @@ impl MysqlPublicV1Replicator {
                 binding: None,
                 epochs: EpochTranslator::new(),
                 operations: CallbackOperationLedger::new(operation_authority),
+                build_results: BuildResultLedger::default(),
+                build_generation: Arc::new(BuildGeneration::new()),
+                idle_build_preparation: IdleBuildPreparation::default(),
                 progress_sequence: 0,
                 last_reported_progress: None,
                 fresh_open_progress: None,
@@ -259,9 +272,11 @@ impl MysqlPublicV1Replicator {
                 closed: false,
             })),
             attempt,
+            group_key,
             endpoint,
             proxy_listen_address,
             abort_requested: AtomicBool::new(false),
+            build_registration: SyncMutex::new(None),
             terminal_failure: SyncMutex::new(None),
         }))
     }
@@ -270,6 +285,11 @@ impl MysqlPublicV1Replicator {
     #[must_use]
     pub fn replication_endpoint(&self) -> String {
         self.endpoint.encode()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn build_group_key(&self) -> &str {
+        &self.group_key
     }
 
     /// Last terminal diagnostic retained by abort or close settlement.
@@ -298,7 +318,7 @@ impl MysqlPublicV1Replicator {
     }
 
     async fn bind_public_context(
-        &self,
+        self: &Arc<Self>,
         context: ReplicatorFactoryContext,
         settings: ReplicatorSettings,
     ) -> Result<()> {
@@ -330,6 +350,9 @@ impl MysqlPublicV1Replicator {
                     "Kuberic factory identity, process session, or settings changed".into(),
                 ));
             }
+            let generation = state.build_generation.clone();
+            drop(state);
+            self.ensure_build_registration(&generation)?;
             return Ok(());
         }
         state
@@ -337,6 +360,26 @@ impl MysqlPublicV1Replicator {
             .bind_proxy_access_guard(Arc::new(KubericProxyAccessGuard { context }))
             .map_err(map_mysql)?;
         state.binding = Some(requested);
+        let generation = state.build_generation.clone();
+        drop(state);
+        self.ensure_build_registration(&generation)?;
+        Ok(())
+    }
+
+    fn ensure_build_registration(
+        self: &Arc<Self>,
+        generation: &Arc<BuildGeneration>,
+    ) -> Result<()> {
+        let mut registration = self
+            .build_registration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registration.is_none() {
+            *registration = Some(
+                BuildEndpointRegistration::register(self.endpoint.encode(), self, generation)
+                    .map_err(map_mysql)?,
+            );
+        }
         Ok(())
     }
 
@@ -824,8 +867,42 @@ impl Replicator for MysqlPublicV1Replicator {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
         let key = EpochKey::from(epoch);
+        if role == ReplicaRole::IdleSecondary {
+            state
+                .idle_build_preparation
+                .validate_epoch(epoch)
+                .map_err(map_mysql)?;
+            let fresh = state.current_configuration.is_none()
+                && state.pending_configuration.is_none()
+                && state.engine.configuration().is_none();
+            if !fresh {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "IdleSecondary preparation requires an unconfigured fresh target".into(),
+                ));
+            }
+            if state.idle_build_preparation.is_idle() {
+                return Ok(());
+            }
+            if state.engine.role().is_some() {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "IdleSecondary preparation cannot replace a native role".into(),
+                ));
+            }
+            Self::ensure_epoch(&mut state, epoch).await?;
+            state
+                .idle_build_preparation
+                .admit_role(epoch)
+                .map_err(map_mysql)?;
+            return Ok(());
+        }
         let native_role = translate_role(role).map_err(map_translation)?;
+        if state.idle_build_preparation.is_idle() {
+            return Err(RuntimeError::AuthorityMismatch(
+                "prepared IdleSecondary requires exact Build completion before another role".into(),
+            ));
+        }
         let mapped = Self::ensure_epoch(&mut state, epoch).await?;
+        state.idle_build_preparation.clear_uncommitted_epoch();
         if let Some(retained) = state.completed_roles.get(&key) {
             if *retained != role {
                 return Err(RuntimeError::AuthorityMismatch(
@@ -982,6 +1059,21 @@ impl Replicator for MysqlPublicV1Replicator {
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        let fresh = state.current_configuration.is_none()
+            && state.pending_configuration.is_none()
+            && state.engine.configuration().is_none()
+            && state.engine.role().is_none();
+        if fresh {
+            state
+                .idle_build_preparation
+                .observe_epoch(epoch)
+                .map_err(map_mysql)?;
+        } else {
+            state
+                .idle_build_preparation
+                .validate_epoch(epoch)
+                .map_err(map_mysql)?;
+        }
         Self::ensure_epoch(&mut state, epoch).await?;
         Ok(())
     }
@@ -1138,6 +1230,9 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
     ) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        if state.idle_build_preparation.is_idle() {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
         if state
             .current_configuration
             .as_ref()
@@ -1209,6 +1304,9 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
     ) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        if state.idle_build_preparation.is_idle() {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
         let native = Self::translate_configuration(&mut state, &self.endpoint, &current)?;
         if Self::refresh_identical_configuration(&mut state, current.clone(), &native) {
             Self::complete_identical_configuration_refresh(
