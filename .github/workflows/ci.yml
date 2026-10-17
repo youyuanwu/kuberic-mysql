@@ -18,9 +18,58 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  qualification:
+  build:
+    name: Build test archive and checks
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace test archive
+        run: cargo nextest archive --locked --offline --workspace --profile ci --archive-file nextest-archive.tar.zst
+
+      - name: Run workspace documentation tests
+        run: cargo test --locked --offline --doc --workspace
+
+      - name: Run Clippy
+        run: cargo clippy --locked --offline --workspace --all-targets -- -D warnings
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  qualification:
+    name: Qualification (${{ matrix.partition }}/4)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +82,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install --yes apparmor-utils ca-certificates gnupg protobuf-compiler wget
+          sudo apt-get install --yes apparmor-utils ca-certificates gnupg wget
           wget --quiet https://dev.mysql.com/get/mysql-apt-config_0.8.39-1_all.deb
           echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.4-lts" |
             sudo debconf-set-selections
@@ -47,20 +96,13 @@ jobs:
           sudo systemctl disable --now mysql.service || true
           test "$(systemctl is-active mysql.service || true)" != active
 
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-
       - name: Install pinned cargo-nextest
         run: scripts/install_nextest.sh
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
 
       - name: Run workspace tests with nextest
-        run: cargo nextest run --locked --offline --workspace --profile ci
-
-      - name: Run workspace documentation tests
-        run: cargo test --locked --offline --doc --workspace
-
-      - name: Run Clippy
-        run: cargo clippy --locked --offline --workspace --all-targets -- -D warnings
+        run: cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --profile ci --partition hash:${{ matrix.partition }}/4

@@ -31,7 +31,9 @@ impl TestRoot {
             .parent()
             .and_then(Path::parent)
             .unwrap();
-        let root = workspace.join("target").join(format!(
+        let target = workspace.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let root = target.join(format!(
             "kms-{}-{serial}-{}",
             std::process::id(),
             &label[..label.len().min(8)]
