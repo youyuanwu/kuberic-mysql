@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dev-dependencies]
 kuberic-mysql = { path = "../kuberic-mysql" }
-kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic", rev = "9eaac46cac5fa674f17c2082918186a9bafeef67", default-features = false, features = ["host"] }
+kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic", rev = "f56949996b366b14c925339ac2e859ca2fbaf637", default-features = false, features = ["host"] }
 mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

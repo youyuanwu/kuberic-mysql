@@ -352,7 +352,13 @@ where
         let generation = self
             .next_generation
             .ok_or(KubericTranslationError::OperationExhausted)?;
-        let identity = MysqlOperationIdentity::new(self.authority.clone(), generation);
+        let operation_authority = AuthorityGeneration::new(format!(
+            "{}-operation-{}",
+            self.authority.as_str(),
+            generation
+        ))
+        .map_err(KubericTranslationError::from)?;
+        let identity = MysqlOperationIdentity::new(operation_authority, generation);
         self.next_generation = generation.get().checked_add(1).and_then(NonZeroU64::new);
         self.entries.insert(key, (value, identity.clone()));
         Ok(identity)

@@ -6,11 +6,15 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use kuberic_runtime::application::{INVALID_LSN, OperationDataStream, StateProvider};
+use kuberic_runtime::protocol::public_operations::{
+    RemoteBuildTargetRebuildRequired, ReplicaRebuildReason, ReplicaRebuildRequired,
+};
 use kuberic_runtime::protocol::types::{
-    AccessStatus, ConfigurationId as PublicConfigurationId, Epoch,
+    AccessStatus, ConfigurationId as PublicConfigurationId, Epoch, OperationId,
     ProcessSessionId as PublicProcessSessionId, ReplicaIdentity, ReplicaRole,
 };
 use kuberic_runtime::replicator::{
@@ -22,19 +26,27 @@ use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 
 use crate::core::{
-    AuthorityGeneration, GroupReplicationAddress, ProgressProjection, QualifiedProgress,
+    AttemptId, AuthorityGeneration, ConfiguredGtidLineage, GroupReplicationAddress,
+    ProgressProjection, QualifiedProgress, StorageBinding, project_progress,
 };
 use crate::service::{
-    AttemptContext, MemberPeer, MemberSourceBoundary, MysqlAccessIntent, MysqlInstanceManager,
-    MysqlOpenReceipt, MysqlOperationIdentity, MysqlProxyAccessGuard, MysqlReplicaConfiguration,
-    MysqlReplicaEpoch, MysqlReplicaRole, MysqlReplicator, MysqlReplicatorError,
-    MysqlRuntimeAccessAuthority,
+    AttemptContext, BuildAttemptGroup, MemberPeer, MemberSourceBoundary, MysqlAccessIntent,
+    MysqlInstanceManager, MysqlOpenReceipt, MysqlOperationIdentity, MysqlProxyAccessGuard,
+    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaRole, MysqlReplicaTarget,
+    MysqlReplicator, MysqlReplicatorError, MysqlRuntimeAccessAuthority,
 };
 
 use super::{
     CallbackOperationLedger, EpochTranslator, KubericTranslationError, ReplicationEndpoint,
-    build::{BuildEndpointRegistration, BuildGeneration, BuildResultLedger, IdleBuildPreparation},
-    translate_replica_identity, translate_replica_set_configuration, translate_role,
+    build::{
+        BuildBinding, BuildCallbackKey, BuildCheckpoint, BuildEndpointRegistration,
+        BuildGeneration, BuildGenerationStatus, BuildGroupPermit, BuildJoinReceipt,
+        BuildOrchestration, BuildRecoveryAccountReceipt, BuildRecoveryCredential,
+        BuildResultLedger, BuildSourceBinding, BuildSourceCleanup, BuildTargetBinding,
+        BuildTerminalResult, IdleBuildPreparation, lookup_build_endpoint,
+    },
+    translate_build_replica_information, translate_replica_identity, translate_replica_information,
+    translate_replica_set_configuration, translate_role,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -56,6 +68,8 @@ enum OperationKey {
     Progress(u64),
     Publish(EpochKey, String, u64),
     Revoke(u64),
+    Build(String),
+    BuildSuccessor(String),
     Close,
     Abort,
 }
@@ -68,6 +82,8 @@ enum OperationValue {
     Configuration(MysqlReplicaConfiguration),
     Progress,
     Access(MysqlAccessIntent),
+    Build(MysqlReplicaTarget),
+    BuildSuccessor(MysqlReplicaConfiguration),
     Terminal,
 }
 
@@ -75,7 +91,17 @@ enum OperationValue {
 struct PublicBinding {
     identity: ReplicaIdentity,
     process_session: PublicProcessSessionId,
+    public_storage: Option<StorageBinding>,
     settings: ReplicatorSettings,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedReplicaProgress {
+    identity: ReplicaIdentity,
+    process_session: PublicProcessSessionId,
+    storage: kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext,
+    current: i64,
+    catch_up: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,11 +139,11 @@ struct DriverState {
     binding: Option<PublicBinding>,
     epochs: EpochTranslator,
     operations: CallbackOperationLedger<OperationKey, OperationValue>,
-    #[allow(dead_code)]
-    build_results: BuildResultLedger,
-    #[allow(dead_code)]
+    build_results: BuildResultLedger<BuildCallbackKey>,
     build_generation: Arc<BuildGeneration>,
+    pending_build_target: Option<BuildTargetBinding>,
     idle_build_preparation: IdleBuildPreparation,
+    retained_replica_progress: Vec<RetainedReplicaProgress>,
     progress_sequence: u64,
     last_reported_progress: Option<i64>,
     fresh_open_progress: Option<QualifiedProgress>,
@@ -132,6 +158,7 @@ struct DriverState {
     catch_up_proven: bool,
     access_generation: NonZeroU64,
     proxy: ProxyState,
+    suppress_public_access: bool,
     opened: bool,
     closed: bool,
 }
@@ -145,7 +172,6 @@ pub struct MysqlPublicV1Replicator {
     callbacks: AsyncMutex<()>,
     state: SyncMutex<Option<DriverState>>,
     attempt: AttemptContext,
-    #[allow(dead_code)]
     group_key: String,
     endpoint: ReplicationEndpoint,
     proxy_listen_address: SocketAddr,
@@ -158,6 +184,199 @@ struct DriverStateLease<'a> {
     owner: &'a MysqlPublicV1Replicator,
     _callbacks: MutexGuard<'a, ()>,
     state: Option<DriverState>,
+}
+
+pub(crate) struct BuildTargetOwner<'a> {
+    state: Option<DriverStateLease<'a>>,
+    token: Option<crate::service::MysqlBuildAbortGeneration>,
+    generation: Arc<BuildGeneration>,
+    armed: bool,
+}
+
+impl BuildTargetOwner<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn join(
+        &mut self,
+        binding: &BuildBinding,
+        operation: MysqlOperationIdentity,
+        configuration: MysqlReplicaConfiguration,
+        source: MemberSourceBoundary,
+        peers: Vec<MemberPeer>,
+        recovery: &BuildRecoveryCredential,
+        build: &crate::service::BuildAttemptContext,
+    ) -> Result<BuildJoinReceipt> {
+        let state = self
+            .state
+            .as_mut()
+            .expect("Build target owner retains its driver lease");
+        if binding.target_generation != self.generation.id()
+            || binding.child_attempt != *build.build()
+            || binding.target_parent_attempt != *build.parent_attempt()
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "Build target owner differs from the exact request binding".into(),
+            ));
+        }
+        if self.token.is_none() {
+            self.token = Some(
+                state
+                    .engine
+                    .arm_build_abort_generation()
+                    .map_err(map_mysql)?,
+            );
+        }
+        let authority = state.engine.current_member_authority().map_err(map_mysql)?;
+        let local = authority.local();
+        let local_target = MysqlReplicaTarget::new(
+            state.engine.identity().clone(),
+            MemberPeer::from_enrollment(local),
+            local.binding().process_session().clone(),
+            local.binding().endpoint().clone(),
+            local.binding().storage().clone(),
+        );
+        let configuration = MysqlReplicaConfiguration::new(
+            configuration.id().clone(),
+            configuration.epoch(),
+            configuration
+                .members()
+                .iter()
+                .map(|member| {
+                    if member.identity() == state.engine.identity() {
+                        local_target.clone()
+                    } else {
+                        member.clone()
+                    }
+                })
+                .collect(),
+        );
+        let receipt = state
+            .engine
+            .build_join(
+                operation,
+                configuration,
+                source,
+                peers,
+                recovery,
+                build,
+                self.generation.id(),
+            )
+            .await
+            .map_err(map_mysql)?;
+        if receipt.build() != build.build()
+            || receipt.parent_attempt() != build.parent_attempt()
+            || receipt.target_generation() != self.generation.id()
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "Build join receipt differs from the target owner".into(),
+            ));
+        }
+        let lineage = ConfiguredGtidLineage::new(binding.source_authority.group_name().as_str())
+            .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+        match project_progress(&lineage, receipt.member().successor().executed()) {
+            ProgressProjection::Projectable(progress) => {
+                state.cached_source_progress = Some(progress);
+                state.last_reported_progress = Some(progress.value());
+                state.fresh_open_progress = None;
+            }
+            ProgressProjection::NonProjectable(_) => {
+                return Err(RuntimeError::InvalidReplication(
+                    "Build target history is not a qualified configured lineage".into(),
+                ));
+            }
+        }
+        state.pending_build_target = Some(binding.target.clone());
+        Ok(receipt)
+    }
+
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+        self.generation.set(BuildGenerationStatus::PendingAdmission);
+    }
+
+    pub(crate) async fn verify_recovery_account(
+        &mut self,
+        receipt: &super::build::BuildRecoveryAccountReceipt,
+        expected_present: bool,
+        build: &crate::service::BuildAttemptContext,
+    ) -> Result<()> {
+        self.state
+            .as_mut()
+            .expect("Build target owner retains its driver lease")
+            .engine
+            .verify_build_recovery_account(receipt, expected_present, build)
+            .await
+            .map_err(map_mysql)
+    }
+
+    pub(crate) async fn verify_fresh(
+        &mut self,
+        build: &crate::service::BuildAttemptContext,
+    ) -> Result<()> {
+        self.state
+            .as_mut()
+            .expect("Build target owner retains its driver lease")
+            .engine
+            .verify_build_target_fresh(build)
+            .await
+            .map_err(map_mysql)
+    }
+
+    pub(crate) async fn refresh_progress(
+        &mut self,
+        build: &crate::service::BuildAttemptContext,
+    ) -> Result<QualifiedProgress> {
+        build
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let progress = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(build.work_deadline()),
+            self.state
+                .as_mut()
+                .expect("Build target owner retains its driver lease")
+                .engine
+                .refresh_pending_build_progress(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?
+        .map_err(map_mysql)?;
+        build
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        match progress.progress() {
+            ProgressProjection::Projectable(progress) => Ok(progress),
+            ProgressProjection::NonProjectable(_) => Err(RuntimeError::InvalidReplication(
+                "post-cleanup target history is not projectable".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn graceful_leave(
+        &mut self,
+        build: &crate::service::BuildAttemptContext,
+    ) -> Result<()> {
+        self.state
+            .as_mut()
+            .expect("Build target owner retains its driver lease")
+            .engine
+            .leave_build_member(build)
+            .await
+            .map_err(map_mysql)
+    }
+}
+
+impl Drop for BuildTargetOwner<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(token) = self.token.as_ref()
+        {
+            self.generation.set(BuildGenerationStatus::NeedsRebuild);
+            if let Some(state) = self.state.as_mut() {
+                let _ = state.engine.force_retire_owned_generation(token);
+            }
+        } else if self.armed {
+            self.generation.set(BuildGenerationStatus::Available);
+        }
+    }
 }
 
 impl Deref for DriverStateLease<'_> {
@@ -199,6 +418,14 @@ impl Drop for DriverStateLease<'_> {
 
 struct KubericProxyAccessGuard {
     context: ReplicatorFactoryContext,
+}
+
+struct DirectClosedAccessGuard;
+
+impl MysqlProxyAccessGuard for DirectClosedAccessGuard {
+    fn access_granted(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { false })
+    }
 }
 
 impl MysqlProxyAccessGuard for KubericProxyAccessGuard {
@@ -253,7 +480,9 @@ impl MysqlPublicV1Replicator {
                 operations: CallbackOperationLedger::new(operation_authority),
                 build_results: BuildResultLedger::default(),
                 build_generation: Arc::new(BuildGeneration::new()),
+                pending_build_target: None,
                 idle_build_preparation: IdleBuildPreparation::default(),
+                retained_replica_progress: Vec::new(),
                 progress_sequence: 0,
                 last_reported_progress: None,
                 fresh_open_progress: None,
@@ -268,6 +497,7 @@ impl MysqlPublicV1Replicator {
                 catch_up_proven: false,
                 access_generation,
                 proxy: ProxyState::Unprepared,
+                suppress_public_access: false,
                 opened: false,
                 closed: false,
             })),
@@ -287,9 +517,424 @@ impl MysqlPublicV1Replicator {
         self.endpoint.encode()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn build_group_key(&self) -> &str {
-        &self.group_key
+    pub(crate) fn build_attempt_parent(&self) -> AttemptContext {
+        self.attempt.clone()
+    }
+
+    pub(crate) async fn acquire_build_target(
+        &self,
+        group_key: &str,
+        epoch: Epoch,
+        target: &super::build::BuildTargetBinding,
+        target_generation: u64,
+        build: &crate::service::BuildAttemptContext,
+    ) -> Result<BuildTargetOwner<'_>> {
+        let mut state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(build.work_deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        require_bound_open(&state)?;
+        if state.build_generation.status() != BuildGenerationStatus::Available
+            || state.engine.has_pending_build_successor()
+        {
+            return Err(RuntimeError::InvalidReplication(
+                "target has a prior Build pending admission or cleanup".into(),
+            ));
+        }
+        let public = state
+            .binding
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let local = state.open_receipt.authority().local();
+        let local_binding = local.binding();
+        if group_key != self.group_key
+            || target_generation != state.build_generation.id()
+            || target.identity != public.identity
+            || target.process_session != public.process_session
+            || target.replication_address != self.endpoint.encode()
+            || target.native.identity() != state.engine.identity()
+            || public
+                .public_storage
+                .as_ref()
+                .is_none_or(|storage| target.native.storage() != storage)
+            || target.native.member().member_id() != local.member_id()
+            || target.native.member().address() != local_binding.member_address()
+            || state.idle_build_preparation.epoch() != Some(epoch)
+            || !state.idle_build_preparation.is_idle()
+            || state.current_configuration.is_some()
+            || state.pending_configuration.is_some()
+            || state.engine.configuration().is_some()
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "Build target binding differs from the prepared idle owner".into(),
+            ));
+        }
+
+        state
+            .engine
+            .verify_build_target_fresh(build)
+            .await
+            .map_err(map_mysql)?;
+        if !state.build_generation.reserve() {
+            return Err(RuntimeError::InvalidReplication(
+                "Build target generation is already reserved or terminal".into(),
+            ));
+        }
+        let generation = state.build_generation.clone();
+        Ok(BuildTargetOwner {
+            state: Some(state),
+            token: None,
+            generation,
+            armed: true,
+        })
+    }
+
+    fn normalize_local_configuration(
+        state: &DriverState,
+        configuration: &MysqlReplicaConfiguration,
+    ) -> Result<MysqlReplicaConfiguration> {
+        let authority = state.engine.current_member_authority().map_err(map_mysql)?;
+        let local = authority.local();
+        let local_target = MysqlReplicaTarget::new(
+            state.engine.identity().clone(),
+            MemberPeer::from_enrollment(local),
+            local.binding().process_session().clone(),
+            local.binding().endpoint().clone(),
+            local.binding().storage().clone(),
+        );
+        Ok(MysqlReplicaConfiguration::new(
+            configuration.id().clone(),
+            configuration.epoch(),
+            configuration
+                .members()
+                .iter()
+                .map(|member| {
+                    if member.identity() == state.engine.identity() {
+                        local_target.clone()
+                    } else {
+                        member.clone()
+                    }
+                })
+                .collect(),
+        ))
+    }
+
+    async fn observe_direct_build_successor(
+        &self,
+        build_id: &OperationId,
+        configuration: &MysqlReplicaConfiguration,
+        callback: &BuildCallbackKey,
+        group: &BuildAttemptGroup,
+    ) -> Result<()> {
+        let child = group
+            .child(self.attempt.clone())
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        child
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let mut state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(child.work_deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        let configuration = Self::normalize_local_configuration(&state, configuration)?;
+        let operation = operation(
+            &mut state,
+            OperationKey::BuildSuccessor(build_id.as_str().to_owned()),
+            OperationValue::BuildSuccessor(configuration.clone()),
+        )?;
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(child.work_deadline()),
+            state
+                .engine
+                .observe_build_successor(operation, configuration),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?
+        .map_err(map_mysql)?;
+        child
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        state
+            .build_generation
+            .set(BuildGenerationStatus::PendingAdmission);
+        state.pending_build_target = Some(callback.target.clone());
+        Ok(())
+    }
+
+    pub(crate) async fn verify_direct_build_account(
+        &self,
+        receipt: &super::build::BuildRecoveryAccountReceipt,
+        expected_present: bool,
+        group: &BuildAttemptGroup,
+        callback: &BuildCallbackKey,
+    ) -> Result<()> {
+        let child = group
+            .child(self.attempt.clone())
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        if expected_present {
+            child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+        } else {
+            child
+                .admit_cleanup()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+        }
+        let deadline = if expected_present {
+            child.work_deadline()
+        } else {
+            child.deadline()
+        };
+        let mut state =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), self.lease())
+                .await
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        state
+            .engine
+            .verify_build_recovery_account(receipt, expected_present, &child)
+            .await
+            .map_err(map_mysql)?;
+        if expected_present {
+            child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+        } else {
+            child
+                .admit_cleanup()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+        }
+        Ok(())
+    }
+
+    fn require_direct_build_donor_binding(
+        &self,
+        state: &DriverState,
+        callback: &BuildCallbackKey,
+    ) -> Result<()> {
+        require_bound_open(state)?;
+        let public = state
+            .binding
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let expected = callback
+            .source_configuration
+            .replicas
+            .iter()
+            .find(|replica| {
+                replica.identity == public.identity
+                    && replica.replication_address == self.endpoint.encode()
+            })
+            .ok_or_else(|| {
+                RuntimeError::AuthorityMismatch(
+                    "Build donor is absent from the original callback binding".into(),
+                )
+            })?;
+        let expected_native = translate_replica_information(expected).map_err(map_translation)?;
+        if state
+            .current_configuration
+            .as_ref()
+            .map(|current| &current.configuration)
+            != Some(&callback.source_configuration.configuration)
+            || expected.process_session_id != public.process_session
+            || Some(expected_native.storage()) != public.public_storage.as_ref()
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "Build donor session, storage, or configuration changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn enter_direct_build_cleanup(
+        &self,
+        callback: &BuildCallbackKey,
+        group: &BuildAttemptGroup,
+    ) -> Result<()> {
+        let state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(group.deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        if state.build_generation.status() != BuildGenerationStatus::PendingAdmission {
+            return Err(RuntimeError::AuthorityMismatch(
+                "Build donor is not pending admission".into(),
+            ));
+        }
+        state
+            .build_generation
+            .set(BuildGenerationStatus::CleanupOnly);
+        Ok(())
+    }
+
+    async fn finish_direct_build_cleanup(
+        &self,
+        callback: &BuildCallbackKey,
+        group: &BuildAttemptGroup,
+    ) -> Result<()> {
+        let state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(group.deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        if state.build_generation.status() != BuildGenerationStatus::CleanupOnly {
+            return Err(RuntimeError::AuthorityMismatch(
+                "Build donor is not in cleanup-only state".into(),
+            ));
+        }
+        state
+            .build_generation
+            .set(BuildGenerationStatus::PendingAdmission);
+        Ok(())
+    }
+
+    async fn observe_direct_build_progress(
+        &self,
+        callback: &BuildCallbackKey,
+        group: &BuildAttemptGroup,
+    ) -> Result<i64> {
+        let child = group
+            .child(self.attempt.clone())
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        child
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let mut state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(child.work_deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        state.progress_sequence = state.progress_sequence.checked_add(1).ok_or_else(|| {
+            RuntimeError::InvalidReplication("progress sequence exhausted".into())
+        })?;
+        let sequence = state.progress_sequence;
+        let operation = operation(
+            &mut state,
+            OperationKey::Progress(sequence),
+            OperationValue::Progress,
+        )?;
+        let progress = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(child.work_deadline()),
+            state.engine.read_progress(operation),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?
+        .map_err(map_mysql)?;
+        child
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        match progress.progress() {
+            ProgressProjection::Projectable(progress) => Ok(progress.value()),
+            ProgressProjection::NonProjectable(_) => Err(RuntimeError::InvalidReplication(
+                "Build donor history is not projectable".into(),
+            )),
+        }
+    }
+
+    async fn retains_complete_build_history(
+        &self,
+        callback: &BuildCallbackKey,
+        group: &BuildAttemptGroup,
+    ) -> Result<bool> {
+        let child = group
+            .child(self.attempt.clone())
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        child
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let mut state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(child.work_deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        state.progress_sequence = state.progress_sequence.checked_add(1).ok_or_else(|| {
+            RuntimeError::InvalidReplication("progress sequence exhausted".into())
+        })?;
+        let progress_sequence = state.progress_sequence;
+        let operation = operation(
+            &mut state,
+            OperationKey::Progress(progress_sequence),
+            OperationValue::Progress,
+        )?;
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(child.work_deadline()),
+            state.engine.read_progress(operation),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?
+        .map_err(map_mysql)?;
+        child
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        self.require_direct_build_donor_binding(&state, callback)?;
+        state
+            .engine
+            .retains_complete_build_history()
+            .map_err(map_mysql)
+    }
+
+    async fn ensure_direct_build_available(&self, group: &BuildAttemptGroup) -> Result<()> {
+        let child = group
+            .child(self.attempt.clone())
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        child
+            .admit_work()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(child.work_deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        if matches!(
+            state.build_generation.status(),
+            BuildGenerationStatus::CleanupOnly
+                | BuildGenerationStatus::NeedsRebuild
+                | BuildGenerationStatus::PendingAdmission
+        ) || state.engine.pending_build().is_some()
+            || state.engine.has_pending_build_successor()
+        {
+            return Err(RuntimeError::InvalidReplication(
+                "prior Build is pending admission, cleanup, or reset".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cleanup_build_account_after_drop(
+        &self,
+        receipt: &super::build::BuildRecoveryAccountReceipt,
+        build: &crate::service::BuildAttemptContext,
+    ) -> Result<()> {
+        build
+            .admit_cleanup()
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let mut state = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(build.deadline()),
+            self.lease(),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?;
+        state
+            .engine
+            .remove_build_recovery_account(receipt, build)
+            .await
+            .map_err(map_mysql)
     }
 
     /// Last terminal diagnostic retained by abort or close settlement.
@@ -327,6 +972,7 @@ impl MysqlPublicV1Replicator {
         if process_session.is_empty() {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
+
         if settings.replication_address != self.endpoint.encode() {
             return Err(RuntimeError::AuthorityMismatch(
                 "replicator settings changed the enrolled MySQL replication endpoint".into(),
@@ -342,6 +988,7 @@ impl MysqlPublicV1Replicator {
         let requested = PublicBinding {
             identity,
             process_session,
+            public_storage: None,
             settings,
         };
         if let Some(bound) = &state.binding {
@@ -364,6 +1011,54 @@ impl MysqlPublicV1Replicator {
         drop(state);
         self.ensure_build_registration(&generation)?;
         Ok(())
+    }
+
+    pub(super) async fn bind_direct_public_context(
+        self: &Arc<Self>,
+        identity: ReplicaIdentity,
+        process_session: PublicProcessSessionId,
+        storage: kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<()> {
+        if process_session.is_empty() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let translated = translate_replica_identity(&identity).map_err(map_translation)?;
+        let public_storage =
+            super::translate_storage_binding(&storage, &identity).map_err(map_translation)?;
+        let mut state = self.lease().await;
+        if state.engine.identity() != &translated || state.open_receipt.identity() != &translated {
+            return Err(RuntimeError::AuthorityMismatch(
+                "direct Build identity differs from the enrolled MySQL owner".into(),
+            ));
+        }
+        let requested = PublicBinding {
+            identity,
+            process_session,
+            public_storage: Some(public_storage),
+            settings: ReplicatorSettings {
+                replication_address: self.endpoint.encode(),
+            },
+        };
+        if state
+            .binding
+            .as_ref()
+            .is_some_and(|bound| bound != &requested)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "direct Build binding changed".into(),
+            ));
+        }
+        if state.binding.is_none() {
+            state
+                .engine
+                .bind_proxy_access_guard(Arc::new(DirectClosedAccessGuard))
+                .map_err(map_mysql)?;
+            state.binding = Some(requested);
+            state.suppress_public_access = true;
+        }
+        let generation = state.build_generation.clone();
+        drop(state);
+        self.ensure_build_registration(&generation)
     }
 
     fn ensure_build_registration(
@@ -428,6 +1123,10 @@ impl MysqlPublicV1Replicator {
         state: &mut DriverState,
         proxy_listen_address: SocketAddr,
     ) -> Result<SocketAddr> {
+        if state.suppress_public_access {
+            state.proxy = ProxyState::Revoked;
+            return Ok(proxy_listen_address);
+        }
         if let ProxyState::Published { endpoint, .. } = &state.proxy {
             return Ok(*endpoint);
         }
@@ -630,20 +1329,128 @@ impl MysqlPublicV1Replicator {
         state: &mut DriverState,
         endpoint: &ReplicationEndpoint,
         configuration: &ReplicaSetConfiguration,
-    ) -> Result<MysqlReplicaConfiguration> {
+    ) -> Result<(ReplicaSetConfiguration, MysqlReplicaConfiguration)> {
         let binding = state
             .binding
             .clone()
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let normalized =
+            normalize_configuration_progress(&state.retained_replica_progress, configuration)?;
         let local_target = state.engine.local_target().map_err(map_mysql)?;
-        translate_replica_set_configuration(
-            configuration,
+        let native = translate_replica_set_configuration(
+            &normalized,
             &mut state.epochs,
             &binding.identity,
             endpoint,
             &local_target,
         )
-        .map_err(map_translation)
+        .map_err(map_translation)?;
+        Ok((normalized, native))
+    }
+
+    fn retain_configuration_progress(
+        state: &mut DriverState,
+        configuration: &ReplicaSetConfiguration,
+    ) -> Result<()> {
+        for replica in &configuration.replicas {
+            Self::retain_replica_progress(
+                state,
+                replica,
+                replica.current_progress,
+                replica.catch_up_capability,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_pending_build_admission(
+        state: &DriverState,
+        configuration: &ReplicaSetConfiguration,
+        endpoint: &ReplicationEndpoint,
+    ) -> Result<()> {
+        let Some(target) = state.pending_build_target.as_ref() else {
+            return Ok(());
+        };
+        let member = configuration
+            .configuration
+            .members
+            .iter()
+            .find(|member| member.identity == target.identity)
+            .ok_or_else(|| {
+                RuntimeError::AuthorityMismatch(
+                    "configuration admission omits the exact built target".into(),
+                )
+            })?;
+        if member.role != ReplicaRole::ActiveSecondary {
+            return Err(RuntimeError::AuthorityMismatch(
+                "built target admission requires ActiveSecondary".into(),
+            ));
+        }
+        let public = state
+            .binding
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if public.identity == target.identity {
+            if public.process_session != target.process_session
+                || endpoint.encode() != target.replication_address
+                || Some(target.native.storage()) != public.public_storage.as_ref()
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "local built target admission changed session, endpoint, or storage".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let replica = configuration
+            .replicas
+            .iter()
+            .find(|replica| replica.identity == target.identity)
+            .ok_or_else(|| {
+                RuntimeError::AuthorityMismatch(
+                    "configuration admission lacks built target information".into(),
+                )
+            })?;
+        let native = translate_replica_information(replica).map_err(map_translation)?;
+        if replica.process_session_id != target.process_session
+            || replica.storage_incarnation.as_ref() != Some(&target.storage)
+            || replica.replication_address != target.replication_address
+            || native != target.native
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "configuration admission substituted the built target binding".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn retain_replica_progress(
+        state: &mut DriverState,
+        replica: &ReplicaInformation,
+        current: i64,
+        catch_up: i64,
+    ) -> Result<()> {
+        let storage = replica.storage_incarnation.clone().ok_or_else(|| {
+            RuntimeError::InvalidReplication(
+                "retained replica progress requires exact storage".into(),
+            )
+        })?;
+        let retained = RetainedReplicaProgress {
+            identity: replica.identity.clone(),
+            process_session: replica.process_session_id.clone(),
+            storage,
+            current,
+            catch_up,
+        };
+        if let Some(existing) = state.retained_replica_progress.iter_mut().find(|known| {
+            known.identity == retained.identity
+                && known.process_session == retained.process_session
+                && known.storage == retained.storage
+        }) {
+            *existing = retained;
+        } else {
+            state.retained_replica_progress.push(retained);
+        }
+        Ok(())
     }
 
     fn stage_configuration(
@@ -655,6 +1462,12 @@ impl MysqlPublicV1Replicator {
             if pending.configuration == public.configuration
                 && state.pending_native_configuration.as_ref() == Some(&native)
             {
+                if pending != &public {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "configuration retry changed normalized progress".into(),
+                    ));
+                }
+
                 state.pending_configuration = Some(public);
                 return Ok(());
             }
@@ -675,7 +1488,7 @@ impl MysqlPublicV1Replicator {
         state: &mut DriverState,
         public: ReplicaSetConfiguration,
         native: &MysqlReplicaConfiguration,
-    ) -> bool {
+    ) -> Result<bool> {
         let identical = state
             .current_configuration
             .as_ref()
@@ -686,15 +1499,26 @@ impl MysqlPublicV1Replicator {
                 .as_ref()
                 .is_none_or(|pending| pending.configuration == public.configuration);
         if !identical {
-            return false;
+            return Ok(false);
+        }
+        if state.current_configuration.as_ref() != Some(&public)
+            || state
+                .pending_configuration
+                .as_ref()
+                .is_some_and(|pending| pending != &public)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "identical configuration retry changed normalized progress".into(),
+            ));
         }
         state.current_configuration = Some(public);
         state.pending_configuration = None;
         state.pending_native_configuration = None;
+        state.pending_build_target = None;
         state.cached_source_boundary = None;
         state.cached_source_progress = None;
         state.pre_epoch_role = None;
-        true
+        Ok(true)
     }
 
     async fn complete_identical_configuration_refresh(
@@ -751,6 +1575,7 @@ impl MysqlPublicV1Replicator {
             .await
             .map_err(map_mysql)?;
         state.current_configuration = Some(public);
+        state.pending_build_target = None;
         state.pending_configuration = None;
         state.pending_native_configuration = None;
         state.cached_source_boundary = None;
@@ -759,6 +1584,9 @@ impl MysqlPublicV1Replicator {
         state.pre_epoch_role = None;
         state.catch_up_proven = false;
         state.completed_roles.insert(key, local_role);
+        if state.build_generation.status() == BuildGenerationStatus::PendingAdmission {
+            state.build_generation.set(BuildGenerationStatus::Available);
+        }
         Ok(())
     }
 
@@ -866,6 +1694,7 @@ impl Replicator for MysqlPublicV1Replicator {
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         let key = EpochKey::from(epoch);
         if role == ReplicaRole::IdleSecondary {
             state
@@ -897,6 +1726,32 @@ impl Replicator for MysqlPublicV1Replicator {
         }
         let native_role = translate_role(role).map_err(map_translation)?;
         if state.idle_build_preparation.is_idle() {
+            if role == ReplicaRole::ActiveSecondary && state.engine.pending_build().is_some() {
+                state
+                    .idle_build_preparation
+                    .validate_epoch(epoch)
+                    .map_err(map_mysql)?;
+                let mapped = Self::ensure_epoch(&mut state, epoch).await?;
+                let role_operation = operation(
+                    &mut state,
+                    OperationKey::FormationRole(key, role_code(role)),
+                    OperationValue::Role(mapped, native_role),
+                )?;
+                state
+                    .engine
+                    .accept_built_secondary_role(role_operation, mapped)
+                    .map_err(map_mysql)?;
+                if state.build_generation.status() != BuildGenerationStatus::PendingAdmission {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "built target lacks pending-admission generation state".into(),
+                    ));
+                }
+                state.build_generation.set(BuildGenerationStatus::Available);
+                state.idle_build_preparation.complete();
+                state.observed_roles.insert(key, role);
+                state.completed_roles.insert(key, role);
+                return Ok(());
+            }
             return Err(RuntimeError::AuthorityMismatch(
                 "prepared IdleSecondary requires exact Build completion before another role".into(),
             ));
@@ -1059,6 +1914,7 @@ impl Replicator for MysqlPublicV1Replicator {
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         let fresh = state.current_configuration.is_none()
             && state.pending_configuration.is_none()
             && state.engine.configuration().is_none()
@@ -1126,7 +1982,33 @@ impl Replicator for MysqlPublicV1Replicator {
     async fn current_progress(&self) -> Result<i64> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        if matches!(
+            state.build_generation.status(),
+            BuildGenerationStatus::CleanupOnly | BuildGenerationStatus::NeedsRebuild
+        ) {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
         if state.engine.configuration().is_none() {
+            if state.engine.pending_build().is_some() {
+                let progress = state
+                    .engine
+                    .refresh_pending_build_progress()
+                    .await
+                    .map_err(map_mysql)?;
+                return match progress.progress() {
+                    ProgressProjection::Projectable(progress) => {
+                        retain_reported_progress(
+                            &mut state.last_reported_progress,
+                            progress.value(),
+                        );
+                        state.cached_source_progress = Some(progress);
+                        Ok(progress.value())
+                    }
+                    ProgressProjection::NonProjectable(_) => Err(RuntimeError::InvalidReplication(
+                        "built MySQL history cannot be projected".into(),
+                    )),
+                };
+            }
             let progress = progress_without_current_configuration(
                 state.cached_source_progress.map(QualifiedProgress::value),
                 state.fresh_open_progress.map(QualifiedProgress::value),
@@ -1165,6 +2047,7 @@ impl Replicator for MysqlPublicV1Replicator {
     async fn catch_up_capability(&self) -> Result<i64> {
         let state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         Ok(INVALID_LSN)
     }
 }
@@ -1174,6 +2057,7 @@ impl StateProvider for MysqlPublicV1Replicator {
     async fn update_epoch(&self, epoch: Epoch, previous_epoch_last_lsn: i64) -> Result<()> {
         let state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         let exact_epoch = state.epochs.latest().is_some_and(|(public, mapped)| {
             public == epoch && state.engine.epoch() == Some(mapped)
         });
@@ -1189,6 +2073,7 @@ impl StateProvider for MysqlPublicV1Replicator {
     async fn last_committed_lsn(&self) -> Result<i64> {
         let state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         retained_committed_progress(state.last_reported_progress)
     }
 
@@ -1230,6 +2115,7 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
     ) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         if state.idle_build_preparation.is_idle() {
             return Err(RuntimeError::ReconfigurationPending);
         }
@@ -1243,22 +2129,27 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                     .into(),
             ));
         }
-        let native = Self::translate_configuration(&mut state, &self.endpoint, &current)?;
-        if Self::refresh_identical_configuration(&mut state, current.clone(), &native) {
+        let (current, native) =
+            Self::translate_configuration(&mut state, &self.endpoint, &current)?;
+        Self::validate_pending_build_admission(&state, &current, &self.endpoint)?;
+        if Self::refresh_identical_configuration(&mut state, current.clone(), &native)? {
             Self::complete_identical_configuration_refresh(
                 &mut state,
                 self.proxy_listen_address,
                 &current,
             )
             .await?;
+            Self::retain_configuration_progress(&mut state, &current)?;
             return Ok(());
         }
-        Self::stage_configuration(&mut state, current, native)
+        Self::stage_configuration(&mut state, current.clone(), native)?;
+        Self::retain_configuration_progress(&mut state, &current)
     }
 
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         if catch_up_requires_fresh_boundary(
             state.engine.configuration().is_some(),
             state.cached_source_progress.is_some(),
@@ -1304,23 +2195,63 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
     ) -> Result<()> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
         if state.idle_build_preparation.is_idle() {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let native = Self::translate_configuration(&mut state, &self.endpoint, &current)?;
-        if Self::refresh_identical_configuration(&mut state, current.clone(), &native) {
+        let (current, native) =
+            Self::translate_configuration(&mut state, &self.endpoint, &current)?;
+        Self::validate_pending_build_admission(&state, &current, &self.endpoint)?;
+        if Self::refresh_identical_configuration(&mut state, current.clone(), &native)? {
             Self::complete_identical_configuration_refresh(
                 &mut state,
                 self.proxy_listen_address,
                 &current,
             )
             .await?;
+            Self::retain_configuration_progress(&mut state, &current)?;
             return Ok(());
         }
         let fresh = state.current_configuration.is_none()
             && state.pending_configuration.is_none()
             && state.engine.configuration().is_none();
         if fresh {
+            let key = EpochKey::from(current.configuration.epoch);
+            if state.engine.pending_build().is_some()
+                && Self::local_public_role(&state, &current)? == ReplicaRole::ActiveSecondary
+            {
+                let _mapped = state
+                    .epochs
+                    .latest()
+                    .filter(|(epoch, _)| *epoch == current.configuration.epoch)
+                    .map(|(_, mapped)| mapped)
+                    .ok_or(RuntimeError::ReconfigurationPending)?;
+                let operation = operation(
+                    &mut state,
+                    OperationKey::Configuration(native.id().as_str().to_owned()),
+                    OperationValue::Configuration(native.clone()),
+                )?;
+                state
+                    .engine
+                    .accept_built_configuration(operation, native)
+                    .map_err(map_mysql)?;
+                state
+                    .observed_roles
+                    .insert(key, ReplicaRole::ActiveSecondary);
+                state
+                    .completed_roles
+                    .insert(key, ReplicaRole::ActiveSecondary);
+                state.current_configuration = Some(current);
+                state.pending_build_target = None;
+                let accepted = state
+                    .current_configuration
+                    .clone()
+                    .expect("just accepted Build configuration");
+                Self::retain_configuration_progress(&mut state, &accepted)?;
+                state.fresh_open_progress = None;
+                state.pre_epoch_role = None;
+                return Ok(());
+            }
             let local = state
                 .binding
                 .as_ref()
@@ -1355,7 +2286,6 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                 .bootstrap_configuration(operation, native)
                 .await
                 .map_err(map_mysql)?;
-            let key = EpochKey::from(current.configuration.epoch);
             state.observed_roles.insert(key, ReplicaRole::Primary);
             state.completed_roles.insert(key, ReplicaRole::Primary);
             state.current_configuration = Some(current);
@@ -1377,20 +2307,824 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
             native.epoch(),
         ) {
             Self::complete_configuration(&mut state, current, native).await?;
+            let accepted = state
+                .current_configuration
+                .clone()
+                .expect("completed configuration is retained");
+            Self::retain_configuration_progress(&mut state, &accepted)?;
             if local_role == ReplicaRole::Primary {
                 Self::publish_current_primary_proxy_locked(&mut state, self.proxy_listen_address)
                     .await?;
             }
             Ok(())
         } else {
-            Self::stage_configuration(&mut state, current, native)
+            Self::stage_configuration(&mut state, current.clone(), native)?;
+            Self::retain_configuration_progress(&mut state, &current)
         }
     }
 
-    async fn build_replica(&self, _replica: ReplicaInformation) -> Result<()> {
-        Err(RuntimeError::InvalidReplication(
-            "MySQL Public V1 Build is unsupported; native reseed is required".into(),
-        ))
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        let (build_id, target_native) =
+            translate_build_replica_information(&replica).map_err(map_translation)?;
+        if replica.replication_address == self.endpoint.encode() {
+            return Err(RuntimeError::AuthorityMismatch(
+                "Build target cannot be the local source".into(),
+            ));
+        }
+        let group_permit =
+            BuildGroupPermit::try_acquire(self.group_key.clone()).ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "Build group is busy or blocked pending cleanup/reset".into(),
+                )
+            })?;
+        let source_endpoint = lookup_build_endpoint(&self.endpoint.encode()).ok_or_else(|| {
+            RuntimeError::InvalidReplication(
+                "Build source endpoint is not registered in this process".into(),
+            )
+        })?;
+        let target_endpoint =
+            lookup_build_endpoint(&replica.replication_address).ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "Build target endpoint is not registered in this process".into(),
+                )
+            })?;
+
+        let target_storage = replica
+            .storage_incarnation
+            .clone()
+            .ok_or_else(|| RuntimeError::AuthorityMismatch("Build target lacks storage".into()))?;
+        let target_binding = BuildTargetBinding {
+            identity: replica.identity.clone(),
+            process_session: replica.process_session_id.clone(),
+            storage: target_storage,
+            replication_address: replica.replication_address.clone(),
+            native: target_native.clone(),
+        };
+        let source_parent = self.attempt.clone();
+        let target_parent = target_endpoint.owner.build_attempt_parent();
+        let child_id = AttemptId::new(build_id.as_str()).map_err(|error| {
+            RuntimeError::InvalidReplication(format!("Build id is not an attempt id: {error}"))
+        })?;
+        let desired_deadline = Instant::now()
+            .checked_add(Duration::from_secs(120))
+            .ok_or_else(|| RuntimeError::InvalidReplication("Build deadline overflow".into()))?;
+        let deadline = desired_deadline
+            .min(source_parent.deadline())
+            .min(target_parent.deadline());
+        let group = BuildAttemptGroup::new(child_id.clone(), deadline, Duration::from_secs(15))
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let source_child = group
+            .child(source_parent.clone())
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let target_child = group
+            .child(target_parent.clone())
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+        let mut orchestration = BuildOrchestration::new(group.clone());
+
+        let (
+            callback_key,
+            operation,
+            public_configuration,
+            native_configuration,
+            source_binding,
+            source_generation,
+        ) = {
+            source_child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            let mut state = orchestration.run_work(self.lease()).await?;
+            require_bound_open(&state)?;
+            let public_configuration = state
+                .current_configuration
+                .clone()
+                .ok_or(RuntimeError::ReconfigurationPending)?;
+            if Self::local_public_role(&state, &public_configuration)? != ReplicaRole::Primary {
+                return Err(RuntimeError::NotPrimary);
+            }
+            if public_configuration
+                .configuration
+                .members
+                .iter()
+                .any(|member| member.identity == replica.identity)
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "Build target already belongs to the Kuberic configuration".into(),
+                ));
+            }
+            let public = state
+                .binding
+                .clone()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            let native_configuration = state
+                .engine
+                .configuration()
+                .cloned()
+                .ok_or(RuntimeError::ReconfigurationPending)?;
+            let source_native = native_configuration
+                .members()
+                .iter()
+                .find(|member| member.identity() == state.engine.identity())
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::AuthorityMismatch(
+                        "current native configuration lacks the local source".into(),
+                    )
+                })?;
+            if let Some((retained, terminal)) = state.build_results.retained(build_id.as_str()) {
+                if retained.build_id != build_id
+                    || retained.epoch != public_configuration.configuration.epoch
+                    || retained.configuration != public_configuration.configuration.configuration_id
+                    || retained.group_key != self.group_key
+                    || retained.source_identity != public.identity
+                    || retained.source_process_session != public.process_session
+                    || retained.source_configuration != public_configuration
+                    || retained.target != target_binding
+                {
+                    return Err(map_mysql(MysqlReplicatorError::OperationConflict));
+                }
+                match terminal {
+                    Some(BuildTerminalResult::Succeeded) => {
+                        self.attempt
+                            .admit_work()
+                            .map_err(|_| RuntimeError::OperationCancelled)?;
+                        if state.engine.current_member_authority().map_err(map_mysql)?
+                            != retained.source_authority
+                            || state.last_reported_progress != Some(retained.source_progress)
+                        {
+                            return Err(RuntimeError::AuthorityMismatch(
+                                "completed Build retry lost its source authority or invocation progress"
+                                    .into(),
+                            ));
+                        }
+                        tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(source_child.work_deadline()),
+                            Self::capture_current_boundary(&mut state, false),
+                        )
+                        .await
+                        .map_err(|_| RuntimeError::OperationCancelled)??;
+                        let latest = state.cached_source_boundary.as_ref().ok_or_else(|| {
+                            RuntimeError::InvalidReplication(
+                                "completed Build retry lacks source evidence".into(),
+                            )
+                        })?;
+                        if !retained
+                            .source_boundary
+                            .evidence()
+                            .executed()
+                            .is_subset_of(latest.evidence().executed())
+                        {
+                            return Err(RuntimeError::AuthorityMismatch(
+                                "completed Build retry lost its frozen source boundary".into(),
+                            ));
+                        }
+                        self.attempt
+                            .admit_work()
+                            .map_err(|_| RuntimeError::OperationCancelled)?;
+                        return Ok(());
+                    }
+                    Some(BuildTerminalResult::Failed(detail)) => {
+                        return Err(RuntimeError::InvalidReplication(detail));
+                    }
+                    Some(BuildTerminalResult::RebuildRequired(detail)) => {
+                        return Err(RuntimeError::ReplicaRebuildRequired(Box::new(detail)));
+                    }
+                    None => {}
+                }
+            }
+            if state.build_generation.status() != BuildGenerationStatus::Available
+                || state.engine.has_pending_build_successor()
+            {
+                return Err(RuntimeError::InvalidReplication(
+                    "source has a prior Build pending admission or cleanup".into(),
+                ));
+            }
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(source_child.work_deadline()),
+                Self::capture_current_boundary(&mut state, false),
+            )
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)??;
+            let source_boundary = state.cached_source_boundary.clone().ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "Build source lacks a fresh structured boundary".into(),
+                )
+            })?;
+            let source_progress = state.cached_source_progress.ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "Build source boundary lacks a qualified projection".into(),
+                )
+            })?;
+            if state.last_reported_progress != Some(source_progress.value()) {
+                return Err(RuntimeError::InvalidReplication(
+                    "Build source boundary differs from last reported Primary progress".into(),
+                ));
+            }
+            let source_authority = state.engine.current_member_authority().map_err(map_mysql)?;
+            let callback_key = BuildCallbackKey {
+                build_id: build_id.clone(),
+                epoch: public_configuration.configuration.epoch,
+                configuration: public_configuration.configuration.configuration_id.clone(),
+                group_key: self.group_key.clone(),
+                source_identity: public.identity.clone(),
+                source_process_session: public.process_session.clone(),
+                source_configuration: public_configuration.clone(),
+                source_authority: source_authority.clone(),
+                source_boundary,
+                source_progress: source_progress.value(),
+                target: target_binding.clone(),
+            };
+            if state
+                .build_results
+                .admit(build_id.as_str(), &callback_key)
+                .map_err(map_mysql)?
+                .is_some()
+            {
+                return Err(RuntimeError::InvalidReplication(
+                    "new Build unexpectedly matched a terminal result".into(),
+                ));
+            }
+            let operation = operation(
+                &mut state,
+                OperationKey::Build(build_id.as_str().to_owned()),
+                OperationValue::Build(target_native.clone()),
+            )?;
+            (
+                callback_key,
+                operation,
+                public_configuration,
+                native_configuration,
+                BuildSourceBinding {
+                    identity: public.identity,
+                    process_session: public.process_session,
+                    replication_address: self.endpoint.encode(),
+                    native: source_native,
+                },
+                state.build_generation.clone(),
+            )
+        };
+
+        for peer in &public_configuration.replicas {
+            let donor = lookup_build_endpoint(&peer.replication_address).ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "configured Build donor is not registered in this process".into(),
+                )
+            })?;
+            donor.owner.ensure_direct_build_available(&group).await?;
+        }
+
+        let cleanup_donors = public_configuration
+            .replicas
+            .iter()
+            .map(|peer| {
+                lookup_build_endpoint(&peer.replication_address)
+                    .map(|endpoint| (Arc::downgrade(&endpoint.owner), endpoint.generation.clone()))
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidReplication(
+                            "configured Build donor is not registered in this process".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut source_cleanup = BuildSourceCleanup::new(
+            Arc::downgrade(&source_endpoint.owner),
+            source_child.clone(),
+            public_configuration.configuration.members.len(),
+            source_generation.clone(),
+            callback_key.clone(),
+            cleanup_donors,
+            group_permit,
+        );
+        let mut target_owner = target_endpoint
+            .owner
+            .acquire_build_target(
+                &self.group_key,
+                public_configuration.configuration.epoch,
+                &target_binding,
+                target_endpoint.generation.id(),
+                &target_child,
+            )
+            .await?;
+        orchestration
+            .advance(BuildCheckpoint::TargetFresh)
+            .map_err(map_mysql)?;
+        let credential = BuildRecoveryCredential::random(child_id.clone()).map_err(map_mysql)?;
+        // Own the exact account identity before CREATE/GRANT begins. If the
+        // future is interrupted after either statement commits, Drop can
+        // still remove only this request-owned account.
+        source_cleanup.set_account(BuildRecoveryAccountReceipt::new(&credential));
+        orchestration
+            .advance(BuildCheckpoint::AccountCleanupOwned)
+            .map_err(map_mysql)?;
+
+        let execution: Result<()> = async {
+            // Re-prove freshness after reservation and immediately before the
+            // first source-side effect; reservation alone is not evidence that
+            // native state remained empty while callback work was scheduled.
+            target_owner.verify_fresh(&target_child).await?;
+            let (
+                account_receipt,
+                source_boundary,
+                source_authority,
+                build_native_configuration,
+                peers,
+                binding,
+                source_retains_history,
+            ) = {
+                let mut state = orchestration.run_work(self.lease()).await?;
+                require_bound_open(&state)?;
+                if state.current_configuration.as_ref() != Some(&public_configuration)
+                    || Self::local_public_role(&state, &public_configuration)?
+                        != ReplicaRole::Primary
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "Build source configuration or role changed".into(),
+                    ));
+                }
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(source_child.work_deadline()),
+                    Self::capture_current_boundary(&mut state, false),
+                )
+                .await
+                .map_err(|_| RuntimeError::OperationCancelled)??;
+                let latest = state.cached_source_boundary.as_ref().ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "Build source lacks a fresh structured boundary".into(),
+                    )
+                })?;
+                if state.last_reported_progress != Some(callback_key.source_progress)
+                    || state.engine.current_member_authority().map_err(map_mysql)?
+                        != callback_key.source_authority
+                    || !callback_key
+                        .source_boundary
+                        .evidence()
+                        .executed()
+                        .is_subset_of(latest.evidence().executed())
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "Build source changed from the retained invocation boundary".into(),
+                    ));
+                }
+                let source_boundary = callback_key.source_boundary.clone();
+                let source_retains_history =
+                    source_boundary.evidence().purged().entries().is_empty();
+                let source_authority =
+                    state.engine.current_member_authority().map_err(map_mysql)?;
+                let account_receipt = state
+                    .engine
+                    .prepare_build_recovery_account(&credential, &source_child)
+                    .await
+                    .map_err(map_mysql)?;
+                if source_cleanup.account() != Some(&account_receipt) {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "created Build account differs from pre-armed cleanup ownership".into(),
+                    ));
+                }
+                state
+                    .engine
+                    .verify_build_recovery_account(&account_receipt, true, &source_child)
+                    .await
+                    .map_err(map_mysql)?;
+                orchestration
+                    .advance(BuildCheckpoint::AccountPresent)
+                    .map_err(map_mysql)?;
+                let mut members = native_configuration.members().to_vec();
+                members.push(target_native.clone());
+                let build_native_configuration = MysqlReplicaConfiguration::new(
+                    native_configuration.id().clone(),
+                    native_configuration.epoch(),
+                    members,
+                );
+                let peers = native_configuration
+                    .members()
+                    .iter()
+                    .map(|member| member.member().clone())
+                    .collect::<Vec<_>>();
+                let mut expected_members = public_configuration
+                    .configuration
+                    .members
+                    .iter()
+                    .map(|member| member.identity.clone())
+                    .collect::<Vec<_>>();
+                expected_members.push(replica.identity.clone());
+                let binding = BuildBinding {
+                    build_id: build_id.clone(),
+                    child_attempt: child_id.clone(),
+                    source_parent_attempt: source_parent.attempt().clone(),
+                    target_parent_attempt: target_parent.attempt().clone(),
+                    source_generation: source_generation.id(),
+                    target_generation: target_endpoint.generation.id(),
+                    epoch: public_configuration.configuration.epoch,
+                    configuration: public_configuration.configuration.configuration_id.clone(),
+                    group_key: self.group_key.clone(),
+                    source: source_binding.clone(),
+                    target: target_binding.clone(),
+                    source_authority,
+                    expected_members,
+                    source_boundary: source_boundary.clone(),
+                    grant_id: credential.generation().as_str().to_owned(),
+                };
+                (
+                    account_receipt,
+                    source_boundary,
+                    binding.source_authority.clone(),
+                    build_native_configuration,
+                    peers,
+                    binding,
+                    source_retains_history,
+                )
+            };
+
+            let mut retained_history_available = source_retains_history;
+            for peer in &public_configuration.replicas {
+                let donor = lookup_build_endpoint(&peer.replication_address).ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "configured Build donor is not registered in this process".into(),
+                    )
+                })?;
+                donor
+                    .owner
+                    .verify_direct_build_account(&account_receipt, true, &group, &callback_key)
+                    .await?;
+                retained_history_available |= donor
+                    .owner
+                    .retains_complete_build_history(&callback_key, &group)
+                    .await?;
+            }
+            if !retained_history_available {
+                return Err(RuntimeError::ReplicaRebuildRequired(Box::new(
+                    ReplicaRebuildRequired::RemoteBuildTarget(Box::new(
+                        RemoteBuildTargetRebuildRequired {
+                            reason: ReplicaRebuildReason::IncompatibleRetainedHistory,
+                            epoch: public_configuration.configuration.epoch,
+                            target: replica.identity.clone(),
+                            target_session: replica.process_session_id.clone(),
+                        },
+                    )),
+                )));
+            }
+            orchestration
+                .advance(BuildCheckpoint::DonorsPrepared)
+                .map_err(map_mysql)?;
+            target_owner
+                .verify_recovery_account(&account_receipt, false, &target_child)
+                .await?;
+            {
+                source_child
+                    .admit_work()
+                    .map_err(|_| RuntimeError::OperationCancelled)?;
+                let mut state = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(source_child.work_deadline()),
+                    self.lease(),
+                )
+                .await
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+                if state.engine.current_member_authority().map_err(map_mysql)?
+                    != binding.source_authority
+                    || state.last_reported_progress != Some(callback_key.source_progress)
+                    || state.current_configuration.as_ref() != Some(&public_configuration)
+                    || state.engine.configuration() != Some(&native_configuration)
+                    || Self::local_public_role(&state, &public_configuration)?
+                        != ReplicaRole::Primary
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "Build source authority changed during donor preparation".into(),
+                    ));
+                }
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(source_child.work_deadline()),
+                    Self::capture_current_boundary(&mut state, false),
+                )
+                .await
+                .map_err(|_| RuntimeError::OperationCancelled)??;
+                let latest = state.cached_source_boundary.as_ref().ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "Build source lost structured evidence before join".into(),
+                    )
+                })?;
+                if !binding
+                    .source_boundary
+                    .evidence()
+                    .executed()
+                    .is_subset_of(latest.evidence().executed())
+                {
+                    return Err(RuntimeError::InvalidReplication(
+                        "Build source no longer contains the frozen boundary".into(),
+                    ));
+                }
+                source_child
+                    .admit_work()
+                    .map_err(|_| RuntimeError::OperationCancelled)?;
+            }
+            orchestration
+                .advance(BuildCheckpoint::SourceRevalidated)
+                .map_err(map_mysql)?;
+
+            // Arm interruption disposition before the native effect future is
+            // entered; dropping anywhere inside recovery must quarantine the
+            // source and every already configured donor synchronously.
+            source_cleanup.mark_native_effect();
+            let _receipt = orchestration
+                .run_work(target_owner.join(
+                    &binding,
+                    operation.clone(),
+                    build_native_configuration.clone(),
+                    source_boundary,
+                    peers,
+                    &credential,
+                    &target_child,
+                ))
+                .await??;
+            orchestration
+                .advance(BuildCheckpoint::TargetJoined)
+                .map_err(map_mysql)?;
+
+            for peer in &public_configuration.replicas {
+                let donor = lookup_build_endpoint(&peer.replication_address).ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "configured Build donor is not registered in this process".into(),
+                    )
+                })?;
+                donor
+                    .owner
+                    .observe_direct_build_successor(
+                        &build_id,
+                        &build_native_configuration,
+                        &callback_key,
+                        &group,
+                    )
+                    .await?;
+            }
+
+            source_child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            let mut state = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(source_child.work_deadline()),
+                self.lease(),
+            )
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+            require_bound_open(&state)?;
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(source_child.work_deadline()),
+                state
+                    .engine
+                    .observe_build_successor(operation, build_native_configuration),
+            )
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)?
+            .map_err(map_mysql)?;
+            source_child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            state
+                .build_generation
+                .set(BuildGenerationStatus::PendingAdmission);
+            state.pending_build_target = Some(callback_key.target.clone());
+            if state.current_configuration.as_ref() != Some(&public_configuration)
+                || state.engine.current_member_authority().map_err(map_mysql)? != source_authority
+                || Self::local_public_role(&state, &public_configuration)? != ReplicaRole::Primary
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "Build source changed before completion".into(),
+                ));
+            }
+            orchestration
+                .advance(BuildCheckpoint::SuccessorsObserved)
+                .map_err(map_mysql)?;
+            drop(state);
+            for peer in &public_configuration.replicas {
+                let donor = lookup_build_endpoint(&peer.replication_address).ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "configured Build donor disappeared before cleanup".into(),
+                    )
+                })?;
+                donor
+                    .owner
+                    .enter_direct_build_cleanup(&callback_key, &group)
+                    .await?;
+            }
+            let mut state = orchestration.run_work(self.lease()).await?;
+            state
+                .build_generation
+                .set(BuildGenerationStatus::CleanupOnly);
+            orchestration
+                .advance(BuildCheckpoint::CleanupOnly)
+                .map_err(map_mysql)?;
+            state
+                .engine
+                .remove_build_recovery_account(&account_receipt, &source_child)
+                .await
+                .map_err(map_mysql)?;
+            drop(state);
+            for peer in &public_configuration.replicas {
+                let donor = lookup_build_endpoint(&peer.replication_address).ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "configured Build donor disappeared during cleanup".into(),
+                    )
+                })?;
+                donor
+                    .owner
+                    .verify_direct_build_account(&account_receipt, false, &group, &callback_key)
+                    .await?;
+                donor
+                    .owner
+                    .finish_direct_build_cleanup(&callback_key, &group)
+                    .await?;
+            }
+            target_owner
+                .verify_recovery_account(&account_receipt, false, &target_child)
+                .await?;
+            orchestration
+                .advance(BuildCheckpoint::AccountAbsent)
+                .map_err(map_mysql)?;
+            let target_progress = target_owner.refresh_progress(&target_child).await?;
+            let mut donor_progress = Vec::new();
+            for peer in &public_configuration.replicas {
+                let donor = lookup_build_endpoint(&peer.replication_address).ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "configured Build donor disappeared before progress refresh".into(),
+                    )
+                })?;
+                donor_progress.push((
+                    peer.clone(),
+                    donor
+                        .owner
+                        .observe_direct_build_progress(&callback_key, &group)
+                        .await?,
+                ));
+            }
+            orchestration
+                .advance(BuildCheckpoint::ProgressRefreshed)
+                .map_err(map_mysql)?;
+            source_child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            target_child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            let mut state = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(source_child.work_deadline()),
+                self.lease(),
+            )
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+            require_bound_open(&state)?;
+            let public = state
+                .binding
+                .as_ref()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if state.current_configuration.as_ref() != Some(&public_configuration)
+                || Self::local_public_role(&state, &public_configuration)? != ReplicaRole::Primary
+                || state.engine.current_member_authority().map_err(map_mysql)?
+                    != binding.source_authority
+                || state.build_generation.id() != binding.source_generation
+                || public.identity != binding.source.identity
+                || public.process_session != binding.source.process_session
+                || self.endpoint.encode() != binding.source.replication_address
+                || state.last_reported_progress != Some(callback_key.source_progress)
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "Build source binding or configuration changed before terminal success".into(),
+                ));
+            }
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(source_child.work_deadline()),
+                Self::capture_current_boundary(&mut state, false),
+            )
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)??;
+            let final_boundary = state.cached_source_boundary.as_ref().ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "Build source lost structured evidence before terminal success".into(),
+                )
+            })?;
+            if !binding
+                .source_boundary
+                .evidence()
+                .executed()
+                .is_subset_of(final_boundary.evidence().executed())
+            {
+                return Err(RuntimeError::InvalidReplication(
+                    "Build source no longer contains the frozen boundary at terminal success"
+                        .into(),
+                ));
+            }
+            source_child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            target_child
+                .admit_work()
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            orchestration
+                .advance(BuildCheckpoint::FinalRevalidated)
+                .map_err(map_mysql)?;
+            source_cleanup.clear_account();
+            state
+                .build_generation
+                .set(BuildGenerationStatus::PendingAdmission);
+            Self::retain_replica_progress(
+                &mut state,
+                &replica,
+                target_progress.value(),
+                INVALID_LSN,
+            )?;
+            for (peer, progress) in donor_progress {
+                Self::retain_replica_progress(
+                    &mut state,
+                    &peer,
+                    progress,
+                    peer.catch_up_capability,
+                )?;
+            }
+            state
+                .build_results
+                .complete(
+                    build_id.as_str(),
+                    &callback_key,
+                    BuildTerminalResult::Succeeded,
+                )
+                .map_err(map_mysql)?;
+            orchestration
+                .advance(BuildCheckpoint::Completed)
+                .map_err(map_mysql)?;
+            Ok(())
+        }
+        .await;
+
+        match execution {
+            Ok(()) => {
+                target_owner.disarm();
+                source_cleanup.disarm();
+                Ok(())
+            }
+            Err(primary) => {
+                if orchestration.interruption_requires_reset() {
+                    source_cleanup.block_for_reset();
+                }
+                let _ = target_owner.graceful_leave(&target_child).await;
+                for peer in &public_configuration.replicas {
+                    if let Some(donor) = lookup_build_endpoint(&peer.replication_address) {
+                        let _ = donor
+                            .owner
+                            .enter_direct_build_cleanup(&callback_key, &group)
+                            .await;
+                    }
+                }
+                if orchestration.account_cleanup_owned()
+                    && let Some(receipt) = source_cleanup.account().cloned()
+                {
+                    let source_absent = match orchestration.run_cleanup(self.lease()).await {
+                        Ok(mut state) => state
+                            .engine
+                            .remove_build_recovery_account(&receipt, &source_child)
+                            .await
+                            .is_ok(),
+                        Err(_) => false,
+                    };
+                    let mut participants_absent = source_absent;
+                    if participants_absent {
+                        for peer in &public_configuration.replicas {
+                            let Some(donor) = lookup_build_endpoint(&peer.replication_address)
+                            else {
+                                participants_absent = false;
+                                break;
+                            };
+                            if donor
+                                .owner
+                                .verify_direct_build_account(&receipt, false, &group, &callback_key)
+                                .await
+                                .is_err()
+                            {
+                                participants_absent = false;
+                                break;
+                            }
+                        }
+                    }
+                    if participants_absent
+                        && target_owner
+                            .verify_recovery_account(&receipt, false, &target_child)
+                            .await
+                            .is_ok()
+                    {
+                        source_cleanup.clear_account();
+                    }
+                }
+                let terminal = match &primary {
+                    RuntimeError::ReplicaRebuildRequired(detail) => {
+                        BuildTerminalResult::RebuildRequired((**detail).clone())
+                    }
+                    _ => BuildTerminalResult::Failed(primary.to_string()),
+                };
+                if let Ok(mut state) = orchestration.run_cleanup(self.lease()).await {
+                    let _ =
+                        state
+                            .build_results
+                            .complete(build_id.as_str(), &callback_key, terminal);
+                }
+                Err(primary)
+            }
+        }
     }
 
     async fn remove_replica(
@@ -1496,6 +3230,48 @@ const fn identical_refresh_requires_primary_publication(role: ReplicaRole) -> bo
     matches!(role, ReplicaRole::Primary)
 }
 
+fn normalize_configuration_progress(
+    retained: &[RetainedReplicaProgress],
+    configuration: &ReplicaSetConfiguration,
+) -> Result<ReplicaSetConfiguration> {
+    let mut normalized = configuration.clone();
+    for replica in &mut normalized.replicas {
+        let storage = replica.storage_incarnation.as_ref().ok_or_else(|| {
+            RuntimeError::InvalidReplication(
+                "configured replica omitted storage incarnation".into(),
+            )
+        })?;
+        let known = retained.iter().find(|known| {
+            known.identity == replica.identity
+                && known.process_session == replica.process_session_id
+                && &known.storage == storage
+        });
+        if replica.current_progress == INVALID_LSN {
+            replica.current_progress = known.map(|known| known.current).ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "configured replica omitted current progress without exact retained state"
+                        .into(),
+                )
+            })?;
+        }
+        if replica.catch_up_capability == INVALID_LSN {
+            if let Some(known) = known {
+                replica.catch_up_capability = known.catch_up;
+            } else if replica.must_catchup {
+                return Err(RuntimeError::InvalidReplication(
+                    "required catch-up capability is unknown".into(),
+                ));
+            }
+        }
+        if replica.must_catchup && replica.catch_up_capability == INVALID_LSN {
+            return Err(RuntimeError::InvalidReplication(
+                "required catch-up capability remained unknown".into(),
+            ));
+        }
+    }
+    Ok(normalized)
+}
+
 fn progress_without_current_configuration(
     cached_pre_epoch_progress: Option<i64>,
     fresh_open_progress: Option<i64>,
@@ -1554,6 +3330,17 @@ fn require_bound_open(state: &DriverState) -> Result<()> {
         Err(RuntimeError::AuthorityNotAdmitted)
     } else if !state.opened {
         Err(RuntimeError::NotOpen)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_not_cleanup_only(state: &DriverState) -> Result<()> {
+    if matches!(
+        state.build_generation.status(),
+        BuildGenerationStatus::CleanupOnly | BuildGenerationStatus::NeedsRebuild
+    ) {
+        Err(RuntimeError::ReconfigurationPending)
     } else {
         Ok(())
     }
@@ -1619,8 +3406,9 @@ fn map_mysql(error: MysqlReplicatorError) -> RuntimeError {
 mod tests {
     use super::*;
     use kuberic_runtime::protocol::types::{
-        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, OperationId,
-        ProcessSessionId, ReplicaId, ReplicaInstanceId,
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, OperationId, PodUid,
+        ProcessSessionId, PvcUid, ReplicaId, ReplicaInstanceId, ReplicaStorageIdentity,
+        ReplicaStorageIncarnationContext, StorageGeneration,
     };
 
     fn identity(id: i64) -> ReplicaIdentity {
@@ -1643,6 +3431,98 @@ mod tests {
             must_catchup: false,
             storage_incarnation: None,
         }
+    }
+
+    fn storage(id: i64) -> ReplicaStorageIncarnationContext {
+        ReplicaStorageIncarnationContext {
+            replica: identity(id),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new(format!("pod-{id}")),
+                pvc_uid: PvcUid::new(format!("pvc-{id}")),
+            },
+            storage_generation: StorageGeneration::new(format!("storage-{id}")),
+        }
+    }
+
+    fn one_remote(replica: ReplicaInformation) -> ReplicaSetConfiguration {
+        ReplicaSetConfiguration {
+            configuration: ConfigurationDescriptor::new(
+                Epoch::new(1, 2),
+                ReplicaId::new(1),
+                vec![
+                    ConfigurationMember {
+                        identity: identity(1),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: replica.identity.clone(),
+                        role: replica.role,
+                    },
+                ],
+                2,
+            ),
+            replicas: vec![replica],
+        }
+    }
+
+    #[test]
+    fn omitted_progress_reuse_is_exact_per_field_and_binding() {
+        let mut replica = information(2, ReplicaRole::ActiveSecondary, INVALID_LSN);
+        replica.storage_incarnation = Some(storage(2));
+        let retained = vec![RetainedReplicaProgress {
+            identity: replica.identity.clone(),
+            process_session: replica.process_session_id.clone(),
+            storage: storage(2),
+            current: 0,
+            catch_up: INVALID_LSN,
+        }];
+        let normalized =
+            normalize_configuration_progress(&retained, &one_remote(replica.clone())).unwrap();
+        assert_eq!(normalized.replicas[0].current_progress, 0);
+        assert_eq!(normalized.replicas[0].catch_up_capability, INVALID_LSN);
+
+        assert!(normalize_configuration_progress(&[], &one_remote(replica.clone())).is_err());
+
+        let mut first_known_unknown = replica.clone();
+        first_known_unknown.current_progress = 7;
+        let normalized =
+            normalize_configuration_progress(&[], &one_remote(first_known_unknown.clone()))
+                .unwrap();
+        assert_eq!(normalized.replicas[0].catch_up_capability, INVALID_LSN);
+        first_known_unknown.must_catchup = true;
+        assert!(normalize_configuration_progress(&[], &one_remote(first_known_unknown)).is_err());
+
+        let numeric = vec![RetainedReplicaProgress {
+            catch_up: 4,
+            ..retained[0].clone()
+        }];
+        let normalized =
+            normalize_configuration_progress(&numeric, &one_remote(replica.clone())).unwrap();
+        assert_eq!(normalized.replicas[0].catch_up_capability, 4);
+
+        let mut rejected_explicit = replica.clone();
+        rejected_explicit.current_progress = 99;
+        let _candidate =
+            normalize_configuration_progress(&retained, &one_remote(rejected_explicit)).unwrap();
+        let omitted_after_rejection =
+            normalize_configuration_progress(&retained, &one_remote(replica.clone())).unwrap();
+        assert_eq!(
+            omitted_after_rejection.replicas[0].current_progress, 0,
+            "normalization must not contaminate retained state before acceptance"
+        );
+
+        let mut changed_session = replica.clone();
+        changed_session.process_session_id = ProcessSessionId::new("replacement-session");
+        assert!(normalize_configuration_progress(&retained, &one_remote(changed_session)).is_err());
+
+        let mut changed_storage = replica.clone();
+        changed_storage.storage_incarnation = Some(storage(3));
+        assert!(normalize_configuration_progress(&retained, &one_remote(changed_storage)).is_err());
+
+        let mut changed_replica = replica;
+        changed_replica.identity = identity(3);
+        changed_replica.storage_incarnation = Some(storage(3));
+        assert!(normalize_configuration_progress(&retained, &one_remote(changed_replica)).is_err());
     }
 
     #[test]

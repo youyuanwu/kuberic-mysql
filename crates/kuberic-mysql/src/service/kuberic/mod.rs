@@ -1,6 +1,6 @@
 //! Strict translation from Kuberic Public V1 values into the MySQL lifecycle seam.
 
-mod build;
+pub(crate) mod build;
 mod driver;
 mod service;
 mod translation;

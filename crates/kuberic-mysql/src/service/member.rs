@@ -435,6 +435,32 @@ impl MemberEffectRequest {
         })
     }
 
+    /// Creates a Build-scoped request whose predecessor belongs to the
+    /// authorized source lifetime while the effect authority belongs to the
+    /// fresh target lifetime. All non-attempt authority remains exact.
+    pub(crate) fn new_for_build(
+        operation: MemberOperationIdentity,
+        epoch: u64,
+        role: MemberRole,
+        configuration: Option<MemberConfigurationIntent>,
+        authority: MemberMutationAuthority,
+        source: MemberSourceBoundary,
+    ) -> Result<Self, MemberTransitionError> {
+        if authority.group_name() != source.evidence().view().group_name() {
+            return Err(MemberTransitionError::Authority(
+                MemberAuthorityError::AttemptMismatch,
+            ));
+        }
+        Ok(Self {
+            operation,
+            epoch,
+            role,
+            configuration,
+            authority,
+            source: Some(source),
+        })
+    }
+
     /// Exact lifecycle operation identity.
     #[must_use]
     pub const fn operation(&self) -> &MemberOperationIdentity {
@@ -547,6 +573,40 @@ impl FreshJoinInput {
             ));
         }
         Self::new_internal(request.authority().clone(), Some(request), source, peers)
+    }
+
+    /// Creates the exact cross-lifetime join used only by an application-owned
+    /// Build. The source and target may have distinct parent attempts, while
+    /// group, target authority, predecessor, and peer evidence remain exact.
+    pub(crate) fn for_build_request(
+        request: MemberEffectRequest,
+        source: MemberSourceBoundary,
+        peers: Vec<MemberPeer>,
+    ) -> Result<Self, MemberTransitionError> {
+        if request.source() != Some(&source)
+            || request.authority().group_name() != source.evidence().view().group_name()
+        {
+            return Err(MemberTransitionError::Receipt(
+                MemberReceiptError::PredecessorMismatch,
+            ));
+        }
+        if source
+            .evidence()
+            .view()
+            .member(request.authority().local().member_id())
+            .is_some()
+        {
+            return Err(MemberTransitionError::Authority(
+                MemberAuthorityError::AuthoritySubstitution,
+            ));
+        }
+        validate_peers(source.evidence().view(), &peers)?;
+        Ok(Self {
+            authority: request.authority().clone(),
+            request: Some(request),
+            source,
+            peers,
+        })
     }
 
     fn new_internal(
@@ -888,6 +948,32 @@ impl MemberEffectReceipt {
             final_binding,
             attempt,
             cleanup,
+            false,
+        )
+    }
+
+    /// Validates a Build receipt with distinct source/target parent attempts.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_build_request(
+        kind: MemberEffectKind,
+        request: MemberEffectRequest,
+        predecessor: MemberNativeEvidence,
+        successor: MemberNativeEvidence,
+        final_binding: &crate::service::MemberControlBinding,
+        attempt: &AttemptContext,
+        cleanup: AttemptCleanupState,
+    ) -> Result<Self, MemberTransitionError> {
+        let authority = request.authority().clone();
+        Self::new_internal(
+            kind,
+            authority,
+            Some(request),
+            Some(predecessor),
+            successor,
+            final_binding,
+            attempt,
+            cleanup,
+            true,
         )
     }
 
@@ -912,6 +998,7 @@ impl MemberEffectReceipt {
             final_binding,
             attempt,
             cleanup,
+            false,
         )
     }
 
@@ -925,15 +1012,18 @@ impl MemberEffectReceipt {
         final_binding: &crate::service::MemberControlBinding,
         attempt: &AttemptContext,
         cleanup: AttemptCleanupState,
+        allow_cross_attempt_predecessor: bool,
     ) -> Result<Self, MemberTransitionError> {
         let deadline = attempt.deadline_state();
         let cancellation = attempt.cancellation_state();
         if attempt.attempt() != authority.attempt()
             || final_binding != authority.local().binding()
             || successor.authority() != &authority
-            || predecessor
-                .as_ref()
-                .is_some_and(|evidence| evidence.authority().attempt() != authority.attempt())
+            || predecessor.as_ref().is_some_and(|evidence| {
+                (!allow_cross_attempt_predecessor
+                    && evidence.authority().attempt() != authority.attempt())
+                    || evidence.view().group_name() != authority.group_name()
+            })
         {
             return Err(MemberTransitionError::Receipt(
                 MemberReceiptError::BindingMismatch,

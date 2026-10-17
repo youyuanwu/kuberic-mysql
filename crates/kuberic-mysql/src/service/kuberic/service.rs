@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kuberic_runtime::application::{OpenContext, OpenMode, RoleChange, StateProvider};
 use kuberic_runtime::host::ApplicationStorageState;
-use kuberic_runtime::protocol::types::ReplicaRole;
+use kuberic_runtime::protocol::types::{
+    ProcessSessionId, ReplicaIdentity, ReplicaRole, ReplicaStorageIncarnationContext,
+};
 use kuberic_runtime::replicator::{Replicator, ReplicatorSettings};
 use kuberic_runtime::{Result, RuntimeError, StatefulServiceReplica};
 use tokio::sync::Notify;
@@ -47,6 +49,7 @@ impl MysqlPublicV1ServiceConfig {
         proxy_listen_address: SocketAddr,
     ) -> Result<Self> {
         let expected_partition_id = expected_partition_id.into();
+        let instance = instance.with_build_recovery_networking();
         validate_service_bindings(&expected_partition_id, proxy_listen_address)?;
         if instance.topology().is_none() {
             return Err(RuntimeError::InvalidReplication(
@@ -80,6 +83,47 @@ impl MysqlPublicV1ServiceConfig {
     #[must_use]
     pub const fn proxy_listen_address(&self) -> SocketAddr {
         self.proxy_listen_address
+    }
+
+    /// Opens one direct custom-trait fixture without a hosted controller.
+    ///
+    /// This is the PostgreSQL-parity qualification seam and makes no
+    /// production-controller integration claim.
+    #[doc(hidden)]
+    pub async fn open_direct_for_qualification(
+        self,
+        identity: ReplicaIdentity,
+        process_session: ProcessSessionId,
+        storage: ReplicaStorageIncarnationContext,
+    ) -> Result<Arc<MysqlPublicV1Replicator>> {
+        let native_identity = translate_replica_identity(&identity)
+            .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+        let fresh = self.fresh;
+        let attempt = fresh.attempt.clone();
+        let group_replication_address = fresh.group_replication_address;
+        let input = MysqlFreshMemberInput::new(
+            fresh.instance,
+            native_identity,
+            fresh.lineage,
+            fresh.credentials,
+            attempt.clone(),
+            fresh.access_generation,
+        );
+        let (engine, receipt) = MysqlReplicator::prepare_fresh_member(input)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let driver = MysqlPublicV1Replicator::new_fresh_open(
+            engine,
+            receipt,
+            attempt,
+            group_replication_address,
+            self.proxy_listen_address,
+        )?;
+        driver
+            .bind_direct_public_context(identity, process_session, storage)
+            .await?;
+        Replicator::open(driver.as_ref()).await?;
+        Ok(driver)
     }
 
     /// Classifies the configured roots without creating or opening MySQL state.

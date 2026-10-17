@@ -1,22 +1,23 @@
-#![allow(
-    dead_code,
-    reason = "Phase 1 Build primitives are wired into execution in later reviewed phases"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::io::Read;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use kuberic_runtime::RuntimeError;
 use kuberic_runtime::protocol::types::{
     ConfigurationId, Epoch, OperationId, ProcessSessionId, ReplicaIdentity,
     ReplicaStorageIncarnationContext,
 };
+use kuberic_runtime::replicator::ReplicaSetConfiguration;
 use zeroize::Zeroize;
 
 use crate::core::AttemptId;
+use crate::core::CredentialGeneration;
 use crate::service::{
-    MemberMutationAuthority, MemberSourceBoundary, MysqlReplicaTarget, MysqlReplicatorError,
+    BuildAttemptContext, BuildAttemptGroup, MemberEffectReceipt, MemberMutationAuthority,
+    MemberSourceBoundary, MysqlReplicaTarget, MysqlReplicatorError,
 };
 
 use super::driver::MysqlPublicV1Replicator;
@@ -63,6 +64,11 @@ impl IdleBuildPreparation {
             self.epoch = None;
         }
     }
+
+    pub(crate) fn complete(&mut self) {
+        self.epoch = None;
+        self.idle_role = false;
+    }
 }
 
 /// Exact public and native target values admitted for one Build callback.
@@ -73,6 +79,29 @@ pub(crate) struct BuildTargetBinding {
     pub(crate) storage: ReplicaStorageIncarnationContext,
     pub(crate) replication_address: String,
     pub(crate) native: MysqlReplicaTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BuildSourceBinding {
+    pub(crate) identity: ReplicaIdentity,
+    pub(crate) process_session: ProcessSessionId,
+    pub(crate) replication_address: String,
+    pub(crate) native: MysqlReplicaTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BuildCallbackKey {
+    pub(crate) build_id: OperationId,
+    pub(crate) epoch: Epoch,
+    pub(crate) configuration: ConfigurationId,
+    pub(crate) group_key: String,
+    pub(crate) source_identity: ReplicaIdentity,
+    pub(crate) source_process_session: ProcessSessionId,
+    pub(crate) source_configuration: ReplicaSetConfiguration,
+    pub(crate) source_authority: MemberMutationAuthority,
+    pub(crate) source_boundary: MemberSourceBoundary,
+    pub(crate) source_progress: i64,
+    pub(crate) target: BuildTargetBinding,
 }
 
 /// Immutable application-owned authority for one direct custom Build.
@@ -87,7 +116,7 @@ pub(crate) struct BuildBinding {
     pub(crate) epoch: Epoch,
     pub(crate) configuration: ConfigurationId,
     pub(crate) group_key: String,
-    pub(crate) source: BuildTargetBinding,
+    pub(crate) source: BuildSourceBinding,
     pub(crate) target: BuildTargetBinding,
     pub(crate) source_authority: MemberMutationAuthority,
     pub(crate) expected_members: Vec<ReplicaIdentity>,
@@ -99,7 +128,7 @@ pub(crate) struct BuildBinding {
 pub(crate) enum BuildTerminalResult {
     Succeeded,
     Failed(String),
-    RebuildRequired(String),
+    RebuildRequired(kuberic_runtime::protocol::public_operations::ReplicaRebuildRequired),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +154,12 @@ impl<B> BuildResultLedger<B>
 where
     B: Clone + Eq,
 {
+    pub(crate) fn retained(&self, key: &str) -> Option<(B, Option<BuildTerminalResult>)> {
+        self.records
+            .get(key)
+            .map(|record| (record.binding.clone(), record.terminal.clone()))
+    }
+
     pub(crate) fn admit(
         &mut self,
         key: &str,
@@ -199,14 +234,287 @@ impl Drop for BuildSecret {
     }
 }
 
+/// One random Build-scoped credential accepted only by the private recovery
+/// listener.
+pub(crate) struct BuildRecoveryCredential {
+    build: AttemptId,
+    generation: CredentialGeneration,
+    username: String,
+    password: BuildSecret,
+}
+
+impl BuildRecoveryCredential {
+    pub(crate) fn random(build: AttemptId) -> Result<Self, MysqlReplicatorError> {
+        static NEXT_CREDENTIAL: AtomicU64 = AtomicU64::new(1);
+        let serial = NEXT_CREDENTIAL.fetch_add(1, Ordering::Relaxed);
+        let generation = CredentialGeneration::new(format!("build-{serial}"))
+            .map_err(|_| MysqlReplicatorError::IdentityMismatch)?;
+        let username = format!("kms_build_{serial}");
+        let mut random = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut random))
+            .map_err(|_| MysqlReplicatorError::IdentityMismatch)?;
+        let mut password = String::with_capacity(random.len() * 2);
+        for byte in random {
+            use std::fmt::Write as _;
+            write!(&mut password, "{byte:02x}")
+                .map_err(|_| MysqlReplicatorError::IdentityMismatch)?;
+        }
+        Self::new(build, generation, username, password.into_bytes())
+    }
+
+    pub(crate) fn new(
+        build: AttemptId,
+        generation: CredentialGeneration,
+        username: impl Into<String>,
+        password: impl Into<Box<[u8]>>,
+    ) -> Result<Self, MysqlReplicatorError> {
+        let username = username.into();
+        let password = password.into();
+        if username.is_empty()
+            || username.len() > 32
+            || !username
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || password.is_empty()
+            || password.len() > 128
+            || password
+                .iter()
+                .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'\'' | b'"' | b'\\' | b'`'))
+        {
+            return Err(MysqlReplicatorError::IdentityMismatch);
+        }
+        Ok(Self {
+            build,
+            generation,
+            username,
+            password: BuildSecret::new(password)?,
+        })
+    }
+
+    pub(crate) const fn build(&self) -> &AttemptId {
+        &self.build
+    }
+
+    pub(crate) const fn generation(&self) -> &CredentialGeneration {
+        &self.generation
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        std::str::from_utf8(self.password.expose())
+            .expect("Build password is validated UTF-8 at creation")
+    }
+}
+
+impl fmt::Debug for BuildRecoveryCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BuildRecoveryCredential")
+            .field("build", &self.build)
+            .field("generation", &self.generation)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Secret-free proof of one exact Build recovery account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BuildRecoveryAccountReceipt {
+    build: AttemptId,
+    generation: CredentialGeneration,
+    username: String,
+    marker: String,
+}
+
+/// Request-bound native join proof retained without admitting Kuberic
+/// configuration membership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BuildJoinReceipt {
+    build: AttemptId,
+    parent_attempt: AttemptId,
+    target_generation: u64,
+    member: MemberEffectReceipt,
+}
+
+impl BuildJoinReceipt {
+    pub(crate) fn new(
+        build: &BuildAttemptContext,
+        target_generation: u64,
+        member: MemberEffectReceipt,
+    ) -> Result<Self, MysqlReplicatorError> {
+        if member.authority().attempt() != build.parent_attempt() {
+            return Err(MysqlReplicatorError::IdentityMismatch);
+        }
+        Ok(Self {
+            build: build.build().clone(),
+            parent_attempt: build.parent_attempt().clone(),
+            target_generation,
+            member,
+        })
+    }
+
+    pub(crate) const fn build(&self) -> &AttemptId {
+        &self.build
+    }
+
+    pub(crate) const fn parent_attempt(&self) -> &AttemptId {
+        &self.parent_attempt
+    }
+
+    pub(crate) const fn target_generation(&self) -> u64 {
+        self.target_generation
+    }
+
+    pub(crate) const fn member(&self) -> &MemberEffectReceipt {
+        &self.member
+    }
+}
+
+impl BuildRecoveryAccountReceipt {
+    pub(crate) fn new(credential: &BuildRecoveryCredential) -> Self {
+        Self {
+            build: credential.build.clone(),
+            generation: credential.generation.clone(),
+            username: credential.username.clone(),
+            marker: build_account_marker(&credential.build, &credential.generation),
+        }
+    }
+
+    pub(crate) const fn build(&self) -> &AttemptId {
+        &self.build
+    }
+
+    pub(crate) const fn generation(&self) -> &CredentialGeneration {
+        &self.generation
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn marker(&self) -> &str {
+        &self.marker
+    }
+
+    pub(crate) fn marker_is_well_formed(&self) -> bool {
+        self.marker == build_account_marker(&self.build, self.generation())
+    }
+}
+
+fn build_account_marker(build: &AttemptId, generation: &CredentialGeneration) -> String {
+    format!(
+        "kuberic-mysql-build-v1:{}:{}",
+        hex_encode(build.as_str().as_bytes()),
+        hex_encode(generation.as_str().as_bytes())
+    )
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum BuildGenerationStatus {
     Available = 0,
     Reserved = 1,
-    CleanupPending = 2,
+    CleanupOnly = 2,
     NeedsRebuild = 3,
-    Completed = 4,
+    PendingAdmission = 4,
+}
+
+/// Ordered checkpoints for the production Build coordinator. Keeping this
+/// sequence explicit makes interruption disposition deterministic rather than
+/// inferred from whichever async call happened to fail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum BuildCheckpoint {
+    TargetFresh = 0,
+    AccountCleanupOwned = 1,
+    AccountPresent = 2,
+    DonorsPrepared = 3,
+    SourceRevalidated = 4,
+    TargetJoined = 5,
+    SuccessorsObserved = 6,
+    CleanupOnly = 7,
+    AccountAbsent = 8,
+    ProgressRefreshed = 9,
+    FinalRevalidated = 10,
+    Completed = 11,
+}
+
+#[derive(Debug)]
+pub(crate) struct BuildOrchestration {
+    group: BuildAttemptGroup,
+    last: Option<BuildCheckpoint>,
+}
+
+impl BuildOrchestration {
+    pub(crate) fn new(group: BuildAttemptGroup) -> Self {
+        Self { group, last: None }
+    }
+
+    pub(crate) async fn run_work<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> Result<T, RuntimeError> {
+        if self.group.cancellation_state() == crate::service::AttemptCancellationState::Cancelled {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(self.group.work_deadline()),
+            future,
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)
+    }
+
+    pub(crate) async fn run_cleanup<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> Result<T, RuntimeError> {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(self.group.deadline()),
+            future,
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        checkpoint: BuildCheckpoint,
+    ) -> Result<(), MysqlReplicatorError> {
+        let expected = self.last.map_or(0, |last| last as u8 + 1);
+        if checkpoint as u8 != expected {
+            return Err(MysqlReplicatorError::OperationConflict);
+        }
+        self.last = Some(checkpoint);
+        Ok(())
+    }
+
+    pub(crate) fn account_cleanup_owned(&self) -> bool {
+        self.last.is_some_and(|last| {
+            last as u8 >= BuildCheckpoint::AccountCleanupOwned as u8
+                && (last as u8) < BuildCheckpoint::AccountAbsent as u8
+        })
+    }
+
+    pub(crate) fn interruption_requires_reset(&self) -> bool {
+        self.last
+            .is_some_and(|last| last as u8 >= BuildCheckpoint::TargetJoined as u8)
+    }
 }
 
 pub(crate) struct BuildGeneration {
@@ -231,9 +539,9 @@ impl BuildGeneration {
         match self.status.load(Ordering::Acquire) {
             0 => BuildGenerationStatus::Available,
             1 => BuildGenerationStatus::Reserved,
-            2 => BuildGenerationStatus::CleanupPending,
+            2 => BuildGenerationStatus::CleanupOnly,
             3 => BuildGenerationStatus::NeedsRebuild,
-            4 => BuildGenerationStatus::Completed,
+            4 => BuildGenerationStatus::PendingAdmission,
             _ => unreachable!("BuildGeneration stores only known states"),
         }
     }
@@ -376,17 +684,215 @@ pub(crate) struct BuildGroupPermit {
     group: String,
 }
 
+struct GroupRegistry {
+    active: BTreeSet<String>,
+    blocked: BTreeSet<String>,
+}
+
+/// Source-side account owner that survives cancellation of the async callback
+/// future. Target containment is owned by the separately stacked target guard.
+pub(crate) struct BuildSourceCleanup {
+    source: Weak<MysqlPublicV1Replicator>,
+    account: Option<BuildRecoveryAccountReceipt>,
+    build: BuildAttemptContext,
+    predecessor_members: usize,
+    source_generation: Arc<BuildGeneration>,
+    callback: Option<BuildCallbackKey>,
+    donors: Vec<(Weak<MysqlPublicV1Replicator>, Arc<BuildGeneration>)>,
+    group: crate::service::BuildAttemptGroup,
+    permit: Option<BuildGroupPermit>,
+    native_effect: bool,
+    armed: bool,
+}
+
+impl BuildSourceCleanup {
+    pub(crate) fn new(
+        source: Weak<MysqlPublicV1Replicator>,
+        build: BuildAttemptContext,
+        predecessor_members: usize,
+        source_generation: Arc<BuildGeneration>,
+        callback: BuildCallbackKey,
+        donors: Vec<(Weak<MysqlPublicV1Replicator>, Arc<BuildGeneration>)>,
+        permit: BuildGroupPermit,
+    ) -> Self {
+        let group = build.group();
+        Self {
+            source,
+            account: None,
+            build,
+            predecessor_members,
+            source_generation,
+            callback: Some(callback),
+            donors,
+            group,
+            permit: Some(permit),
+            native_effect: false,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn set_account(&mut self, account: BuildRecoveryAccountReceipt) {
+        self.account = Some(account);
+    }
+
+    pub(crate) fn account(&self) -> Option<&BuildRecoveryAccountReceipt> {
+        self.account.as_ref()
+    }
+
+    pub(crate) fn clear_account(&mut self) {
+        self.account = None;
+    }
+
+    pub(crate) fn mark_native_effect(&mut self) {
+        self.native_effect = true;
+    }
+
+    pub(crate) fn block_for_reset(&mut self) {
+        self.source_generation
+            .set(BuildGenerationStatus::CleanupOnly);
+        if let Some(permit) = self.permit.as_mut() {
+            permit.block_for_reset();
+        }
+    }
+
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        build: BuildAttemptContext,
+        source_generation: Arc<BuildGeneration>,
+        donor_generation: Arc<BuildGeneration>,
+        permit: BuildGroupPermit,
+    ) -> Self {
+        Self {
+            source: Weak::new(),
+            account: None,
+            build: build.clone(),
+            predecessor_members: 2,
+            source_generation,
+            callback: None,
+            donors: vec![(Weak::new(), donor_generation)],
+            group: build.group(),
+            permit: Some(permit),
+            native_effect: false,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for BuildSourceCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.source_generation
+            .set(BuildGenerationStatus::CleanupOnly);
+        if self.native_effect {
+            for (_, generation) in &self.donors {
+                generation.set(BuildGenerationStatus::CleanupOnly);
+            }
+        }
+        let Some(account) = self.account.take() else {
+            if self.native_effect {
+                if let Some(permit) = self.permit.as_mut() {
+                    permit.block_for_reset();
+                }
+            } else {
+                self.source_generation.set(BuildGenerationStatus::Available);
+            }
+            return;
+        };
+        // One surviving member in a two-member view cannot safely commit the
+        // replicated DROP. The fixture remains blocked for reset.
+        if self.predecessor_members < 2 {
+            if let Some(permit) = self.permit.as_mut() {
+                permit.block_for_reset();
+            }
+            return;
+        }
+        let Some(source) = self.source.upgrade() else {
+            if let Some(permit) = self.permit.as_mut() {
+                permit.block_for_reset();
+            }
+            return;
+        };
+        let build = self.build.clone();
+        let source_generation = self.source_generation.clone();
+        let donors = self.donors.clone();
+        let callback = self.callback.clone();
+        let group = self.group.clone();
+        let native_effect = self.native_effect;
+        if let Some(permit) = self.permit.as_mut() {
+            permit.block_for_reset();
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let permit = self.permit.take();
+        runtime.spawn(async move {
+            let mut permit = permit;
+            let result = source
+                .cleanup_build_account_after_drop(&account, &build)
+                .await;
+            let mut result = result;
+            if result.is_ok() {
+                for donor in donors.into_iter().filter_map(|(donor, _)| donor.upgrade()) {
+                    let Some(callback) = callback.as_ref() else {
+                        result = Err(RuntimeError::InvalidReplication(
+                            "Build cleanup lost its callback binding".into(),
+                        ));
+                        break;
+                    };
+                    if let Err(error) = donor
+                        .verify_direct_build_account(&account, false, &group, callback)
+                        .await
+                    {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+            if result.is_ok() && !native_effect {
+                if let Some(permit) = permit.as_mut() {
+                    permit.clear_reset_block();
+                }
+                source_generation.set(BuildGenerationStatus::Available);
+            } else if let Some(permit) = permit.as_mut() {
+                permit.block_for_reset();
+            }
+        });
+    }
+}
+
 impl BuildGroupPermit {
     pub(crate) fn try_acquire(group: impl Into<String>) -> Option<Self> {
         let group = group.into();
         let mut groups = group_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if groups.insert(group.clone()) {
-            Some(Self { group })
-        } else {
+        if groups.blocked.contains(&group) || !groups.active.insert(group.clone()) {
             None
+        } else {
+            Some(Self { group })
         }
+    }
+
+    pub(crate) fn block_for_reset(&mut self) {
+        group_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .blocked
+            .insert(self.group.clone());
+    }
+
+    pub(crate) fn clear_reset_block(&mut self) {
+        group_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .blocked
+            .remove(&self.group);
     }
 }
 
@@ -395,18 +901,27 @@ impl Drop for BuildGroupPermit {
         group_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
             .remove(&self.group);
     }
 }
 
-fn group_registry() -> &'static Mutex<BTreeSet<String>> {
-    static GROUPS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    GROUPS.get_or_init(|| Mutex::new(BTreeSet::new()))
+fn group_registry() -> &'static Mutex<GroupRegistry> {
+    static GROUPS: OnceLock<Mutex<GroupRegistry>> = OnceLock::new();
+    GROUPS.get_or_init(|| {
+        Mutex::new(GroupRegistry {
+            active: BTreeSet::new(),
+            blocked: BTreeSet::new(),
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    use crate::service::AttemptContext;
 
     #[test]
     fn generation_is_fail_closed_after_reservation() {
@@ -414,10 +929,147 @@ mod tests {
         assert_ne!(generation.id(), BuildGeneration::new().id());
         assert!(generation.reserve());
         assert!(!generation.reserve());
-        generation.set(BuildGenerationStatus::CleanupPending);
-        assert_eq!(generation.status(), BuildGenerationStatus::CleanupPending);
         generation.set(BuildGenerationStatus::NeedsRebuild);
         assert_eq!(generation.status(), BuildGenerationStatus::NeedsRebuild);
+    }
+
+    #[test]
+    fn orchestration_checkpoints_classify_every_interruption_cut() {
+        let checkpoints = [
+            BuildCheckpoint::TargetFresh,
+            BuildCheckpoint::AccountCleanupOwned,
+            BuildCheckpoint::AccountPresent,
+            BuildCheckpoint::DonorsPrepared,
+            BuildCheckpoint::SourceRevalidated,
+            BuildCheckpoint::TargetJoined,
+            BuildCheckpoint::SuccessorsObserved,
+            BuildCheckpoint::CleanupOnly,
+            BuildCheckpoint::AccountAbsent,
+            BuildCheckpoint::ProgressRefreshed,
+            BuildCheckpoint::FinalRevalidated,
+            BuildCheckpoint::Completed,
+        ];
+        for (cut, checkpoint) in checkpoints.into_iter().enumerate() {
+            let mut sequence = test_orchestration(&format!("checkpoint-{cut}"));
+            for admitted in checkpoints.into_iter().take(cut + 1) {
+                sequence.advance(admitted).unwrap();
+            }
+            assert_eq!(
+                sequence.account_cleanup_owned(),
+                (BuildCheckpoint::AccountCleanupOwned as u8..BuildCheckpoint::AccountAbsent as u8)
+                    .contains(&(checkpoint as u8))
+            );
+            assert_eq!(
+                sequence.interruption_requires_reset(),
+                checkpoint as u8 >= BuildCheckpoint::TargetJoined as u8
+            );
+        }
+    }
+
+    #[test]
+    fn orchestration_rejects_skipped_or_reordered_effects() {
+        let mut sequence = test_orchestration("reordered");
+        assert!(
+            sequence
+                .advance(BuildCheckpoint::AccountCleanupOwned)
+                .is_err()
+        );
+        sequence.advance(BuildCheckpoint::TargetFresh).unwrap();
+        sequence
+            .advance(BuildCheckpoint::AccountCleanupOwned)
+            .unwrap();
+        assert!(
+            sequence
+                .advance(BuildCheckpoint::AccountCleanupOwned)
+                .is_err()
+        );
+        assert!(sequence.advance(BuildCheckpoint::DonorsPrepared).is_err());
+    }
+
+    fn test_orchestration(name: &str) -> BuildOrchestration {
+        BuildOrchestration::new(
+            BuildAttemptGroup::new(
+                AttemptId::new(format!("{name}-build")).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_coordinator_bounds_scripted_work_and_cleanup_effects() {
+        let group = BuildAttemptGroup::new(
+            AttemptId::new("scripted-deadline-build").unwrap(),
+            Instant::now() + Duration::from_millis(80),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        let coordinator = BuildOrchestration::new(group);
+        assert!(
+            coordinator
+                .run_work(tokio::time::sleep(Duration::from_millis(100)))
+                .await
+                .is_err()
+        );
+        assert!(
+            coordinator
+                .run_cleanup(tokio::time::sleep(Duration::from_millis(100)))
+                .await
+                .is_err()
+        );
+    }
+
+    fn cleanup_test_child(name: &str) -> BuildAttemptContext {
+        let now = Instant::now();
+        let parent = AttemptContext::new_at(
+            AttemptId::new(format!("{name}-parent")).unwrap(),
+            now,
+            now + Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        BuildAttemptContext::new(
+            parent,
+            AttemptId::new(format!("{name}-build")).unwrap(),
+            now + Duration::from_secs(20),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn production_cleanup_drop_releases_pre_effect_cut_without_reset() {
+        let group = "cleanup-pre-effect-cut";
+        let source = Arc::new(BuildGeneration::new());
+        let donor = Arc::new(BuildGeneration::new());
+        let owner = BuildSourceCleanup::for_test(
+            cleanup_test_child(group),
+            source.clone(),
+            donor,
+            BuildGroupPermit::try_acquire(group).unwrap(),
+        );
+        drop(owner);
+        assert_eq!(source.status(), BuildGenerationStatus::Available);
+        assert!(BuildGroupPermit::try_acquire(group).is_some());
+    }
+
+    #[test]
+    fn production_cleanup_drop_synchronously_quarantines_native_effect_cut() {
+        let group = "cleanup-native-effect-cut";
+        let source = Arc::new(BuildGeneration::new());
+        let donor = Arc::new(BuildGeneration::new());
+        let mut owner = BuildSourceCleanup::for_test(
+            cleanup_test_child(group),
+            source.clone(),
+            donor.clone(),
+            BuildGroupPermit::try_acquire(group).unwrap(),
+        );
+        owner.mark_native_effect();
+        drop(owner);
+        assert_eq!(source.status(), BuildGenerationStatus::CleanupOnly);
+        assert_eq!(donor.status(), BuildGenerationStatus::CleanupOnly);
+        assert!(BuildGroupPermit::try_acquire(group).is_none());
     }
 
     #[test]
@@ -429,10 +1081,52 @@ mod tests {
     }
 
     #[test]
+    fn blocked_group_requires_process_reset() {
+        let group = "phase-reset-test";
+        let mut permit = BuildGroupPermit::try_acquire(group).unwrap();
+        permit.block_for_reset();
+        drop(permit);
+        assert!(BuildGroupPermit::try_acquire(group).is_none());
+    }
+
+    #[test]
     fn secret_debug_is_redacted() {
         let secret = BuildSecret::new(vec![1_u8, 2, 3]).unwrap();
         assert_eq!(format!("{secret:?}"), "BuildSecret([REDACTED])");
         assert_eq!(secret.expose(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn recovery_credential_is_build_bound_and_redacted() {
+        let credential = BuildRecoveryCredential::new(
+            AttemptId::new("build-credential").unwrap(),
+            CredentialGeneration::new("generation").unwrap(),
+            "build_recovery_1",
+            b"recovery-secret".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(credential.build().as_str(), "build-credential");
+        assert_eq!(credential.password(), "recovery-secret");
+        assert!(!format!("{credential:?}").contains("recovery-secret"));
+        let receipt = BuildRecoveryAccountReceipt::new(&credential);
+        assert_eq!(receipt.username(), "build_recovery_1");
+        assert_eq!(receipt.generation(), credential.generation());
+    }
+
+    #[test]
+    fn recovery_account_marker_hex_encodes_opaque_sql_metacharacters() {
+        let credential = BuildRecoveryCredential::new(
+            AttemptId::new("build-'; DROP USER root; --").unwrap(),
+            CredentialGeneration::new("generation'quoted").unwrap(),
+            "build_recovery_safe",
+            b"recovery-secret".to_vec(),
+        )
+        .unwrap();
+        let receipt = BuildRecoveryAccountReceipt::new(&credential);
+        assert!(receipt.marker_is_well_formed());
+        assert!(!receipt.marker().contains('\''));
+        assert!(!receipt.marker().contains(';'));
+        assert!(!receipt.marker().contains(' '));
     }
 
     #[test]

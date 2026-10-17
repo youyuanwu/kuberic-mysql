@@ -365,6 +365,11 @@ fn exported_retry_state_reuses_exact_values_and_rejects_conflicts_or_regression(
         ledger.admit("role", (Epoch::new(1, 2), ReplicaRole::ActiveSecondary)),
         Err(KubericTranslationError::OperationConflict)
     );
+    let second = ledger
+        .admit("progress", (Epoch::new(1, 2), ReplicaRole::Primary))
+        .unwrap();
+    assert_ne!(first.id(), second.id());
+    assert!(second.generation() > first.generation());
 
     let mut epochs = EpochTranslator::new();
     let mapped = epochs.translate(Epoch::new(1, 9)).unwrap();
@@ -449,6 +454,14 @@ fn pinned_public_v1_bundle_and_fresh_only_service_shape_are_exported() {
         MysqlPublicV1ServiceConfig::storage_state(&config).unwrap(),
         ApplicationStorageState::FreshEmpty
     );
+    let rendered = config.instance().render_server_config();
+    assert!(config.instance().build_recovery_networking());
+    assert!(rendered.contains("bind-address=127.0.0.1"));
+    assert!(rendered.contains("skip-name-resolve=ON"));
+    assert!(rendered.contains("loose-group-replication-recovery-get-public-key=ON"));
+    assert!(rendered.contains("loose-group-replication-recovery-use-ssl=OFF"));
+    assert!(!rendered.contains("skip-networking=ON"));
+    assert!(!rendered.contains("clone"));
     fs::create_dir_all(config.instance().data_root()).unwrap();
     fs::write(config.instance().data_root().join("native-state"), b"owned").unwrap();
     assert_eq!(

@@ -239,7 +239,6 @@ impl AttemptContext {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn cancellation_receiver(&self) -> watch::Receiver<bool> {
         self.cancellation.subscribe()
     }
@@ -266,10 +265,18 @@ impl BuildAttemptContext {
         self.parent.attempt()
     }
 
+    pub(crate) const fn parent_context(&self) -> &AttemptContext {
+        &self.parent
+    }
+
     /// Exact child Build identity.
     #[must_use]
     pub const fn build(&self) -> &AttemptId {
         &self.group.build
+    }
+
+    pub(crate) fn group(&self) -> BuildAttemptGroup {
+        self.group.clone()
     }
 
     /// Common absolute Build deadline, bounded by the parent.
@@ -324,14 +331,6 @@ impl BuildAttemptContext {
             .then_some(())
             .ok_or(AttemptAdmissionError::Expired)
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn cancellation_receivers(&self) -> (watch::Receiver<bool>, watch::Receiver<bool>) {
-        (
-            self.parent.cancellation_receiver(),
-            self.group.cancellation.subscribe(),
-        )
-    }
 }
 
 impl BuildAttemptGroup {
@@ -371,10 +370,21 @@ impl BuildAttemptGroup {
         if self.deadline > parent.deadline() {
             return Err(AttemptAdmissionError::Expired);
         }
+
         Ok(BuildAttemptContext {
             parent,
             group: self.clone(),
         })
+    }
+
+    #[must_use]
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    #[must_use]
+    pub const fn work_deadline(&self) -> Instant {
+        self.work_deadline
     }
 
     /// Cancels every participant child without cancelling any parent.
@@ -506,5 +516,33 @@ mod build_attempt_tests {
             child_three.admit_work(),
             Err(AttemptAdmissionError::Cancelled)
         );
+    }
+
+    #[test]
+    fn child_reserves_cleanup_and_never_credits_late_work() {
+        let now = Instant::now();
+        let parent = AttemptContext::new_at(
+            AttemptId::new("cleanup-parent").unwrap(),
+            now,
+            now + Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let group = BuildAttemptGroup::new(
+            AttemptId::new("cleanup-build").unwrap(),
+            Instant::now() + Duration::from_millis(80),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        let child = group.child(parent).unwrap();
+        child.admit_work().unwrap();
+        std::thread::sleep(Duration::from_millis(45));
+        assert_eq!(
+            child.admit_work(),
+            Err(AttemptAdmissionError::CleanupReserve)
+        );
+        child.admit_cleanup().unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(child.admit_cleanup(), Err(AttemptAdmissionError::Expired));
     }
 }
