@@ -432,6 +432,27 @@ The live tests launch only isolated project-local fixture children, require all
 scenarios and cleanup to pass, and remove temporary data, runtime files, and
 sockets.
 
-GitHub Actions installs the same exact Oracle package and pinned nextest binary
-on Ubuntu 24.04 and runs the standard workspace gate for every pull request and
-every push to `main`.
+For every pull request and every push to `main`, a GitHub Actions build job
+compiles the workspace tests once with `cargo nextest archive` and uploads the
+Zstandard-compressed tarball. Formatting, documentation tests, and Clippy also
+run once in that job. Four separate Ubuntu 24.04 runners install the same exact
+Oracle package and pinned nextest binary, download the archive, and run disjoint
+hash partitions (`hash:1/4` through `hash:4/4`) in parallel without recompiling.
+The `ci` profile keeps tests serial within each runner. A failed partition does
+not cancel the others.
+
+To reproduce one CI partition locally:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --workspace --profile ci \
+  --partition hash:1/4
+```
+
+To build and reuse the same archive locally:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest archive --locked --offline --workspace \
+  --profile ci --archive-file nextest-archive.tar.zst
+cargo nextest run --archive-file nextest-archive.tar.zst \
+  --workspace-remap "$PWD" --profile ci --partition hash:1/4
+```
