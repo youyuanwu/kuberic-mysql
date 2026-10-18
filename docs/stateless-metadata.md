@@ -126,6 +126,32 @@ Durable MySQL facts belong to the MySQL data directory. Durable orchestration
 facts belong to Kuberic's generic controller and replica-agent facilities.
 Scratch files are disposable.
 
+### Delivered closed retained-owner reopen
+
+The first Stage 3 slice adds the separate public `MysqlStoppedReopen` primitive,
+not automatic `Existing` or owner-loss reconstruction. A trusted embedding
+consumes an exact quiet manager into a nonserializable graceful-stop capability
+and supplies accepted public generic authority plus an exact expected native
+boundary. The one-use capability owns the same data and scratch/native logs;
+reopen starts a fresh closed child and returns only `MysqlClosedReopened`.
+Full executed/purged sets, native UUID/topology, device/inode and independent
+native/generic process-session fences are validated. No predecessor role,
+configuration, access, Build ledger or commitment sample is resurrected.
+
+Native SQL/X/GR ingress, asynchronous replication and event scheduling remain
+disabled. Native read-only settings are necessary but not sufficient: issuing
+any application/proxy capability monotonically disqualifies the owner, even
+if an idle or unpublished proxy currently has no backend sessions. Lifetime
+durability disqualification is also monotonic across the stop/reopen.
+
+This selected mode retains native binary logs on scratch. Ordinary terminal
+stop still deletes scratch; its data-only remainder is not a reopen capability.
+Lost logs/scratch, abrupt shutdown or lost in-memory ownership require reset.
+The native-log inventory and all generic/native binding evidence remain
+memory-only. Current settings do not certify an unknown predecessor lifetime.
+See [closed safe reopen](mysql-safe-reopen.md) for the complete API, trusted-caller
+boundary, exact upstream recovery-envelope gap and qualification commands.
+
 ## Motivation
 
 The broader MySQL design requires exact process and storage ownership,

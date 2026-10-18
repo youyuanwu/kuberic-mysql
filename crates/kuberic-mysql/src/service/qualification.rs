@@ -469,9 +469,10 @@ impl<'a> MysqlNativeQualification<'a> {
             Ok(())
         } else {
             Err(format!(
-                "qualification cleanup failed: {} member failures, deadline_overrun={}",
+                "qualification cleanup failed: {} member failures, deadline_overrun={}, failures={:?}",
                 cleanup.failures.len(),
-                cleanup.deadline_overrun
+                cleanup.deadline_overrun,
+                cleanup.failures,
             ))
         }
     }

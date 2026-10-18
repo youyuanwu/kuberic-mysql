@@ -215,6 +215,8 @@ impl MysqlStoppedReopen {
         admit(attempt)?;
         manager.revalidate_roots()?;
         let logs = NativeLogs::capture(manager.config().runtime().scratch_root())?;
+        // Filesystem inspection can itself consume the remaining work budget.
+        admit(attempt)?;
         Ok(Self {
             manager,
             sealed,
@@ -286,6 +288,7 @@ impl MysqlClosedReopened {
         {
             return Err(MysqlReopenError::Ownership);
         }
+        admit(attempt)?;
         self.current = observed.clone();
         Ok(observed)
     }
