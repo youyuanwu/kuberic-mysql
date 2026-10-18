@@ -86,6 +86,11 @@ donor capability or access, and does not enable hosted `Existing`. Lost-owner,
 abrupt and lost-log recovery remain unsupported; no private durable authority
 is added.
 
+The [recovery authority contract](docs/mysql-recovery-authority.md) records the
+next contract-only Stage 3 slice: exact upstream accepted-envelope and physical
+retained-owner handoff requirements. Conversion to a fresh unassigned,
+access-closed generic replicator remains blocked; no runtime API or pin changes.
+
 The same module now exposes `MysqlReplicator`, a one-member lifecycle engine
 that owns one `MysqlInstanceManager` and enforces open, newer epoch, role,
 configuration, access, and terminal ordering. Same-role transitions still

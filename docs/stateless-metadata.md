@@ -158,6 +158,9 @@ The native-log inventory and all generic/native binding evidence remain
 memory-only. Current settings do not certify an unknown predecessor lifetime.
 See [closed safe reopen](mysql-safe-reopen.md) for the complete API, trusted-caller
 boundary, exact upstream recovery-envelope gap and qualification commands.
+The [recovery authority contract](mysql-recovery-authority.md) specifies the
+missing public accepted-envelope and physical-retirement/retained-owner handoff.
+That documentation-only slice grants no generic attachment or public progress.
 
 ## Motivation
 
@@ -573,7 +576,14 @@ its delivery stage.
 
 ## Startup Reconstruction
 
-A replacement MySQL lifecycle component follows this sequence:
+The following is the broader **future** reconstruction contract, not delivered
+startup behavior. Today's hosted `Existing` remains rejected. The bounded
+[retained-owner handoff contract](mysql-recovery-authority.md#required-public-production-contract)
+first requires a fresh unassigned, access-closed attachment with no public
+scalar/committed progress or donor credit; any later election-progress report
+requires independent qualification. Neither this recipe nor retained native
+history supplies missing generic authority or permits private generic-store
+access. A future replacement MySQL lifecycle component follows this sequence:
 
 1. Begin with external read and write access closed.
 2. Open and validate the generic agent authority.

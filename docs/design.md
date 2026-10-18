@@ -1492,7 +1492,7 @@ scope, returning only a closed `MysqlClosedReopened` handle.
 
 No-proof capture rejects every manager that issued application/proxy capability:
 a currently idle, unpublished or previously revoked proxy does not prove closure
-of its independent listener owner. The next bounded slice adds opt-in
+of its independent listener owner. The delivered terminal-proxy slice adds opt-in
 `prepare_reopenable_proxy` and terminal `close_for_reopen`: one exact production
 issuance can surrender its listener, complete task/native-session history and
 account into a noncloneable, one-use `MysqlProxyReopenClosure`. The manager is
@@ -1519,6 +1519,13 @@ PoC never resumes the operation.
 
 The contract below remains future Stage 3 work; the delivered closed primitive
 does not supply these role/configuration/peer/access replay steps.
+The next bounded slice is the documented
+[recovery authority and retained-owner handoff contract](mysql-recovery-authority.md):
+immutable public-contract evidence, accepted scope, physical custody sequencing
+and future fail-closed gates. Runtime conversion remains blocked; no manager
+extraction, dependency repin or hosted `Existing` is delivered. Its initial
+fresh attachment must grant no public scalar/committed progress or donor credit;
+later qualified progress in the broader protocol below is separate work.
 
 Runtime or host restart creates fresh process and observation sessions. The
 replacement starts unassigned and access-closed. It receives no predecessor
