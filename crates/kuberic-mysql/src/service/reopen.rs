@@ -48,7 +48,7 @@ pub struct MysqlReopenAuthority {
 }
 
 impl MysqlReopenAuthority {
-    fn validate(&self) -> Result<(), MysqlReopenError> {
+    pub(crate) fn validate(&self) -> Result<(), MysqlReopenError> {
         if self.storage.validate().is_err()
             || self.history.validate().is_err()
             || self.partition.is_empty()
@@ -179,17 +179,52 @@ impl MysqlReopenEvidence {
     }
 }
 
+/// Noncloneable, nonserializable custody of one terminal production proxy
+/// closure. No public value constructor or conversion from ordinary receipts.
+///
+/// This binds the complete trusted generic predecessor supplied at surrender,
+/// in addition to private native owner/member/storage/process issuance identity.
+/// It does not authenticate generic authority or restore application access.
+pub struct MysqlProxyReopenClosure {
+    issuance: std::sync::Arc<crate::service::instance::MysqlProxyIssuance>,
+    authority: MysqlReopenAuthority,
+}
+
+impl MysqlProxyReopenClosure {
+    pub(crate) fn new(
+        issuance: std::sync::Arc<crate::service::instance::MysqlProxyIssuance>,
+        authority: MysqlReopenAuthority,
+    ) -> Self {
+        Self {
+            issuance,
+            authority,
+        }
+    }
+
+    fn validate_authority(
+        sealed: &MysqlReopenAuthority,
+        actual: &MysqlReopenAuthority,
+    ) -> Result<(), MysqlReopenError> {
+        if sealed != actual {
+            return Err(MysqlReopenError::Authority);
+        }
+        Ok(())
+    }
+}
+
 /// Noncloneable, nonserializable, one-use proof of an exactly owned graceful
 /// stop. Native data AND scratch logs stay intact. Drop never adopts a survivor.
 ///
 /// Only quiet, closed, inactive topology-member managers which have never
-/// issued an application/proxy capability are admitted. Idle, unpublished or
-/// previously revoked proxies do not supply an exact closed-owner handoff.
+/// issued an application/proxy capability are admitted without a closure proof.
+/// The explicit production proxy path additionally supports exact terminal
+/// surrender; idle, unpublished or revoked state alone never qualifies.
 /// Ordinary `MysqlInstanceManager::stop` does not produce this capability.
 pub struct MysqlStoppedReopen {
     manager: MysqlInstanceManager,
     sealed: MysqlReopenEvidence,
     logs: NativeLogs,
+    ingress: Option<MysqlProxyReopenClosure>,
 }
 
 impl MysqlStoppedReopen {
@@ -200,15 +235,39 @@ impl MysqlStoppedReopen {
     /// cancellation or lost ownership. On error/drop, the retained child owner
     /// contains only its own process; existing data is never deleted.
     pub async fn capture(
-        mut manager: MysqlInstanceManager,
+        manager: MysqlInstanceManager,
         authority: MysqlReopenAuthority,
         expected: MysqlReopenBoundary,
         attempt: &AttemptContext,
     ) -> Result<Self, MysqlReopenError> {
+        Self::capture_qualified(manager, authority, expected, attempt, None).await
+    }
+
+    /// Consumes the exact one-use production proxy closure. No-proof capture
+    /// still rejects the same issued owner, even after terminal surrender.
+    pub async fn capture_with_proxy_closure(
+        mut manager: MysqlInstanceManager,
+        closure: MysqlProxyReopenClosure,
+        authority: MysqlReopenAuthority,
+        expected: MysqlReopenBoundary,
+        attempt: &AttemptContext,
+    ) -> Result<Self, MysqlReopenError> {
+        MysqlProxyReopenClosure::validate_authority(&closure.authority, &authority)?;
+        manager.validate_proxy_issuance(&closure.issuance, true)?;
+        Self::capture_qualified(manager, authority, expected, attempt, Some(closure)).await
+    }
+
+    async fn capture_qualified(
+        mut manager: MysqlInstanceManager,
+        authority: MysqlReopenAuthority,
+        expected: MysqlReopenBoundary,
+        attempt: &AttemptContext,
+        ingress: Option<MysqlProxyReopenClosure>,
+    ) -> Result<Self, MysqlReopenError> {
         authority.validate()?;
         expected.validate()?;
         admit(attempt)?;
-        let observed = read_closed(&mut manager, attempt, false).await?;
+        let observed = read_closed(&mut manager, attempt, false, ingress.as_ref()).await?;
         expected.matches(&observed)?;
         let sealed = evidence(&mut manager, authority, observed, attempt)?;
         manager.stop_for_reopen(attempt)?;
@@ -221,6 +280,7 @@ impl MysqlStoppedReopen {
             manager,
             sealed,
             logs,
+            ingress,
         })
     }
 
@@ -242,7 +302,7 @@ impl MysqlStoppedReopen {
         self.logs
             .verify(self.manager.config().runtime().scratch_root())?;
         self.manager.start_for_reopen(attempt)?;
-        let observed = read_closed(&mut self.manager, attempt, true).await?;
+        let observed = read_closed(&mut self.manager, attempt, true, self.ingress.as_ref()).await?;
         self.sealed.boundary.matches(&observed)?;
         let current = evidence(&mut self.manager, renewal.replacement, observed, attempt)?;
         if current.native_process_session == self.sealed.native_process_session
@@ -254,6 +314,7 @@ impl MysqlStoppedReopen {
         Ok(MysqlClosedReopened {
             manager: self.manager,
             current,
+            ingress: self.ingress,
         })
     }
 }
@@ -266,6 +327,7 @@ impl MysqlStoppedReopen {
 pub struct MysqlClosedReopened {
     manager: MysqlInstanceManager,
     current: MysqlReopenEvidence,
+    ingress: Option<MysqlProxyReopenClosure>,
 }
 
 impl MysqlClosedReopened {
@@ -275,7 +337,7 @@ impl MysqlClosedReopened {
         &mut self,
         attempt: &AttemptContext,
     ) -> Result<MysqlReopenEvidence, MysqlReopenError> {
-        let observed = read_closed(&mut self.manager, attempt, true).await?;
+        let observed = read_closed(&mut self.manager, attempt, true, self.ingress.as_ref()).await?;
         self.current.boundary.matches(&observed)?;
         let observed = evidence(
             &mut self.manager,
@@ -324,6 +386,8 @@ pub enum MysqlReopenError {
     Instance(MysqlInstanceError),
     /// Private-UDS native read failure.
     Native(MysqlTopologyError),
+    /// Terminal proxy listener/task/backend/account containment failed.
+    Proxy(crate::service::MysqlProxyError),
 }
 
 impl std::fmt::Display for MysqlReopenError {
@@ -351,11 +415,13 @@ async fn read_closed(
     manager: &mut MysqlInstanceManager,
     attempt: &AttemptContext,
     reopened: bool,
+    ingress: Option<&MysqlProxyReopenClosure>,
 ) -> Result<MysqlReopenBoundary, MysqlReopenError> {
     admit(attempt)?;
     if manager.config().topology().is_none()
         || manager.config().build_recovery_networking()
-        || manager.application_capability_issued()
+        || (manager.application_capability_issued()
+            && !ingress.is_some_and(|proof| manager.matches_proxy_issuance(&proof.issuance, true)))
     {
         return Err(MysqlReopenError::AccessNotClosed);
     }
@@ -451,14 +517,14 @@ impl NativeLogs {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use kuberic_runtime::protocol::types::{
         AgentGeneration, HistoryId, PodUid, PublicProtocolGeneration, PvcUid, ReplicaId,
         ReplicaIdentity, ReplicaInstanceId, ReplicaStorageIdentity, ResourceUid, StorageGeneration,
     };
 
-    fn authority() -> MysqlReopenAuthority {
+    pub(crate) fn authority() -> MysqlReopenAuthority {
         MysqlReopenAuthority {
             storage: ReplicaStorageIncarnationContext {
                 replica: ReplicaIdentity {
@@ -485,6 +551,42 @@ mod tests {
             configuration: ConfigurationId::new("old-config"),
             operation: OperationId::new("old-op"),
             revision: 1,
+        }
+    }
+
+    #[test]
+    fn reopen_proxy_closure_freezes_every_generic_predecessor_dimension() {
+        let sealed = authority();
+        MysqlProxyReopenClosure::validate_authority(&sealed, &sealed).unwrap();
+        let substitutions: Vec<fn(&mut MysqlReopenAuthority)> = vec![
+            |a| a.storage.replica.replica_id = ReplicaId::new(2),
+            |a| a.storage.replica.instance_id = ReplicaInstanceId::new("other"),
+            |a| a.storage.replica.agent_generation = AgentGeneration::new("other"),
+            |a| a.storage.storage_generation = StorageGeneration::new("other"),
+            |a| {
+                a.storage.storage = ReplicaStorageIdentity::Volatile {
+                    identity: "other".into(),
+                }
+            },
+            |a| a.partition = PartitionId::new("other"),
+            |a| a.history.resource_uid = ResourceUid::new("other"),
+            |a| a.history.protocol_generation = PublicProtocolGeneration::new(2),
+            |a| a.history.history_id = HistoryId::new("other"),
+            |a| a.history.data_loss_number = 1,
+            |a| a.process_session = ProcessSessionId::new("other"),
+            |a| a.replicator_creation = ReplicatorCreationId::new("other"),
+            |a| a.epoch = Epoch::new(0, 2),
+            |a| a.configuration = ConfigurationId::new("other"),
+            |a| a.operation = OperationId::new("other"),
+            |a| a.revision = 2,
+        ];
+        for substitute in substitutions {
+            let mut actual = sealed.clone();
+            substitute(&mut actual);
+            assert!(matches!(
+                MysqlProxyReopenClosure::validate_authority(&sealed, &actual),
+                Err(MysqlReopenError::Authority),
+            ));
         }
     }
 

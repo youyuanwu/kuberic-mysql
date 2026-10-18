@@ -33,6 +33,10 @@ const SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const REVOCATION_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod tests;
+
 const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
@@ -582,6 +586,8 @@ struct SessionRecord {
 #[derive(Debug)]
 struct Registry {
     accepting: bool,
+    terminal: bool,
+    task_failure: bool,
     generation: Option<NonZeroU64>,
     settlement_reason: Option<MysqlProxySettlementReason>,
     next_session: u64,
@@ -690,6 +696,8 @@ pub struct MysqlClientProxy {
     tasks_joined: bool,
     native_absence_proved: bool,
     account_active: bool,
+    reopen_issuance: Option<Arc<crate::service::instance::MysqlProxyIssuance>>,
+    closure_minted: bool,
 }
 
 impl MysqlClientProxy {
@@ -821,6 +829,8 @@ impl MysqlClientProxy {
             shared: Arc::new(Shared {
                 registry: Mutex::new(Registry {
                     accepting: false,
+                    terminal: false,
+                    task_failure: false,
                     generation: None,
                     settlement_reason: None,
                     next_session: 1,
@@ -840,7 +850,136 @@ impl MysqlClientProxy {
             tasks_joined: true,
             native_absence_proved: true,
             account_active: true,
+            reopen_issuance: None,
+            closure_minted: false,
         })
+    }
+
+    pub(crate) fn attach_reopen_issuance(
+        &mut self,
+        issuance: Arc<crate::service::instance::MysqlProxyIssuance>,
+    ) {
+        self.reopen_issuance = Some(issuance);
+    }
+
+    pub(crate) fn reopen_issuance(
+        &self,
+    ) -> Option<&Arc<crate::service::instance::MysqlProxyIssuance>> {
+        self.reopen_issuance.as_ref()
+    }
+
+    /// Irreversibly retires this exact production proxy. The synchronous entry
+    /// fence runs before the returned future can be dropped, even unpolled.
+    ///
+    /// Owns the manager through all asynchronous settlement. Error/drop contains
+    /// that exact child and returns no proof; stale shared proxy owners remain
+    /// terminal. Success returns the manager and one noncloneable capability for
+    /// `MysqlStoppedReopen::capture_with_proxy_closure`, not serving handoff.
+    pub fn close_for_reopen<'a>(
+        &'a mut self,
+        mut manager: crate::service::MysqlInstanceManager,
+        authority: crate::service::MysqlReopenAuthority,
+        attempt: &'a AttemptContext,
+    ) -> impl Future<
+        Output = Result<
+            (
+                crate::service::MysqlInstanceManager,
+                crate::service::MysqlProxyReopenClosure,
+            ),
+            crate::service::MysqlReopenError,
+        >,
+    > + 'a {
+        let issuance = self.reopen_issuance.clone();
+        let validation = (|| {
+            authority.validate()?;
+            if self.closure_minted {
+                return Err(crate::service::MysqlReopenError::Ownership);
+            }
+            let issuance = issuance
+                .as_ref()
+                .ok_or(crate::service::MysqlReopenError::Ownership)?;
+            manager.validate_proxy_issuance(issuance, false)?;
+            Ok(())
+        })();
+        self.close_validated(manager, issuance, authority, attempt, validation)
+    }
+
+    fn close_validated<'a>(
+        &'a mut self,
+        mut manager: crate::service::MysqlInstanceManager,
+        issuance: Option<Arc<crate::service::instance::MysqlProxyIssuance>>,
+        authority: crate::service::MysqlReopenAuthority,
+        attempt: &'a AttemptContext,
+        validation: Result<(), crate::service::MysqlReopenError>,
+    ) -> impl Future<
+        Output = Result<
+            (
+                crate::service::MysqlInstanceManager,
+                crate::service::MysqlProxyReopenClosure,
+            ),
+            crate::service::MysqlReopenError,
+        >,
+    > + 'a {
+        if validation.is_ok() {
+            self.terminal_now();
+            manager.seal_proxy_issuance();
+        }
+        async move {
+            validation?;
+            let issuance = issuance.expect("validated exact production issuance");
+            attempt
+                .admit_work()
+                .map_err(crate::service::MysqlReopenError::Attempt)?;
+            self.settle_terminal(&mut manager, attempt)
+                .await
+                .map_err(crate::service::MysqlReopenError::Proxy)?;
+            manager.validate_proxy_issuance(&issuance, true)?;
+            attempt
+                .admit_work()
+                .map_err(crate::service::MysqlReopenError::Attempt)?;
+            self.closure_minted = true;
+            let proof = crate::service::reopen::MysqlProxyReopenClosure::new(issuance, authority);
+            Ok((manager, proof))
+        }
+    }
+
+    fn terminal_now(&self) {
+        {
+            let mut registry = self.shared.lock();
+            registry.terminal = true;
+            registry.accepting = false;
+        }
+        self.seal_now();
+    }
+
+    /// Shared mechanics are private: fake generic controls cannot certify the
+    /// history of a provenance-bearing production proxy.
+    async fn settle_terminal<C: MysqlProxyControlBoundary>(
+        &mut self,
+        control: &mut C,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        let (terminal, task_failure) = {
+            let registry = self.shared.lock();
+            (registry.terminal, registry.task_failure)
+        };
+        if !terminal || task_failure {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        let authority = self.authority.clone();
+        if let Some(generation) = self.published_generation {
+            self.revoke_owned(control, &authority, generation, attempt)
+                .await?;
+        } else {
+            // No task/backend can ever have run in this prepared generation.
+            self.contain_prepared(NonZeroU64::MIN, attempt)?;
+        }
+        self.cleanup_account_owned(control, &authority, attempt)
+            .await?;
+        if self.listener_is_bound() || self.shared.lock().task_failure {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        Ok(())
     }
 
     /// Bound unpublished or published loopback address.
@@ -866,7 +1005,8 @@ impl MysqlClientProxy {
         &mut self,
         access_guard: Arc<dyn MysqlProxyAccessGuard>,
     ) -> Result<(), MysqlProxyError> {
-        if self.published_generation.is_some()
+        if self.shared.lock().terminal
+            || self.published_generation.is_some()
             || self.accept_task.is_some()
             || self.snapshot().generation().is_some()
         {
@@ -888,7 +1028,7 @@ impl MysqlClientProxy {
         if !read || !write {
             return Err(MysqlProxyError::BothPermissionsRequired);
         }
-        if self.accept_task.is_some() || !self.account_active {
+        if self.shared.lock().terminal || self.accept_task.is_some() || !self.account_active {
             return Err(MysqlProxyError::InvalidState);
         }
         if !self.listener_is_bound() {
@@ -896,7 +1036,7 @@ impl MysqlClientProxy {
         }
         {
             let mut registry = self.shared.lock();
-            if registry.generation.is_some() || !registry.sessions.is_empty() {
+            if registry.terminal || registry.generation.is_some() || !registry.sessions.is_empty() {
                 return Err(MysqlProxyError::InvalidState);
             }
             registry.accepting = true;
@@ -958,6 +1098,23 @@ impl MysqlClientProxy {
         generation: NonZeroU64,
         attempt: &AttemptContext,
     ) -> Result<MysqlProxyContainmentReceipt, MysqlProxyError> {
+        if self.reopen_issuance.is_some() {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        self.revoke_owned(control, authority, generation, attempt)
+            .await
+    }
+
+    pub(crate) async fn revoke_owned<C: MysqlProxyControlBoundary>(
+        &mut self,
+        control: &mut C,
+        authority: &MemberMutationAuthority,
+        generation: NonZeroU64,
+        attempt: &AttemptContext,
+    ) -> Result<MysqlProxyContainmentReceipt, MysqlProxyError> {
+        if self.shared.lock().task_failure {
+            return Err(MysqlProxyError::InvalidState);
+        }
         if self.published_generation != Some(generation)
             || self.shared.lock().generation != Some(generation)
         {
@@ -980,6 +1137,7 @@ impl MysqlClientProxy {
             match tokio::time::timeout(remaining, &mut *task).await {
                 Ok(joined) => {
                     if joined.is_err() {
+                        self.shared.lock().task_failure = true;
                         self.accept_task.take();
                         self.record_cleanup_failure();
                         return Err(MysqlProxyError::InvalidState);
@@ -987,16 +1145,21 @@ impl MysqlClientProxy {
                     self.accept_task.take();
                 }
                 Err(_) => {
+                    self.shared.lock().task_failure = true;
                     let task = self
                         .accept_task
-                        .take()
+                        .as_mut()
                         .expect("timed out task remained owned by proxy");
                     task.abort();
-                    let _ = task.await;
+                    let _ = (&mut *task).await;
+                    self.accept_task.take();
                     self.record_cleanup_failure();
                     return Err(MysqlProxyError::Deadline(MysqlProxyPhase::Revocation));
                 }
             }
+        }
+        if self.shared.lock().task_failure {
+            return Err(MysqlProxyError::InvalidState);
         }
         self.tasks_joined = true;
         let mut proved = BTreeSet::new();
@@ -1111,7 +1274,12 @@ impl MysqlClientProxy {
     ) -> Result<SocketAddr, MysqlProxyError> {
         attempt.admit_work().map_err(map_attempt_admission)?;
         let snapshot = self.snapshot();
-        if !listen_address.ip().is_loopback()
+        let blocked = {
+            let registry = self.shared.lock();
+            registry.terminal || registry.task_failure
+        };
+        if blocked
+            || !listen_address.ip().is_loopback()
             || !self.account_active
             || !self.is_fully_contained()
             || snapshot.accepting()
@@ -1167,9 +1335,23 @@ impl MysqlClientProxy {
         authority: &MemberMutationAuthority,
         attempt: &AttemptContext,
     ) -> Result<(), MysqlProxyError> {
+        if self.reopen_issuance.is_some() {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        self.cleanup_account_owned(control, authority, attempt)
+            .await
+    }
+
+    async fn cleanup_account_owned<C: MysqlProxyControlBoundary>(
+        &mut self,
+        control: &mut C,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
         let cleanup_ready = {
             let registry = self.shared.lock();
             !registry.accepting
+                && !registry.task_failure
                 && registry.sessions.is_empty()
                 && registry.active_commands == 0
                 && registry.unidentified_backends == 0
@@ -1352,10 +1534,7 @@ async fn accept_loop(
             }
             completed = sessions.join_next(), if !sessions.is_empty() => {
                 if completed.is_some_and(|result| result.is_err()) {
-                    let mut registry = context.shared.lock();
-                    registry.ambiguous_effect = true;
-                    registry.diagnostics.ambiguities =
-                        registry.diagnostics.ambiguities.saturating_add(1);
+                    record_task_failure(&context.shared);
                 }
             }
             () = tokio::time::sleep(POLL_INTERVAL) => {
@@ -1410,7 +1589,7 @@ async fn accept_loop(
                 }
                 let session_id = {
                     let mut registry = context.shared.lock();
-                    if !registry.accepting
+                    if registry.terminal || !registry.accepting
                         || registry.generation != Some(context.generation)
                     {
                         drop(client);
@@ -1457,13 +1636,22 @@ async fn accept_loop(
         .lock()
         .expect("proxy listener mutex poisoned")
         .take();
+    join_sessions(&mut sessions, &context.shared).await;
+}
+
+async fn join_sessions(sessions: &mut tokio::task::JoinSet<()>, shared: &Shared) {
     while let Some(result) = sessions.join_next().await {
         if result.is_err() {
-            let mut registry = context.shared.lock();
-            registry.ambiguous_effect = true;
-            registry.diagnostics.ambiguities = registry.diagnostics.ambiguities.saturating_add(1);
+            record_task_failure(shared);
         }
     }
+}
+
+fn record_task_failure(shared: &Shared) {
+    let mut registry = shared.lock();
+    registry.task_failure = true;
+    registry.ambiguous_effect = true;
+    registry.diagnostics.ambiguities = registry.diagnostics.ambiguities.saturating_add(1);
 }
 
 fn settle_registry(
@@ -1522,7 +1710,7 @@ impl SessionGuard {
         if let Err(error) = attempt.admit_work() {
             return Err(MysqlProxyError::Settled(settlement_from_admission(error)));
         }
-        if !registry.accepting {
+        if registry.terminal || !registry.accepting {
             return Err(registry
                 .settlement_reason
                 .map(MysqlProxyError::Settled)
