@@ -2423,7 +2423,9 @@ fn retain_owned_runtime_evidence(root: &OwnedRoot) -> Result<(), MysqlInstanceEr
     let mismatch = || MysqlInstanceError::Ownership(crate::service::OwnershipError::RootMismatch);
     let parent = root.path().parent().ok_or_else(mismatch)?;
     let name = root.path().file_name().ok_or_else(mismatch)?;
-    let retained = root.path().with_extension("retained");
+    let mut retained = root.path().as_os_str().to_os_string();
+    retained.push(".retained");
+    let retained = std::path::PathBuf::from(retained);
     let retained_name = retained.file_name().ok_or_else(mismatch)?;
     let parent_fd = open(
         parent,
@@ -2662,7 +2664,13 @@ mod tests {
 
     #[test]
     fn terminal_evidence_retention_is_opt_in_and_never_replaces_a_destination() {
-        for (retain, collision) in [(false, false), (true, false), (true, true)] {
+        for (retain, collision, scratch_name) in [
+            (false, false, "s"),
+            (true, false, "s"),
+            (true, true, "s"),
+            (true, false, "s.log"),
+            (true, false, "s.retained"),
+        ] {
             let parent = std::env::temp_dir().join(format!(
                 "te-{}-{}",
                 std::process::id(),
@@ -2674,7 +2682,7 @@ mod tests {
                 "/usr/bin/sleep",
                 "/usr/bin/env",
                 parent.join("d"),
-                parent.join("s"),
+                parent.join(scratch_name),
                 MysqlOperationTimeouts::new(
                     Duration::from_secs(1),
                     Duration::from_secs(1),
@@ -2692,7 +2700,7 @@ mod tests {
                 .unwrap_or_else(|_| panic!("test layout"));
             fs::write(roots.data.path().join("native"), b"data").unwrap();
             fs::write(roots.scratch.path().join("mysqld.err"), b"diagnostics").unwrap();
-            let retained = parent.join("s.retained");
+            let retained = parent.join(format!("{scratch_name}.retained"));
             if collision {
                 fs::create_dir(&retained).unwrap();
                 fs::write(retained.join("foreign"), b"untouched").unwrap();
@@ -2707,12 +2715,12 @@ mod tests {
             if collision {
                 assert_eq!(fs::read(retained.join("foreign")).unwrap(), b"untouched");
                 assert_eq!(
-                    fs::read(parent.join("s/mysqld.err")).unwrap(),
+                    fs::read(parent.join(scratch_name).join("mysqld.err")).unwrap(),
                     b"diagnostics"
                 );
                 assert_ne!(manager.state, MysqlInstanceState::Stopped);
             } else {
-                assert!(!parent.join("s").exists());
+                assert!(!parent.join(scratch_name).exists());
                 assert_eq!(manager.state, MysqlInstanceState::Stopped);
                 assert_eq!(retained.exists(), retain);
                 if retain {

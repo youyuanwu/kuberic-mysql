@@ -469,6 +469,7 @@ impl HostedFixture {
             "admitted proxy did not commit/read real native DML",
         )?;
         client.disconnect().await.map_err(failure)?;
+        self.reject_unauthorized_proxy_logins().await?;
         self.reject_direct_login().await?;
         self.execute(PublicOperationProgram::Epoch {
             epoch: self.configuration.epoch,
@@ -563,8 +564,46 @@ impl HostedFixture {
                 let _ = connection.disconnect().await;
                 Err("application login bypassed the hosted proxy".into())
             }
+
             Err(_) => Ok(()),
         }
+    }
+
+    async fn reject_unauthorized_proxy_logins(&self) -> TestResult {
+        for (user, password) in [
+            (
+                self.application_user.as_str(),
+                "incorrect-disposable-password",
+            ),
+            ("root", ""),
+        ] {
+            let options = OptsBuilder::default()
+                .ip_or_hostname(self.proxy.ip().to_string())
+                .tcp_port(self.proxy.port())
+                .user(Some(user))
+                .pass(Some(password));
+            match Conn::new(options).await {
+                // The production proxy can close a rejected authentication
+                // exchange rather than emit a MySQL ERR packet. A valid
+                // command immediately afterwards rules out a dead listener.
+                Err(_) => {}
+                Ok(connection) => {
+                    let _ = connection.disconnect().await;
+                    return Err("unauthorized login was admitted by the production proxy".into());
+                }
+            }
+            let mut valid = self
+                .application_connection(self.proxy)
+                .await
+                .map_err(failure)?;
+            let value: Option<u64> = valid.query_first("SELECT 1").await.map_err(failure)?;
+            require(
+                value == Some(1),
+                "proxy unavailable after rejected authentication",
+            )?;
+            valid.disconnect().await.map_err(failure)?;
+        }
+        Ok(())
     }
 
     async fn shutdown(&mut self) -> TestResult {
