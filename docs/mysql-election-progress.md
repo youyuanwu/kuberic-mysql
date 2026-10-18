@@ -7,7 +7,8 @@ projection, researched on 2026-10-16. This status records the selected design;
 it does not expand the lifecycle behavior delivered by the current adapter.
 The historical comparison below intentionally retains its reviewed Kuberic
 commit. The delivered adapter is now pinned to
-`f56949996b366b14c925339ac2e859ca2fbaf637`.
+`be4f83b43567c59f48472025d55dd731efecc4c6` (upstream main resolved once on
+2026-10-17 and frozen for both crates).
 
 ## Question
 
@@ -218,11 +219,11 @@ value:
 - recovering or unassigned progress can be election evidence only while
   external access remains closed.
 
-For future election authority, a primary must expose only a qualified boundary
+For election authority, a primary must expose only a qualified boundary
 independently proven committed under the exact installed public configuration
 and commit profile, while a secondary must expose a qualified boundary durably
-applied locally. Those are architectural requirements, not claims that the
-current adapter already maintains two distinct role-specific watermarks.
+applied locally. The current bounded implementation qualifies those meanings
+as described below; it does not claim a general MySQL commit-watermark API.
 
 This value is an adapter-level **qualified public LSN**. It is not an InnoDB
 redo LSN, a binary-log position, or a replacement for the complete MySQL GTID
@@ -230,11 +231,34 @@ set.
 
 ## Current Delivery Boundary
 
-The current adapter projects a qualified local `gtid_executed` observation
-under exact current authority, role, configuration, process, storage, view, and
-receipt checks. `StateProvider::last_committed_lsn` returns the retained value
-from the preceding accepted progress observation; the adapter does not
-maintain a distinct primary-only commit watermark.
+The adapter first samples qualified local `gtid_executed` under exact native
+authority, role, configuration, process, storage, view, and receipt checks.
+That observation alone establishes applied history, not primary quorum
+commitment. For a primary, a separate bounded proof holds every exact public
+voter owner, proves durable containment of the **whole frozen GTID set** on
+each, and revalidates the source. All applicable voters are required, even in
+write-quorum mode. Missing, lagging, divergent, stale, or substituted evidence
+rejects instead of returning the local tail or zero. Native-only idle members
+do not count as voters.
+
+Durability is qualified only for fresh, exclusively owned processes with a
+continuous enforced profile: `innodb_flush_log_at_trx_commit=1`,
+`sync_binlog=1`, enabled binary logging and replica updates, and
+`binlog_error_action=ABORT_SERVER`. Effective values are sampled around
+history; any observed invalid interval latches the concrete owner unqualified
+for its lifetime. Restoring settings does not certify history produced during
+that interval. Privileged external mutation/import/restart is outside this
+authority. Periodic `TRANSACTIONS_COMMITTED_ALL_MEMBERS` statistics and
+`AFTER` configuration alone are not used as commitment certificates.
+
+`StateProvider::last_committed_lsn` re-proves the retained structured primary
+sample and compares complete source/participant scopes. It returns the
+original scalar even if writes have advanced history; catch-up proof cannot
+overwrite that pair. A secondary's accepted/applied result is not retained as
+provider commitment: without an independently proved sample the provider
+explicitly rejects. Epoch input is bound to the immediate predecessor and
+post-revocation boundary, with a separate fresh-empty proof, not scalar
+equality under unrelated authority.
 
 Fresh-secondary Build freezes and proves a complete structured GTID source
 boundary and uses scalar progress only as the pinned Public V1 invocation and
@@ -242,6 +266,16 @@ configuration projection. Scalar equality is never substituted for GTID-set
 containment. At the delivered runtime pin, omitted active-configuration
 progress reuses only an exact retained identity/process-session/storage
 observation; it does not create a new commit watermark.
+
+The supported additive Build admission proves all voters in the union of
+accepted and proposed configurations. A not-yet-configured target must retain
+its exact successful Build receipt, epoch and ActiveSecondary role admission;
+predecessor-configured donors must retain that same transition binding.
+Source-first final configuration is therefore supported without pretending
+that an idle native member was already a public voter. The successful native
+successor view remains an exact anchor while that authority is reused.
+Quiet catch-up requires fresh live structured containment, not equal scalar
+advertisements or an upstream built-in copy-prefix optimization.
 
 More precisely, omitted current progress requires an exact retained value for
 the same replica identity, process session, and storage incarnation. Omitted
@@ -253,17 +287,22 @@ binding fail closed. Idle Build targets still require both fields to be
 
 Current contract sources:
 
-- [Kuberic replication trait contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/f56949996b366b14c925339ac2e859ca2fbaf637/kuberic-runtime/src/replicator/traits.rs)
-- [Kuberic public protocol types at the delivered pin](https://github.com/youyuanwu/kuberic/blob/f56949996b366b14c925339ac2e859ca2fbaf637/kuberic-runtime/src/protocol/types.rs)
+- [Kuberic replication trait contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/replicator/traits.rs)
+- [Kuberic provider contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/traits.rs)
+- [SF semantics and quiet-copy proof boundary](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/docs/features/kuberic/service-fabric-api-semantics.md)
 
 The adapter also does not supply durable cross-restart `HistoryContext`,
-restart adoption, incremental catch-up proof, or automatic failover. The
-accepted direction requires those broader stages to prove the role-correct
-committed or lossless boundary independently before promotion.
+restart adoption, retained-binlog catch-up capability, arbitrary differing
+PC/CC histories, or automatic failover. The public traits do not supply an
+application-owned durable `HistoryContext` reconstruction channel; retained
+same-lifetime native history/configuration bindings are not a substitute for
+that future authority. The upstream SF port plan/source ledger is not an
+implemented engine cutover or production-controller activation fix.
 
 Sources:
 
 - [Current Public V1 progress implementation](../crates/kuberic-mysql/src/service/kuberic/driver.rs)
+- [Independent live commitment proof](../crates/kuberic-mysql/src/service/kuberic/proof.rs)
 - [Staged delivery and non-claims](design.md#staged-delivery)
 - [Restart reconstruction requirements](design.md#restart-reconstruction)
 

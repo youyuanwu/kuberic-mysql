@@ -32,7 +32,7 @@ fixture reset even if surviving MySQL state appears healthy.
 
 The delivered adapter translates public replica/process/storage/epoch/role/
 configuration/progress/access values from `kuberic-runtime` commit
-`f56949996b366b14c925339ac2e859ca2fbaf637` into the one-member MySQL engine.
+`be4f83b43567c59f48472025d55dd731efecc4c6` into the one-member MySQL engine.
 The fixed three-member manager and three-engine handoff fixture remain
 qualification infrastructure. Runtime correctness does not depend on a
 private MySQL lifecycle, observation, access, evidence, or receipt capability;
@@ -58,6 +58,33 @@ progress with `must_catchup=false` may establish a first known-unknown
 capability. Required unknown capability, first-seen omitted current progress,
 and every cross-binding reuse fail closed before admission. Rejected input
 does not mutate retained progress.
+
+Independent primary commitment samples retain complete structured history,
+source and participant scopes, native view and durability qualification only
+in memory. Primary progress requires live durable containment on every
+applicable public voter, not a saved local applied scalar. The provider
+revalidates the same proved sample; it does not relabel an unproved
+secondary's accepted progress. An observed invalid native durability profile
+latches that fresh concrete owner unqualified until reset, even after the
+setting is restored. This is not durable `HistoryContext` reconstruction or
+authority over imported/restarted history.
+
+Successful Build also retains exact target/donor native ownership and its
+successor view past the child callback lifetime. Completed-idle Remove derives
+a new bounded budget from current owners, proves recovery account/grant
+absence and target-only native departure, then proves exact process/socket/
+scratch retirement before invalidating registry, pending receipts, progress
+and old Build completion authority. Persistent data is not deleted; active
+voting membership still changes through configuration updates. Exact
+successful retries use retained containment plus fresh survivor proofs.
+Numeric replica-ID reuse is refused within that source lifetime.
+
+Before effects, cancellation preserves retryability. After arming, failed or
+dropped removal retains target ownership and a nonterminal removal record,
+retires its registration, attempts bounded exact-generation containment and
+quarantines the group. Unreaped ownership is retained and unproved cleanup
+cannot publish success. Reset is required; none of these records becomes an
+application journal, restart-adoption capability or durable recovery cursor.
 
 Bootstrap cancellation remains restart-stateless but not uncontained. After
 any bootstrap-enable attempt, bootstrap-off and proof are attempted. If the
@@ -919,7 +946,7 @@ The delivered adapter makes no claim that its in-memory callback ledger,
 mapped epoch ordinal, opaque replication endpoint, cached pre-epoch boundary,
 proxy address, native receipt, or terminal outcome can be replayed after
 process loss. It makes no claim of `OpenMode::Existing`, fresh secondary
-adoption, Clone/reseed, Remove, data-loss recovery, non-projectable catch-up,
+adoption, Clone/reseed, active-member Remove, data-loss recovery, non-projectable catch-up,
 automated failover, controller-dispatched custom Build, or durable interrupted
 Build recovery. None of those
 gaps authorizes a MySQL-private durable metadata file.
@@ -934,9 +961,10 @@ Binding-preserving monotonic progress refresh, including omissions resolving
 to retained values, preserves the original native-effect identity; regressions
 or binding changes conflict. A refreshed local Primary also retries its separate
 fixed-port proxy publication obligation before success; already-published
-state is idempotent. Every catch-up wait with a current engine
-configuration captures a fresh qualified boundary; only the deliberate
-post-epoch gap reuses its cached pre-epoch observation. A newer epoch first
+state is idempotent. Catch-up with a current engine configuration captures a
+fresh qualified boundary and independently proves live structured containment
+on all applicable public voters; a cached pre-epoch scalar is not a commitment
+certificate. A newer epoch first
 physically revokes any prepared or published proxy generation. Its pre-epoch
 observation validates exact authority, membership, receipt, deadline,
 cancellation, and structured GTID projection while tolerating a target whose
@@ -944,9 +972,11 @@ native role already changed before the callback; ordinary progress remains
 role-strict, and only a recorded source Primary retains a transfer boundary.
 The exact driver also serves as a progress-only `StateProvider`: successful
 fresh `OpenMode::New` retains qualified `0` only from the freshly initialized,
-closed-access owner proof, then `current_progress` and `last_committed_lsn`
-return that same observation. Unknown pre-configuration progress still fails;
-later exact progress is retained similarly. The provider exposes no copy bytes
+closed-access owner proof. Later primary `current_progress` independently
+proves commitment and `last_committed_lsn` revalidates that exact paired sample
+and complete participant scope, without advancing it for intervening writes
+or catch-up. Secondary accepted progress alone never establishes provider
+commitment. Unknown pre-configuration progress still fails. The provider exposes no copy bytes
 or private durable state. Synchronous abort closes the shared listener and
 contains the exact native member even when an async
 callback lease is dropped; task abortion is owned but not claimed to be

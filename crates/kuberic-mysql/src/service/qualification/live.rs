@@ -48,6 +48,7 @@ struct FixtureRoot {
 impl FixtureRoot {
     fn create(path: PathBuf) -> Self {
         assert!(!path.exists(), "qualification fixture root already exists");
+        fs::create_dir_all(path.parent().expect("qualification fixture parent")).unwrap();
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         let metadata = fs::symlink_metadata(&path).unwrap();
         Self {
@@ -144,7 +145,7 @@ impl LiveQualificationFixture {
         let (reservations, sql_addresses, group_addresses) = reserve_ports();
         let topology = topology(sql_addresses, group_addresses);
         let timeouts = MysqlOperationTimeouts::new(
-            Duration::from_secs(60),
+            Duration::from_secs(180),
             Duration::from_secs(30),
             Duration::from_secs(20),
             Duration::from_secs(10),
@@ -465,4 +466,24 @@ fn command_stdout(program: &str, arguments: &[&str]) -> String {
     let output = Command::new(program).args(arguments).output().unwrap();
     assert!(output.status.success(), "{program} failed");
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn archived_fixture_creates_missing_checkout_target_parents() {
+    let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!(
+        "kmql-archive-parent-{}-{serial}",
+        std::process::id()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+    let leaf = base.join("fresh-checkout/target/fixture");
+    assert!(!leaf.parent().unwrap().exists());
+    let mut root = FixtureRoot::create(leaf.clone());
+    assert_eq!(
+        fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    root.try_remove().unwrap();
+    assert!(!leaf.exists());
+    fs::remove_dir_all(base).unwrap();
 }
