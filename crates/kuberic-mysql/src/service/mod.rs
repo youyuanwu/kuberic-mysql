@@ -48,6 +48,7 @@ mod process;
 mod proxy;
 #[cfg(test)]
 mod qualification;
+mod reopen;
 mod replicator;
 mod topology;
 
@@ -87,6 +88,10 @@ pub use proxy::{
     APPLICATION_QUALIFICATION_SCHEMA, ApplicationAccountReceipt, ApplicationCredential,
     BackendSessionIdentity, MysqlClientProxy, MysqlProxyAccessGuard, MysqlProxyContainmentReceipt,
     MysqlProxyControlBoundary, MysqlProxyDiagnostics, MysqlProxySnapshot,
+};
+pub use reopen::{
+    MysqlClosedReopened, MysqlReopenAuthority, MysqlReopenBoundary, MysqlReopenError,
+    MysqlReopenEvidence, MysqlReopenRenewal, MysqlStoppedReopen,
 };
 pub use replicator::{
     MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,
