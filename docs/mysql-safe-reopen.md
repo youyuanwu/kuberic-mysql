@@ -2,7 +2,7 @@
 
 ## Delivered boundary
 
-The first bounded Stage 3 primitive reopens existing Oracle MySQL 8.4.11 data
+The bounded Stage 3 primitives reopen existing Oracle MySQL 8.4.11 data
 under a **new, closed native child**, after an exactly owned quiet graceful stop.
 It does not recover after loss of the adapter owner, restore serving, or make
 the Public V1 service accept `OpenMode::Existing`.
@@ -22,11 +22,13 @@ MysqlReopenBoundary, MysqlReopenRenewal}` with a topology-member manager:
    disabled; Group Replication, bootstrap, asynchronous replication and the
    event scheduler must be stopped. Enable native `read_only` and
    `super_read_only`. These settings alone are not an independent fence.
-2. The manager must **never have issued an application/proxy capability**.
+2. For ordinary `capture`, the manager must **never have issued an
+   application/proxy capability**.
    An idle published proxy or an unpublished-but-publishable proxy is not
    closed. Even account cleanup or prior proxy revocation does not reset this
-   conservative lifetime restriction; exact proxy-to-reopen handoff is not
-   implemented. The Build recovery TCP profile also rejects.
+   conservative lifetime restriction. The explicit terminal proxy handoff
+   below is the only additional supported path. The Build recovery TCP profile
+   always rejects.
 3. Obtain authentic accepted generic authority from the trusted embedding.
    Fill `MysqlReopenAuthority` with public storage/replica incarnation,
    partition, complete `HistoryContext`, process session, replicator creation,
@@ -56,6 +58,71 @@ authenticate arbitrary callers or replace generic Kuberic admission. The OS
 account/private administration socket and privileged administrator are trusted.
 No API can infer unknown past privileged history/settings mutation from current
 native state.
+
+## Terminal independent-proxy handoff
+
+The supported path is an **opt-in single production issuance**, not a receipt
+claim that any previously created proxy is idle or revoked:
+
+1. With the exact retained topology-member manager, enroll native control as
+   usual and call `manager.prepare_reopenable_proxy(&native_authority, address,
+   credential, &attempt)`. This reserves the sole controlled issuance before
+   native preparation; failure/cancellation does not erase that reservation.
+   The returned proxy is independently owned and may remain unpublished, publish,
+   or be retained behind cloned `Arc<tokio::sync::Mutex<MysqlClientProxy>>` facades.
+2. Before terminal surrender, ordinary generation revocation uses
+   `manager.revoke_reopenable_proxy(&mut proxy, generation, &attempt)`. Genuine
+   complete revocation permits ordinary `proxy.rearm(...)`. Generic public
+   `proxy.revoke` and `cleanup_account` reject this provenance-bearing proxy
+   **before calling the supplied control**; fake-success cleanup must not erase
+   historical backend obligations and launder them through rearm.
+3. Obtain the trusted complete generic predecessor and an independently expected
+   final executed/purged boundary. Stop external workload initiation. Call
+   `proxy.close_for_reopen(manager, predecessor, &attempt)`. It synchronously
+   validates exact production custody and sets the permanent shared admission/
+   publication/rearm fence **before returning its future**. Awaiting that future
+   joins all accept/session work, proves exact known native backends absent,
+   rejects unidentified connections or abnormal task history, removes the exact
+   application account and clears the retained credential.
+4. Success returns `(manager, MysqlProxyReopenClosure)`. The closure has no public
+   constructor, Clone or serialization and binds private owner/member/storage/
+   native-process issuance plus the full generic predecessor. New issuance is
+   sealed. Shared stale proxy owners cannot publish, rearm or replace their guard.
+   Ordinary serving-handoff eligibility still rejects interrupted commands;
+   terminal containment does not claim their success.
+5. Separately establish the inactive/native read-only conditions above, **after**
+   account retirement: Oracle rejects `DROP USER` under `super_read_only`.
+   Surrender does not change native role/settings or stop replication for you.
+   Native SQL TCP/X must have remained disabled throughout; a Build owner cannot
+   substitute a proxy proof for its independent SQL listener.
+6. Call `MysqlStoppedReopen::capture_with_proxy_closure(manager, closure,
+   predecessor, expected, &attempt)`, then use the same renewal/reopen/observe/
+   close sequence above. All native identity, complete final history, monotonic
+   durability, graceful-exit, retained-log and final-admission checks still run.
+   If in-flight work changed the expected history, capture rejects rather than
+   blessing an interrupted write or inventing a boundary.
+
+The lifetime issued flag is **never reset**. No-proof `capture` still rejects
+even after successful terminal surrender. The qualified ingress lifetime stays
+privately sealed through reopen and subsequent closed observations, never
+granting a second reopen token or serving extraction. Another manager/storage/
+native-process issuance, stale generation or substituted generic predecessor
+cannot consume the proof. Generic authority is still trusted embedding input,
+not authenticated by the adapter.
+
+Direct socket/account capabilities, ordinary generic `MysqlClientProxy::prepare`
+(including engine staged preparation), failed/partial unproven construction and
+Build TCP remain conservative. A direct issuance call after controlled preparation
+but before terminal sealing permanently disqualifies that lifetime. After sealing,
+raw issuance rejects without invalidating its proof; additional controlled preparations reject.
+There is no upgrade of an already issued generic proxy into production custody.
+
+Cancellation, error or drop of the owning surrender future returns no proof
+and contains only the manager's exact child, preserving data/native logs.
+Dropping it unpolled still leaves a validly begun proxy terminal. Task join
+failure/timeout is permanent proof poison, distinct from interrupted-command
+ambiguity; neither retry nor rearm clears it. Unidentified native connections
+cannot be waived merely because a later session snapshot is empty.
 
 ## Validation and failure semantics
 
@@ -134,7 +201,7 @@ remain subject to the `<108` encoded-byte limit.
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql -E 'test(reopen) or test(durability_lifetime)'
+  -p kuberic-mysql --lib -E 'test(reopen) or test(durability_lifetime) or test(terminal_)'
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests --test service_reopen_live_mysql_8_4_11
 ```
@@ -147,6 +214,14 @@ foreign PID noninterference, cancellation and dropped futures/owners.
 The diagnostic-path matrix covers both retained and new stdout/error paths with
 both link kinds, asserting unchanged retained sentinel bytes and native logs.
 Numeric binlog sequences above the zero-leading range remain recognizable.
+Terminal proxy gates additionally cover published, unpublished, revoked and
+rearmed owners; acknowledged proxy writes; exact native idle/transaction and
+executing `SELECT SLEEP(60)` retirement; an accepted connection waiting at the
+runtime gate; racing publication and retained stale facades; native Build/direct/
+no-proof rejections; wrong-manager and generic incarnation/session substitutions;
+and cancelled/unpolled/pending owning-future drop while another native owner
+remains live. Deterministic tests separately cover lost/failed task joins,
+cleanup interruption, unidentified backends and fake lifecycle evidence.
 
 Not supported: adapter/host-crash or lost-owner reconstruction; abrupt, data-only
 or lost-native-log reopening; survivor adoption; automatic hosted Existing;
@@ -158,11 +233,12 @@ durability, security or failover claim follows from this host-local primitive.
 ## Implementation references
 
 - [Authority and structured boundary validation, reopen.rs:29–147](../crates/kuberic-mysql/src/service/reopen.rs#L29-L147).
-- [Linear owner and closed handle, reopen.rs:189–302](../crates/kuberic-mysql/src/service/reopen.rs#L189-L302).
-- [Closed admission and memory-only log inventory, reopen.rs:350–451](../crates/kuberic-mysql/src/service/reopen.rs#L350-L451).
-- [Owned closed startup, instance.rs:324–449](../crates/kuberic-mysql/src/service/instance.rs#L324-L449),
-  [graceful-stop/reopen seams, instance.rs:1345–1406](../crates/kuberic-mysql/src/service/instance.rs#L1345-L1406),
-  and [exclusive diagnostics, instance.rs:2125–2167](../crates/kuberic-mysql/src/service/instance.rs#L2125-L2167).
+- [Linear closure, capture and closed handle, reopen.rs:180–365](../crates/kuberic-mysql/src/service/reopen.rs#L180-L365).
+- [Closed admission and memory-only log inventory, reopen.rs:414–514](../crates/kuberic-mysql/src/service/reopen.rs#L414-L514).
+- [Production custody and genuine revocation, instance.rs:156–270](../crates/kuberic-mysql/src/service/instance.rs#L156-L270),
+  [terminal proxy settlement, proxy.rs:870–984](../crates/kuberic-mysql/src/service/proxy.rs#L870-L984),
+  [graceful-stop/reopen seams, instance.rs:1470–1530](../crates/kuberic-mysql/src/service/instance.rs#L1470-L1530),
+  and [exclusive diagnostics, instance.rs:2330–2372](../crates/kuberic-mysql/src/service/instance.rs#L2330-L2372).
 - [Inactive native snapshots, control.rs:42–191](../crates/kuberic-mysql/src/service/control.rs#L42-L191)
   and [monotonic durability reader, control.rs:698–729](../crates/kuberic-mysql/src/service/control.rs#L698-L729).
-- [Actual production-API live qualification, service_reopen_live_mysql_8_4_11.rs:186–633](../crates/kuberic-mysql-tests/tests/service_reopen_live_mysql_8_4_11.rs#L186-L633).
+- [Actual terminal production-API qualification, service_reopen_live_mysql_8_4_11.rs:393–875](../crates/kuberic-mysql-tests/tests/service_reopen_live_mysql_8_4_11.rs#L393-L875).

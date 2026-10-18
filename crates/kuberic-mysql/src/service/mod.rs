@@ -94,8 +94,8 @@ pub use proxy::{
     MysqlProxyControlBoundary, MysqlProxyDiagnostics, MysqlProxySnapshot,
 };
 pub use reopen::{
-    MysqlClosedReopened, MysqlReopenAuthority, MysqlReopenBoundary, MysqlReopenError,
-    MysqlReopenEvidence, MysqlReopenRenewal, MysqlStoppedReopen,
+    MysqlClosedReopened, MysqlProxyReopenClosure, MysqlReopenAuthority, MysqlReopenBoundary,
+    MysqlReopenError, MysqlReopenEvidence, MysqlReopenRenewal, MysqlStoppedReopen,
 };
 pub use replicator::{
     MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,

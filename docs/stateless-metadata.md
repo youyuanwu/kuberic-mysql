@@ -139,9 +139,16 @@ native/generic process-session fences are validated. No predecessor role,
 configuration, access, Build ledger or commitment sample is resurrected.
 
 Native SQL/X/GR ingress, asynchronous replication and event scheduling remain
-disabled. Native read-only settings are necessary but not sufficient: issuing
-any application/proxy capability monotonically disqualifies the owner, even
-if an idle or unpublished proxy currently has no backend sessions. Lifetime
+disabled. Native read-only settings are necessary but not sufficient. No-proof
+capture still rejects every issued application/proxy capability, even an idle
+or unpublished proxy without current backend sessions. The explicit singleton
+production proxy path now permits terminal surrender: a private issuance identity,
+permanent admission fence, joined task tree, exact native-backend absence and
+account retirement produce a noncloneable closure consumed by capture. Generic/
+direct escaped capabilities and Build SQL TCP remain rejected. The issuance latch
+is never reset; the exact sealed qualification stays with the closed owner.
+This identity, closure and cleanup history are memory-only, not MySQL recovery
+records or durable generic authority. Lifetime
 durability disqualification is also monotonic across the stop/reopen.
 
 This selected mode retains native binary logs on scratch. Ordinary terminal

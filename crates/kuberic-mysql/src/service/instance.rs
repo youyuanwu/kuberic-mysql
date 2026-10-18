@@ -90,6 +90,17 @@ pub struct MysqlInstanceManager {
     cleanup_quarantined: bool,
     native_durability_qualified: std::sync::Arc<std::sync::atomic::AtomicBool>,
     application_capability_issued: bool,
+    unsupported_application_capability: bool,
+    proxy_issuance: Option<std::sync::Arc<MysqlProxyIssuance>>,
+    proxy_issuance_sealed: bool,
+}
+
+/// Private construction custody, never derived from caller-constructible receipts.
+#[derive(Debug)]
+pub(crate) struct MysqlProxyIssuance {
+    pub(super) authority: MemberMutationAuthority,
+    pub(super) owner_generation: u64,
+    pub(super) process_generation: u64,
 }
 
 /// Unforgeable in-process ownership token for one exact MySQL child generation.
@@ -122,6 +133,9 @@ impl MysqlInstanceManager {
                 true,
             )),
             application_capability_issued: false,
+            unsupported_application_capability: false,
+            proxy_issuance: None,
+            proxy_issuance_sealed: false,
         }
     }
 
@@ -137,6 +151,117 @@ impl MysqlInstanceManager {
 
     pub(crate) const fn application_capability_issued(&self) -> bool {
         self.application_capability_issued
+    }
+
+    /// Prepares the sole independently owned proxy eligible for terminal
+    /// closed-reopen surrender. Ordinary generic preparation, raw application
+    /// capabilities and Build TCP are deliberately not qualified by this API.
+    ///
+    /// Reservation is permanent, including preparation failure/cancellation.
+    pub async fn prepare_reopenable_proxy(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        listen_address: std::net::SocketAddr,
+        credential: ApplicationCredential,
+        attempt: &AttemptContext,
+    ) -> Result<crate::service::MysqlClientProxy, MysqlProxyError> {
+        self.check_reopen_proxy_reservation()?;
+        self.revalidate_member_effect_binding(authority)
+            .map_err(MysqlProxyError::Native)?;
+        let issuance = self.reserve_reopen_proxy(authority)?;
+        let mut control = ReopenProxyPreparation(self);
+        let mut proxy = crate::service::MysqlClientProxy::prepare(
+            &mut control,
+            authority,
+            listen_address,
+            credential,
+            attempt,
+        )
+        .await?;
+        proxy.attach_reopen_issuance(issuance);
+        Ok(proxy)
+    }
+
+    fn check_reopen_proxy_reservation(&self) -> Result<(), MysqlProxyError> {
+        if self.application_capability_issued
+            || self.proxy_issuance.is_some()
+            || self.proxy_issuance_sealed
+            || self.config.topology().is_none()
+            || self.config.build_recovery_networking()
+        {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn reserve_reopen_proxy(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<std::sync::Arc<MysqlProxyIssuance>, MysqlProxyError> {
+        self.check_reopen_proxy_reservation()?;
+        let issuance = std::sync::Arc::new(MysqlProxyIssuance {
+            authority: authority.clone(),
+            owner_generation: self.owner_generation,
+            process_generation: self.process_generation,
+        });
+        self.application_capability_issued = true;
+        self.proxy_issuance = Some(std::sync::Arc::clone(&issuance));
+        Ok(issuance)
+    }
+
+    /// Ordinary generation revocation for a reopenable proxy, with genuine
+    /// production cleanup evidence. Generic proxy cleanup cannot certify this
+    /// private issuance. Rearm remains possible until terminal surrender.
+    pub async fn revoke_reopenable_proxy(
+        &mut self,
+        proxy: &mut crate::service::MysqlClientProxy,
+        generation: std::num::NonZeroU64,
+        attempt: &AttemptContext,
+    ) -> Result<crate::service::MysqlProxyContainmentReceipt, MysqlProxyError> {
+        let issuance = proxy
+            .reopen_issuance()
+            .ok_or(MysqlProxyError::InvalidState)?;
+        self.validate_proxy_issuance(issuance, false)
+            .map_err(|_| MysqlProxyError::InvalidState)?;
+        let authority = issuance.authority.clone();
+        proxy
+            .revoke_owned(self, &authority, generation, attempt)
+            .await
+    }
+
+    pub(crate) fn validate_proxy_issuance(
+        &mut self,
+        issuance: &std::sync::Arc<MysqlProxyIssuance>,
+        sealed: bool,
+    ) -> Result<(), crate::service::MysqlReopenError> {
+        if !self.matches_proxy_issuance(issuance, sealed)
+            || issuance.owner_generation != self.owner_generation
+            || issuance.process_generation != self.process_generation
+        {
+            return Err(crate::service::MysqlReopenError::Ownership);
+        }
+        self.prepare_control_target()?;
+        self.revalidate_member_effect_binding(&issuance.authority)
+            .map_err(|_| crate::service::MysqlReopenError::Ownership)?;
+        Ok(())
+    }
+
+    pub(crate) fn matches_proxy_issuance(
+        &self,
+        issuance: &std::sync::Arc<MysqlProxyIssuance>,
+        sealed: bool,
+    ) -> bool {
+        self.application_capability_issued
+            && !self.unsupported_application_capability
+            && self.proxy_issuance_sealed == sealed
+            && self
+                .proxy_issuance
+                .as_ref()
+                .is_some_and(|owned| std::sync::Arc::ptr_eq(owned, issuance))
+    }
+
+    pub(crate) fn seal_proxy_issuance(&mut self) {
+        self.proxy_issuance_sealed = true;
     }
 
     fn retain_native_durability(&mut self, evidence: MemberNativeEvidence) -> MemberNativeEvidence {
@@ -1798,6 +1923,107 @@ fn exact_path_absent(
     }
 }
 
+impl MysqlInstanceManager {
+    fn proxy_backend_socket_owned(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<UnixSocketPath, MysqlProxyError> {
+        let target = self
+            .prepare_control_target()
+            .map_err(MysqlProxyError::Account)?;
+        self.revalidate_member_effect_binding(authority)
+            .map_err(MysqlProxyError::Native)?;
+        target
+            .revalidate_socket()
+            .map_err(MysqlProxyError::Native)?;
+        Ok(target.socket())
+    }
+
+    async fn prepare_application_account_owned(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        credential: &ApplicationCredential,
+        attempt: &AttemptContext,
+    ) -> Result<ApplicationAccountReceipt, MysqlProxyError> {
+        attempt.admit_work().map_err(|error| match error {
+            AttemptAdmissionError::Cancelled => MysqlProxyError::Cancelled,
+            AttemptAdmissionError::CleanupReserve | AttemptAdmissionError::Expired => {
+                MysqlProxyError::Deadline(MysqlProxyPhase::AccountLifecycle)
+            }
+        })?;
+        let target = self
+            .prepare_member_effect_target(authority, attempt)
+            .map_err(MysqlProxyError::Native)?;
+        let mut cancellation_containment = MemberEffectCancellationContainment::new(self, attempt);
+        let result = crate::service::control::prepare_application_account(
+            target,
+            authority,
+            credential,
+            attempt.work_deadline(),
+            attempt.deadline(),
+        )
+        .await
+        .map_err(MysqlProxyError::Account);
+        cancellation_containment.disarm();
+        result
+    }
+}
+
+/// This boundary never escapes controlled construction. Its socket/account
+/// values transfer directly into the newly constructed proxy, not a caller.
+struct ReopenProxyPreparation<'a>(&'a mut MysqlInstanceManager);
+
+impl MysqlProxyControlBoundary for ReopenProxyPreparation<'_> {
+    fn contain_proxy_preparation(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        self.0.contain_proxy_preparation(authority, attempt)
+    }
+
+    fn proxy_backend_socket(
+        &mut self,
+        authority: &MemberMutationAuthority,
+    ) -> Result<UnixSocketPath, MysqlProxyError> {
+        self.0.proxy_backend_socket_owned(authority)
+    }
+
+    async fn prepare_application_account(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        credential: &ApplicationCredential,
+        attempt: &AttemptContext,
+    ) -> Result<ApplicationAccountReceipt, MysqlProxyError> {
+        self.0
+            .prepare_application_account_owned(authority, credential, attempt)
+            .await
+    }
+
+    async fn remove_application_account(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        receipt: &ApplicationAccountReceipt,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlProxyError> {
+        self.0
+            .remove_application_account(authority, receipt, attempt)
+            .await
+    }
+
+    async fn terminate_proxy_backend(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        session: &crate::service::BackendSessionIdentity,
+        attempt: &AttemptContext,
+        deadline: Instant,
+    ) -> Result<(), MysqlProxyError> {
+        self.0
+            .terminate_proxy_backend(authority, session, attempt, deadline)
+            .await
+    }
+}
+
 impl MysqlProxyControlBoundary for MysqlInstanceManager {
     fn contain_proxy_preparation(
         &mut self,
@@ -1818,18 +2044,12 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         &mut self,
         authority: &MemberMutationAuthority,
     ) -> Result<UnixSocketPath, MysqlProxyError> {
-        let target = self
-            .prepare_control_target()
-            .map_err(MysqlProxyError::Account)?;
-        self.revalidate_member_effect_binding(authority)
-            .map_err(MysqlProxyError::Native)?;
-        target
-            .revalidate_socket()
-            .map_err(MysqlProxyError::Native)?;
-        // This capability may outlive the manager and be published later.
-        // There is no closed-reopen proof for its independent listener owner.
+        if self.proxy_issuance_sealed {
+            return Err(MysqlProxyError::InvalidState);
+        }
         self.application_capability_issued = true;
-        Ok(target.socket())
+        self.unsupported_application_capability = true;
+        self.proxy_backend_socket_owned(authority)
     }
 
     async fn prepare_application_account(
@@ -1838,29 +2058,14 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         credential: &ApplicationCredential,
         attempt: &AttemptContext,
     ) -> Result<ApplicationAccountReceipt, MysqlProxyError> {
-        attempt.admit_work().map_err(|error| match error {
-            AttemptAdmissionError::Cancelled => MysqlProxyError::Cancelled,
-            AttemptAdmissionError::CleanupReserve | AttemptAdmissionError::Expired => {
-                MysqlProxyError::Deadline(MysqlProxyPhase::AccountLifecycle)
-            }
-        })?;
-        let target = self
-            .prepare_member_effect_target(authority, attempt)
-            .map_err(MysqlProxyError::Native)?;
-        // Monotonic even if an account-preparation future later fails/drops.
+        if self.proxy_issuance_sealed {
+            return Err(MysqlProxyError::InvalidState);
+        }
+        // Monotonic before any native await, including failed/dropped calls.
         self.application_capability_issued = true;
-        let mut cancellation_containment = MemberEffectCancellationContainment::new(self, attempt);
-        let result = crate::service::control::prepare_application_account(
-            target,
-            authority,
-            credential,
-            attempt.work_deadline(),
-            attempt.deadline(),
-        )
-        .await
-        .map_err(MysqlProxyError::Account);
-        cancellation_containment.disarm();
-        result
+        self.unsupported_application_capability = true;
+        self.prepare_application_account_owned(authority, credential, attempt)
+            .await
     }
 
     async fn remove_application_account(
@@ -2406,6 +2611,155 @@ mod tests {
     use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    #[tokio::test]
+    async fn reopen_proxy_issuance_is_exact_monotonic_and_sealed_against_all_raw_calls() {
+        let parent = std::env::temp_dir().join(format!(
+            "pi-{}-{}",
+            std::process::id(),
+            CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = MysqlInstanceConfig::new_topology_member(
+            "/usr/bin/sleep",
+            "/usr/bin/env",
+            parent.join("d"),
+            parent.join("s"),
+            topology(),
+            MysqlMemberIndex::First,
+            MysqlOperationTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut manager = MysqlInstanceManager::new(config);
+        let native = test_authority(manager.config());
+        let issuance = std::sync::Arc::new(MysqlProxyIssuance {
+            authority: native.clone(),
+            owner_generation: manager.owner_generation,
+            process_generation: manager.process_generation,
+        });
+        assert!(!manager.matches_proxy_issuance(&issuance, false));
+        let issuance = manager.reserve_reopen_proxy(&native).unwrap();
+        assert!(manager.matches_proxy_issuance(&issuance, false));
+        assert!(manager.reserve_reopen_proxy(&native).is_err());
+        let cancelled = AttemptContext::new(
+            native.attempt().clone(),
+            Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        cancelled.cancel();
+        let credential = ApplicationCredential::new(
+            native.attempt().clone(),
+            CredentialGeneration::new("application").unwrap(),
+            "app_local",
+            "secret",
+        )
+        .unwrap();
+        assert!(matches!(
+            ReopenProxyPreparation(&mut manager)
+                .prepare_application_account(&native, &credential, &cancelled,)
+                .await,
+            Err(MysqlProxyError::Cancelled),
+        ));
+        assert!(manager.reserve_reopen_proxy(&native).is_err());
+        assert!(manager.matches_proxy_issuance(&issuance, false));
+        for account in [false, true] {
+            let mut raw = MysqlInstanceManager::new(manager.config.clone());
+            if account {
+                assert!(
+                    raw.prepare_application_account(&native, &credential, &cancelled)
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(raw.proxy_backend_socket(&native).is_err());
+            }
+            assert!(raw.application_capability_issued());
+            assert!(raw.unsupported_application_capability);
+            assert!(raw.reserve_reopen_proxy(&native).is_err());
+        }
+        let mut build =
+            MysqlInstanceManager::new(manager.config.clone().with_build_recovery_networking());
+        assert!(build.reserve_reopen_proxy(&native).is_err());
+        let mut wrong_owner = MysqlInstanceManager::new(manager.config.clone());
+        assert!(matches!(
+            wrong_owner.validate_proxy_issuance(&issuance, false),
+            Err(crate::service::MysqlReopenError::Ownership)
+        ));
+        let substitute = std::sync::Arc::new(MysqlProxyIssuance {
+            authority: native.clone(),
+            owner_generation: manager.owner_generation,
+            process_generation: manager.process_generation,
+        });
+        assert!(
+            !manager.matches_proxy_issuance(&substitute, false),
+            "even identical public/native values cannot substitute construction custody"
+        );
+        manager.owner_generation += 1;
+        assert!(matches!(
+            manager.validate_proxy_issuance(&issuance, false),
+            Err(crate::service::MysqlReopenError::Ownership)
+        ));
+        manager.owner_generation -= 1;
+        manager.process_generation += 1;
+        assert!(matches!(
+            manager.validate_proxy_issuance(&issuance, false),
+            Err(crate::service::MysqlReopenError::Ownership)
+        ));
+        manager.process_generation -= 1;
+        manager.unsupported_application_capability = true;
+        assert!(!manager.matches_proxy_issuance(&issuance, false));
+        // The monotonic production latch is never cleared. Reset here only
+        // isolates the distinct sealed-state branch in this private unit test.
+        manager.unsupported_application_capability = false;
+        manager.seal_proxy_issuance();
+        assert!(!manager.matches_proxy_issuance(&issuance, false));
+        assert!(manager.matches_proxy_issuance(&issuance, true));
+        let attempt = AttemptContext::new(
+            native.attempt().clone(),
+            Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let credential = || {
+            ApplicationCredential::new(
+                native.attempt().clone(),
+                CredentialGeneration::new("application").unwrap(),
+                "app_local",
+                "secret",
+            )
+            .unwrap()
+        };
+        assert!(manager.proxy_backend_socket(&native).is_err());
+        assert!(
+            manager
+                .prepare_application_account(&native, &credential(), &attempt)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .prepare_reopenable_proxy(
+                    &native,
+                    "127.0.0.1:0".parse().unwrap(),
+                    credential(),
+                    &attempt
+                )
+                .await
+                .is_err()
+        );
+        assert!(manager.application_capability_issued());
+        assert!(manager.matches_proxy_issuance(&issuance, true));
+        drop(manager);
+        fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn reopen_diagnostic_creation_rejects_existing_files_and_links_without_truncation() {

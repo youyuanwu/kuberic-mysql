@@ -75,9 +75,13 @@ is available separately as `MysqlStoppedReopen::capture` and `reopen`. It
 requires a continuously retained exact owner, a quiet graceful stop, preserved
 native logs, matching complete structured GTIDs and explicitly renewed generic
 caller authority. It starts a distinct attested child with SQL TCP/X/group
-startup disabled and returns only closed observation/containment. A manager
-which ever issued an application/proxy capability rejects, including idle or
-unpublished proxies. It restores no role, epoch/configuration, commitment,
+startup disabled and returns only closed observation/containment. No-proof
+capture still rejects every issued application/proxy capability. The opt-in
+`prepare_reopenable_proxy` → `close_for_reopen` →
+`capture_with_proxy_closure` path additionally supports terminal surrender of
+one exact independent production proxy, including published and unpublished
+owners. Stale shared handles cannot rearm or republish; direct/generic issuance
+and Build TCP remain unqualified. It restores no role, epoch/configuration, commitment,
 donor capability or access, and does not enable hosted `Existing`. Lost-owner,
 abrupt and lost-log recovery remain unsupported; no private durable authority
 is added.
