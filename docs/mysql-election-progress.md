@@ -10,6 +10,13 @@ commit. The delivered adapter is now pinned to
 `be4f83b43567c59f48472025d55dd731efecc4c6` (upstream main resolved once on
 2026-10-17 and frozen for both crates).
 
+The first Stage 3 [closed retained-owner reopen](mysql-safe-reopen.md) compares
+complete structured executed/purged sets, including nonprojectable shapes.
+It returns no election, provider-committed or donor/catch-up scalar and does not
+feed a reopened tail into the fresh-zero or all-voter commitment proof. Explicit
+generic history/session renewal scope is not, by itself, progress or serving
+authority.
+
 ## Question
 
 Kuberic Public V1 requires an `i64` log sequence number (LSN) that can represent

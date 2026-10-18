@@ -64,11 +64,23 @@ do not supply operation ticks or per-call control/observation deadlines.
 The service keeps persistent MySQL data separate
 from disposable runtime files, retains and attests exact children in memory,
 and contains all owned members on failure or stop. It writes no application
-metadata store and has no restart, reattachment, or survivor-adoption path;
+metadata store and has no owner-loss recovery, reattachment, or survivor-adoption path;
 loss of in-memory ownership or attempt context requires fixture reset.
 Cancelling bootstrap cannot detach a query future: bootstrap-off and proof are
 attempted after every enable attempt, while cancellation synchronously contains
 the exact owned topology before returning control.
+
+The first bounded Stage 3 [closed safe-reopen primitive](docs/mysql-safe-reopen.md)
+is available separately as `MysqlStoppedReopen::capture` and `reopen`. It
+requires a continuously retained exact owner, a quiet graceful stop, preserved
+native logs, matching complete structured GTIDs and explicitly renewed generic
+caller authority. It starts a distinct attested child with SQL TCP/X/group
+startup disabled and returns only closed observation/containment. A manager
+which ever issued an application/proxy capability rejects, including idle or
+unpublished proxies. It restores no role, epoch/configuration, commitment,
+donor capability or access, and does not enable hosted `Existing`. Lost-owner,
+abrupt and lost-log recovery remain unsupported; no private durable authority
+is added.
 
 The same module now exposes `MysqlReplicator`, a one-member lifecycle engine
 that owns one `MysqlInstanceManager` and enforces open, newer epoch, role,
@@ -359,7 +371,8 @@ scripts/install_nextest.sh
 ## Validation
 
 The standard workspace test starts isolated MySQL fixtures and runs the
-observer, single-process lifecycle, and three-member bootstrap/join gates:
+observer, single-process lifecycle, three-member bootstrap/join, and closed
+retained-owner reopen gates:
 
 ```bash
 cargo fmt --all -- --check

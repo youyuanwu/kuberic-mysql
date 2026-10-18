@@ -38,6 +38,156 @@ pub(crate) struct OwnedControlTarget {
     durability: Arc<AtomicBool>,
 }
 
+/// Quiet inactive evidence has no fabricated native view or fresh enrollment.
+pub(crate) async fn read_closed_reopen(
+    target: OwnedControlTarget,
+    deadline: Instant,
+    reopened: bool,
+) -> Result<crate::service::MysqlReopenBoundary, crate::service::MysqlReopenError> {
+    use crate::service::MysqlReopenError;
+    let mut session = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        let first = closed_reopen_snapshot(&mut session, &target, deadline, reopened).await?;
+        let second = closed_reopen_snapshot(&mut session, &target, deadline, reopened).await?;
+        if first != second {
+            return Err(MysqlReopenError::History);
+        }
+        Ok(first)
+    }
+    .await;
+    let disconnected = session.disconnect(deadline).await;
+    let boundary = result?;
+    disconnected?;
+    Ok(boundary)
+}
+
+async fn closed_reopen_snapshot(
+    session: &mut MysqlControlSession,
+    target: &OwnedControlTarget,
+    deadline: Instant,
+    reopened: bool,
+) -> Result<crate::service::MysqlReopenBoundary, crate::service::MysqlReopenError> {
+    use crate::service::{MysqlReopenBoundary, MysqlReopenError};
+    let server_uuid = validate_product(session, deadline).await?;
+    // Latch a violation immediately, before any later read/disconnect can fail.
+    if !read_durable_profile(session, deadline).await? {
+        return Err(MysqlReopenError::Durability);
+    }
+    const FLAGS: &str = "SELECT @@GLOBAL.skip_networking, @@GLOBAL.read_only, @@GLOBAL.super_read_only, \
+         @@GLOBAL.group_replication_start_on_boot, @@GLOBAL.group_replication_bootstrap_group, \
+         (SELECT COUNT(*) FROM information_schema.plugins \
+          WHERE PLUGIN_NAME='mysqlx' AND PLUGIN_STATUS='ACTIVE'), \
+         (SELECT COUNT(*) FROM performance_schema.replication_group_members \
+          WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID<>'' AND MEMBER_STATE<>'OFFLINE'), \
+         (SELECT COUNT(*) FROM performance_schema.threads WHERE TYPE='FOREGROUND' \
+          AND PROCESSLIST_ID IS NOT NULL AND PROCESSLIST_ID<>CONNECTION_ID() \
+          AND NOT (NAME='thread/sql/compress_gtid_table' \
+                   AND PROCESSLIST_COMMAND='Daemon' AND PROCESSLIST_USER IS NULL))";
+    let mut flags: (u8, u8, u8, u8, u8, u64, u64, u64) = query_one_mysql(
+        &mut session.connection,
+        FLAGS,
+        deadline,
+        ControlStage::InspectExistingGroup,
+    )
+    .await?;
+    // COM_QUIT completion on the client does not imply that MySQL has already
+    // removed the prior private control session. Wait briefly for actual
+    // quiescence; never disregard or credit another session as closed.
+    let quiescence = (Instant::now() + std::time::Duration::from_millis(500)).min(deadline);
+    while flags.7 != 0 && Instant::now() < quiescence {
+        tokio::time::sleep_until(
+            quiescence
+                .min(Instant::now() + std::time::Duration::from_millis(10))
+                .into(),
+        )
+        .await;
+        if Instant::now() >= quiescence {
+            break;
+        }
+        flags = query_one_mysql(
+            &mut session.connection,
+            FLAGS,
+            deadline,
+            ControlStage::InspectExistingGroup,
+        )
+        .await?;
+    }
+    let replication: u64 = query_one_mysql(
+        &mut session.connection,
+        "SELECT (SELECT COUNT(*) FROM performance_schema.replication_connection_status \
+         WHERE SERVICE_STATE='ON') + \
+         (SELECT COUNT(*) FROM performance_schema.replication_applier_status \
+         WHERE SERVICE_STATE='ON')",
+        deadline,
+        ControlStage::InspectExistingGroup,
+    )
+    .await?;
+    if flags != (1, 1, 1, 0, 0, 0, 0, 0) || replication != 0 {
+        return Err(MysqlReopenError::AccessNotClosed);
+    }
+    let scheduler: String = query_one_mysql(
+        &mut session.connection,
+        "SELECT @@GLOBAL.event_scheduler",
+        deadline,
+        ControlStage::InspectExistingGroup,
+    )
+    .await?;
+    if scheduler != "OFF" && scheduler != "DISABLED" {
+        return Err(MysqlReopenError::AccessNotClosed);
+    }
+    if reopened {
+        let persisted: u8 = query_one_mysql(
+            &mut session.connection,
+            "SELECT @@GLOBAL.persisted_globals_load",
+            deadline,
+            ControlStage::InspectExistingGroup,
+        )
+        .await?;
+        if persisted != 0 {
+            return Err(MysqlReopenError::AccessNotClosed);
+        }
+    }
+    let (group_name, server_id, host, port, group_address): (String, u32, String, u16, String) =
+        query_one_mysql(
+            &mut session.connection,
+            "SELECT @@GLOBAL.group_replication_group_name, @@GLOBAL.server_id, \
+             @@GLOBAL.report_host, @@GLOBAL.report_port, @@GLOBAL.group_replication_local_address",
+            deadline,
+            ControlStage::InspectExistingGroup,
+        )
+        .await?;
+    let member = &target.member;
+    let sql_address = std::net::SocketAddr::new(
+        host.parse().map_err(|_| MysqlReopenError::NativeIdentity)?,
+        port,
+    );
+    if group_name != member.group_uuid()
+        || server_id != member.server_id()
+        || sql_address != member.sql_address()
+        || group_address != member.group_replication_address().to_string()
+    {
+        return Err(MysqlReopenError::NativeIdentity);
+    }
+    let (executed, purged): (String, String) = query_one_mysql(
+        &mut session.connection,
+        "SELECT @@GLOBAL.gtid_executed, @@GLOBAL.gtid_purged",
+        deadline,
+        ControlStage::ReadExecutedHistory,
+    )
+    .await?;
+    let boundary = MysqlReopenBoundary {
+        server_uuid,
+        group_name,
+        server_id,
+        sql_address,
+        group_address,
+        executed: GtidSet::from_str(&executed).map_err(|_| MysqlReopenError::History)?,
+        purged: GtidSet::from_str(&purged).map_err(|_| MysqlReopenError::History)?,
+    };
+    boundary.validate()?;
+    Ok(boundary)
+}
+
 pub(crate) async fn member_bootstrap(
     target: OwnedControlTarget,
     authority: &MemberMutationAuthority,

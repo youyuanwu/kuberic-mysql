@@ -238,6 +238,49 @@ pub(crate) fn terminate_and_reap(
     terminate_and_reap_before(child, deadline)
 }
 
+/// A reopen checkpoint requires a successful graceful exit, never credit for
+/// escalation. The retained owner remains responsible for cleanup on error.
+pub(crate) fn gracefully_reap_before(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<(), MysqlInstanceError> {
+    if child
+        .try_wait()
+        .map_err(|_| MysqlInstanceError::Ownership(OwnershipError::InspectionFailed))?
+        .is_some()
+    {
+        return Err(MysqlInstanceError::Ownership(OwnershipError::ChildExited));
+    }
+    let mut signal = Command::new("/bin/kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .spawn()
+        .map_err(|error| MysqlInstanceError::Io {
+            operation: LifecycleOperation::Shutdown,
+            kind: error.kind(),
+        })?;
+    let status = wait_until(&mut signal, deadline, LifecycleOperation::Shutdown);
+    // Never leave the short-lived signal helper unreaped on timeout.
+    if status.is_err() {
+        let _ = signal.kill();
+        let _ = signal.wait();
+    }
+    if !status?.success() {
+        return Err(MysqlInstanceError::Ownership(
+            OwnershipError::InspectionFailed,
+        ));
+    }
+    let status = wait_until(child, deadline, LifecycleOperation::Shutdown)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(MysqlInstanceError::ChildFailure {
+            operation: LifecycleOperation::Shutdown,
+            code: status.code(),
+        })
+    }
+}
+
 pub(crate) fn terminate_and_reap_before(
     child: &mut Child,
     deadline: Instant,

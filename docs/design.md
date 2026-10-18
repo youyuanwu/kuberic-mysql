@@ -1479,11 +1479,23 @@ Force recovery is outside the initial automated support claim.
 
 ## Restart Reconstruction
 
-The PoC supports component replacement only when a surviving fixture host
-retains the exact process and in-memory operation ownership context and proves
-that no topology mutation or handoff was pending. It first verifies effective
-client-access closure, then revalidates the exact owned processes, storage,
-identities, view, and GTID state before reconciling Kuberic callbacks again.
+### Delivered first Stage 3 slice
+
+`MysqlStoppedReopen::capture` consumes an exact, continuously retained quiet
+owner into a one-use graceful-stop capability. It preserves data and native logs,
+requires effective closed access and an independently supplied exact structured
+native boundary, and binds explicit accepted generic caller authority.
+`reopen` starts a new attested native child with persisted-global loading and
+SQL/X/group startup disabled. It requires matching full native identity/history
+and exact renewed generic storage/history/session/epoch/configuration/operation
+scope, returning only a closed `MysqlClosedReopened` handle.
+
+The manager must never have issued an application/proxy capability: a currently
+idle, unpublished or previously revoked proxy does not prove closure of its
+independent listener owner. The monotonically qualified predecessor durability
+lifetime is retained, not reconstructed from post-restart settings. This is
+not callback replay, serving, committed progress, donor proof or automatic
+`OpenMode::Existing`. See [closed safe reopen](mysql-safe-reopen.md).
 
 If the lifecycle component and its ownership context are both lost, the PoC
 cannot prove quiescence from MySQL state alone. It keeps writes closed and
@@ -1492,7 +1504,10 @@ healthy. A pending topology mutation, partially completed handoff, ambiguous
 native effect, or unproven client-path closure also requires fixture reset; the
 PoC never resumes the operation.
 
-The resumable reconstruction contract below belongs to Stage 3 and later.
+### Remaining resumable reconstruction contract
+
+The contract below remains future Stage 3 work; the delivered closed primitive
+does not supply these role/configuration/peer/access replay steps.
 
 Runtime or host restart creates fresh process and observation sessions. The
 replacement starts unassigned and access-closed. It receives no predecessor
@@ -1619,7 +1634,7 @@ stage.
 | 0. Design | No prior stage. Deliver this design and concise README with current/future claims separated. | Spec, plan, cross-artifact, implementation, and final reviews pass with no unresolved safety finding. | Intended contract is documented. | No executable MySQL support. |
 | 1. Server-free core | Stage 0 passed. Add typed identities, GTID relations, views, observation decoding, and minimal fail-closed state machines without a server dependency. | Deterministic tests pass for malformed, stale, partial, divergent, and stale-authority cases. | Core identity/history decisions do not flatten GTIDs or accept stale work. | No process, SQL, topology mutation, TLS, or recovery automation. |
 | 2. Host-local Kuberic PoC | Stage 1 passed and the exact MySQL patch is pinned. Deliver the MySQL-owned member-local lifecycle/effect seam, qualified progress, bounded gateway, direct custom Build/completed-idle Remove, fresh three-engine formation, controlled handoff, and bounded Public V1 adapter. | Gates cover exact identity/view/history receipts, role-correct all-voter commitment and coherent provider pairs, explicit/omitted source-first Build, stale authority/settings rejection, target-only Remove/retry/interruption containment, active-member Remove/data-loss rejection, gateway closure, source stop/reap and combined successor publication proof. | Fresh initial Primary, distributed-recovery Build and exact completed-idle retirement are delivered for retained same-host owners; generic handoff qualification remains separately fenced. | No production-controller custom-Build dispatch, restart recovery, TLS, Clone/reseed, automated failover, independent fence provider, cross-host, Kubernetes, or production claim. |
-| 3. Resumable lifecycle and repair | Stage 2 passed. Add generic durable effect records, ambiguous-effect recovery, Clone/reseed, replacement, cleanup recovery, and destructive approvals. | Restart and fault gates prove effects are recovered, retried only when idempotent, or left safely closed. | Host-local lifecycle survives interrupted provisioning and replacement without a MySQL-specific metadata store. | No automated writable failover or production security claim. |
+| 3. Resumable lifecycle and repair | Stage 2 passed. First delivered slice: exact retained-owner quiet graceful stop/reopen with closed access and explicit generic authority. Later add generic effect replay, ambiguous-effect recovery, Clone/reseed, replacement, cleanup and destructive approvals. | Delivered closed-reopen gates prove retained native identity/history, renewed ownership and rejection of stale authority, substituted storage/settings/logs and application/proxy capabilities. Full restart/fault gates for effect replay remain future. | Only closed reopening through the retained one-use owner capability is delivered. | No owner-loss/abrupt/lost-log recovery, hosted Existing, serving replay, interrupted-effect continuation, automatic writable failover or production security claim. |
 | 4. Automated failover and independent fencing | Stage 3 passed; the pinned native commit invariant and an independent fence provider are validated. Add lossless-boundary derivation, continuing fence dependencies, unplanned failover, and quorum recovery. | Old-primary survival, direct-client, provider-loss, divergent-history, and quorum-loss gates pass with no premature write publication. | Controlled automated failover for the exact validated environment. | No portable cross-host or Kubernetes claim. |
 | 5. Secure cross-host qualification | Stage 4 passed. Add separate principals, secure secret handling, native TLS or an explicitly qualified equivalent network profile, real fault domains, and a production-candidate fence backend. | Cross-host network, trust rotation, host loss, storage, direct-client, and fence-lifetime gates pass. | Only the named cross-host security and infrastructure profile that passed. | No generic CNI, mesh, cloud, or cross-region assumption. |
 | 6. Kubernetes qualification | Stage 5 passed; named Kubernetes/provider versions, images, secrets, storage, routing, and platform fence integrations are fixed. | The Kubernetes gate matrix passes lifecycle, faults, storage reuse, routing, trust rotation, controller restart, old-primary survival, and exact fence/release scenarios. | Only the named Kubernetes, storage, network, and fence-provider matrix. | No generic Kubernetes or provider portability. |
@@ -1627,7 +1642,9 @@ stage.
 Stages 0 and 1, the native observation and process/topology slices, the native
 feasibility gate, the MySQL-owned Stage 2 member-local
 lifecycle/progress/gateway/controlled-handoff foundation, and the bounded
-Public V1 adapter and process-local direct custom Build are delivered.
+Public V1 adapter and process-local direct custom Build are delivered. The
+first Stage 3 closed retained-owner reopen primitive is also delivered; this
+does not complete Stage 3.
 Production-controller custom-Build dispatch, restart-resumable effects, and
 every later stage remain delivery contracts rather than current feature
 claims.
@@ -1801,7 +1818,8 @@ must define their exact inputs and pass conditions.
 | Fresh topology bootstrap/join | Exactly three fresh owned instances, loopback Group Replication, retained in-memory attempt authority | One designated bootstrap and two sequential joins receive exact fresh identity/view/GTID credit; access stays closed; every process and scratch root is contained | Bounded fresh three-member bootstrap/join for the exact qualified local profile | No callbacks, access publication, switchover, failover, repair, survivor adoption, or restart continuation |
 | Native Stage 2 feasibility | The exact fresh topology plus the pinned setting tuple and test-only internal runner | Full GTID evidence stays one untagged group source and contiguous through the exercised transitions; normal acknowledgement, exact ambiguous-disconnect inclusion, and post-ack primary SIGKILL/restart pass; source-wait and peer revocation gaps return explicit negative results | The named Oracle 8.4.11 native profile, ambiguous transaction inclusion, and acknowledged-primary crash behavior are feasible inputs to the delivered scalar and handoff foundation | No retained catch-up capability, credential-bound peer revocation, secondary-loss-during-`AFTER`, automated failover, or production durability claim |
 | MySQL-owned Stage 2 lifecycle and handoff | Three fresh member-local owners, loopback Group Replication, intended-order repository values, one bounded gateway per member, and the exact pinned Public V1 dependency | Lifecycle/effect conformance, public translation/trait contracts, role-correct commitment, direct custom Build/idle Remove, gateway profile/closure, formation and handoff qualification; target access stays closed during Build and removal | Controlled host-local lifecycle foundation, fresh initial-primary bootstrap, distributed-recovery Build and exact completed-idle retirement; combined handoff proof remains separate | No production-controller custom-Build dispatch, active/generic Remove, Clone/reseed, restart recovery, automated failover, external fence, cross-host, or production claim |
-| Advanced repair and restart | Stage 3 implementation, generic durable effect records, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Resumable host-local repair for the exercised profile without an application-owned metadata store | No automated writable failover |
+| Closed retained-owner reopen | Exact quiet owned topology member, no issued app/proxy capability, qualified lifetime, preserved native logs, explicit generic caller authority | Actual API preserves data/full GTIDs, renews native and generic sessions, keeps ports closed and rejects identity/history/authority/settings/log/root substitutions | Closed observation/containment of a fresh child after exact graceful retirement; no private durable store | No owner-loss/abrupt recovery, survivor adoption, hosted Existing, role/configuration/access replay or scalar commitment/donor claim |
+| Advanced repair and restart | Remaining Stage 3 implementation, generic durable effect records, destructive approvals | Clone/reseed/replacement and effect-before-receipt faults resume or fail closed without touching foreign state | Future resumable host-local repair for the exercised profile without an application-owned metadata store | No automated writable failover |
 | Advanced failover and fencing | Validated native commit invariant and independent fence provider | Only a candidate containing the required history publishes; old-primary survival, provider loss, quorum loss, and divergent histories remain fail-closed | Automated failover for the exact qualified environment | No portable infrastructure or Kubernetes claim |
 | Secure cross-host and Kubernetes | Named network, TLS or qualified equivalent, separate principals, storage, routing, and fence integration | The environment-specific lifecycle, partition, trust-rotation, direct-client, restart, and replacement matrix passes | Only the exact named deployment matrix | No generic CNI, mesh, cloud, or Kubernetes portability |
 

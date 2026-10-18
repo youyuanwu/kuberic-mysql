@@ -15,6 +15,10 @@
 //! state exist only in memory. Losing a manager means losing ownership context:
 //! callers must keep access closed and reset the fixture rather than discover,
 //! adopt, or continue surviving processes.
+//! [`MysqlStoppedReopen`] separately supports one exactly owned quiet graceful
+//! stop and closed native reopen while its linear in-memory capability survives.
+//! It preserves native logs and requires explicit generic caller authority;
+//! it never resumes serving or restores role/configuration/progress authority.
 //! Cancelling bootstrap synchronously contains the exact owned topology unless
 //! bootstrap-off plus its proof already completed; query futures are never
 //! detached.
@@ -48,6 +52,7 @@ mod process;
 mod proxy;
 #[cfg(test)]
 mod qualification;
+mod reopen;
 mod replicator;
 mod topology;
 
@@ -87,6 +92,10 @@ pub use proxy::{
     APPLICATION_QUALIFICATION_SCHEMA, ApplicationAccountReceipt, ApplicationCredential,
     BackendSessionIdentity, MysqlClientProxy, MysqlProxyAccessGuard, MysqlProxyContainmentReceipt,
     MysqlProxyControlBoundary, MysqlProxyDiagnostics, MysqlProxySnapshot,
+};
+pub use reopen::{
+    MysqlClosedReopened, MysqlReopenAuthority, MysqlReopenBoundary, MysqlReopenError,
+    MysqlReopenEvidence, MysqlReopenRenewal, MysqlStoppedReopen,
 };
 pub use replicator::{
     MysqlAccessIntent, MysqlAccessOutcome, MysqlConfigurationOutcome, MysqlEpochOutcome,

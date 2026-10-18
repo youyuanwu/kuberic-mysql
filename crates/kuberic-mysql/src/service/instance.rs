@@ -89,6 +89,7 @@ pub struct MysqlInstanceManager {
     process_generation: u64,
     cleanup_quarantined: bool,
     native_durability_qualified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    application_capability_issued: bool,
 }
 
 /// Unforgeable in-process ownership token for one exact MySQL child generation.
@@ -120,6 +121,7 @@ impl MysqlInstanceManager {
             native_durability_qualified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 true,
             )),
+            application_capability_issued: false,
         }
     }
 
@@ -131,6 +133,10 @@ impl MysqlInstanceManager {
 
     pub(crate) fn native_durability_qualified(&self) -> bool {
         self.native_durability_qualified.load(Ordering::Acquire)
+    }
+
+    pub(crate) const fn application_capability_issued(&self) -> bool {
+        self.application_capability_issued
     }
 
     fn retain_native_durability(&mut self, evidence: MemberNativeEvidence) -> MemberNativeEvidence {
@@ -312,6 +318,14 @@ impl MysqlInstanceManager {
         &mut self,
         attempt: Option<&AttemptContext>,
     ) -> Result<(), MysqlInstanceError> {
+        self.start_profile(attempt, false)
+    }
+
+    fn start_profile(
+        &mut self,
+        attempt: Option<&AttemptContext>,
+        closed_reopen: bool,
+    ) -> Result<(), MysqlInstanceError> {
         self.require_state(MysqlInstanceState::Initialized)?;
         self.config.revalidate_executables()?;
         if let Err(error) = self.revalidate_roots() {
@@ -324,23 +338,56 @@ impl MysqlInstanceManager {
                 .ok_or(MysqlInstanceError::Ownership(
                     crate::service::OwnershipError::InspectionFailed,
                 ))?;
-        let stdout = File::create(self.config.runtime().stdout_log()).map_err(|error| {
-            MysqlInstanceError::Io {
-                operation: LifecycleOperation::Startup,
-                kind: error.kind(),
-            }
-        })?;
-        let stderr = File::create(self.config.runtime().error_log()).map_err(|error| {
-            MysqlInstanceError::Io {
-                operation: LifecycleOperation::Startup,
-                kind: error.kind(),
-            }
-        })?;
-        let child = launcher_command(&self.config)
-            .arg(format!(
-                "--defaults-file={}",
-                self.config.runtime().config().display()
-            ))
+        let (stdout, stderr, closed_error_log) = if closed_reopen {
+            let scratch = self.scratch_root.as_ref().expect("retained scratch owner");
+            let (stdout, stderr, error_log) = create_reopen_diagnostic_files(scratch)?;
+            self.revalidate_roots()?;
+            (stdout, stderr, Some(error_log))
+        } else {
+            let stdout = File::create(self.config.runtime().stdout_log()).map_err(|error| {
+                MysqlInstanceError::Io {
+                    operation: LifecycleOperation::Startup,
+                    kind: error.kind(),
+                }
+            })?;
+            let stderr = File::create(self.config.runtime().error_log()).map_err(|error| {
+                MysqlInstanceError::Io {
+                    operation: LifecycleOperation::Startup,
+                    kind: error.kind(),
+                }
+            })?;
+            (stdout, stderr, None)
+        };
+        let mut command = launcher_command(&self.config);
+        command.arg(format!(
+            "--defaults-file={}",
+            self.config.runtime().config().display()
+        ));
+        if closed_reopen {
+            // Command-line options outrank generated configuration and native
+            // persisted globals must not reopen client ingress during startup.
+            command.args([
+                "--persisted-globals-load=OFF",
+                "--skip-networking=ON",
+                "--mysqlx=OFF",
+                "--read-only=ON",
+                "--super-read-only=ON",
+                "--group-replication-start-on-boot=OFF",
+                "--group-replication-bootstrap-group=OFF",
+                "--skip-replica-start",
+                "--event-scheduler=OFF",
+            ]);
+            // Both the inherited stream and MySQL's own error logger use the
+            // new, exclusively created destination, never a retained pathname.
+            command.arg(format!(
+                "--log-error={}",
+                closed_error_log
+                    .as_ref()
+                    .expect("closed diagnostic owner")
+                    .display(),
+            ));
+        }
+        let child = command
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -1230,7 +1277,7 @@ impl MysqlInstanceManager {
         }
     }
 
-    fn revalidate_roots(&self) -> Result<(), MysqlInstanceError> {
+    pub(crate) fn revalidate_roots(&self) -> Result<(), MysqlInstanceError> {
         for root in [&self.data_root, &self.scratch_root] {
             root.as_ref()
                 .ok_or(MysqlInstanceError::Ownership(
@@ -1242,7 +1289,9 @@ impl MysqlInstanceManager {
         Ok(())
     }
 
-    fn prepare_control_target(&mut self) -> Result<OwnedControlTarget, MysqlTopologyError> {
+    pub(crate) fn prepare_control_target(
+        &mut self,
+    ) -> Result<OwnedControlTarget, MysqlTopologyError> {
         if self.config.topology().is_none() {
             return Err(MysqlTopologyError::TopologyState(
                 TopologyStateError::TopologyConfigurationRequired,
@@ -1277,6 +1326,81 @@ impl MysqlInstanceManager {
             self.config.member().clone(),
         )
         .with_durability_qualification(self.native_durability_qualified.clone()))
+    }
+
+    pub(crate) fn reopen_process_session(&mut self) -> Result<String, MysqlInstanceError> {
+        self.revalidate_roots()?;
+        let child = self.child.as_mut().ok_or(MysqlInstanceError::Ownership(
+            crate::service::OwnershipError::ChildExited,
+        ))?;
+        attest_child(child, &self.config)?;
+        Ok(format!(
+            "owned-{}-process-{}-pid-{}",
+            self.owner_generation,
+            self.process_generation,
+            child.id(),
+        ))
+    }
+
+    pub(crate) fn stop_for_reopen(
+        &mut self,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlInstanceError> {
+        self.require_state(MysqlInstanceState::Running)?;
+        self.revalidate_roots()?;
+        attempt.admit_work().map_err(MysqlInstanceError::Attempt)?;
+        let child = self.child.as_mut().expect("running owner");
+        attest_child(child, &self.config)?;
+        let deadline = checked_deadline(
+            self.config.timeouts().shutdown(),
+            LifecycleOperation::Shutdown,
+        )?
+        .min(attempt.work_deadline());
+        crate::service::process::gracefully_reap_before(child, deadline)?;
+        self.child = None;
+        wait_for_absence_before(self.config.runtime().socket(), deadline)?;
+        // A graceful native shutdown must remove its own PID file. Never
+        // unlink a substituted endpoint on behalf of a possible survivor.
+        if fs::symlink_metadata(self.config.runtime().pid()).is_ok() {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InvalidPidFile,
+            ));
+        }
+        self.state = MysqlInstanceState::Initialized;
+        Ok(())
+    }
+
+    pub(crate) fn start_for_reopen(
+        &mut self,
+        attempt: &AttemptContext,
+    ) -> Result<(), MysqlInstanceError> {
+        self.require_state(MysqlInstanceState::Initialized)?;
+        self.revalidate_roots()?;
+        let options = self.config.runtime().config();
+        let metadata = fs::symlink_metadata(options).map_err(|_| {
+            MysqlInstanceError::Ownership(crate::service::OwnershipError::InspectionFailed)
+        })?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || fs::read(options).ok().as_deref()
+                != Some(self.config.render_server_config().as_bytes())
+        {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InspectionFailed,
+            ));
+        }
+        for path in [self.config.runtime().socket(), self.config.runtime().pid()] {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => {
+                    return Err(MysqlInstanceError::Ownership(
+                        crate::service::OwnershipError::InspectionFailed,
+                    ));
+                }
+            }
+        }
+        attempt.admit_work().map_err(MysqlInstanceError::Attempt)?;
+        self.start_profile(Some(attempt), true)
     }
 
     pub(crate) fn topology_binding(
@@ -1702,6 +1826,9 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         target
             .revalidate_socket()
             .map_err(MysqlProxyError::Native)?;
+        // This capability may outlive the manager and be published later.
+        // There is no closed-reopen proof for its independent listener owner.
+        self.application_capability_issued = true;
         Ok(target.socket())
     }
 
@@ -1720,6 +1847,8 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         let target = self
             .prepare_member_effect_target(authority, attempt)
             .map_err(MysqlProxyError::Native)?;
+        // Monotonic even if an account-preparation future later fails/drops.
+        self.application_capability_issued = true;
         let mut cancellation_containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = crate::service::control::prepare_application_account(
             target,
@@ -1990,6 +2119,53 @@ impl Drop for MysqlInstanceManager {
     }
 }
 
+/// Creates diagnostic files for the one permitted closed reopen generation.
+/// Existing names (including links) always reject; no retained file is opened
+/// destructively. These are diagnostic output, never recovery authority.
+fn create_reopen_diagnostic_files(
+    scratch: &OwnedRoot,
+) -> Result<(File, File, std::path::PathBuf), MysqlInstanceError> {
+    scratch
+        .revalidate()
+        .map_err(MysqlInstanceError::Ownership)?;
+    let directory = open(
+        scratch.path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+    verify_fd_identity(&directory, scratch.device(), scratch.inode())?;
+    let parent = fstat(&directory).map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+    let create = |name: &str| -> Result<File, MysqlInstanceError> {
+        let output = openat(
+            &directory,
+            name,
+            OFlags::WRONLY
+                | OFlags::APPEND
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+        let metadata =
+            fstat(&output).map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+            || metadata.st_nlink != 1
+            || metadata.st_uid != parent.st_uid
+        {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InspectionFailed,
+            ));
+        }
+        Ok(File::from(output))
+    };
+    let stdout = create("mysqld-reopen.out")?;
+    let stderr = create("mysqld-reopen.err")?;
+    Ok((stdout, stderr, scratch.path().join("mysqld-reopen.err")))
+}
+
 fn checked_deadline(
     timeout: Duration,
     operation: LifecycleOperation,
@@ -2230,6 +2406,148 @@ mod tests {
     use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    #[test]
+    fn reopen_diagnostic_creation_rejects_existing_files_and_links_without_truncation() {
+        for name in ["mysqld-reopen.out", "mysqld-reopen.err"] {
+            for kind in ["file", "symlink", "hardlink"] {
+                let parent = std::env::temp_dir().join(format!(
+                    "kms-ro-{}-{}",
+                    std::process::id(),
+                    CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed),
+                ));
+                fs::create_dir(&parent).unwrap();
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+                let config = MysqlInstanceConfig::new(
+                    "/usr/bin/sleep",
+                    "/usr/bin/env",
+                    parent.join("d"),
+                    parent.join("s"),
+                    MysqlOperationTimeouts::new(
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let roots = match config.create_layout() {
+                    Ok(roots) => roots,
+                    Err(_) => panic!("owned test layout"),
+                };
+                let sentinel = roots.data.path().join("retained-sentinel");
+                fs::write(&sentinel, b"retained-data-must-not-be-truncated").unwrap();
+                let destination = roots.scratch.path().join(name);
+                match kind {
+                    "file" => fs::write(&destination, b"existing-output").unwrap(),
+                    "symlink" => std::os::unix::fs::symlink(&sentinel, &destination).unwrap(),
+                    "hardlink" => fs::hard_link(&sentinel, &destination).unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(create_reopen_diagnostic_files(&roots.scratch).is_err());
+                assert_eq!(
+                    fs::read(&sentinel).unwrap(),
+                    b"retained-data-must-not-be-truncated"
+                );
+                if kind == "file" {
+                    assert_eq!(fs::read(&destination).unwrap(), b"existing-output");
+                }
+                fs::remove_dir_all(parent).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_capture_cannot_restore_a_disqualified_predecessor_lifetime() {
+        use crate::service::{
+            MysqlReopenAuthority, MysqlReopenBoundary, MysqlReopenError, MysqlStoppedReopen,
+        };
+        use kuberic_runtime::protocol::types as public;
+        let parent = std::env::temp_dir().join(format!(
+            "kms-reopen-latch-{}-{}",
+            std::process::id(),
+            CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = MysqlInstanceConfig::new_topology_member(
+            "/usr/bin/sleep",
+            "/usr/bin/env",
+            parent.join("d"),
+            parent.join("s"),
+            topology(),
+            MysqlMemberIndex::First,
+            MysqlOperationTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        fs::create_dir(config.data_root()).unwrap();
+        fs::write(config.data_root().join("retained"), b"native-data").unwrap();
+        let manager = MysqlInstanceManager::new(config);
+        // This is the same monotonic atomic updated by the native profile reader.
+        // A later qualified sample must not restore the original owner lifetime.
+        manager
+            .native_durability_qualified
+            .fetch_and(false, Ordering::AcqRel);
+        manager
+            .native_durability_qualified
+            .fetch_and(true, Ordering::AcqRel);
+        let replica = public::ReplicaIdentity {
+            replica_id: public::ReplicaId::new(1),
+            instance_id: public::ReplicaInstanceId::new("instance"),
+            agent_generation: public::AgentGeneration::new("agent"),
+        };
+        let authority = MysqlReopenAuthority {
+            storage: public::ReplicaStorageIncarnationContext {
+                replica,
+                storage: public::ReplicaStorageIdentity::Volatile {
+                    identity: "fixture".into(),
+                },
+                storage_generation: public::StorageGeneration::new("storage"),
+            },
+            partition: public::PartitionId::new("partition"),
+            history: public::HistoryContext {
+                resource_uid: public::ResourceUid::new("resource"),
+                protocol_generation: public::PublicProtocolGeneration::new(1),
+                history_id: public::HistoryId::new("history"),
+                data_loss_number: 0,
+            },
+            process_session: public::ProcessSessionId::new("session"),
+            replicator_creation: public::ReplicatorCreationId::new("creation"),
+            epoch: public::Epoch::new(0, 1),
+            configuration: public::ConfigurationId::new("config"),
+            operation: public::OperationId::new("capture"),
+            revision: 1,
+        };
+        let expected = MysqlReopenBoundary {
+            server_uuid: crate::core::ServerUuid::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+                .unwrap(),
+            group_name: "cccccccc-cccc-cccc-cccc-cccccccccccc".into(),
+            server_id: 1,
+            sql_address: "127.0.0.1:33061".parse().unwrap(),
+            group_address: "127.0.0.1:43061".into(),
+            executed: crate::core::GtidSet::empty(),
+            purged: crate::core::GtidSet::empty(),
+        };
+        let attempt = AttemptContext::new(
+            AttemptId::new("capture").unwrap(),
+            Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            MysqlStoppedReopen::capture(manager, authority, expected, &attempt).await,
+            Err(MysqlReopenError::Durability),
+        ));
+        assert_eq!(fs::read(parent.join("d/retained")).unwrap(), b"native-data");
+        fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn cleanup_remains_bound_to_open_root_when_quarantine_is_replaced() {
