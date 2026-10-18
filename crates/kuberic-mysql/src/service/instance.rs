@@ -2423,10 +2423,8 @@ fn retain_owned_runtime_evidence(root: &OwnedRoot) -> Result<(), MysqlInstanceEr
     let mismatch = || MysqlInstanceError::Ownership(crate::service::OwnershipError::RootMismatch);
     let parent = root.path().parent().ok_or_else(mismatch)?;
     let name = root.path().file_name().ok_or_else(mismatch)?;
-    let mut retained = root.path().as_os_str().to_os_string();
-    retained.push(".retained");
-    let retained = std::path::PathBuf::from(retained);
-    let retained_name = retained.file_name().ok_or_else(mismatch)?;
+    let mut retained_name = name.to_os_string();
+    retained_name.push(".retained");
     let parent_fd = open(
         parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -2448,11 +2446,11 @@ fn retain_owned_runtime_evidence(root: &OwnedRoot) -> Result<(), MysqlInstanceEr
         &parent_fd,
         name,
         &parent_fd,
-        retained_name,
+        &retained_name,
         RenameFlags::NOREPLACE,
     )
     .map_err(|error| io_error(operation, error))?;
-    let moved = statat(&parent_fd, retained_name, AtFlags::SYMLINK_NOFOLLOW)
+    let moved = statat(&parent_fd, &retained_name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io_error(operation, error))?;
     if moved.st_dev != root.device() || moved.st_ino != root.inode() {
         return Err(mismatch());
@@ -2670,6 +2668,10 @@ mod tests {
             (true, true, "s"),
             (true, false, "s.log"),
             (true, false, "s.retained"),
+            (true, false, "s/"),
+            (true, false, "s.log/"),
+            (true, false, "s.retained/"),
+            (true, true, "s/"),
         ] {
             let parent = std::env::temp_dir().join(format!(
                 "te-{}-{}",
@@ -2700,7 +2702,15 @@ mod tests {
                 .unwrap_or_else(|_| panic!("test layout"));
             fs::write(roots.data.path().join("native"), b"data").unwrap();
             fs::write(roots.scratch.path().join("mysqld.err"), b"diagnostics").unwrap();
-            let retained = parent.join(format!("{scratch_name}.retained"));
+            let basename = Path::new(scratch_name)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let retained = parent.join(format!("{basename}.retained"));
+            let original = fs::metadata(roots.scratch.path()).unwrap();
+            fs::create_dir(parent.join(".retained")).unwrap();
+            fs::write(parent.join(".retained/foreign"), b"parent-sentinel").unwrap();
             if collision {
                 fs::create_dir(&retained).unwrap();
                 fs::write(retained.join("foreign"), b"untouched").unwrap();
@@ -2712,6 +2722,10 @@ mod tests {
             let result = manager.contain_before(Instant::now() + Duration::from_secs(1));
             assert_eq!(result.is_err(), collision);
             assert_eq!(fs::read(parent.join("d/native")).unwrap(), b"data");
+            assert_eq!(
+                fs::read(parent.join(".retained/foreign")).unwrap(),
+                b"parent-sentinel"
+            );
             if collision {
                 assert_eq!(fs::read(retained.join("foreign")).unwrap(), b"untouched");
                 assert_eq!(
@@ -2724,6 +2738,8 @@ mod tests {
                 assert_eq!(manager.state, MysqlInstanceState::Stopped);
                 assert_eq!(retained.exists(), retain);
                 if retain {
+                    let moved = fs::metadata(&retained).unwrap();
+                    assert_eq!((moved.dev(), moved.ino()), (original.dev(), original.ino()));
                     assert_eq!(
                         fs::read(retained.join("mysqld.err")).unwrap(),
                         b"diagnostics"

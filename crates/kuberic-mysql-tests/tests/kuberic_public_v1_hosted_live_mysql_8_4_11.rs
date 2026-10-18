@@ -63,7 +63,7 @@ fn hosted_new_factory_initial_primary_progress_and_native_access() {
         let mut fixture = HostedFixture::new("hosted-new").await?;
         let result = fixture.fresh_primary().await;
         let cleanup = fixture.shutdown().await;
-        result.and(cleanup)
+        finish_scenario(result, cleanup, Ok(()))
     });
 }
 
@@ -112,7 +112,7 @@ fn hosted_interrupted_open_after_real_server_spawn_is_contained() {
         let result = fixture.interrupt_open().await;
         let cleanup = fixture.shutdown().await;
         let unaffected = foreign.assert_live();
-        result.and(cleanup).and(unaffected)
+        finish_scenario(result, cleanup, unaffected)
     });
 }
 
@@ -178,7 +178,7 @@ async fn terminal_scenario(abort: bool) -> TestResult {
     }
     .await;
     let cleanup = fixture.shutdown().await;
-    result.and(cleanup).and(foreign.assert_live())
+    finish_scenario(result, cleanup, foreign.assert_live())
 }
 
 /// A retained unrelated child, signalled only by its own fixture owner.
@@ -187,7 +187,7 @@ struct ForeignChild(Child);
 impl ForeignChild {
     fn new() -> TestResult<Self> {
         Command::new("/usr/bin/sleep")
-            .arg("300")
+            .arg("3600")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -901,4 +901,35 @@ impl Drop for HostedFixture {
         self.service.abort();
         self.running.shutdown();
     }
+}
+
+fn finish_scenario(scenario: TestResult, cleanup: TestResult, foreign: TestResult) -> TestResult {
+    let errors = [
+        ("scenario", scenario),
+        ("shutdown/containment", cleanup),
+        ("foreign child", foreign),
+    ]
+    .into_iter()
+    .filter_map(|(label, result)| result.err().map(|error| format!("{label}: {error}")))
+    .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[test]
+fn failed_scenario_keeps_all_cleanup_and_noninterference_errors() {
+    let result = finish_scenario(
+        Err("primary failure".into()),
+        Err("child still live".into()),
+        Err("sentinel exited".into()),
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "scenario: primary failure; shutdown/containment: child still live; foreign child: sentinel exited"
+    );
+    assert!(finish_scenario(Ok(()), Ok(()), Ok(())).is_ok());
+    assert!(finish_scenario(Ok(()), Err("cleanup failed".into()), Ok(())).is_err());
 }

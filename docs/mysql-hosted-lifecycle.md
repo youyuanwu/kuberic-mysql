@@ -79,7 +79,7 @@ There is no retry-until-pass loop or fabricated generic containment witness.
 The [production service constructor](../crates/kuberic-mysql/src/service/kuberic/service.rs#L203-L220)
 selects an in-memory retention policy. After exact owned-child termination and
 root revalidation, [terminal containment](../crates/kuberic-mysql/src/service/instance.rs#L1632-L1671)
-atomically renames the owned runtime root to its complete original name plus
+atomically renames the owned runtime root to its complete basename plus
 `.retained`. It validates retained device/inode ownership and uses nonreplacing
 directory-relative rename; a destination collision fails containment rather
 than overwriting foreign evidence. The active runtime name really is absent.
