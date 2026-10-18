@@ -27,6 +27,8 @@ use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 
 #[path = "proof.rs"]
 mod proof;
+#[path = "remove.rs"]
+mod remove;
 
 use crate::core::{
     AttemptId, AuthorityGeneration, ConfiguredGtidLineage, GroupReplicationAddress,
@@ -148,6 +150,7 @@ struct DriverState {
     epoch_commit: Option<(Epoch, proof::CommittedSample)>,
     fresh_epoch: Option<Epoch>,
     durability_qualified: bool,
+    removals: Vec<remove::RemoveRecord>,
     build_generation: Arc<BuildGeneration>,
     pending_build_target: Option<BuildTargetBinding>,
     pending_build_binding: Option<Box<BuildBinding>>,
@@ -510,6 +513,7 @@ impl MysqlPublicV1Replicator {
                 epoch_commit: None,
                 fresh_epoch: None,
                 durability_qualified: true,
+                removals: Vec::new(),
                 build_generation: Arc::new(BuildGeneration::new()),
                 pending_build_target: None,
                 pending_build_binding: None,
@@ -841,7 +845,7 @@ impl MysqlPublicV1Replicator {
         &self,
         callback: &BuildCallbackKey,
         group: &BuildAttemptGroup,
-    ) -> Result<i64> {
+    ) -> Result<(i64, u64, crate::service::MemberMutationAuthority)> {
         let child = group
             .child(self.attempt.clone())
             .map_err(|_| RuntimeError::OperationCancelled)?;
@@ -877,7 +881,11 @@ impl MysqlPublicV1Replicator {
             .map_err(|_| RuntimeError::OperationCancelled)?;
         self.require_direct_build_donor_binding(&state, callback)?;
         match progress.progress() {
-            ProgressProjection::Projectable(progress) => Ok(progress.value()),
+            ProgressProjection::Projectable(progress) => Ok((
+                progress.value(),
+                state.build_generation.id(),
+                state.open_receipt.authority().clone(),
+            )),
             ProgressProjection::NonProjectable(_) => Err(RuntimeError::InvalidReplication(
                 "Build donor history is not projectable".into(),
             )),
@@ -1128,6 +1136,12 @@ impl MysqlPublicV1Replicator {
             .build_registration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            generation.status(),
+            BuildGenerationStatus::CleanupOnly | BuildGenerationStatus::NeedsRebuild
+        ) {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
         if registration.is_none() {
             *registration = Some(
                 BuildEndpointRegistration::register(self.endpoint.encode(), self, generation)
@@ -2642,6 +2656,15 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
             let mut state = self.lease().await;
             require_bound_open(&state)?;
             Self::require_native_durability(&mut state)?;
+            if state
+                .removals
+                .iter()
+                .any(|record| record.target_id() == replica.identity.replica_id)
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "removed replica id cannot be reused in this source lifetime".into(),
+                ));
+            }
             if let Some((retained, terminal)) = state.build_results.retained(build_id.as_str()) {
                 let public = state
                     .binding
@@ -2686,6 +2709,11 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                             ));
                         }
                         return Ok(());
+                    }
+                    Some(BuildTerminalResult::Retired) => {
+                        return Err(RuntimeError::InvalidReplication(
+                            "Build authority was retired by Remove".into(),
+                        ));
                     }
                     Some(BuildTerminalResult::Failed(detail)) => {
                         return Err(RuntimeError::InvalidReplication(detail));
@@ -2833,6 +2861,11 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                             .admit_work()
                             .map_err(|_| RuntimeError::OperationCancelled)?;
                         return Ok(());
+                    }
+                    Some(BuildTerminalResult::Retired) => {
+                        return Err(RuntimeError::InvalidReplication(
+                            "Build authority was retired by Remove".into(),
+                        ));
                     }
                     Some(BuildTerminalResult::Failed(detail)) => {
                         return Err(RuntimeError::InvalidReplication(detail));
@@ -3555,7 +3588,17 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                 target_progress.value(),
                 INVALID_LSN,
             )?;
-            for (peer, progress) in donor_progress {
+            let donor_owners = donor_progress
+                .iter()
+                .map(
+                    |(peer, (_, generation, authority))| super::build::CompletedBuildDonor {
+                        identity: peer.identity.clone(),
+                        generation: *generation,
+                        authority: authority.clone(),
+                    },
+                )
+                .collect();
+            for (peer, (progress, _, _)) in donor_progress {
                 Self::retain_replica_progress(
                     &mut state,
                     &peer,
@@ -3584,6 +3627,8 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                     callback: callback_key.clone(),
                     account: account_receipt.clone(),
                     successor,
+                    target_authority: _receipt.member().authority().clone(),
+                    donors: donor_owners,
                 });
             orchestration
                 .advance(BuildCheckpoint::Completed)
@@ -3688,11 +3733,9 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
 
     async fn remove_replica(
         &self,
-        _replica_id: kuberic_runtime::protocol::types::ReplicaId,
+        replica_id: kuberic_runtime::protocol::types::ReplicaId,
     ) -> Result<()> {
-        Err(RuntimeError::InvalidReplication(
-            "MySQL Public V1 Remove is unsupported".into(),
-        ))
+        self.remove_completed_idle(replica_id).await
     }
 }
 

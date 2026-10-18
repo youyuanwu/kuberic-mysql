@@ -65,6 +65,117 @@ fn canonical_decimal(value: &str) -> bool {
     value.bytes().all(|byte| byte.is_ascii_digit()) && (value == "0" || !value.starts_with('0'))
 }
 
+pub(crate) fn validate_idle_remove_successor(
+    before: &NativeView,
+    after: &NativeView,
+    removed: &MemberId,
+) -> Result<(), MemberTransitionError> {
+    CanonicalViewId::parse(before.id())
+        .and_then(|before| before.require_successor(CanonicalViewId::parse(after.id())?))
+        .map_err(MemberTransitionError::View)?;
+    if before.group_name() != after.group_name()
+        || before
+            .member(removed)
+            .is_none_or(|member| member.role() != MemberRole::Secondary)
+        || before.members().len() != after.members().len() + 1
+        || after.member(removed).is_some()
+        || !before
+            .members()
+            .iter()
+            .filter(|member| member.id() != removed)
+            .all(|member| after.member(member.id()) == Some(member))
+    {
+        return Err(MemberTransitionError::View(
+            MemberViewError::IncoherentReadback,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod idle_remove_tests {
+    use super::*;
+
+    fn view(id: &str, members: &[(u8, MemberRole)]) -> NativeView {
+        NativeView::new(
+            GroupName::new("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap(),
+            ViewId::new(id).unwrap(),
+            members
+                .iter()
+                .map(|(id, role)| {
+                    NativeMember::new(
+                        MemberId::new(format!("{id:08x}-1111-1111-1111-111111111111")).unwrap(),
+                        MemberAddress::new(format!("127.0.0.1:3306{id}")).unwrap(),
+                        *role,
+                        MemberState::Online,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remove_successor_is_exact_next_view_without_only_the_idle_secondary() {
+        let before = view(
+            "700:2",
+            &[
+                (1, MemberRole::Primary),
+                (2, MemberRole::Secondary),
+                (3, MemberRole::Secondary),
+            ],
+        );
+        let after = view(
+            "700:3",
+            &[(1, MemberRole::Primary), (2, MemberRole::Secondary)],
+        );
+        let removed = before
+            .members()
+            .iter()
+            .find(|m| m.address().as_str() == "127.0.0.1:33063")
+            .unwrap()
+            .id();
+        validate_idle_remove_successor(&before, &after, removed).unwrap();
+        for bad in [
+            view(
+                "700:2",
+                &[(1, MemberRole::Primary), (2, MemberRole::Secondary)],
+            ),
+            view(
+                "700:4",
+                &[(1, MemberRole::Primary), (2, MemberRole::Secondary)],
+            ),
+            view(
+                "701:3",
+                &[(1, MemberRole::Primary), (2, MemberRole::Secondary)],
+            ),
+            view(
+                "700:3",
+                &[(1, MemberRole::Primary), (3, MemberRole::Secondary)],
+            ),
+            view(
+                "700:3",
+                &[(1, MemberRole::Secondary), (2, MemberRole::Primary)],
+            ),
+        ] {
+            assert!(validate_idle_remove_successor(&before, &bad, removed).is_err());
+        }
+        assert!(
+            validate_idle_remove_successor(
+                &before,
+                &after,
+                before
+                    .members()
+                    .iter()
+                    .find(|m| m.role() == MemberRole::Primary)
+                    .unwrap()
+                    .id()
+            )
+            .is_err()
+        );
+    }
+}
+
 /// Immutable peer identity that grants no process or storage ownership.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberPeer {

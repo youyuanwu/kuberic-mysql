@@ -1435,6 +1435,18 @@ impl MysqlInstanceManager {
         &mut self,
         generation: &MysqlBuildAbortGeneration,
     ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
+        let deadline = checked_deadline(
+            self.config.timeouts().shutdown(),
+            LifecycleOperation::Shutdown,
+        )?;
+        self.retire_owned_generation_before(generation, deadline)
+    }
+
+    pub(crate) fn retire_owned_generation_before(
+        &mut self,
+        generation: &MysqlBuildAbortGeneration,
+        deadline: Instant,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
         if generation.owner_generation != self.owner_generation
             || generation.process_generation != self.process_generation
             || generation.process_id != self.child.as_ref().map(Child::id)
@@ -1451,10 +1463,12 @@ impl MysqlInstanceManager {
 
         let mut complete = true;
         if let Some(child) = self.child.as_mut() {
-            if terminate_and_reap(child, self.config.timeouts().shutdown()).is_err() {
+            let deadline = deadline.min(checked_deadline(
+                self.config.timeouts().shutdown(),
+                LifecycleOperation::Shutdown,
+            )?);
+            if terminate_and_reap_before(child, deadline).is_err() {
                 complete = false;
-                let _ = child.kill();
-                let _ = child.wait();
             }
             if child.try_wait().ok().flatten().is_some() {
                 self.child = None;
@@ -1474,7 +1488,9 @@ impl MysqlInstanceManager {
         if self.child.is_none() {
             if self.revalidate_roots().is_ok() && !self.cleanup_quarantined {
                 if let Some(scratch) = self.scratch_root.as_ref() {
-                    if remove_owned_root(scratch, LifecycleOperation::ScratchCleanup).is_ok() {
+                    if ensure_cleanup_deadline(deadline, LifecycleOperation::ScratchCleanup).is_ok()
+                        && remove_owned_root(scratch, LifecycleOperation::ScratchCleanup).is_ok()
+                    {
                         self.scratch_root = None;
                     } else {
                         complete = false;
@@ -2319,6 +2335,24 @@ mod tests {
             authority,
         };
 
+        let mut substituted = generation.clone();
+        substituted.process_generation += 1;
+        assert!(manager.force_retire_owned_generation(&substituted).is_err());
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        let started = Instant::now();
+        let expired = manager
+            .retire_owned_generation_before(&generation, started)
+            .unwrap();
+        assert!(!expired.is_complete());
+        assert!(!expired.process_absent());
+        assert!(
+            manager.child.is_some(),
+            "unreaped ownership must be retained"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "expired cleanup must not block in wait()"
+        );
         let receipt = manager.force_retire_owned_generation(&generation).unwrap();
         assert!(receipt.process_absent());
         assert_eq!(receipt.retired_process_id(), Some(pid));

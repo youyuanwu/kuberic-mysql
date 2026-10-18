@@ -1634,8 +1634,81 @@ impl MysqlReplicator<MysqlInstanceManager> {
             .map_err(MysqlReplicatorError::Instance)?;
         self.close_access();
         self.clear_all_credentials();
+        self.pending_build = None;
+        self.pending_build_successor = None;
+        self.native_evidence = None;
+        self.progress = None;
         self.terminal = Some(MysqlTerminalState::Aborted);
         Ok(receipt)
+    }
+
+    pub(crate) fn retire_idle_build_before(
+        &mut self,
+        generation: &MysqlBuildAbortGeneration,
+        deadline: std::time::Instant,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlReplicatorError> {
+        let receipt = self
+            .effects
+            .retire_owned_generation_before(generation, deadline)
+            .map_err(MysqlReplicatorError::Instance)?;
+        self.close_access();
+        self.clear_all_credentials();
+        self.pending_build = None;
+        self.pending_build_successor = None;
+        self.native_evidence = None;
+        self.progress = None;
+        self.terminal = Some(MysqlTerminalState::Aborted);
+        Ok(receipt)
+    }
+
+    pub(crate) async fn observe_idle_remove_successor(
+        &mut self,
+        operation: MysqlOperationIdentity,
+        before: &crate::core::NativeView,
+        removed: &crate::core::MemberId,
+    ) -> Result<Option<MemberNativeEvidence>, MysqlReplicatorError> {
+        self.require_current_configuration()?;
+        self.admit_work()?;
+        let configuration = self
+            .configuration
+            .clone()
+            .expect("current configuration required");
+        let request = self.effect_request(
+            &operation,
+            self.epoch.expect("current epoch"),
+            self.role.expect("current role"),
+            Some(configuration.member_intent()),
+            None,
+        )?;
+        let receipt = self
+            .effects
+            .read_member_view_for_request(request.clone(), &self.attempt)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)?;
+        self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)?;
+        let after = receipt.successor();
+        if !after.has_durable_profile() {
+            return Err(MysqlReplicatorError::ReceiptMismatch);
+        }
+        if after.view() == before {
+            return Ok(None);
+        }
+        super::member::validate_idle_remove_successor(before, after.view(), removed)
+            .map_err(MysqlReplicatorError::MemberTransition)?;
+        self.validate_evidence(after)?;
+        self.require_native_role(after, self.role.expect("current role"))?;
+        self.require_configuration_evidence(&configuration, after)?;
+        if self
+            .native_evidence
+            .as_ref()
+            .is_none_or(|prior| !prior.executed().is_subset_of(after.executed()))
+        {
+            return Err(MysqlReplicatorError::ReceiptMismatch);
+        }
+        self.pending_build_successor = None;
+        self.native_evidence = Some(after.clone());
+        self.progress = None;
+        Ok(Some(after.clone()))
     }
 }
 
