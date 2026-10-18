@@ -1326,15 +1326,15 @@ impl MysqlPublicV1Replicator {
     }
 
     async fn ensure_epoch(state: &mut DriverState, epoch: Epoch) -> Result<MysqlReplicaEpoch> {
+        let predecessor = state
+            .committed_sample
+            .clone()
+            .filter(|sample| sample.matches_scope(state));
         let mapped = state.epochs.translate(epoch).map_err(map_translation)?;
         if state.engine.epoch() == Some(mapped) {
             return Ok(mapped);
         }
         Self::revoke_client_proxy_locked(state).await?;
-        let predecessor = state
-            .committed_sample
-            .clone()
-            .filter(|sample| sample.matches_scope(state));
         state.epoch_commit = None;
         state.fresh_epoch = if state.engine.epoch().is_none() && state.fresh_open_progress.is_some()
         {

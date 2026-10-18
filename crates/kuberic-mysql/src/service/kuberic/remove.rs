@@ -843,7 +843,7 @@ async fn bounded_remove_work<T>(
 
 #[cfg(test)]
 #[path = "remove_tests.rs"]
-mod deterministic_tests;
+pub(super) mod deterministic_tests;
 
 #[cfg(test)]
 mod tests {

@@ -88,7 +88,7 @@ pub struct MysqlInstanceManager {
     owner_generation: u64,
     process_generation: u64,
     cleanup_quarantined: bool,
-    native_durability_qualified: bool,
+    native_durability_qualified: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Unforgeable in-process ownership token for one exact MySQL child generation.
@@ -117,7 +117,9 @@ impl MysqlInstanceManager {
             owner_generation: INSTANCE_OWNER_SERIAL.fetch_add(1, Ordering::Relaxed),
             process_generation: 0,
             cleanup_quarantined: false,
-            native_durability_qualified: true,
+            native_durability_qualified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )),
         }
     }
 
@@ -127,13 +129,14 @@ impl MysqlInstanceManager {
         self.state
     }
 
-    pub(crate) const fn native_durability_qualified(&self) -> bool {
-        self.native_durability_qualified
+    pub(crate) fn native_durability_qualified(&self) -> bool {
+        self.native_durability_qualified.load(Ordering::Acquire)
     }
 
     fn retain_native_durability(&mut self, evidence: MemberNativeEvidence) -> MemberNativeEvidence {
-        self.native_durability_qualified &= evidence.has_durable_profile();
-        if self.native_durability_qualified {
+        self.native_durability_qualified
+            .fetch_and(evidence.has_durable_profile(), Ordering::AcqRel);
+        if self.native_durability_qualified() {
             evidence
         } else {
             evidence.without_durable_profile()
@@ -1272,7 +1275,8 @@ impl MysqlInstanceManager {
             socket,
             self.config.member_index(),
             self.config.member().clone(),
-        ))
+        )
+        .with_durability_qualification(self.native_durability_qualified.clone()))
     }
 
     pub(crate) fn topology_binding(

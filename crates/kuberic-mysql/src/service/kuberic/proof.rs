@@ -12,6 +12,12 @@ struct ProofScope {
     generation: u64,
     authority: crate::service::MemberMutationAuthority,
     status: BuildGenerationStatus,
+    public_epoch: Option<Epoch>,
+    mapped_epoch_matches: bool,
+    admitted_role: Option<ReplicaRole>,
+    pending_join: bool,
+    native_identity: crate::service::MysqlReplicaIdentity,
+    native_successor: bool,
 }
 
 impl ProofScope {
@@ -26,6 +32,18 @@ impl ProofScope {
             generation: state.build_generation.id(),
             authority: state.open_receipt.authority().clone(),
             status: state.build_generation.status(),
+            public_epoch: state.epochs.latest().map(|(epoch, _)| epoch),
+            mapped_epoch_matches: state
+                .epochs
+                .latest()
+                .is_some_and(|(_, mapped)| state.engine.epoch() == Some(mapped)),
+            admitted_role: state
+                .epochs
+                .latest()
+                .and_then(|(epoch, _)| state.completed_roles.get(&EpochKey::from(epoch)).copied()),
+            pending_join: state.engine.pending_build().is_some(),
+            native_identity: state.engine.identity().clone(),
+            native_successor: state.engine.has_pending_build_successor(),
         }
     }
 }
@@ -56,7 +74,10 @@ impl CommittedSample {
 }
 
 pub(super) fn epoch_commit_matches(state: &DriverState, epoch: Epoch, value: i64) -> bool {
-    if !state.durability_qualified {
+    if !epoch_profile_qualified(
+        state.durability_qualified,
+        state.engine.native_durability_qualified(),
+    ) {
         return false;
     }
     let fresh = state.fresh_epoch == Some(epoch)
@@ -74,6 +95,10 @@ pub(super) fn epoch_commit_matches(state: &DriverState, epoch: Epoch, value: i64
                     && sample.scope.generation == state.build_generation.id()
                     && sample.scope.binding == state.binding
             })
+}
+
+fn epoch_profile_qualified(driver_copy: bool, owner_latch: bool) -> bool {
+    driver_copy && owner_latch
 }
 
 impl MysqlPublicV1Replicator {
@@ -191,19 +216,7 @@ impl MysqlPublicV1Replicator {
                 "commitment proof requires the exact native primary",
             ));
         }
-        if configurations.len() > 1
-            && configurations[1..]
-                .iter()
-                .any(|c| c.configuration != configurations[0].configuration)
-            && !state.completed_builds.iter().any(|completed| {
-                configurations.iter().any(|c| {
-                    c.configuration == completed.binding.source_configuration.configuration
-                }) && configurations.iter().all(|c| {
-                    c.configuration == completed.binding.source_configuration.configuration
-                        || additive_build_configuration(&completed.binding, c)
-                })
-            })
-        {
+        if !applicable_configurations_supported(&state.completed_builds, configurations) {
             return Err(unproved(
                 "differing configurations lack an exact additive Build transition",
             ));
@@ -243,7 +256,14 @@ impl MysqlPublicV1Replicator {
                 ));
             }
             let (_, observation) = Self::sample_native_progress(&mut voter).await?;
-            require_durable_containment(&sample, &observation)?;
+            validate_voter_observation(
+                &ProofScope::capture(&voter),
+                &state.completed_builds,
+                configurations,
+                peer,
+                &sample,
+                &observation,
+            )?;
             participants.push((
                 peer.replication_address.clone(),
                 ProofScope::capture(&voter),
@@ -279,6 +299,7 @@ impl MysqlPublicV1Replicator {
     }
 
     pub(super) async fn coherent_committed_sample(&self, state: &mut DriverState) -> Result<i64> {
+        Self::require_native_durability(state)?;
         if state.fresh_open_progress.is_some()
             && state.engine.configuration().is_none()
             && state.engine.epoch().is_none()
@@ -354,46 +375,128 @@ fn voter_configuration_authorized(
     peer: &ReplicaInformation,
     sample: &MemberNativeEvidence,
 ) -> bool {
+    voter_authority_is_allowed(
+        &ProofScope::capture(voter),
+        &source.completed_builds,
+        applicable,
+        peer,
+        sample.view(),
+    )
+}
+
+fn voter_authority_is_allowed(
+    voter: &ProofScope,
+    completed: &[super::super::build::CompletedBuildOwnership],
+    applicable: &[ReplicaSetConfiguration],
+    peer: &ReplicaInformation,
+    sample_view: &crate::core::NativeView,
+) -> bool {
     let expected_epoch = applicable[0].configuration.epoch;
-    if voter.epochs.latest().is_none_or(|(epoch, mapped)| {
+    if voter.public_epoch.is_none_or(|epoch| {
         !voter_epoch_role_authorized(
             epoch,
             expected_epoch,
-            voter.engine.epoch() == Some(mapped),
-            voter.engine.role(),
-            voter.completed_roles.get(&EpochKey::from(epoch)).copied(),
-            voter.build_generation.status(),
+            voter.mapped_epoch_matches,
+            voter.role,
+            voter.admitted_role,
+            voter.status,
         )
     }) {
         return false;
     }
-    if voter
-        .current_configuration
-        .as_ref()
-        .is_some_and(|installed| {
-            applicable
-                .iter()
-                .any(|c| c.configuration == installed.configuration)
+    if let Some(binding) = voter.build.as_deref()
+        && !completed.iter().any(|owned| {
+            owned.binding.as_ref() == binding
+                && if peer.identity == binding.target.identity {
+                    voter.generation == binding.target_generation
+                        && voter.authority == owned.target_authority
+                } else {
+                    owned.donors.iter().any(|donor| {
+                        donor.identity == peer.identity
+                            && donor.generation == voter.generation
+                            && donor.authority == voter.authority
+                    })
+                }
         })
     {
+        return false;
+    }
+    if voter.current.as_ref().is_some_and(|installed| {
+        applicable
+            .iter()
+            .any(|c| c.configuration == installed.configuration)
+            && !completed.iter().any(|owned| {
+                installed.configuration == owned.binding.source_configuration.configuration
+                    && applicable
+                        .iter()
+                        .any(|c| additive_build_configuration(&owned.binding, c))
+            })
+    }) {
         return true;
     }
-    source.completed_builds.iter().any(|completed| {
+    completed.iter().any(|completed| {
         let build = completed.binding.as_ref();
         let proposed = applicable
             .iter()
             .find(|c| additive_build_configuration(build, c));
         proposed.is_some()
-            && &completed.successor == sample.view()
-            && voter.pending_build_binding.as_deref() == Some(build)
-            && voter.build_generation.status() == BuildGenerationStatus::PendingAdmission
-            && (voter
-                .current_configuration
-                .as_ref()
-                .is_some_and(|c| c.configuration == build.source_configuration.configuration)
-                || (peer.identity == build.target.identity
-                    && voter.engine.pending_build().is_some()))
+            && &completed.successor == sample_view
+            && voter.build.as_deref() == Some(build)
+            && voter.status == BuildGenerationStatus::PendingAdmission
+            && (voter.current.as_ref().is_some_and(|c| {
+                c.configuration == build.source_configuration.configuration
+                    && voter.native_successor
+            }) || (peer.identity == build.target.identity && voter.pending_join))
     })
+}
+
+fn applicable_configurations_supported(
+    completed: &[super::super::build::CompletedBuildOwnership],
+    configurations: &[ReplicaSetConfiguration],
+) -> bool {
+    !configurations.is_empty()
+        && (configurations[1..]
+            .iter()
+            .all(|c| c.configuration == configurations[0].configuration)
+            || completed.iter().any(|owned| {
+                configurations
+                    .iter()
+                    .any(|c| c.configuration == owned.binding.source_configuration.configuration)
+                    && configurations.iter().all(|c| {
+                        c.configuration == owned.binding.source_configuration.configuration
+                            || additive_build_configuration(&owned.binding, c)
+                    })
+            }))
+}
+
+fn validate_voter_observation(
+    voter: &ProofScope,
+    completed: &[super::super::build::CompletedBuildOwnership],
+    applicable: &[ReplicaSetConfiguration],
+    peer: &ReplicaInformation,
+    frozen: &MemberNativeEvidence,
+    observed: &MemberNativeEvidence,
+) -> Result<()> {
+    let public = voter
+        .binding
+        .as_ref()
+        .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+    let native = translate_replica_information(peer).map_err(map_translation)?;
+    if public.identity != peer.identity
+        || public.process_session != peer.process_session_id
+        || public.public_storage.as_ref() != Some(native.storage())
+        || public.settings.replication_address != peer.replication_address
+        || voter.native_identity != *native.identity()
+        || voter.authority.local().member_id() != native.member().member_id()
+        || observed.authority() != &voter.authority
+        || !applicable_configurations_supported(completed, applicable)
+        || !voter_authority_is_allowed(voter, completed, applicable, peer, frozen.view())
+    {
+        return Err(unproved(
+            "live voter does not retain the complete transition scope",
+        ));
+    }
+    require_durable_containment(frozen, observed)
 }
 
 fn voter_epoch_role_authorized(
@@ -450,15 +553,24 @@ pub(super) fn require_durable_containment(
     frozen: &MemberNativeEvidence,
     observed: &MemberNativeEvidence,
 ) -> Result<()> {
+    if !frozen.has_durable_profile()
+        || !observed.has_durable_profile()
+        || frozen.view() != observed.view()
+    {
+        return Err(unproved(
+            "missing exact-view native durability qualification",
+        ));
+    }
     if !durable_containment(
         frozen.has_durable_profile() && observed.has_durable_profile(),
         frozen.view() == observed.view(),
         frozen.executed(),
         observed.executed(),
     ) {
-        return Err(unproved(
-            "missing exact-view durable structured-history containment",
-        ));
+        if observed.executed().is_subset_of(frozen.executed()) {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        return Err(unproved("divergent durable structured history"));
     }
     Ok(())
 }
@@ -477,10 +589,22 @@ fn unproved(message: &str) -> RuntimeError {
 }
 
 #[cfg(test)]
+#[path = "proof_transition_tests.rs"]
+mod transition_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::GtidSet;
     use std::str::FromStr;
+
+    #[test]
+    fn epoch_validation_observes_native_invalidation_before_driver_copy_is_updated() {
+        assert!(epoch_profile_qualified(true, true));
+        assert!(!epoch_profile_qualified(true, false));
+        assert!(!epoch_profile_qualified(false, true));
+        assert!(!epoch_profile_qualified(false, false));
+    }
 
     #[tokio::test]
     async fn partial_peer_acquisition_timeout_and_drop_release_leases_and_group_permit() {

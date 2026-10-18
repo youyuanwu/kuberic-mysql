@@ -644,6 +644,10 @@ certify imported or historically unqualified data. Privileged external
 settings/history mutation, restart adoption, arbitrary PC/CC histories and
 production activation remain outside this qualification.
 
+The qualification latch is shared with exact native control sessions and is
+updated at tuple observation, before further awaits. A later query,
+disconnect failure or dropped callback cannot erase an observed violation.
+
 The callback translation still retains post-epoch applied evidence for
 closed-access lifecycle sequencing. It does not turn that cache into primary
 commitment: without an applicable native configuration the custom adapter

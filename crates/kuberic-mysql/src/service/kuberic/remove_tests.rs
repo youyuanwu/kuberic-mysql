@@ -68,7 +68,7 @@ fn authority(id: u8) -> MemberMutationAuthority {
     MemberMutationAuthority::new(attempt, GroupName::new(GROUP).unwrap(), enrollment).unwrap()
 }
 
-fn information(id: u8, role: ReplicaRole) -> ReplicaInformation {
+pub(crate) fn information(id: u8, role: ReplicaRole) -> ReplicaInformation {
     let identity = ReplicaIdentity {
         replica_id: ReplicaId::new(i64::from(id)),
         instance_id: ReplicaInstanceId::new(format!("public-instance-{id}")),
@@ -295,6 +295,9 @@ fn fixture() -> (
     (owned, s, t, d)
 }
 
+pub(crate) fn completed_fixture() -> CompletedBuildOwnership {
+    fixture().0
+}
 type Mutation = (&'static str, fn(&mut OwnerAdmission));
 
 fn shared_mutations() -> Vec<Mutation> {

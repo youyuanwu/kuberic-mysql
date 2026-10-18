@@ -182,7 +182,8 @@ Commitment qualification is limited to fresh exclusively owned processes
 continuously running the enforced Oracle profile: flush-at-commit and
 sync-binlog `1`, enabled binlogging/replica updates, and `ABORT_SERVER` binlog
 error policy. Effective settings are read in the native bracket. An observed
-violation permanently invalidates that owner lifetime, even if settings are
+violation immediately invalidates that owner lifetime, even if the rest of
+the read is cancelled/fails or settings are
 restored. Privileged external settings/history mutation is outside this
 authority. Missing/lagging voters and unsupported configuration histories
 reject; no missing evidence is replaced by zero. Exact additive Build
