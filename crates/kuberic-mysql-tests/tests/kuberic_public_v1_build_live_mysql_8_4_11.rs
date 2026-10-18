@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::num::NonZeroU64;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -368,10 +367,8 @@ async fn run_custom_build_fixture(
             }
             if proof_case == 13 {
                 drivers[target].close().await.unwrap();
-                let replacement_root = root.join("replacement");
-                std::fs::create_dir(&replacement_root).unwrap();
-                std::fs::set_permissions(&replacement_root, std::fs::Permissions::from_mode(0o700))
-                    .unwrap();
+                let mut replacement_fixture = FixtureRoot::new("public-repl").unwrap();
+                let replacement_root = replacement_fixture.path().to_path_buf();
                 let mut replacement_identity = identities[target].clone();
                 replacement_identity.instance_id = ReplicaInstanceId::new("replacement-instance");
                 replacement_identity.agent_generation = AgentGeneration::new("replacement-agent");
@@ -402,6 +399,7 @@ async fn run_custom_build_fixture(
                     "stale removal cannot touch replacement"
                 );
                 replacement.close().await.unwrap();
+                replacement_fixture.remove().unwrap();
                 for driver in drivers.iter().rev() {
                     driver.close().await.unwrap();
                 }
