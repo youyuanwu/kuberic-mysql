@@ -176,9 +176,16 @@ adapter process requires reset, not reconstruction from saved evidence.
 ## Public Kuberic boundary and pin
 
 Keep exact pin `be4f83b43567c59f48472025d55dd731efecc4c6` in both crates and
-Cargo.lock. Comparison with immutable upstream
-`1074ecaca9730e1f8c6ea6a6a89029e867c5cccd` found no needed recovery-contract
-change; the later unselected SF V1 async/tonic substrate does not solve this gap.
+Cargo.lock. The 2026-10-18 assessment rechecked that pin against immutable upstream
+`c0e52ee6ef361d86cf9e984e1f0682bc1f479013`, then checked the complete delta to
+`11d804425bbdbe7759dfd18208a0d73ce667a9f4`, including controller admission,
+authenticated agent dispatch, lifecycle/factory attachment, logical renewal,
+physical resource retirement and selected built-in recovery. No public combined
+accepted-envelope/retained-native-owner handoff was found. The unselected SF V1
+substrate does not solve this gap. The
+[recovery authority contract](mysql-recovery-authority.md) records exact public
+evidence, required authority/custody sequencing, failure rules and future gates;
+it is a contract-only deliverable, not runtime integration or a reason to repin.
 
 Kuberic already owns generic durable operation intent/completion and a
 [replacement-session protocol](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/protocol/public_operations.rs#L1158-L1446).
