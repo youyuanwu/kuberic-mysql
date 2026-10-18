@@ -338,18 +338,26 @@ impl MysqlInstanceManager {
                 .ok_or(MysqlInstanceError::Ownership(
                     crate::service::OwnershipError::InspectionFailed,
                 ))?;
-        let stdout = File::create(self.config.runtime().stdout_log()).map_err(|error| {
-            MysqlInstanceError::Io {
-                operation: LifecycleOperation::Startup,
-                kind: error.kind(),
-            }
-        })?;
-        let stderr = File::create(self.config.runtime().error_log()).map_err(|error| {
-            MysqlInstanceError::Io {
-                operation: LifecycleOperation::Startup,
-                kind: error.kind(),
-            }
-        })?;
+        let (stdout, stderr, closed_error_log) = if closed_reopen {
+            let scratch = self.scratch_root.as_ref().expect("retained scratch owner");
+            let (stdout, stderr, error_log) = create_reopen_diagnostic_files(scratch)?;
+            self.revalidate_roots()?;
+            (stdout, stderr, Some(error_log))
+        } else {
+            let stdout = File::create(self.config.runtime().stdout_log()).map_err(|error| {
+                MysqlInstanceError::Io {
+                    operation: LifecycleOperation::Startup,
+                    kind: error.kind(),
+                }
+            })?;
+            let stderr = File::create(self.config.runtime().error_log()).map_err(|error| {
+                MysqlInstanceError::Io {
+                    operation: LifecycleOperation::Startup,
+                    kind: error.kind(),
+                }
+            })?;
+            (stdout, stderr, None)
+        };
         let mut command = launcher_command(&self.config);
         command.arg(format!(
             "--defaults-file={}",
@@ -369,6 +377,15 @@ impl MysqlInstanceManager {
                 "--skip-replica-start",
                 "--event-scheduler=OFF",
             ]);
+            // Both the inherited stream and MySQL's own error logger use the
+            // new, exclusively created destination, never a retained pathname.
+            command.arg(format!(
+                "--log-error={}",
+                closed_error_log
+                    .as_ref()
+                    .expect("closed diagnostic owner")
+                    .display(),
+            ));
         }
         let child = command
             .stdout(Stdio::from(stdout))
@@ -2102,6 +2119,53 @@ impl Drop for MysqlInstanceManager {
     }
 }
 
+/// Creates diagnostic files for the one permitted closed reopen generation.
+/// Existing names (including links) always reject; no retained file is opened
+/// destructively. These are diagnostic output, never recovery authority.
+fn create_reopen_diagnostic_files(
+    scratch: &OwnedRoot,
+) -> Result<(File, File, std::path::PathBuf), MysqlInstanceError> {
+    scratch
+        .revalidate()
+        .map_err(MysqlInstanceError::Ownership)?;
+    let directory = open(
+        scratch.path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+    verify_fd_identity(&directory, scratch.device(), scratch.inode())?;
+    let parent = fstat(&directory).map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+    let create = |name: &str| -> Result<File, MysqlInstanceError> {
+        let output = openat(
+            &directory,
+            name,
+            OFlags::WRONLY
+                | OFlags::APPEND
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+        let metadata =
+            fstat(&output).map_err(|error| io_error(LifecycleOperation::Startup, error))?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+            || metadata.st_nlink != 1
+            || metadata.st_uid != parent.st_uid
+        {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::InspectionFailed,
+            ));
+        }
+        Ok(File::from(output))
+    };
+    let stdout = create("mysqld-reopen.out")?;
+    let stderr = create("mysqld-reopen.err")?;
+    Ok((stdout, stderr, scratch.path().join("mysqld-reopen.err")))
+}
+
 fn checked_deadline(
     timeout: Duration,
     operation: LifecycleOperation,
@@ -2342,6 +2406,57 @@ mod tests {
     use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    #[test]
+    fn reopen_diagnostic_creation_rejects_existing_files_and_links_without_truncation() {
+        for name in ["mysqld-reopen.out", "mysqld-reopen.err"] {
+            for kind in ["file", "symlink", "hardlink"] {
+                let parent = std::env::temp_dir().join(format!(
+                    "kms-ro-{}-{}",
+                    std::process::id(),
+                    CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed),
+                ));
+                fs::create_dir(&parent).unwrap();
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+                let config = MysqlInstanceConfig::new(
+                    "/usr/bin/sleep",
+                    "/usr/bin/env",
+                    parent.join("d"),
+                    parent.join("s"),
+                    MysqlOperationTimeouts::new(
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let roots = match config.create_layout() {
+                    Ok(roots) => roots,
+                    Err(_) => panic!("owned test layout"),
+                };
+                let sentinel = roots.data.path().join("retained-sentinel");
+                fs::write(&sentinel, b"retained-data-must-not-be-truncated").unwrap();
+                let destination = roots.scratch.path().join(name);
+                match kind {
+                    "file" => fs::write(&destination, b"existing-output").unwrap(),
+                    "symlink" => std::os::unix::fs::symlink(&sentinel, &destination).unwrap(),
+                    "hardlink" => fs::hard_link(&sentinel, &destination).unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(create_reopen_diagnostic_files(&roots.scratch).is_err());
+                assert_eq!(
+                    fs::read(&sentinel).unwrap(),
+                    b"retained-data-must-not-be-truncated"
+                );
+                if kind == "file" {
+                    assert_eq!(fs::read(&destination).unwrap(), b"existing-output");
+                }
+                fs::remove_dir_all(parent).unwrap();
+            }
+        }
+    }
 
     #[tokio::test]
     async fn reopen_capture_cannot_restore_a_disqualified_predecessor_lifetime() {

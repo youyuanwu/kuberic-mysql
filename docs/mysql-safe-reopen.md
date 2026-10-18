@@ -60,10 +60,22 @@ native state.
 ## Validation and failure semantics
 
 Before spawn, the retained roots/executables, absent socket/PID, exact generated
-option-file contents and in-memory native-log file identity/length inventory
-must still match. A PID file never authorizes process adoption or termination.
+option-file contents and in-memory native/diagnostic log identity/length inventory
+must still match. Retained files must be regular, singly linked and owned by
+the scratch owner. A PID file never authorizes process adoption or termination.
 The new child is owned before polling and attested against retained child PID,
 executable and exact private endpoint.
+
+Closed reopen never truncates retained diagnostic paths. It exclusively creates
+`mysqld-reopen.out` and `mysqld-reopen.err` relative to the verified scratch
+directory descriptor, without following links, and verifies their file type,
+owner and link count. Existing destinations reject rather than being adopted.
+Both inherited stderr and MySQL's native `log-error` use the new owned `.err`
+destination. These files are diagnostics only, never recovery authority.
+Stable preflight symlink/hard-link substitutions of either retained or new
+output destination reject without following or truncating retained data.
+Concurrent privileged filesystem mutation is outside the qualified OS/private-
+directory trust boundary, as it is for native data and configuration themselves.
 
 Closed startup uses command-line overrides for disabled SQL TCP, MySQL X, GR
 autostart/bootstrap, replica autostart and event scheduler, with read-only and
@@ -132,6 +144,9 @@ nonempty GTIDs, renewed native/generic sessions, persisted-setting suppression,
 closed ports, idle published/unpublished proxy rejection, substituted roots/
 native UUID/options/logs, stale authority, bad history/durability, extra sessions,
 foreign PID noninterference, cancellation and dropped futures/owners.
+The diagnostic-path matrix covers both retained and new stdout/error paths with
+both link kinds, asserting unchanged retained sentinel bytes and native logs.
+Numeric binlog sequences above the zero-leading range remain recognizable.
 
 Not supported: adapter/host-crash or lost-owner reconstruction; abrupt, data-only
 or lost-native-log reopening; survivor adoption; automatic hosted Existing;
@@ -144,9 +159,10 @@ durability, security or failover claim follows from this host-local primitive.
 
 - [Authority and structured boundary validation, reopen.rs:29–147](../crates/kuberic-mysql/src/service/reopen.rs#L29-L147).
 - [Linear owner and closed handle, reopen.rs:189–302](../crates/kuberic-mysql/src/service/reopen.rs#L189-L302).
-- [Closed admission and memory-only log inventory, reopen.rs:350–435](../crates/kuberic-mysql/src/service/reopen.rs#L350-L435).
-- [Owned closed startup, instance.rs:324–432](../crates/kuberic-mysql/src/service/instance.rs#L324-L432)
-  and [graceful-stop/reopen seams, instance.rs:1328–1389](../crates/kuberic-mysql/src/service/instance.rs#L1328-L1389).
+- [Closed admission and memory-only log inventory, reopen.rs:350–451](../crates/kuberic-mysql/src/service/reopen.rs#L350-L451).
+- [Owned closed startup, instance.rs:324–449](../crates/kuberic-mysql/src/service/instance.rs#L324-L449),
+  [graceful-stop/reopen seams, instance.rs:1345–1406](../crates/kuberic-mysql/src/service/instance.rs#L1345-L1406),
+  and [exclusive diagnostics, instance.rs:2125–2167](../crates/kuberic-mysql/src/service/instance.rs#L2125-L2167).
 - [Inactive native snapshots, control.rs:42–191](../crates/kuberic-mysql/src/service/control.rs#L42-L191)
   and [monotonic durability reader, control.rs:698–729](../crates/kuberic-mysql/src/service/control.rs#L698-L729).
-- [Actual production-API live qualification, service_reopen_live_mysql_8_4_11.rs:182–565](../crates/kuberic-mysql-tests/tests/service_reopen_live_mysql_8_4_11.rs#L182-L565).
+- [Actual production-API live qualification, service_reopen_live_mysql_8_4_11.rs:186–633](../crates/kuberic-mysql-tests/tests/service_reopen_live_mysql_8_4_11.rs#L186-L633).

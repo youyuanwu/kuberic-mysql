@@ -206,6 +206,7 @@ async fn closed_reopen_preserves_data_history_and_renews_owned_sessions() {
             .await
             .unwrap();
     let predecessor = stopped.predecessor().clone();
+    let retained_error = fs::read(fixture.path().join("s/mysqld.err")).unwrap();
     assert_process_absent(old_pid).unwrap();
     assert!(!socket.exists());
     assert_closed(&boundary);
@@ -227,6 +228,24 @@ async fn closed_reopen_preserves_data_history_and_renews_owned_sessions() {
     assert_eq!(fs::metadata(fixture.path().join("d")).unwrap().ino(), inode);
     assert_closed(&boundary);
     let mut root = connect(&socket).await;
+    let error_log: String = root
+        .query_first("SELECT @@GLOBAL.log_error")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        error_log,
+        fixture.path().join("s/mysqld-reopen.err").to_str().unwrap()
+    );
+    assert_eq!(
+        fs::read(fixture.path().join("s/mysqld.err")).unwrap(),
+        retained_error
+    );
+    assert!(
+        !fs::read(fixture.path().join("s/mysqld-reopen.err"))
+            .unwrap()
+            .is_empty()
+    );
     let value: String = root
         .query_first("SELECT value FROM reopen_data.proof WHERE id=1")
         .await
@@ -515,6 +534,7 @@ async fn closed_capture_rejects_idle_published_and_unpublished_proxy_capabilitie
         ] {
             root.query_drop(sql).await.unwrap();
         }
+
         root.disconnect().await.unwrap();
         if published {
             proxy
@@ -561,5 +581,53 @@ async fn closed_capture_rejects_idle_published_and_unpublished_proxy_capabilitie
         assert!(fixture.path().join("s/mysql-bin.index").is_file());
         drop(proxy);
         tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closed_reopen_rejects_diagnostic_symlinks_and_hardlinks_without_data_loss() {
+    for name in [
+        "mysqld.out",
+        "mysqld.err",
+        "mysqld-reopen.out",
+        "mysqld-reopen.err",
+    ] {
+        for hardlink in [false, true] {
+            let (fixture, manager, boundary) = prepared("reopen-links").await;
+            let sentinel = fixture.path().join("d/retained-sentinel");
+            fs::write(&sentinel, b"retained-data-must-not-be-truncated").unwrap();
+            let pid_path = manager.config().runtime().pid().to_path_buf();
+            let stopped =
+                MysqlStoppedReopen::capture(manager, authority(), boundary, &attempt("capture"))
+                    .await
+                    .unwrap();
+            let index_path = fixture.path().join("s/mysql-bin.index");
+            let index = fs::read(&index_path).unwrap();
+            let destination = fixture.path().join("s").join(name);
+            if destination.exists() {
+                fs::remove_file(&destination).unwrap();
+            }
+            if hardlink {
+                fs::hard_link(&sentinel, &destination).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&sentinel, &destination).unwrap();
+            }
+            let result = stopped.reopen(renewal(), &attempt("reopen")).await;
+            if name.starts_with("mysqld-reopen") {
+                assert!(matches!(result, Err(MysqlReopenError::Instance(_))));
+            } else {
+                assert!(matches!(result, Err(MysqlReopenError::NativeLogs)));
+            }
+            assert_eq!(
+                fs::read(&sentinel).unwrap(),
+                b"retained-data-must-not-be-truncated"
+            );
+            assert_eq!(fs::read(&index_path).unwrap(), index);
+            assert!(
+                !pid_path.exists(),
+                "no replacement process was credited or launched"
+            );
+            assert!(fixture.path().join("d/auto.cnf").is_file());
+        }
     }
 }

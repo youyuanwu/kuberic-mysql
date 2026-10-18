@@ -314,7 +314,7 @@ pub enum MysqlReopenError {
     AccessNotClosed,
     /// Lifetime durability is unqualified, even if current settings are valid.
     Durability,
-    /// Exact native-log files are missing or substituted.
+    /// Exact retained native/diagnostic log files are missing or substituted.
     NativeLogs,
     /// Root/child/session ownership cannot be proven.
     Ownership,
@@ -397,29 +397,45 @@ fn evidence(
     })
 }
 
-/// Native log identity inventory only; this is never persisted as a manifest.
+/// Retained native/diagnostic file identities; never persisted as a manifest.
 struct NativeLogs(BTreeMap<String, (u64, u64, u64)>);
 
 impl NativeLogs {
     fn capture(root: &Path) -> Result<Self, MysqlReopenError> {
         let mut files = BTreeMap::new();
+        let owner = fs::symlink_metadata(root)
+            .map_err(|_| MysqlReopenError::NativeLogs)?
+            .uid();
         for entry in fs::read_dir(root).map_err(|_| MysqlReopenError::NativeLogs)? {
             let entry = entry.map_err(|_| MysqlReopenError::NativeLogs)?;
             let name = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| MysqlReopenError::NativeLogs)?;
-            if name.starts_with("mysql-bin.") || name.starts_with("relay-bin.") {
+            if name.starts_with("mysql-bin.")
+                || name.starts_with("relay-bin.")
+                || name == "mysqld.out"
+                || name == "mysqld.err"
+            {
                 let metadata =
                     fs::symlink_metadata(entry.path()).map_err(|_| MysqlReopenError::NativeLogs)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.nlink() != 1
+                    || metadata.uid() != owner
+                {
                     return Err(MysqlReopenError::NativeLogs);
                 }
                 files.insert(name, (metadata.dev(), metadata.ino(), metadata.len()));
             }
         }
         if !files.contains_key("mysql-bin.index")
-            || !files.keys().any(|name| name.starts_with("mysql-bin.0"))
+            || !files.contains_key("mysqld.out")
+            || !files.contains_key("mysqld.err")
+            || !files.keys().any(|name| {
+                name.strip_prefix("mysql-bin.")
+                    .is_some_and(|suffix| suffix.parse::<u64>().is_ok_and(|sequence| sequence > 0))
+            })
         {
             return Err(MysqlReopenError::NativeLogs);
         }
@@ -470,6 +486,28 @@ mod tests {
             operation: OperationId::new("old-op"),
             revision: 1,
         }
+    }
+
+    #[test]
+    fn reopen_inventory_accepts_high_native_binlog_sequences_and_requires_real_logs() {
+        let root = std::env::temp_dir().join(format!("kms-high-binlog-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        for name in [
+            "mysqld.out",
+            "mysqld.err",
+            "mysql-bin.index",
+            "mysql-bin.100000",
+        ] {
+            fs::write(root.join(name), b"native-fixture").unwrap();
+        }
+        let retained = NativeLogs::capture(&root).unwrap();
+        retained.verify(&root).unwrap();
+        fs::remove_file(root.join("mysql-bin.100000")).unwrap();
+        assert!(matches!(
+            NativeLogs::capture(&root),
+            Err(MysqlReopenError::NativeLogs)
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn renewal() -> MysqlReopenRenewal {
