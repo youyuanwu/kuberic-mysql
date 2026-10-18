@@ -91,7 +91,7 @@ async fn connect(socket: &std::path::Path) -> Conn {
     .unwrap()
 }
 
-async fn prepared(label: &str) -> (FixtureRoot, MysqlInstanceManager, MysqlReopenBoundary) {
+fn fresh(label: &str) -> (FixtureRoot, MysqlInstanceManager) {
     preflight_oracle_mysql_8_4_11().unwrap_or_else(|e| panic!("{e}"));
     let fixture = FixtureRoot::new(label).unwrap();
     let mut ports = ReservedPorts::allocate().unwrap();
@@ -137,6 +137,11 @@ async fn prepared(label: &str) -> (FixtureRoot, MysqlInstanceManager, MysqlReope
     let mut manager = MysqlInstanceManager::new(config);
     manager.initialize().unwrap();
     manager.start().unwrap();
+    (fixture, manager)
+}
+
+async fn prepared(label: &str) -> (FixtureRoot, MysqlInstanceManager, MysqlReopenBoundary) {
+    let (fixture, manager) = fresh(label);
     let mut root = connect(manager.socket_path().unwrap()).await;
     for sql in [
         "CREATE DATABASE reopen_data",
@@ -450,4 +455,111 @@ async fn dropped_capture_and_reopen_futures_reap_the_exact_owned_child() {
     drop(reopen);
     assert_process_absent(owned).unwrap();
     assert!(fixture.path().join("d/auto.cnf").is_file());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closed_capture_rejects_idle_published_and_unpublished_proxy_capabilities() {
+    use kuberic_mysql::core::CredentialGeneration;
+    use kuberic_mysql::service::{
+        ApplicationCredential, ControlCredential, ControlCredentialRole, MysqlClientProxy,
+    };
+    for published in [false, true] {
+        let (fixture, mut manager) = fresh(if published { "proxy-pub" } else { "proxy-prep" });
+        let budget = attempt("proxy-owner");
+        let observer = ControlCredential::new(
+            budget.attempt().clone(),
+            CredentialGeneration::new("observer").unwrap(),
+            ControlCredentialRole::Observer,
+            "reopen_observer",
+            "ReopenObserverA7",
+        )
+        .unwrap();
+        let recovery = ControlCredential::new(
+            budget.attempt().clone(),
+            CredentialGeneration::new("recovery").unwrap(),
+            ControlCredentialRole::Recovery,
+            "reopen_recovery",
+            "ReopenRecoveryB9",
+        )
+        .unwrap();
+        let native = manager
+            .enroll_local_control_authority(&budget, &observer, &recovery)
+            .await
+            .unwrap();
+        let reserved = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let credential = ApplicationCredential::new(
+            budget.attempt().clone(),
+            CredentialGeneration::new("application").unwrap(),
+            "reopen_application",
+            "ReopenApplicationC11",
+        )
+        .unwrap();
+        let mut proxy =
+            MysqlClientProxy::prepare(&mut manager, &native, address, credential, &budget)
+                .await
+                .unwrap();
+        let mut root = connect(manager.socket_path().unwrap()).await;
+        let (uuid, executed, purged): (String, String, String) = root
+            .query_first(
+                "SELECT @@GLOBAL.server_uuid, @@GLOBAL.gtid_executed, @@GLOBAL.gtid_purged",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for sql in [
+            "SET GLOBAL read_only=ON",
+            "SET GLOBAL super_read_only=ON",
+            "SET GLOBAL event_scheduler=OFF",
+        ] {
+            root.query_drop(sql).await.unwrap();
+        }
+        root.disconnect().await.unwrap();
+        if published {
+            proxy
+                .publish(std::num::NonZeroU64::new(1).unwrap(), true, true, &budget)
+                .unwrap();
+            let mut application = Conn::new(
+                OptsBuilder::default()
+                    .ip_or_hostname("127.0.0.1")
+                    .tcp_port(address.port())
+                    .prefer_socket(false)
+                    .socket(None::<String>)
+                    .user(Some("reopen_application"))
+                    .pass(Some("ReopenApplicationC11")),
+            )
+            .await
+            .unwrap();
+            let value: u8 = application.query_first("SELECT 42").await.unwrap().unwrap();
+            assert_eq!(value, 42);
+            application.disconnect().await.unwrap();
+            for _ in 0..100 {
+                if proxy.snapshot().sessions() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(proxy.snapshot().sessions(), 0, "published path is idle");
+        }
+        let member = manager.config().member();
+        let expected = MysqlReopenBoundary {
+            server_uuid: ServerUuid::new(uuid).unwrap(),
+            group_name: member.group_uuid().into(),
+            server_id: member.server_id(),
+            sql_address: member.sql_address(),
+            group_address: member.group_replication_address().to_string(),
+            executed: executed.parse().unwrap(),
+            purged: purged.parse().unwrap(),
+        };
+        let owned = pid(manager.config().runtime().pid());
+        let result =
+            MysqlStoppedReopen::capture(manager, authority(), expected, &attempt("capture")).await;
+        assert!(matches!(result, Err(MysqlReopenError::AccessNotClosed)));
+        assert_process_absent(owned).unwrap();
+        assert!(fixture.path().join("d/auto.cnf").is_file());
+        assert!(fixture.path().join("s/mysql-bin.index").is_file());
+        drop(proxy);
+        tokio::task::yield_now().await;
+    }
 }

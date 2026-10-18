@@ -182,7 +182,9 @@ impl MysqlReopenEvidence {
 /// Noncloneable, nonserializable, one-use proof of an exactly owned graceful
 /// stop. Native data AND scratch logs stay intact. Drop never adopts a survivor.
 ///
-/// Only quiet, closed, inactive topology-member managers are admitted.
+/// Only quiet, closed, inactive topology-member managers which have never
+/// issued an application/proxy capability are admitted. Idle, unpublished or
+/// previously revoked proxies do not supply an exact closed-owner handoff.
 /// Ordinary `MysqlInstanceManager::stop` does not produce this capability.
 pub struct MysqlStoppedReopen {
     manager: MysqlInstanceManager,
@@ -348,7 +350,10 @@ async fn read_closed(
     reopened: bool,
 ) -> Result<MysqlReopenBoundary, MysqlReopenError> {
     admit(attempt)?;
-    if manager.config().topology().is_none() || manager.config().build_recovery_networking() {
+    if manager.config().topology().is_none()
+        || manager.config().build_recovery_networking()
+        || manager.application_capability_issued()
+    {
         return Err(MysqlReopenError::AccessNotClosed);
     }
     if !manager.native_durability_qualified() {

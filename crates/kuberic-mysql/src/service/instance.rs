@@ -89,6 +89,7 @@ pub struct MysqlInstanceManager {
     process_generation: u64,
     cleanup_quarantined: bool,
     native_durability_qualified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    application_capability_issued: bool,
 }
 
 /// Unforgeable in-process ownership token for one exact MySQL child generation.
@@ -120,6 +121,7 @@ impl MysqlInstanceManager {
             native_durability_qualified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 true,
             )),
+            application_capability_issued: false,
         }
     }
 
@@ -131,6 +133,10 @@ impl MysqlInstanceManager {
 
     pub(crate) fn native_durability_qualified(&self) -> bool {
         self.native_durability_qualified.load(Ordering::Acquire)
+    }
+
+    pub(crate) const fn application_capability_issued(&self) -> bool {
+        self.application_capability_issued
     }
 
     fn retain_native_durability(&mut self, evidence: MemberNativeEvidence) -> MemberNativeEvidence {
@@ -1803,6 +1809,9 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         target
             .revalidate_socket()
             .map_err(MysqlProxyError::Native)?;
+        // This capability may outlive the manager and be published later.
+        // There is no closed-reopen proof for its independent listener owner.
+        self.application_capability_issued = true;
         Ok(target.socket())
     }
 
@@ -1821,6 +1830,8 @@ impl MysqlProxyControlBoundary for MysqlInstanceManager {
         let target = self
             .prepare_member_effect_target(authority, attempt)
             .map_err(MysqlProxyError::Native)?;
+        // Monotonic even if an account-preparation future later fails/drops.
+        self.application_capability_issued = true;
         let mut cancellation_containment = MemberEffectCancellationContainment::new(self, attempt);
         let result = crate::service::control::prepare_application_account(
             target,
