@@ -203,7 +203,8 @@ impl Drop for OpenSettlementGuard {
 impl MysqlPublicV1Service {
     /// Stores one fresh input without creating, opening, or classifying MySQL state.
     #[must_use]
-    pub fn new(config: MysqlPublicV1ServiceConfig) -> Self {
+    pub fn new(mut config: MysqlPublicV1ServiceConfig) -> Self {
+        config.fresh.instance = config.fresh.instance.with_retained_containment_evidence();
         Self {
             expected_partition_id: config.expected_partition_id,
             proxy_listen_address: config.proxy_listen_address,

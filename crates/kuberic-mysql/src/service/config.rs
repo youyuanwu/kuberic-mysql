@@ -388,6 +388,7 @@ pub struct MysqlInstanceConfig {
     topology: Option<MysqlTopologyConfig>,
     member_index: Option<MysqlMemberIndex>,
     build_recovery_networking: bool,
+    retain_containment_evidence: bool,
     timeouts: MysqlOperationTimeouts,
 }
 
@@ -538,6 +539,7 @@ impl MysqlInstanceConfig {
             topology,
             member_index,
             build_recovery_networking: false,
+            retain_containment_evidence: false,
             timeouts,
         })
     }
@@ -548,6 +550,17 @@ impl MysqlInstanceConfig {
     pub(crate) fn with_build_recovery_networking(mut self) -> Self {
         self.build_recovery_networking = true;
         self
+    }
+
+    /// Keeps native diagnostics at a terminal-only sibling path. This is an
+    /// in-memory cleanup policy, never an adoption or reopen capability.
+    pub(crate) fn with_retained_containment_evidence(mut self) -> Self {
+        self.retain_containment_evidence = true;
+        self
+    }
+
+    pub(crate) const fn retain_containment_evidence(&self) -> bool {
+        self.retain_containment_evidence
     }
 
     /// Whether this member exposes the private Build recovery listener.

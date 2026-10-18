@@ -1656,7 +1656,11 @@ impl MysqlInstanceManager {
         }
         ensure_cleanup_deadline(deadline, LifecycleOperation::ScratchCleanup)?;
         if let Some(scratch) = self.scratch_root.as_ref() {
-            remove_owned_root(scratch, LifecycleOperation::ScratchCleanup)?;
+            if self.config.retain_containment_evidence() {
+                retain_owned_runtime_evidence(scratch)?;
+            } else {
+                remove_owned_root(scratch, LifecycleOperation::ScratchCleanup)?;
+            }
             self.scratch_root = None;
         }
         self.state = MysqlInstanceState::Stopped;
@@ -2410,6 +2414,50 @@ fn remove_owned_root(
     remove_owned_root_with_hook(root, operation, |_| {})
 }
 
+/// Removes the active scratch name without deleting its native evidence. The
+/// original name really is absent for containment receipts; the retained name
+/// is not usable for startup/adoption. Never replace an existing destination.
+fn retain_owned_runtime_evidence(root: &OwnedRoot) -> Result<(), MysqlInstanceError> {
+    let operation = LifecycleOperation::ScratchCleanup;
+    root.revalidate().map_err(MysqlInstanceError::Ownership)?;
+    let mismatch = || MysqlInstanceError::Ownership(crate::service::OwnershipError::RootMismatch);
+    let parent = root.path().parent().ok_or_else(mismatch)?;
+    let name = root.path().file_name().ok_or_else(mismatch)?;
+    let retained = root.path().with_extension("retained");
+    let retained_name = retained.file_name().ok_or_else(mismatch)?;
+    let parent_fd = open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error(operation, error))?;
+    lock_directory(&parent_fd, operation)?;
+    verify_fd_identity(&parent_fd, root.parent_device(), root.parent_inode())?;
+    let root_fd = openat(
+        &parent_fd,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| mismatch())?;
+    lock_directory(&root_fd, operation)?;
+    verify_fd_identity(&root_fd, root.device(), root.inode())?;
+    renameat_with(
+        &parent_fd,
+        name,
+        &parent_fd,
+        retained_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| io_error(operation, error))?;
+    let moved = statat(&parent_fd, retained_name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error(operation, error))?;
+    if moved.st_dev != root.device() || moved.st_ino != root.inode() {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
 fn remove_owned_root_with_hook<F>(
     root: &OwnedRoot,
     operation: LifecycleOperation,
@@ -2611,6 +2659,73 @@ mod tests {
     use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    #[test]
+    fn terminal_evidence_retention_is_opt_in_and_never_replaces_a_destination() {
+        for (retain, collision) in [(false, false), (true, false), (true, true)] {
+            let parent = std::env::temp_dir().join(format!(
+                "te-{}-{}",
+                std::process::id(),
+                CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = MysqlInstanceConfig::new(
+                "/usr/bin/sleep",
+                "/usr/bin/env",
+                parent.join("d"),
+                parent.join("s"),
+                MysqlOperationTimeouts::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if retain {
+                config = config.with_retained_containment_evidence();
+            }
+            let roots = config
+                .create_layout()
+                .unwrap_or_else(|_| panic!("test layout"));
+            fs::write(roots.data.path().join("native"), b"data").unwrap();
+            fs::write(roots.scratch.path().join("mysqld.err"), b"diagnostics").unwrap();
+            let retained = parent.join("s.retained");
+            if collision {
+                fs::create_dir(&retained).unwrap();
+                fs::write(retained.join("foreign"), b"untouched").unwrap();
+            }
+            let mut manager = MysqlInstanceManager::new(config);
+            manager.data_root = Some(roots.data);
+            manager.scratch_root = Some(roots.scratch);
+            manager.state = MysqlInstanceState::Initialized;
+            let result = manager.contain_before(Instant::now() + Duration::from_secs(1));
+            assert_eq!(result.is_err(), collision);
+            assert_eq!(fs::read(parent.join("d/native")).unwrap(), b"data");
+            if collision {
+                assert_eq!(fs::read(retained.join("foreign")).unwrap(), b"untouched");
+                assert_eq!(
+                    fs::read(parent.join("s/mysqld.err")).unwrap(),
+                    b"diagnostics"
+                );
+                assert_ne!(manager.state, MysqlInstanceState::Stopped);
+            } else {
+                assert!(!parent.join("s").exists());
+                assert_eq!(manager.state, MysqlInstanceState::Stopped);
+                assert_eq!(retained.exists(), retain);
+                if retain {
+                    assert_eq!(
+                        fs::read(retained.join("mysqld.err")).unwrap(),
+                        b"diagnostics"
+                    );
+                }
+            }
+            drop(manager);
+            fs::remove_dir_all(parent).unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn reopen_proxy_issuance_is_exact_monotonic_and_sealed_against_all_raw_calls() {
