@@ -440,6 +440,7 @@ async fn read_member_view_connected(
     }
     let opening_view = query_view_id(session, deadline).await?;
     let opening_members = query_members(session, deadline).await?;
+    let opening_durability = read_durable_profile(session, deadline).await?;
     let executed: String = query_one(
         session,
         "SELECT @@GLOBAL.gtid_executed",
@@ -463,6 +464,7 @@ async fn read_member_view_connected(
     .await?;
     let closing_view = query_view_id(session, deadline).await?;
     let closing_members = query_members(session, deadline).await?;
+    let closing_durability = read_durable_profile(session, deadline).await?;
     if closing_server_uuid != authority.local().server_uuid().as_str()
         || closing_view != opening_view
         || closing_members != opening_members
@@ -529,7 +531,29 @@ async fn read_member_view_connected(
             ControlStage::ReadExecutedHistory,
         ))
     })?;
-    MemberNativeEvidence::new_with_purged(authority.clone(), view, executed, purged)
+    let evidence =
+        MemberNativeEvidence::new_with_purged(authority.clone(), view, executed, purged)?;
+    Ok(if opening_durability && closing_durability {
+        evidence.with_durable_profile()
+    } else {
+        evidence
+    })
+}
+
+async fn read_durable_profile(
+    session: &mut MysqlControlSession,
+    deadline: Instant,
+) -> Result<bool, MysqlTopologyError> {
+    let (flush, sync, binlog, updates, error_action): (u64, u64, u64, u64, String) =
+        query_one_mysql(
+            &mut session.connection,
+            "SELECT @@GLOBAL.innodb_flush_log_at_trx_commit, @@GLOBAL.sync_binlog, \
+             @@GLOBAL.log_bin, @@GLOBAL.log_replica_updates, @@GLOBAL.binlog_error_action",
+            deadline,
+            ControlStage::ReadExecutedHistory,
+        )
+        .await?;
+    Ok(flush == 1 && sync == 1 && binlog == 1 && updates == 1 && error_action == "ABORT_SERVER")
 }
 
 async fn validate_member_product(

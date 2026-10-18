@@ -128,6 +128,14 @@ pub(crate) struct BuildBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedBuildOwnership {
+    pub(crate) binding: Box<BuildBinding>,
+    pub(crate) callback: BuildCallbackKey,
+    pub(crate) account: BuildRecoveryAccountReceipt,
+    pub(crate) successor: crate::core::NativeView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BuildTerminalResult {
     Succeeded,
     Failed(String),

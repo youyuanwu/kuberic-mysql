@@ -53,7 +53,31 @@ fn custom_second_build_drop_is_contained() {
     run_live_fixture(true, false);
 }
 
+#[test]
+fn stale_source_first_target_epoch_cannot_supply_commitment() {
+    run_live_scenario(false, false, 1);
+}
+
+#[test]
+fn exact_build_retry_cannot_requalify_observed_undurable_history() {
+    run_live_scenario(false, false, 2);
+}
+
+#[test]
+fn completed_idle_successor_view_churn_and_missing_voter_are_rejected() {
+    run_live_scenario(false, false, 3);
+}
+
+#[test]
+fn missing_configured_voter_cannot_supply_a_retained_commitment() {
+    run_live_scenario(false, false, 4);
+}
+
 fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
+    run_live_scenario(interrupt_second, omit_source_progress, 0);
+}
+
+fn run_live_scenario(interrupt_second: bool, omit_source_progress: bool, proof_case: u8) {
     std::thread::Builder::new()
         .name("mysql-public-build-live".into())
         .stack_size(8 * 1024 * 1024)
@@ -65,6 +89,7 @@ fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
                 .block_on(run_custom_build_fixture(
                     interrupt_second,
                     omit_source_progress,
+                    proof_case,
                 ));
         })
         .unwrap()
@@ -72,7 +97,11 @@ fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
         .unwrap();
 }
 
-async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: bool) {
+async fn run_custom_build_fixture(
+    interrupt_second: bool,
+    omit_source_progress: bool,
+    proof_case: u8,
+) {
     preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
     let mut fixture = FixtureRoot::new("public-build-live").unwrap();
     let root = fixture.path().to_path_buf();
@@ -149,6 +178,9 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
         assert_tcp_login_rejected(sql[index], &format!("kms_app_{index}"), None).await;
     }
     drivers[0].update_epoch(epoch).await.unwrap();
+    kuberic_runtime::application::StateProvider::update_epoch(drivers[0].as_ref(), epoch, 0)
+        .await
+        .unwrap();
     drivers[0]
         .change_role(epoch, ReplicaRole::Primary)
         .await
@@ -169,6 +201,20 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
         .await
         .unwrap();
     let mut accepted_source_configuration = singleton.clone();
+
+    let before_write = drivers[0].current_progress().await.unwrap();
+    commit_marker(&instance_socket(&root, 0), "coherent-provider-pair").await;
+    drivers[0]
+        .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+        .await
+        .unwrap();
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        before_write
+    );
+    assert!(drivers[0].current_progress().await.unwrap() > before_write);
 
     for target in 1..3 {
         drivers[target].update_epoch(epoch).await.unwrap();
@@ -243,9 +289,80 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
         Box::pin(drivers[0].build_replica(build.clone()))
             .await
             .unwrap();
+        assert!(
+            kuberic_runtime::application::StateProvider::last_committed_lsn(
+                drivers[target].as_ref()
+            )
+            .await
+            .is_err(),
+            "a built secondary's local accepted tail is not provider commitment"
+        );
         // A terminal exact retry is served from the retained complete
         // binding, but only after fresh Primary/authority/boundary proof.
-        Box::pin(drivers[0].build_replica(build)).await.unwrap();
+        Box::pin(drivers[0].build_replica(build.clone()))
+            .await
+            .unwrap();
+        if proof_case == 2 {
+            let mut admin = root_connection(&instance_socket(&root, 0)).await;
+            admin.query_drop("SET GLOBAL sync_binlog=0").await.unwrap();
+            commit_marker(&instance_socket(&root, 0), "invalid-retry-history").await;
+            assert!(drivers[0].build_replica(build).await.is_err());
+            admin.query_drop("SET GLOBAL sync_binlog=1").await.unwrap();
+            assert!(drivers[0].current_progress().await.is_err());
+            admin.disconnect().await.unwrap();
+            for driver in drivers.iter().rev() {
+                driver.close().await.unwrap();
+            }
+            fixture.remove().unwrap();
+            return;
+        }
+        if proof_case == 3 {
+            let mut admin = root_connection(&instance_socket(&root, 0)).await;
+            admin
+                .query_drop(
+                    "CREATE USER 'view_recovery'@'127.0.0.1' IDENTIFIED BY 'ViewRecoverySecret1A'",
+                )
+                .await
+                .unwrap();
+            admin.query_drop("GRANT REPLICATION SLAVE, CONNECTION_ADMIN ON *.* TO 'view_recovery'@'127.0.0.1'").await.unwrap();
+            let mut target_admin = root_connection(&instance_socket(&root, target)).await;
+            target_admin
+                .query_drop("STOP GROUP_REPLICATION")
+                .await
+                .unwrap();
+            target_admin.query_drop("START GROUP_REPLICATION USER='view_recovery', PASSWORD='ViewRecoverySecret1A', DEFAULT_AUTH='caching_sha2_password'").await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !local_secondary_online(&instance_socket(&root, target)).await {
+                assert!(Instant::now() < deadline);
+                sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(group_member_count(&instance_socket(&root, 0)).await, 2);
+            assert!(
+                drivers[0].current_progress().await.is_err(),
+                "same members in a new view cannot reuse completed-idle authority"
+            );
+            assert!(drivers[0].build_replica(build).await.is_err());
+            admin
+                .query_drop("DROP USER 'view_recovery'@'127.0.0.1'")
+                .await
+                .unwrap();
+            admin.disconnect().await.unwrap();
+            target_admin.disconnect().await.unwrap();
+            for driver in drivers.iter().rev() {
+                driver.close().await.unwrap();
+            }
+            fixture.remove().unwrap();
+            return;
+        }
+        let (progress, competing_retry) = tokio::join!(
+            drivers[0].current_progress(),
+            drivers[0].build_replica(build.clone())
+        );
+        assert!(progress.is_ok());
+        assert!(
+            competing_retry.is_err(),
+            "Build retry must use the same fail-fast group permit"
+        );
         let source_gtids = query_gtids(&instance_socket(&root, 0)).await;
         let target_gtids = query_gtids(&instance_socket(&root, target)).await;
         assert!(!source_gtids.entries().is_empty());
@@ -331,6 +448,34 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
             .update_current_replica_set_configuration(source_configuration)
             .await
             .unwrap();
+        if proof_case == 1 {
+            let before = drivers[0].current_progress().await.unwrap();
+            assert_eq!(
+                kuberic_runtime::application::StateProvider::last_committed_lsn(
+                    drivers[0].as_ref()
+                )
+                .await
+                .unwrap(),
+                before
+            );
+            drivers[target]
+                .update_epoch(Epoch::new(0, 2))
+                .await
+                .unwrap();
+            assert!(drivers[0].current_progress().await.is_err());
+            assert!(
+                kuberic_runtime::application::StateProvider::last_committed_lsn(
+                    drivers[0].as_ref()
+                )
+                .await
+                .is_err()
+            );
+            for driver in drivers.iter().rev() {
+                driver.close().await.unwrap();
+            }
+            fixture.remove().unwrap();
+            return;
+        }
         accepted_source_configuration = if omit_source_progress {
             configuration_without_remote_progress(
                 epoch,
@@ -387,6 +532,169 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
                 .await
                 .unwrap();
         }
+    }
+
+    commit_marker(&instance_socket(&root, 0), "participant-scope-refresh").await;
+    let refreshed_peer = configuration(
+        epoch,
+        1,
+        &[
+            ReplicaRole::Primary,
+            ReplicaRole::ActiveSecondary,
+            ReplicaRole::ActiveSecondary,
+        ],
+        &drivers,
+        &identities,
+        &sessions,
+        &storage,
+        &[0, 1, 2],
+    )
+    .await;
+    let retained_pair = drivers[0].current_progress().await.unwrap();
+    drivers[1]
+        .update_current_replica_set_configuration(refreshed_peer)
+        .await
+        .unwrap();
+    assert!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .is_err(),
+        "participant-only full configuration scope change must invalidate paired proof reuse"
+    );
+    assert_eq!(drivers[0].current_progress().await.unwrap(), retained_pair);
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        retained_pair
+    );
+    let (current, competing_provider) = tokio::join!(
+        drivers[0].current_progress(),
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref()),
+    );
+    assert_eq!(current.unwrap(), retained_pair);
+    assert!(
+        competing_provider.is_err(),
+        "simultaneous proof callbacks cannot acquire opposing leases"
+    );
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        retained_pair
+    );
+    let refreshed_source = configuration(
+        epoch,
+        0,
+        &[
+            ReplicaRole::Primary,
+            ReplicaRole::ActiveSecondary,
+            ReplicaRole::ActiveSecondary,
+        ],
+        &drivers,
+        &identities,
+        &sessions,
+        &storage,
+        &[0, 1, 2],
+    )
+    .await;
+    drivers[0].current_progress().await.unwrap();
+    drivers[0]
+        .update_current_replica_set_configuration(refreshed_source)
+        .await
+        .unwrap();
+    assert!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .is_err(),
+        "source-only full configuration scope change must invalidate paired proof reuse"
+    );
+    let fresh_pair = drivers[0].current_progress().await.unwrap();
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        fresh_pair
+    );
+    if proof_case == 4 {
+        drivers[2].close().await.unwrap();
+        assert!(drivers[0].current_progress().await.is_err());
+        assert!(
+            kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+                .await
+                .is_err()
+        );
+        assert!(instance_socket(&root, 0).exists());
+        assert!(instance_socket(&root, 1).exists());
+        for driver in drivers.iter().rev() {
+            driver.close().await.unwrap();
+        }
+        fixture.remove().unwrap();
+        return;
+    }
+
+    if omit_source_progress {
+        let committed = drivers[0].current_progress().await.unwrap();
+        drivers[0].update_epoch(Epoch::new(0, 2)).await.unwrap();
+        kuberic_runtime::application::StateProvider::update_epoch(
+            drivers[0].as_ref(),
+            Epoch::new(0, 2),
+            committed,
+        )
+        .await
+        .unwrap();
+        assert!(
+            kuberic_runtime::application::StateProvider::update_epoch(
+                drivers[0].as_ref(),
+                Epoch::new(0, 2),
+                committed + 1
+            )
+            .await
+            .is_err()
+        );
+        drivers[0].update_epoch(Epoch::new(0, 3)).await.unwrap();
+        assert!(
+            kuberic_runtime::application::StateProvider::update_epoch(
+                drivers[0].as_ref(),
+                Epoch::new(0, 3),
+                committed
+            )
+            .await
+            .is_err(),
+            "an unrelated older proof cannot authorize the next epoch"
+        );
+    } else {
+        let mut peer_admin = root_connection(&instance_socket(&root, 1)).await;
+        peer_admin
+            .query_drop("SET GLOBAL sync_binlog=0")
+            .await
+            .unwrap();
+        assert!(drivers[0].current_progress().await.is_err());
+        peer_admin
+            .query_drop("SET GLOBAL sync_binlog=1")
+            .await
+            .unwrap();
+        assert!(
+            drivers[0].current_progress().await.is_err(),
+            "restored tuple cannot requalify peer history"
+        );
+        peer_admin.disconnect().await.unwrap();
+        let mut source_admin = root_connection(&instance_socket(&root, 0)).await;
+        source_admin
+            .query_drop("SET GLOBAL sync_binlog=0")
+            .await
+            .unwrap();
+        commit_marker(&instance_socket(&root, 0), "unqualified-history").await;
+        assert!(drivers[0].current_progress().await.is_err());
+        source_admin
+            .query_drop("SET GLOBAL sync_binlog=1")
+            .await
+            .unwrap();
+        assert!(
+            drivers[0].current_progress().await.is_err(),
+            "restored tuple cannot requalify source history"
+        );
+        source_admin.disconnect().await.unwrap();
     }
 
     for driver in drivers.iter().rev() {

@@ -1309,6 +1309,10 @@ where
 }
 
 impl MysqlReplicator<MysqlInstanceManager> {
+    pub(crate) fn native_durability_qualified(&self) -> bool {
+        self.effects.native_durability_qualified()
+    }
+
     pub(crate) async fn verify_build_target_fresh(
         &mut self,
         build: &BuildAttemptContext,
@@ -1486,7 +1490,7 @@ impl MysqlReplicator<MysqlInstanceManager> {
         self.validate_receipt(&receipt, &MemberEffectKind::ViewReadback, &request)?;
         let before = pending.member().successor();
         let after = receipt.successor();
-        if before.view().members() != after.view().members()
+        if before.view() != after.view()
             || after
                 .view()
                 .member(self.authority().local().member_id())

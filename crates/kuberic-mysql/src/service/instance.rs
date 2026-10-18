@@ -88,6 +88,7 @@ pub struct MysqlInstanceManager {
     owner_generation: u64,
     process_generation: u64,
     cleanup_quarantined: bool,
+    native_durability_qualified: bool,
 }
 
 /// Unforgeable in-process ownership token for one exact MySQL child generation.
@@ -116,6 +117,7 @@ impl MysqlInstanceManager {
             owner_generation: INSTANCE_OWNER_SERIAL.fetch_add(1, Ordering::Relaxed),
             process_generation: 0,
             cleanup_quarantined: false,
+            native_durability_qualified: true,
         }
     }
 
@@ -123,6 +125,19 @@ impl MysqlInstanceManager {
     #[must_use]
     pub const fn state(&self) -> MysqlInstanceState {
         self.state
+    }
+
+    pub(crate) const fn native_durability_qualified(&self) -> bool {
+        self.native_durability_qualified
+    }
+
+    fn retain_native_durability(&mut self, evidence: MemberNativeEvidence) -> MemberNativeEvidence {
+        self.native_durability_qualified &= evidence.has_durable_profile();
+        if self.native_durability_qualified {
+            evidence
+        } else {
+            evidence.without_durable_profile()
+        }
     }
 
     /// Returns the immutable validated configuration.
@@ -773,7 +788,9 @@ impl MysqlInstanceManager {
     ) -> Result<MemberNativeEvidence, MemberTransitionError> {
         let target = self.prepare_member_effect_target(authority, attempt)?;
         let deadline = Self::member_effect_deadline(attempt)?;
-        crate::service::control::read_member_view(target, authority, &deadline).await
+        let evidence =
+            crate::service::control::read_member_view(target, authority, &deadline).await?;
+        Ok(self.retain_native_durability(evidence))
     }
 
     /// Reads one request-bound coherent native member view and returns an
@@ -789,6 +806,7 @@ impl MysqlInstanceManager {
         let evidence =
             crate::service::control::read_member_view(target.clone(), &authority, &deadline)
                 .await?;
+        let evidence = self.retain_native_durability(evidence);
         let final_binding = self.revalidate_member_effect_binding(&authority)?;
         target.revalidate_socket()?;
         MemberEffectReceipt::for_request(
@@ -820,6 +838,7 @@ impl MysqlInstanceManager {
             let current =
                 crate::service::control::read_member_view(target.clone(), &authority, &deadline)
                     .await?;
+            let current = containment.instance.retain_native_durability(current);
             if current != predecessor {
                 return Err(MemberTransitionError::View(
                     crate::service::MemberViewError::StaleView,
@@ -875,8 +894,10 @@ impl MysqlInstanceManager {
                 &deadline,
             )
             .await?;
-            crate::service::control::read_member_view(target.clone(), &authority, &deadline)
-                .await?;
+            let evidence =
+                crate::service::control::read_member_view(target.clone(), &authority, &deadline)
+                    .await?;
+            containment.instance.retain_native_durability(evidence);
             let final_binding = containment.revalidate_binding(&authority)?;
             target.revalidate_socket()?;
             BackendConnectionReceipt::new(
@@ -1794,6 +1815,7 @@ async fn poll_member_receipt(
         }
         let evidence =
             crate::service::control::read_member_view(target.clone(), &authority, deadline).await?;
+        let evidence = containment.instance.retain_native_durability(evidence);
         let final_binding = containment.revalidate_binding(&authority)?;
         target.revalidate_socket()?;
         let receipt = if build_cross_parent {

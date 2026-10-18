@@ -160,6 +160,7 @@ pub struct MemberNativeEvidence {
     view: NativeView,
     executed: GtidSet,
     purged: GtidSet,
+    durable_profile: bool,
 }
 
 impl MemberNativeEvidence {
@@ -203,6 +204,7 @@ impl MemberNativeEvidence {
             view,
             executed,
             purged: GtidSet::empty(),
+            durable_profile: false,
         })
     }
 
@@ -240,6 +242,20 @@ impl MemberNativeEvidence {
     #[must_use]
     pub const fn purged(&self) -> &GtidSet {
         &self.purged
+    }
+
+    pub(crate) fn with_durable_profile(mut self) -> Self {
+        self.durable_profile = true;
+        self
+    }
+
+    pub(crate) const fn has_durable_profile(&self) -> bool {
+        self.durable_profile
+    }
+
+    pub(crate) fn without_durable_profile(mut self) -> Self {
+        self.durable_profile = false;
+        self
     }
 
     /// Returns the exact current primary.

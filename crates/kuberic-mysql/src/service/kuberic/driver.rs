@@ -25,6 +25,9 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 
+#[path = "proof.rs"]
+mod proof;
+
 use crate::core::{
     AttemptId, AuthorityGeneration, ConfiguredGtidLineage, GroupReplicationAddress,
     ProgressProjection, QualifiedProgress, StorageBinding, project_progress,
@@ -140,6 +143,11 @@ struct DriverState {
     epochs: EpochTranslator,
     operations: CallbackOperationLedger<OperationKey, OperationValue>,
     build_results: BuildResultLedger<BuildCallbackKey>,
+    completed_builds: Vec<super::build::CompletedBuildOwnership>,
+    committed_sample: Option<proof::CommittedSample>,
+    epoch_commit: Option<(Epoch, proof::CommittedSample)>,
+    fresh_epoch: Option<Epoch>,
+    durability_qualified: bool,
     build_generation: Arc<BuildGeneration>,
     pending_build_target: Option<BuildTargetBinding>,
     pending_build_binding: Option<Box<BuildBinding>>,
@@ -272,6 +280,7 @@ impl BuildTargetOwner<'_> {
             )
             .await
             .map_err(map_mysql)?;
+        MysqlPublicV1Replicator::require_native_durability(state)?;
         if receipt.build() != build.build()
             || receipt.parent_attempt() != build.parent_attempt()
             || receipt.target_generation() != self.generation.id()
@@ -351,6 +360,7 @@ impl BuildTargetOwner<'_> {
         .await
         .map_err(|_| RuntimeError::OperationCancelled)?
         .map_err(map_mysql)?;
+        MysqlPublicV1Replicator::require_native_durability(state)?;
         build
             .admit_work()
             .map_err(|_| RuntimeError::OperationCancelled)?;
@@ -495,6 +505,11 @@ impl MysqlPublicV1Replicator {
                 epochs: EpochTranslator::new(),
                 operations: CallbackOperationLedger::new(operation_authority),
                 build_results: BuildResultLedger::default(),
+                completed_builds: Vec::new(),
+                committed_sample: None,
+                epoch_commit: None,
+                fresh_epoch: None,
+                durability_qualified: true,
                 build_generation: Arc::new(BuildGeneration::new()),
                 pending_build_target: None,
                 pending_build_binding: None,
@@ -677,6 +692,7 @@ impl MysqlPublicV1Replicator {
         .await
         .map_err(|_| RuntimeError::OperationCancelled)?
         .map_err(map_mysql)?;
+        Self::require_native_durability(&mut state)?;
         child
             .admit_work()
             .map_err(|_| RuntimeError::OperationCancelled)?;
@@ -855,6 +871,7 @@ impl MysqlPublicV1Replicator {
         .await
         .map_err(|_| RuntimeError::OperationCancelled)?
         .map_err(map_mysql)?;
+        Self::require_native_durability(&mut state)?;
         child
             .admit_work()
             .map_err(|_| RuntimeError::OperationCancelled)?;
@@ -1300,6 +1317,17 @@ impl MysqlPublicV1Replicator {
             return Ok(mapped);
         }
         Self::revoke_client_proxy_locked(state).await?;
+        let predecessor = state
+            .committed_sample
+            .clone()
+            .filter(|sample| sample.matches_scope(state));
+        state.epoch_commit = None;
+        state.fresh_epoch = if state.engine.epoch().is_none() && state.fresh_open_progress.is_some()
+        {
+            Some(epoch)
+        } else {
+            None
+        };
         if state.engine.configuration().is_some() {
             Self::capture_current_boundary(state, true).await?;
         } else {
@@ -1312,6 +1340,11 @@ impl MysqlPublicV1Replicator {
             OperationKey::AdvanceEpoch(epoch.into()),
             OperationValue::Epoch(mapped),
         )?;
+        if let Some(sample) = predecessor
+            && sample.matches_boundary(state)
+        {
+            state.epoch_commit = Some((epoch, sample));
+        }
         state
             .engine
             .advance_epoch(epoch_operation, mapped)
@@ -1344,6 +1377,7 @@ impl MysqlPublicV1Replicator {
             state.engine.read_progress(progress_operation).await
         }
         .map_err(map_mysql)?;
+        Self::require_native_durability(state)?;
         let qualified = match progress.progress() {
             ProgressProjection::Projectable(progress) => progress,
             ProgressProjection::NonProjectable(_) => {
@@ -2121,8 +2155,29 @@ impl Replicator for MysqlPublicV1Replicator {
     }
 
     async fn current_progress(&self) -> Result<i64> {
+        let _permit = self.acquire_proof_permit()?;
+        let deadline = self.proof_deadline();
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.current_progress_proved(deadline),
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?
+    }
+
+    async fn catch_up_capability(&self) -> Result<i64> {
+        let state = self.lease().await;
+        require_bound_open(&state)?;
+        require_not_cleanup_only(&state)?;
+        Ok(INVALID_LSN)
+    }
+}
+
+impl MysqlPublicV1Replicator {
+    async fn current_progress_proved(&self, deadline: Instant) -> Result<i64> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
+        Self::require_native_durability(&mut state)?;
         if matches!(
             state.build_generation.status(),
             BuildGenerationStatus::CleanupOnly | BuildGenerationStatus::NeedsRebuild
@@ -2131,24 +2186,14 @@ impl Replicator for MysqlPublicV1Replicator {
         }
         if state.engine.configuration().is_none() {
             if state.engine.pending_build().is_some() {
-                let progress = state
-                    .engine
-                    .refresh_pending_build_progress()
-                    .await
-                    .map_err(map_mysql)?;
-                return match progress.progress() {
-                    ProgressProjection::Projectable(progress) => {
-                        retain_reported_progress(
-                            &mut state.last_reported_progress,
-                            progress.value(),
-                        );
-                        state.cached_source_progress = Some(progress);
-                        Ok(progress.value())
-                    }
-                    ProgressProjection::NonProjectable(_) => Err(RuntimeError::InvalidReplication(
-                        "built MySQL history cannot be projected".into(),
-                    )),
-                };
+                let (value, _) = Self::sample_native_progress(&mut state).await?;
+                retain_reported_progress(&mut state.last_reported_progress, value);
+                return Ok(value);
+            }
+            if state.engine.role() == Some(MysqlReplicaRole::Primary) {
+                return Err(RuntimeError::InvalidReplication(
+                    "Primary committed progress requires an applicable configuration proof".into(),
+                ));
             }
             let progress = progress_without_current_configuration(
                 state.cached_source_progress.map(QualifiedProgress::value),
@@ -2160,36 +2205,23 @@ impl Replicator for MysqlPublicV1Replicator {
             }
             return progress;
         }
-        state.progress_sequence = state.progress_sequence.checked_add(1).ok_or_else(|| {
-            RuntimeError::InvalidReplication("progress sequence exhausted".into())
-        })?;
-        let progress_sequence = state.progress_sequence;
-        let operation = operation(
-            &mut state,
-            OperationKey::Progress(progress_sequence),
-            OperationValue::Progress,
-        )?;
-        let progress = state
-            .engine
-            .read_progress(operation)
-            .await
-            .map_err(map_mysql)?;
-        match progress.progress() {
-            ProgressProjection::Projectable(progress) => {
-                retain_reported_progress(&mut state.last_reported_progress, progress.value());
-                Ok(progress.value())
+        let (value, evidence) = Self::sample_native_progress(&mut state).await?;
+        if state.engine.role() == Some(MysqlReplicaRole::Primary) {
+            let configuration = state
+                .current_configuration
+                .clone()
+                .ok_or(RuntimeError::ReconfigurationPending)?;
+            let mut applicable = vec![configuration];
+            if let Some(pending) = state.pending_configuration.clone() {
+                applicable.push(pending);
             }
-            ProgressProjection::NonProjectable(_) => Err(RuntimeError::InvalidReplication(
-                "MySQL history cannot be projected to a qualified public LSN".into(),
-            )),
+            let sample = self
+                .prove_primary_sample(&mut state, value, evidence, &applicable, deadline)
+                .await?;
+            state.committed_sample = Some(sample);
         }
-    }
-
-    async fn catch_up_capability(&self) -> Result<i64> {
-        let state = self.lease().await;
-        require_bound_open(&state)?;
-        require_not_cleanup_only(&state)?;
-        Ok(INVALID_LSN)
+        retain_reported_progress(&mut state.last_reported_progress, value);
+        Ok(value)
     }
 }
 
@@ -2202,7 +2234,7 @@ impl StateProvider for MysqlPublicV1Replicator {
         let exact_epoch = state.epochs.latest().is_some_and(|(public, mapped)| {
             public == epoch && state.engine.epoch() == Some(mapped)
         });
-        if !exact_epoch || state.last_reported_progress != Some(previous_epoch_last_lsn) {
+        if !exact_epoch || !proof::epoch_commit_matches(&state, epoch, previous_epoch_last_lsn) {
             return Err(RuntimeError::AuthorityMismatch(
                 "StateProvider epoch validation requires the exact accepted epoch and reported committed tail"
                     .into(),
@@ -2212,10 +2244,18 @@ impl StateProvider for MysqlPublicV1Replicator {
     }
 
     async fn last_committed_lsn(&self) -> Result<i64> {
-        let state = self.lease().await;
-        require_bound_open(&state)?;
-        require_not_cleanup_only(&state)?;
-        retained_committed_progress(state.last_reported_progress)
+        let _permit = self.acquire_proof_permit()?;
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(self.proof_deadline()),
+            async {
+                let mut state = self.lease().await;
+                require_bound_open(&state)?;
+                require_not_cleanup_only(&state)?;
+                self.coherent_committed_sample(&mut state).await
+            },
+        )
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?
     }
 
     async fn get_copy_context(&self) -> Result<OperationDataStream> {
@@ -2290,57 +2330,75 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
     }
 
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
-        let mut state = self.lease().await;
-        require_bound_open(&state)?;
-        require_not_cleanup_only(&state)?;
-        if let Some(target) = state.pending_build_target.as_ref()
-            && (state.pending_configuration.is_none()
-                || lookup_build_endpoint(&target.replication_address).is_none_or(|endpoint| {
-                    !endpoint.owner.build_role_admitted.load(Ordering::Acquire)
-                }))
-        {
-            return Err(RuntimeError::ReconfigurationPending);
-        }
-        if catch_up_requires_fresh_boundary(
-            state.engine.configuration().is_some(),
-            state.cached_source_progress.is_some(),
-        )? {
-            Self::capture_current_boundary(&mut state, false).await?;
-        }
-        let boundary = state
-            .cached_source_progress
-            .ok_or_else(|| {
-                RuntimeError::InvalidReplication(
-                    "catch-up lacks a retained qualified pre-epoch source boundary".into(),
-                )
-            })?
-            .value();
-        let configuration = state
-            .pending_configuration
-            .as_ref()
-            .or(state.current_configuration.as_ref())
-            .ok_or(RuntimeError::ReconfigurationPending)?;
-        let local = &state
-            .binding
-            .as_ref()
-            .expect("bound state was required")
-            .identity;
-        if !configuration_satisfies_catch_up(configuration, local, boundary, mode)? {
-            return Err(RuntimeError::ReconfigurationPending);
-        }
-        state.catch_up_proven = true;
-        if state.pending_build_target.is_some() {
-            self.build_catch_up_admitted.store(true, Ordering::Release);
-        }
-        if let (Some(current), Some(pending)) = (
-            state.current_configuration.as_ref(),
-            state.pending_configuration.as_ref(),
-        ) && current.configuration == pending.configuration
-        {
-            state.current_configuration = state.pending_configuration.take();
-            state.pending_native_configuration = None;
-        }
-        Ok(())
+        let _permit = self.acquire_proof_permit()?;
+        let deadline = self.proof_deadline();
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            let mut state = self.lease().await;
+            require_bound_open(&state)?;
+            require_not_cleanup_only(&state)?;
+            if let Some(target) = state.pending_build_target.as_ref()
+                && (state.pending_configuration.is_none()
+                    || lookup_build_endpoint(&target.replication_address).is_none_or(|endpoint| {
+                        !endpoint.owner.build_role_admitted.load(Ordering::Acquire)
+                    }))
+            {
+                return Err(RuntimeError::ReconfigurationPending);
+            }
+            if catch_up_requires_fresh_boundary(
+                state.engine.configuration().is_some(),
+                state.cached_source_progress.is_some(),
+            )? {
+                Self::capture_current_boundary(&mut state, false).await?;
+            }
+            let boundary = state
+                .cached_source_progress
+                .ok_or_else(|| {
+                    RuntimeError::InvalidReplication(
+                        "catch-up lacks a retained qualified pre-epoch source boundary".into(),
+                    )
+                })?
+                .value();
+            let configuration = state
+                .pending_configuration
+                .as_ref()
+                .or(state.current_configuration.as_ref())
+                .ok_or(RuntimeError::ReconfigurationPending)?;
+            let local = &state
+                .binding
+                .as_ref()
+                .expect("bound state was required")
+                .identity;
+            if !configuration_satisfies_catch_up(configuration, local, boundary, mode)? {
+                return Err(RuntimeError::ReconfigurationPending);
+            }
+            let mut applicable = vec![
+                state
+                    .current_configuration
+                    .clone()
+                    .ok_or(RuntimeError::ReconfigurationPending)?,
+            ];
+            if let Some(pending) = state.pending_configuration.clone() {
+                applicable.push(pending);
+            }
+            let (value, sample) = Self::sample_native_progress(&mut state).await?;
+            self.prove_primary_sample(&mut state, value, sample, &applicable, deadline)
+                .await?;
+            state.catch_up_proven = true;
+            if state.pending_build_target.is_some() {
+                self.build_catch_up_admitted.store(true, Ordering::Release);
+            }
+            if let (Some(current), Some(pending)) = (
+                state.current_configuration.as_ref(),
+                state.pending_configuration.as_ref(),
+            ) && current.configuration == pending.configuration
+            {
+                state.current_configuration = state.pending_configuration.take();
+                state.pending_native_configuration = None;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RuntimeError::OperationCancelled)?
     }
 
     async fn update_current_replica_set_configuration(
@@ -2574,9 +2632,16 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
             replication_address: replica.replication_address.clone(),
             native: target_native.clone(),
         };
+        let group_permit =
+            BuildGroupPermit::try_acquire(self.group_key.clone()).ok_or_else(|| {
+                RuntimeError::InvalidReplication(
+                    "Build group is busy or blocked pending cleanup/reset".into(),
+                )
+            })?;
         {
             let mut state = self.lease().await;
             require_bound_open(&state)?;
+            Self::require_native_durability(&mut state)?;
             if let Some((retained, terminal)) = state.build_results.retained(build_id.as_str()) {
                 let public = state
                     .binding
@@ -2636,12 +2701,6 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                 }
             }
         }
-        let group_permit =
-            BuildGroupPermit::try_acquire(self.group_key.clone()).ok_or_else(|| {
-                RuntimeError::InvalidReplication(
-                    "Build group is busy or blocked pending cleanup/reset".into(),
-                )
-            })?;
         let source_endpoint = lookup_build_endpoint(&self.endpoint.encode()).ok_or_else(|| {
             RuntimeError::InvalidReplication(
                 "Build source endpoint is not registered in this process".into(),
@@ -2812,6 +2871,7 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                     "Build source boundary differs from last reported Primary progress".into(),
                 ));
             }
+            Self::require_proved_build_boundary(&state)?;
             let source_authority = state.engine.current_member_authority().map_err(map_mysql)?;
             let source_binding = BuildSourceBinding {
                 identity: public.identity.clone(),
@@ -3511,6 +3571,20 @@ impl PrimaryReplicator for MysqlPublicV1Replicator {
                     BuildTerminalResult::Succeeded,
                 )
                 .map_err(map_mysql)?;
+            let successor = state
+                .engine
+                .native_evidence()
+                .expect("final Build readback")
+                .view()
+                .clone();
+            state
+                .completed_builds
+                .push(super::build::CompletedBuildOwnership {
+                    binding: binding.clone(),
+                    callback: callback_key.clone(),
+                    account: account_receipt.clone(),
+                    successor,
+                });
             orchestration
                 .advance(BuildCheckpoint::Completed)
                 .map_err(map_mysql)?;
@@ -3819,14 +3893,6 @@ fn retained_fresh_open_progress(
     progress: QualifiedProgress,
 ) -> (Option<QualifiedProgress>, Option<i64>) {
     (Some(progress), Some(progress.value()))
-}
-
-fn retained_committed_progress(retained: Option<i64>) -> Result<i64> {
-    retained.ok_or_else(|| {
-        RuntimeError::InvalidReplication(
-            "committed progress requires a preceding exact current-progress observation".into(),
-        )
-    })
 }
 
 fn catch_up_requires_fresh_boundary(
@@ -4233,18 +4299,6 @@ mod tests {
     }
 
     #[test]
-    fn state_provider_returns_the_exact_last_reported_scalar_without_a_zero_fallback() {
-        let mut retained = None;
-        assert!(retained_committed_progress(retained).is_err());
-
-        retain_reported_progress(&mut retained, 0);
-        assert_eq!(retained_committed_progress(retained).unwrap(), 0);
-
-        retain_reported_progress(&mut retained, 73);
-        assert_eq!(retained_committed_progress(retained).unwrap(), 73);
-    }
-
-    #[test]
     fn qualified_fresh_open_progress_is_retained_for_applied_and_committed_reads() {
         let lineage =
             crate::core::ConfiguredGtidLineage::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -4266,7 +4320,7 @@ mod tests {
             .unwrap(),
             0
         );
-        assert_eq!(retained_committed_progress(committed).unwrap(), 0);
+        assert_eq!(committed, Some(0));
     }
 
     #[test]
