@@ -128,8 +128,26 @@ pub(crate) struct BuildBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedBuildOwnership {
+    pub(crate) binding: Box<BuildBinding>,
+    pub(crate) callback: BuildCallbackKey,
+    pub(crate) account: BuildRecoveryAccountReceipt,
+    pub(crate) successor: crate::core::NativeView,
+    pub(crate) target_authority: MemberMutationAuthority,
+    pub(crate) donors: Vec<CompletedBuildDonor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedBuildDonor {
+    pub(crate) identity: ReplicaIdentity,
+    pub(crate) generation: u64,
+    pub(crate) authority: MemberMutationAuthority,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BuildTerminalResult {
     Succeeded,
+    Retired,
     Failed(String),
     RebuildRequired(kuberic_runtime::protocol::public_operations::ReplicaRebuildRequired),
 }
@@ -204,6 +222,18 @@ where
             return Ok(());
         }
         record.terminal = Some(terminal);
+        Ok(())
+    }
+
+    pub(crate) fn retire(&mut self, key: &str, binding: &B) -> Result<(), MysqlReplicatorError> {
+        let record = self
+            .records
+            .get_mut(key)
+            .ok_or(MysqlReplicatorError::OperationConflict)?;
+        if record.binding != *binding || record.terminal != Some(BuildTerminalResult::Succeeded) {
+            return Err(MysqlReplicatorError::OperationConflict);
+        }
+        record.terminal = Some(BuildTerminalResult::Retired);
         Ok(())
     }
 }
@@ -1155,6 +1185,27 @@ mod tests {
             ledger.admit("build", &"changed".into()),
             Err(MysqlReplicatorError::OperationConflict)
         ));
+    }
+
+    #[test]
+    fn retired_build_authority_rejects_delayed_success_and_rebinding() {
+        let mut ledger = BuildResultLedger::<String>::default();
+        ledger.admit("built", &"exact".into()).unwrap();
+        ledger
+            .complete("built", &"exact".into(), BuildTerminalResult::Succeeded)
+            .unwrap();
+        ledger.retire("built", &"exact".into()).unwrap();
+        assert_eq!(
+            ledger.retained("built"),
+            Some(("exact".into(), Some(BuildTerminalResult::Retired)))
+        );
+        assert!(
+            ledger
+                .complete("built", &"exact".into(), BuildTerminalResult::Succeeded)
+                .is_err()
+        );
+        assert!(ledger.admit("built", &"substituted".into()).is_err());
+        assert!(ledger.retire("built", &"exact".into()).is_err());
     }
 
     #[test]

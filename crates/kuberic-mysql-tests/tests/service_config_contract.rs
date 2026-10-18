@@ -45,6 +45,8 @@ fn exact_three_member_render_is_unique_and_keeps_runtime_disposable() {
          report-port=33061\n\
          server-id=1\n\
          binlog-format=ROW\n\
+         log-replica-updates=ON\n\
+         binlog-error-action=ABORT_SERVER\n\
          binlog-checksum=NONE\n\
          relay-log-recovery=ON\n\
          gtid-mode=ON\n\
@@ -97,6 +99,8 @@ fn exact_three_member_render_is_unique_and_keeps_runtime_disposable() {
         assert!(value.contains("loose-group-replication-consistency=AFTER"));
         assert!(value.contains("innodb-flush-log-at-trx-commit=1"));
         assert!(value.contains("sync-binlog=1"));
+        assert!(value.contains("log-replica-updates=ON"));
+        assert!(value.contains("binlog-error-action=ABORT_SERVER"));
         assert!(value.contains("binlog-expire-logs-seconds=2592000"));
         assert!(value.contains("loose-group-replication-member-expel-timeout=5"));
         assert!(value.contains("loose-group-replication-start-on-boot=OFF"));

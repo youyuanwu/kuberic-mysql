@@ -703,6 +703,8 @@ impl MysqlInstanceConfig {
              mysqlx=OFF\n\
              {}\
              binlog-format=ROW\n\
+             log-replica-updates=ON\n\
+             binlog-error-action=ABORT_SERVER\n\
              binlog-checksum=NONE\n\
              relay-log-recovery=ON\n\
              {}\n\

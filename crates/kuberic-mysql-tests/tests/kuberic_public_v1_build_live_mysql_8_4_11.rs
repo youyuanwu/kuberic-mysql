@@ -2,11 +2,13 @@
 mod live_support;
 
 use std::collections::BTreeSet;
+use std::future::{Future, poll_fn};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use kuberic_mysql::core::{AttemptId, ConfiguredGtidLineage, CredentialGeneration, GtidSet};
@@ -53,7 +55,66 @@ fn custom_second_build_drop_is_contained() {
     run_live_fixture(true, false);
 }
 
+#[test]
+fn stale_source_first_target_epoch_cannot_supply_commitment() {
+    run_live_scenario(false, false, 1);
+}
+
+#[test]
+fn exact_build_retry_cannot_requalify_observed_undurable_history() {
+    run_live_scenario(false, false, 2);
+}
+
+#[test]
+fn completed_idle_successor_view_churn_and_missing_voter_are_rejected() {
+    run_live_scenario(false, false, 3);
+}
+
+#[test]
+fn missing_configured_voter_cannot_supply_a_retained_commitment() {
+    run_live_scenario(false, false, 4);
+}
+
+#[test]
+fn provider_epoch_rejects_native_latch_before_driver_progress_reentry() {
+    run_live_scenario(false, false, 5);
+}
+
+#[test]
+fn remove_first_completed_idle_retires_only_its_exact_owner() {
+    run_live_scenario(false, false, 10);
+}
+
+#[test]
+fn remove_second_completed_idle_preserves_primary_and_admitted_secondary() {
+    run_live_scenario(false, false, 11);
+}
+
+#[test]
+fn remove_rejects_stale_target_epoch_without_retirement() {
+    run_live_scenario(false, false, 12);
+}
+
+#[test]
+fn stale_remove_does_not_retire_substituted_target_incarnation() {
+    run_live_scenario(false, false, 13);
+}
+
+#[test]
+fn interrupted_remove_after_native_leave_is_contained_not_successful() {
+    run_live_scenario(false, false, 20);
+}
+
+#[test]
+fn dropped_remove_before_effects_is_retryable() {
+    run_live_scenario(false, false, 21);
+}
+
 fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
+    run_live_scenario(interrupt_second, omit_source_progress, 0);
+}
+
+fn run_live_scenario(interrupt_second: bool, omit_source_progress: bool, proof_case: u8) {
     std::thread::Builder::new()
         .name("mysql-public-build-live".into())
         .stack_size(8 * 1024 * 1024)
@@ -65,6 +126,7 @@ fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
                 .block_on(run_custom_build_fixture(
                     interrupt_second,
                     omit_source_progress,
+                    proof_case,
                 ));
         })
         .unwrap()
@@ -72,7 +134,11 @@ fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
         .unwrap();
 }
 
-async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: bool) {
+async fn run_custom_build_fixture(
+    interrupt_second: bool,
+    omit_source_progress: bool,
+    proof_case: u8,
+) {
     preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
     let mut fixture = FixtureRoot::new("public-build-live").unwrap();
     let root = fixture.path().to_path_buf();
@@ -149,6 +215,9 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
         assert_tcp_login_rejected(sql[index], &format!("kms_app_{index}"), None).await;
     }
     drivers[0].update_epoch(epoch).await.unwrap();
+    kuberic_runtime::application::StateProvider::update_epoch(drivers[0].as_ref(), epoch, 0)
+        .await
+        .unwrap();
     drivers[0]
         .change_role(epoch, ReplicaRole::Primary)
         .await
@@ -170,6 +239,20 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
         .unwrap();
     let mut accepted_source_configuration = singleton.clone();
 
+    let before_write = qualified_progress(drivers[0].as_ref()).await;
+    commit_marker(&instance_socket(&root, 0), "coherent-provider-pair").await;
+    drivers[0]
+        .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+        .await
+        .unwrap();
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        before_write
+    );
+    assert!(qualified_progress(drivers[0].as_ref()).await > before_write);
+
     for target in 1..3 {
         drivers[target].update_epoch(epoch).await.unwrap();
         drivers[target]
@@ -179,7 +262,7 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
 
         let socket = instance_socket(&root, 0);
         commit_marker(&socket, &format!("build_marker_{target}")).await;
-        assert!(drivers[0].current_progress().await.unwrap() > 0);
+        assert!(qualified_progress(drivers[0].as_ref()).await > 0);
         let build = idle_information(
             target,
             OperationId::new(format!("direct-build-{target}")),
@@ -243,9 +326,256 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
         Box::pin(drivers[0].build_replica(build.clone()))
             .await
             .unwrap();
+        if proof_case >= 10 && (target == 2 || matches!(proof_case, 10 | 12 | 13)) {
+            assert!(drivers[0].remove_replica(ReplicaId::new(99)).await.is_err());
+            assert!(
+                drivers[0]
+                    .remove_replica(identities[0].replica_id)
+                    .await
+                    .is_err()
+            );
+            if target == 2 {
+                assert!(
+                    drivers[0]
+                        .remove_replica(identities[1].replica_id)
+                        .await
+                        .is_err(),
+                    "active membership removal is not the idle callback"
+                );
+            }
+            if proof_case == 12 {
+                drivers[target]
+                    .change_role(epoch, ReplicaRole::ActiveSecondary)
+                    .await
+                    .unwrap();
+                drivers[target]
+                    .update_epoch(Epoch::new(0, 2))
+                    .await
+                    .unwrap();
+                assert!(
+                    drivers[0]
+                        .remove_replica(identities[target].replica_id)
+                        .await
+                        .is_err()
+                );
+                assert!(instance_socket(&root, target).exists());
+                for driver in drivers.iter().rev() {
+                    driver.close().await.unwrap();
+                }
+                fixture.remove().unwrap();
+                return;
+            }
+            if proof_case == 13 {
+                drivers[target].close().await.unwrap();
+                let mut replacement_fixture = FixtureRoot::new("public-repl").unwrap();
+                let replacement_root = replacement_fixture.path().to_path_buf();
+                let mut replacement_identity = identities[target].clone();
+                replacement_identity.instance_id = ReplicaInstanceId::new("replacement-instance");
+                replacement_identity.agent_generation = AgentGeneration::new("replacement-agent");
+                let replacement_storage = self::storage(&replacement_identity);
+                let replacement = direct_config(
+                    &replacement_root,
+                    topology.clone(),
+                    member_indexes[target],
+                    timeouts,
+                    proxy[target],
+                    target,
+                )
+                .open_direct_for_qualification(
+                    replacement_identity,
+                    ProcessSessionId::new("replacement-session"),
+                    replacement_storage,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    drivers[0]
+                        .remove_replica(identities[target].replica_id)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    instance_socket(&replacement_root, target).exists(),
+                    "stale removal cannot touch replacement"
+                );
+                replacement.close().await.unwrap();
+                replacement_fixture.remove().unwrap();
+                for driver in drivers.iter().rev() {
+                    driver.close().await.unwrap();
+                }
+                fixture.remove().unwrap();
+                return;
+            }
+            if proof_case == 21 {
+                let mut removed =
+                    Box::pin(drivers[0].remove_replica(identities[target].replica_id));
+                assert!(
+                    poll_fn(|cx| Poll::Ready(removed.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                drop(removed);
+                assert!(instance_socket(&root, target).exists());
+                qualified_progress(drivers[0].as_ref()).await;
+            }
+            if proof_case == 20 {
+                let mut removed =
+                    Box::pin(drivers[0].remove_replica(identities[target].replica_id));
+                let deadline = Instant::now() + Duration::from_secs(90);
+                loop {
+                    let status = poll_fn(|cx| Poll::Ready(removed.as_mut().poll(cx))).await;
+                    assert!(
+                        status.is_pending(),
+                        "Remove completed before the controlled leave cut: {status:?}"
+                    );
+                    // The callback is not polled while independently checking
+                    // native membership: it cannot race past this cut.
+                    if group_member_count(&instance_socket(&root, 0)).await == target {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Remove did not enter native leave"
+                    );
+                    sleep(Duration::from_millis(5)).await;
+                }
+                drop(removed);
+                assert!(!instance_socket(&root, target).exists());
+                assert!(
+                    drivers[0]
+                        .remove_replica(identities[target].replica_id)
+                        .await
+                        .is_err()
+                );
+                assert!(drivers[0].build_replica(build).await.is_err());
+                for member in 0..target {
+                    assert!(instance_socket(&root, member).exists());
+                    wait_for_build_accounts_removed(&instance_socket(&root, member)).await;
+                }
+                for driver in drivers[..target].iter().rev() {
+                    driver.close().await.unwrap();
+                }
+                fixture.remove().unwrap();
+                return;
+            }
+            drivers[0]
+                .remove_replica(identities[target].replica_id)
+                .await
+                .unwrap();
+            assert!(!instance_socket(&root, target).exists());
+            assert!(!root.join(format!("member-{}-scratch", target + 1)).exists());
+            assert!(
+                root.join(format!("member-{}-data/auto.cnf", target + 1))
+                    .is_file(),
+                "Remove must retain persistent data"
+            );
+            assert!(drivers[target].current_progress().await.is_err());
+            assert_tcp_refuses(sql[target]).unwrap();
+            assert_tcp_refuses(proxy[target]).unwrap();
+            assert_eq!(group_member_count(&instance_socket(&root, 0)).await, target);
+            for member in 0..target {
+                assert!(instance_socket(&root, member).exists());
+                wait_for_build_accounts_removed(&instance_socket(&root, member)).await;
+            }
+            commit_marker(&instance_socket(&root, 0), "primary-after-idle-remove").await;
+            qualified_progress(drivers[0].as_ref()).await;
+            drivers[0]
+                .remove_replica(identities[target].replica_id)
+                .await
+                .unwrap();
+            assert!(
+                drivers[0].build_replica(build.clone()).await.is_err(),
+                "delayed Build cannot reinstall retired authority"
+            );
+            let mut substituted = build;
+            substituted.build_id = OperationId::new("replacement-build");
+            substituted.identity.instance_id = ReplicaInstanceId::new("replacement-instance");
+            substituted.storage_incarnation.as_mut().unwrap().replica =
+                substituted.identity.clone();
+            assert!(
+                drivers[0].build_replica(substituted).await.is_err(),
+                "ReplicaId reuse is fenced in the source lifetime"
+            );
+            for driver in drivers.iter().rev() {
+                driver.close().await.unwrap();
+            }
+            fixture.remove().unwrap();
+            return;
+        }
+        assert!(
+            kuberic_runtime::application::StateProvider::last_committed_lsn(
+                drivers[target].as_ref()
+            )
+            .await
+            .is_err(),
+            "a built secondary's local accepted tail is not provider commitment"
+        );
         // A terminal exact retry is served from the retained complete
         // binding, but only after fresh Primary/authority/boundary proof.
-        Box::pin(drivers[0].build_replica(build)).await.unwrap();
+        Box::pin(drivers[0].build_replica(build.clone()))
+            .await
+            .unwrap();
+        if proof_case == 2 {
+            let mut admin = root_connection(&instance_socket(&root, 0)).await;
+            admin.query_drop("SET GLOBAL sync_binlog=0").await.unwrap();
+            commit_marker(&instance_socket(&root, 0), "invalid-retry-history").await;
+            assert!(drivers[0].build_replica(build).await.is_err());
+            admin.query_drop("SET GLOBAL sync_binlog=1").await.unwrap();
+            assert!(drivers[0].current_progress().await.is_err());
+            admin.disconnect().await.unwrap();
+            for driver in drivers.iter().rev() {
+                driver.close().await.unwrap();
+            }
+            fixture.remove().unwrap();
+            return;
+        }
+        if proof_case == 3 {
+            let mut admin = root_connection(&instance_socket(&root, 0)).await;
+            admin
+                .query_drop(
+                    "CREATE USER 'view_recovery'@'127.0.0.1' IDENTIFIED BY 'ViewRecoverySecret1A'",
+                )
+                .await
+                .unwrap();
+            admin.query_drop("GRANT REPLICATION SLAVE, CONNECTION_ADMIN ON *.* TO 'view_recovery'@'127.0.0.1'").await.unwrap();
+            let mut target_admin = root_connection(&instance_socket(&root, target)).await;
+            target_admin
+                .query_drop("STOP GROUP_REPLICATION")
+                .await
+                .unwrap();
+            target_admin.query_drop("START GROUP_REPLICATION USER='view_recovery', PASSWORD='ViewRecoverySecret1A', DEFAULT_AUTH='caching_sha2_password'").await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !local_secondary_online(&instance_socket(&root, target)).await {
+                assert!(Instant::now() < deadline);
+                sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(group_member_count(&instance_socket(&root, 0)).await, 2);
+            assert!(
+                drivers[0].current_progress().await.is_err(),
+                "same members in a new view cannot reuse completed-idle authority"
+            );
+            assert!(drivers[0].build_replica(build).await.is_err());
+            admin
+                .query_drop("DROP USER 'view_recovery'@'127.0.0.1'")
+                .await
+                .unwrap();
+            admin.disconnect().await.unwrap();
+            target_admin.disconnect().await.unwrap();
+            for driver in drivers.iter().rev() {
+                driver.close().await.unwrap();
+            }
+            fixture.remove().unwrap();
+            return;
+        }
+        let (progress, competing_retry) = tokio::join!(
+            drivers[0].current_progress(),
+            drivers[0].build_replica(build.clone())
+        );
+        assert!(progress.is_ok());
+        assert!(
+            competing_retry.is_err(),
+            "Build retry must use the same fail-fast group permit"
+        );
         let source_gtids = query_gtids(&instance_socket(&root, 0)).await;
         let target_gtids = query_gtids(&instance_socket(&root, target)).await;
         assert!(!source_gtids.entries().is_empty());
@@ -331,6 +661,34 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
             .update_current_replica_set_configuration(source_configuration)
             .await
             .unwrap();
+        if proof_case == 1 {
+            let before = qualified_progress(drivers[0].as_ref()).await;
+            assert_eq!(
+                kuberic_runtime::application::StateProvider::last_committed_lsn(
+                    drivers[0].as_ref()
+                )
+                .await
+                .unwrap(),
+                before
+            );
+            drivers[target]
+                .update_epoch(Epoch::new(0, 2))
+                .await
+                .unwrap();
+            assert!(drivers[0].current_progress().await.is_err());
+            assert!(
+                kuberic_runtime::application::StateProvider::last_committed_lsn(
+                    drivers[0].as_ref()
+                )
+                .await
+                .is_err()
+            );
+            for driver in drivers.iter().rev() {
+                driver.close().await.unwrap();
+            }
+            fixture.remove().unwrap();
+            return;
+        }
         accepted_source_configuration = if omit_source_progress {
             configuration_without_remote_progress(
                 epoch,
@@ -387,6 +745,205 @@ async fn run_custom_build_fixture(interrupt_second: bool, omit_source_progress: 
                 .await
                 .unwrap();
         }
+    }
+
+    commit_marker(&instance_socket(&root, 0), "participant-scope-refresh").await;
+    let refreshed_peer = configuration(
+        epoch,
+        1,
+        &[
+            ReplicaRole::Primary,
+            ReplicaRole::ActiveSecondary,
+            ReplicaRole::ActiveSecondary,
+        ],
+        &drivers,
+        &identities,
+        &sessions,
+        &storage,
+        &[0, 1, 2],
+    )
+    .await;
+    let retained_pair = qualified_progress(drivers[0].as_ref()).await;
+    drivers[1]
+        .update_current_replica_set_configuration(refreshed_peer)
+        .await
+        .unwrap();
+    assert!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .is_err(),
+        "participant-only full configuration scope change must invalidate paired proof reuse"
+    );
+    assert_eq!(qualified_progress(drivers[0].as_ref()).await, retained_pair);
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        retained_pair
+    );
+    let (current, competing_provider) = tokio::join!(
+        drivers[0].current_progress(),
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref()),
+    );
+    assert_eq!(current.unwrap(), retained_pair);
+    assert!(
+        competing_provider.is_err(),
+        "simultaneous proof callbacks cannot acquire opposing leases"
+    );
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        retained_pair
+    );
+    let refreshed_source = configuration(
+        epoch,
+        0,
+        &[
+            ReplicaRole::Primary,
+            ReplicaRole::ActiveSecondary,
+            ReplicaRole::ActiveSecondary,
+        ],
+        &drivers,
+        &identities,
+        &sessions,
+        &storage,
+        &[0, 1, 2],
+    )
+    .await;
+    qualified_progress(drivers[0].as_ref()).await;
+    drivers[0]
+        .update_current_replica_set_configuration(refreshed_source)
+        .await
+        .unwrap();
+    assert!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .is_err(),
+        "source-only full configuration scope change must invalidate paired proof reuse"
+    );
+    let fresh_pair = qualified_progress(drivers[0].as_ref()).await;
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+            .await
+            .unwrap(),
+        fresh_pair
+    );
+    if proof_case == 4 {
+        drivers[2].close().await.unwrap();
+        assert!(drivers[0].current_progress().await.is_err());
+        assert!(
+            kuberic_runtime::application::StateProvider::last_committed_lsn(drivers[0].as_ref())
+                .await
+                .is_err()
+        );
+        assert!(instance_socket(&root, 0).exists());
+        assert!(instance_socket(&root, 1).exists());
+        for driver in drivers.iter().rev() {
+            driver.close().await.unwrap();
+        }
+        fixture.remove().unwrap();
+        return;
+    }
+
+    if proof_case == 5 {
+        let committed = qualified_progress(drivers[0].as_ref()).await;
+        let next = Epoch::new(0, 2);
+        drivers[0].update_epoch(next).await.unwrap();
+        kuberic_runtime::application::StateProvider::update_epoch(
+            drivers[0].as_ref(),
+            next,
+            committed,
+        )
+        .await
+        .unwrap();
+        let mut admin = root_connection(&instance_socket(&root, 0)).await;
+        admin.query_drop("SET GLOBAL sync_binlog=0").await.unwrap();
+        drivers[0]
+            .change_role(next, ReplicaRole::Primary)
+            .await
+            .unwrap();
+        admin.query_drop("SET GLOBAL sync_binlog=1").await.unwrap();
+        assert!(
+            kuberic_runtime::application::StateProvider::update_epoch(
+                drivers[0].as_ref(),
+                next,
+                committed
+            )
+            .await
+            .is_err(),
+            "native latch must fence epoch validation before any progress callback copies it"
+        );
+        admin.disconnect().await.unwrap();
+        for driver in drivers.iter().rev() {
+            driver.close().await.unwrap();
+        }
+        fixture.remove().unwrap();
+        return;
+    }
+
+    if omit_source_progress {
+        let committed = qualified_progress(drivers[0].as_ref()).await;
+        drivers[0].update_epoch(Epoch::new(0, 2)).await.unwrap();
+        kuberic_runtime::application::StateProvider::update_epoch(
+            drivers[0].as_ref(),
+            Epoch::new(0, 2),
+            committed,
+        )
+        .await
+        .unwrap();
+        assert!(
+            kuberic_runtime::application::StateProvider::update_epoch(
+                drivers[0].as_ref(),
+                Epoch::new(0, 2),
+                committed + 1
+            )
+            .await
+            .is_err()
+        );
+        drivers[0].update_epoch(Epoch::new(0, 3)).await.unwrap();
+        assert!(
+            kuberic_runtime::application::StateProvider::update_epoch(
+                drivers[0].as_ref(),
+                Epoch::new(0, 3),
+                committed
+            )
+            .await
+            .is_err(),
+            "an unrelated older proof cannot authorize the next epoch"
+        );
+    } else {
+        let mut peer_admin = root_connection(&instance_socket(&root, 1)).await;
+        peer_admin
+            .query_drop("SET GLOBAL sync_binlog=0")
+            .await
+            .unwrap();
+        assert!(drivers[0].current_progress().await.is_err());
+        peer_admin
+            .query_drop("SET GLOBAL sync_binlog=1")
+            .await
+            .unwrap();
+        assert!(
+            drivers[0].current_progress().await.is_err(),
+            "restored tuple cannot requalify peer history"
+        );
+        peer_admin.disconnect().await.unwrap();
+        let mut source_admin = root_connection(&instance_socket(&root, 0)).await;
+        source_admin
+            .query_drop("SET GLOBAL sync_binlog=0")
+            .await
+            .unwrap();
+        commit_marker(&instance_socket(&root, 0), "unqualified-history").await;
+        assert!(drivers[0].current_progress().await.is_err());
+        source_admin
+            .query_drop("SET GLOBAL sync_binlog=1")
+            .await
+            .unwrap();
+        assert!(
+            drivers[0].current_progress().await.is_err(),
+            "restored tuple cannot requalify source history"
+        );
+        source_admin.disconnect().await.unwrap();
     }
 
     for driver in drivers.iter().rev() {
@@ -486,12 +1043,7 @@ async fn configuration(
         replicas.push(active_information(
             index,
             roles[index],
-            drivers[index]
-                .current_progress()
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("progress for member {index} while local is {local}: {error:?}")
-                }),
+            qualified_progress(drivers[index].as_ref()).await,
             drivers,
             identities,
             sessions,
@@ -670,6 +1222,20 @@ async fn commit_marker(socket: &Path, marker: &str) {
         .await
         .unwrap();
     connection.disconnect().await.unwrap();
+}
+
+async fn qualified_progress(driver: &MysqlPublicV1Replicator) -> i64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, driver.current_progress()).await {
+            Ok(Ok(progress)) => return progress,
+            Ok(Err(RuntimeError::ReconfigurationPending)) => sleep(Duration::from_millis(20)).await,
+            Ok(Err(error)) => panic!("qualified progress rejected authority/history: {error:?}"),
+            Err(_) => {
+                panic!("qualified progress did not become available before the fixed deadline")
+            }
+        }
+    }
 }
 
 async fn root_connection(socket: &Path) -> Conn {

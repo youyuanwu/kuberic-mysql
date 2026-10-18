@@ -16,11 +16,11 @@ use kuberic_mysql::core::{
 };
 use kuberic_mysql::service::{
     ApplicationCredential, AttemptContext, CanonicalViewId, ControlCredential,
-    ControlCredentialRole, MysqlAccessIntent, MysqlFreshMemberCredentials, MysqlFreshMemberInput,
-    MysqlHandoffBoundary, MysqlHandoffPublicationProof, MysqlInstanceConfig, MysqlMemberConfig,
-    MysqlMemberIndex, MysqlOperationIdentity, MysqlOperationTimeouts, MysqlReplicaConfiguration,
-    MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole, MysqlReplicaTarget, MysqlReplicator,
-    MysqlTerminalState, MysqlTopologyConfig,
+    ControlCredentialRole, MemberNativeEvidence, MysqlAccessIntent, MysqlFreshMemberCredentials,
+    MysqlFreshMemberInput, MysqlHandoffBoundary, MysqlHandoffPublicationProof, MysqlInstanceConfig,
+    MysqlMemberConfig, MysqlMemberIndex, MysqlOperationIdentity, MysqlOperationTimeouts,
+    MysqlReplicaConfiguration, MysqlReplicaEpoch, MysqlReplicaIdentity, MysqlReplicaRole,
+    MysqlReplicaTarget, MysqlReplicator, MysqlTerminalState, MysqlTopologyConfig,
 };
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
@@ -559,33 +559,67 @@ impl ReplicatorLiveFixture {
         let mut trace = Vec::new();
         create_qualification_schema(&self.members[0].socket).await?;
         self.application_schema_created = true;
-        let mut publication_history = None;
-        let mut publication_view = None;
-        for index in 0..3 {
-            let operation = self.members[index].operation("initial-publication-history");
-            self.members[index]
-                .engine_mut()
-                .read_progress(operation)
+        let publication_deadline =
+            (Instant::now() + Duration::from_secs(10)).min(self.attempt.work_deadline());
+        let mut previous = Vec::new();
+        loop {
+            let mut observations = Vec::new();
+            for index in 0..3 {
+                let operation = self.members[index].operation("initial-publication-history");
+                let progress = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(publication_deadline),
+                    self.members[index].engine_mut().read_progress(operation),
+                )
                 .await
+                .map_err(|_| "schema publication observation deadline expired".to_owned())?
                 .map_err(|error| error.to_string())?;
-            let evidence = self.members[index]
-                .engine()
-                .native_evidence()
-                .cloned()
-                .ok_or_else(|| "initial publication evidence was missing".to_owned())?;
-            if let Some(expected) = publication_history.as_ref() {
-                if evidence.executed() != expected
-                    || publication_view.as_ref() != Some(evidence.view())
-                {
-                    return Err(
-                        "schema DDL was not present in one exact common publication view/history"
-                            .to_owned(),
-                    );
+                if !matches!(progress.progress(), ProgressProjection::Projectable(_)) {
+                    return Err("schema publication history was non-projectable".to_owned());
                 }
-            } else {
-                publication_history = Some(evidence.executed().clone());
-                publication_view = Some(evidence.view().clone());
+                let evidence = self.members[index]
+                    .engine()
+                    .native_evidence()
+                    .cloned()
+                    .ok_or_else(|| "initial publication evidence was missing".to_owned())?;
+                observations.push(evidence);
             }
+            if Instant::now() >= publication_deadline {
+                return Err("schema publication observation deadline expired".to_owned());
+            }
+            if observations
+                .iter()
+                .any(|e| e.view().id().as_str() != formation.final_view())
+                || observations
+                    .iter()
+                    .any(|e| e.view() != observations[0].view())
+            {
+                return Err("schema publication left the exact accepted formation view".to_owned());
+            }
+            if previous.iter().zip(&observations).any(
+                |(prior, next): (&MemberNativeEvidence, _)| {
+                    prior.authority() != next.authority()
+                        || !prior.executed().is_subset_of(next.executed())
+                },
+            ) {
+                return Err("schema publication history regressed or owner changed".to_owned());
+            }
+            if observations
+                .iter()
+                .all(|e| e.executed() == observations[0].executed())
+            {
+                break;
+            }
+            if observations.iter().any(|e| {
+                !e.executed().is_subset_of(observations[0].executed())
+                    && !observations[0].executed().is_subset_of(e.executed())
+            }) {
+                return Err("schema publication histories diverged".to_owned());
+            }
+            if Instant::now() >= publication_deadline {
+                return Err("schema DDL did not converge to one exact common publication history before deadline".to_owned());
+            }
+            previous = observations;
+            sleep(Duration::from_millis(20)).await;
         }
         push_trace(
             &mut trace,

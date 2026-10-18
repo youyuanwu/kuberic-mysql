@@ -25,7 +25,7 @@ per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
 infrastructure, not production topology owners. The normal crate surface
 includes the public adapter against `kuberic-runtime` pinned exactly to commit
-`f56949996b366b14c925339ac2e859ca2fbaf637`; no private managed lifecycle,
+`be4f83b43567c59f48472025d55dd731efecc4c6`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
 ## Status
@@ -77,8 +77,9 @@ require an epoch barrier. Native bootstrap, join, coherent view readback, and
 primary transfer receive credit only from exact request-bound member-effect
 receipts. Its ordinary generic Build and removal entry points validate current
 primary authority, target identity, operation identity, and exact retries,
-then return a typed unsupported outcome; the bounded Public V1 custom-Build
-coordinator described below owns fresh-secondary transfer instead.
+then return a typed unsupported outcome; the bounded Public V1 custom
+coordinators described below own fresh-secondary Build and completed-idle
+retirement instead.
 Successful close and abort retain their exact terminal outcome for idempotent
 retry. Changed retries conflict, unrelated post-terminal work rejects, and an
 unsettled abort remains terminal without claiming complete containment. Abort
@@ -104,10 +105,17 @@ After successful `Replicator::open`, the adapter retains `0` only from the
 explicit `OpenMode::New` + freshly initialized empty owner + closed-access
 proof; the pinned host can therefore refresh applied and committed progress
 before role/configuration. Unknown pre-configuration progress still fails
-closed. Later `current_progress` retains its exact qualified scalar and
-`last_committed_lsn` returns that same observation, while provider epoch,
-copy-state, and data-loss surfaces validate exactly or fail closed without
-application bytes or private durable state. It supports only fresh
+closed. Later primary `current_progress` independently proves its frozen,
+complete GTID boundary on **every applicable public voter**, with exact live
+owner/configuration/session/storage/view checks. This is stronger than a write
+quorum, not a relabeling of local execution or a native statistics column.
+Secondary progress remains qualified local durable acceptance; it does not
+establish provider commitment. `last_committed_lsn` revalidates the same
+independently proved public sampling pair, without advancing it because of
+intervening writes or catch-up callbacks. An unproved secondary provider read
+rejects. Provider epoch input requires a scoped immediate-predecessor proof
+or the separately proved fresh empty boundary; copy/data-loss methods reject.
+There are no application bytes or private durable state. It supports only fresh
 `OpenMode::New` ownership,
 an initial one-member local-primary bootstrap, scalar progress publication,
 same-role epoch transitions, fresh-secondary Build through the direct custom
@@ -151,14 +159,49 @@ can remain technically authenticatable until its replicated `DROP USER`
 commits; the Build group remains blocked until absence is proved or reset is
 required.
 
+`PrimaryReplicator::remove_replica` retires only an exactly retained,
+successfully built target that is still publicly idle and nonvoting. Native
+membership alone is not public voting admission. Remove verifies recovery
+account/grant absence, proves the exact next native view on every survivor,
+retires the target's exact process/socket/scratch generation, and invalidates
+its endpoint, pending receipts, progress, and old Build completion authority.
+Persistent data is **not deleted**. The source and admitted peers remain owned
+and operational; active membership removal belongs to configuration updates.
+An exact successful retry rechecks retained containment and live survivor
+authority/account/view evidence. Unknown, activated, stale, or substituted
+targets reject. Numeric replica-ID reuse is fenced for that source lifetime.
+
+Remove uses a fresh bounded child of current lifetime owners, not the old
+Build deadline. Dropping it before effects leaves the completed Build
+retryable. After effects start, cancellation/error retains target ownership,
+retires its exact generation and registry entry, and quarantines the group;
+unproved cleanup never becomes success. That state requires reset, not a
+durable recovery journal or a success-shaped retry.
+
+Commitment qualification is limited to fresh exclusively owned processes
+continuously running the enforced Oracle profile: flush-at-commit and
+sync-binlog `1`, enabled binlogging/replica updates, and `ABORT_SERVER` binlog
+error policy. Effective settings are read in the native bracket. An observed
+violation immediately invalidates that owner lifetime, even if the rest of
+the read is cancelled/fails or settings are
+restored. Privileged external settings/history mutation is outside this
+authority. Missing/lagging voters and unsupported configuration histories
+reject; no missing evidence is replaced by zero. Exact additive Build
+transitions cover both previous/proposed voter sets, including source-first
+admission while peer callbacks remain outstanding. Omitted scalar input alone
+cannot establish commitment or quiet-copy catch-up.
+
 Kuberic callback order is adapted without weakening the native engine order.
 Ordinary formed members complete Epoch, then Role, then Configuration; role is
 observed before configuration credit. A controller-composed source swap runs
 Revoke, Epoch, refreshed Configuration staging, CatchUp, Role/native transfer,
 then application Role, without inventing a `previous` callback value. Catch-up
-captures a fresh qualified local boundary on every wait while a current engine
-configuration exists; only the intentional post-epoch gap reuses its cached
-pre-epoch boundary. Before a newer epoch mutates the engine, any prepared or
+captures a fresh qualified local boundary and independent all-voter proof
+while a current engine configuration exists. A cached post-epoch scalar is
+not commitment authority: a Primary without an applicable native
+configuration cannot complete that wait or publish committed progress.
+Already-formed planned-swap translation is not a claim of qualified custom
+controller cutover through that gap. Before a newer epoch mutates the engine, any prepared or
 published proxy generation is physically revoked through the native-backed
 containment path. Binding-preserving monotonic progress refresh, including
 omissions that resolve to retained values, avoids another native configuration
@@ -186,12 +229,12 @@ the generation available for a later runtime regrant. Application `None` or
 secondary callbacks retain explicit generation revocation behavior.
 
 This bounded adapter deliberately rejects `OpenMode::Existing`, Clone/reseed,
-Remove, data-loss acceptance,
+active-member Remove, data-loss acceptance,
 non-projectable or unproved catch-up, and automated/unplanned failover. It does
 not claim cross-host, TLS, Kubernetes, durable interrupted-effect recovery, or
 production readiness. Its custom Build path is process-local and follows the
 direct PostgreSQL example shape. Production-controller dispatch into a custom
-replicator remains unsupported because the controller's target inbound
+replicator remains separately unsupported because the controller's target inbound
 authority installation uses crate-private runtime control.
 
 The application endpoint is a generation-fenced plaintext loopback MySQL
@@ -362,14 +405,24 @@ CARGO_BUILD_JOBS=1 cargo clippy --locked --offline \
   -p kuberic-mysql --lib -- -D warnings
 ```
 
-The resource-conscious live custom-Build gate forms one fresh Primary and
-builds two fresh secondaries. It covers explicit progress, exact retained
-omission, and dropped-Build containment:
+The serial live custom-trait gate forms one fresh Primary and builds fresh
+secondaries. It covers explicit/omitted progress, independent commitment and
+provider pairing, stale authority/settings/view rejection, first/second idle
+Remove with retained data and surviving writers, exact retries, replacement
+incarnations, and controlled Build/Remove future-drop containment:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
   --test kuberic_public_v1_build_live_mysql_8_4_11
+```
+
+Production-shared progress/Remove admission, retirement ledger, cleanup
+checkpoint, deadline and contention reducers also run without MySQL:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql --lib -E 'test(/service::kuberic::/) | test(/idle_remove_tests/)'
 ```
 
 The bounded real-server gateway compatibility gate can be rerun independently:
@@ -440,6 +493,10 @@ Oracle package and pinned nextest binary, download the archive, and run disjoint
 hash partitions (`hash:1/4` through `hash:4/4`) in parallel without recompiling.
 The `ci` profile keeps tests serial within each runner. A failed partition does
 not cancel the others.
+
+Fixture allocation, including crate-private native qualification, creates its
+parents explicitly. Archive consumers do not need compilation to have created
+a checkout-local `target` directory.
 
 To reproduce one CI partition locally:
 

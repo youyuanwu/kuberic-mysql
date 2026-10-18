@@ -3,6 +3,10 @@
 use core::future::Future;
 use core::str::FromStr;
 use std::num::NonZeroU64;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
 
 use mysql_async::prelude::Queryable;
@@ -31,6 +35,7 @@ pub(crate) struct OwnedControlTarget {
     socket: UnixSocketPath,
     member_index: MysqlMemberIndex,
     member: MysqlMemberConfig,
+    durability: Arc<AtomicBool>,
 }
 
 pub(crate) async fn member_bootstrap(
@@ -440,6 +445,7 @@ async fn read_member_view_connected(
     }
     let opening_view = query_view_id(session, deadline).await?;
     let opening_members = query_members(session, deadline).await?;
+    let opening_durability = read_durable_profile(session, deadline).await?;
     let executed: String = query_one(
         session,
         "SELECT @@GLOBAL.gtid_executed",
@@ -463,6 +469,7 @@ async fn read_member_view_connected(
     .await?;
     let closing_view = query_view_id(session, deadline).await?;
     let closing_members = query_members(session, deadline).await?;
+    let closing_durability = read_durable_profile(session, deadline).await?;
     if closing_server_uuid != authority.local().server_uuid().as_str()
         || closing_view != opening_view
         || closing_members != opening_members
@@ -529,7 +536,168 @@ async fn read_member_view_connected(
             ControlStage::ReadExecutedHistory,
         ))
     })?;
-    MemberNativeEvidence::new_with_purged(authority.clone(), view, executed, purged)
+    let evidence =
+        MemberNativeEvidence::new_with_purged(authority.clone(), view, executed, purged)?;
+    Ok(if opening_durability && closing_durability {
+        evidence.with_durable_profile()
+    } else {
+        evidence
+    })
+}
+
+async fn read_durable_profile(
+    session: &mut MysqlControlSession,
+    deadline: Instant,
+) -> Result<bool, MysqlTopologyError> {
+    observe_durable_profile(
+        &session.durability,
+        query_one_mysql(
+            &mut session.connection,
+            "SELECT @@GLOBAL.innodb_flush_log_at_trx_commit, @@GLOBAL.sync_binlog, \
+             @@GLOBAL.log_bin, @@GLOBAL.log_replica_updates, @@GLOBAL.binlog_error_action",
+            deadline,
+            ControlStage::ReadExecutedHistory,
+        ),
+    )
+    .await
+}
+
+async fn observe_durable_profile(
+    qualification: &AtomicBool,
+    query: impl Future<Output = Result<(u64, u64, u64, u64, String), MysqlTopologyError>>,
+) -> Result<bool, MysqlTopologyError> {
+    let (flush, sync, binlog, updates, error_action) = query.await?;
+    let qualified =
+        flush == 1 && sync == 1 && binlog == 1 && updates == 1 && error_action == "ABORT_SERVER";
+    // This is owner-lifetime state, not a property of a successful enclosing
+    // observation. Publish a violation before any further await or disconnect.
+    qualification.fetch_and(qualified, Ordering::AcqRel);
+    Ok(qualification.load(Ordering::Acquire))
+}
+
+#[cfg(test)]
+mod durability_lifetime_tests {
+    use super::*;
+
+    fn tuple(valid: bool) -> (u64, u64, u64, u64, String) {
+        (1, u64::from(valid), 1, 1, "ABORT_SERVER".into())
+    }
+
+    struct FailedDisconnect {
+        stall: bool,
+    }
+    impl ControlSession for FailedDisconnect {
+        async fn execute(
+            &mut self,
+            _: &str,
+            _: Instant,
+            _: ControlStage,
+        ) -> Result<(), MysqlTopologyError> {
+            unreachable!("only disconnect is scripted")
+        }
+        async fn query(
+            &mut self,
+            _: &str,
+            _: Instant,
+            _: ControlStage,
+        ) -> Result<ControlQueryResult, MysqlTopologyError> {
+            unreachable!("only disconnect is scripted")
+        }
+        async fn disconnect(self, _: Instant) -> Result<(), MysqlTopologyError> {
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
+            Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::ReadExecutedHistory,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_opening_tuple_survives_followup_error_and_disconnect_failure() {
+        for disconnect_failure in [false, true] {
+            let owner = Arc::new(AtomicBool::new(true));
+            let session = owner.clone();
+            assert!(
+                !observe_durable_profile(&session, std::future::ready(Ok(tuple(false))))
+                    .await
+                    .unwrap()
+            );
+            let primary = if disconnect_failure {
+                Ok(())
+            } else {
+                Err(MysqlTopologyError::ControlProtocol(
+                    ControlStage::ReadExecutedHistory,
+                ))
+            };
+            assert!(
+                disconnect(
+                    FailedDisconnect { stall: false },
+                    primary,
+                    Instant::now() + std::time::Duration::from_secs(1)
+                )
+                .await
+                .is_err()
+            );
+            assert!(!owner.load(Ordering::Acquire));
+            assert!(
+                !observe_durable_profile(&owner, std::future::ready(Ok(tuple(true))))
+                    .await
+                    .unwrap(),
+                "restoring a tuple after failed observation cannot requalify history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_profile_survives_drop_after_opening_and_before_disconnect_completion() {
+        for before_disconnect in [false, true] {
+            let owner = Arc::new(AtomicBool::new(true));
+            let session = owner.clone();
+            let mut read = Box::pin(async move {
+                observe_durable_profile(&session, std::future::ready(Ok(tuple(false)))).await?;
+                if before_disconnect {
+                    // A complete closing bracket still cannot erase the
+                    // already observed lifetime violation.
+                    observe_durable_profile(&session, std::future::ready(Ok(tuple(true)))).await?;
+                    disconnect(FailedDisconnect { stall: true }, Ok(()), Instant::now()).await
+                } else {
+                    std::future::pending::<Result<(), MysqlTopologyError>>().await
+                }
+            });
+            let status =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(status.is_pending());
+            assert!(
+                !owner.load(Ordering::Acquire),
+                "violation is published before the next await"
+            );
+            drop(read);
+            assert!(
+                !observe_durable_profile(&owner, std::future::ready(Ok(tuple(true))))
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_failed_read_does_not_publish_success_or_invent_a_violation() {
+        let owner = Arc::new(AtomicBool::new(true));
+        assert!(
+            observe_durable_profile(&owner, std::future::ready(Ok(tuple(true))))
+                .await
+                .unwrap()
+        );
+        let result = disconnect(
+            FailedDisconnect { stall: false },
+            Ok::<(), MysqlTopologyError>(()),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(owner.load(Ordering::Acquire));
+    }
 }
 
 async fn validate_member_product(
@@ -814,7 +982,13 @@ impl OwnedControlTarget {
             socket,
             member_index,
             member,
+            durability: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    pub(crate) fn with_durability_qualification(mut self, qualification: Arc<AtomicBool>) -> Self {
+        self.durability = qualification;
+        self
     }
 
     pub(crate) fn revalidate_socket(&self) -> Result<(), MemberTransitionError> {
@@ -877,6 +1051,7 @@ struct MysqlControlConnector;
 
 struct MysqlControlSession {
     connection: Conn,
+    durability: Arc<AtomicBool>,
 }
 
 pub(crate) async fn provision_accounts(
@@ -2296,7 +2471,10 @@ impl ControlConnector for MysqlControlConnector {
             ))
             .user(Some("root".to_owned()));
         let connection = bounded(deadline, ControlStage::Connect, Conn::new(options)).await?;
-        Ok(MysqlControlSession { connection })
+        Ok(MysqlControlSession {
+            connection,
+            durability: target.durability.clone(),
+        })
     }
 }
 

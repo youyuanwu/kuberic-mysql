@@ -88,6 +88,7 @@ pub struct MysqlInstanceManager {
     owner_generation: u64,
     process_generation: u64,
     cleanup_quarantined: bool,
+    native_durability_qualified: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Unforgeable in-process ownership token for one exact MySQL child generation.
@@ -116,6 +117,9 @@ impl MysqlInstanceManager {
             owner_generation: INSTANCE_OWNER_SERIAL.fetch_add(1, Ordering::Relaxed),
             process_generation: 0,
             cleanup_quarantined: false,
+            native_durability_qualified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )),
         }
     }
 
@@ -123,6 +127,20 @@ impl MysqlInstanceManager {
     #[must_use]
     pub const fn state(&self) -> MysqlInstanceState {
         self.state
+    }
+
+    pub(crate) fn native_durability_qualified(&self) -> bool {
+        self.native_durability_qualified.load(Ordering::Acquire)
+    }
+
+    fn retain_native_durability(&mut self, evidence: MemberNativeEvidence) -> MemberNativeEvidence {
+        self.native_durability_qualified
+            .fetch_and(evidence.has_durable_profile(), Ordering::AcqRel);
+        if self.native_durability_qualified() {
+            evidence
+        } else {
+            evidence.without_durable_profile()
+        }
     }
 
     /// Returns the immutable validated configuration.
@@ -773,7 +791,9 @@ impl MysqlInstanceManager {
     ) -> Result<MemberNativeEvidence, MemberTransitionError> {
         let target = self.prepare_member_effect_target(authority, attempt)?;
         let deadline = Self::member_effect_deadline(attempt)?;
-        crate::service::control::read_member_view(target, authority, &deadline).await
+        let evidence =
+            crate::service::control::read_member_view(target, authority, &deadline).await?;
+        Ok(self.retain_native_durability(evidence))
     }
 
     /// Reads one request-bound coherent native member view and returns an
@@ -789,6 +809,7 @@ impl MysqlInstanceManager {
         let evidence =
             crate::service::control::read_member_view(target.clone(), &authority, &deadline)
                 .await?;
+        let evidence = self.retain_native_durability(evidence);
         let final_binding = self.revalidate_member_effect_binding(&authority)?;
         target.revalidate_socket()?;
         MemberEffectReceipt::for_request(
@@ -820,6 +841,7 @@ impl MysqlInstanceManager {
             let current =
                 crate::service::control::read_member_view(target.clone(), &authority, &deadline)
                     .await?;
+            let current = containment.instance.retain_native_durability(current);
             if current != predecessor {
                 return Err(MemberTransitionError::View(
                     crate::service::MemberViewError::StaleView,
@@ -875,8 +897,10 @@ impl MysqlInstanceManager {
                 &deadline,
             )
             .await?;
-            crate::service::control::read_member_view(target.clone(), &authority, &deadline)
-                .await?;
+            let evidence =
+                crate::service::control::read_member_view(target.clone(), &authority, &deadline)
+                    .await?;
+            containment.instance.retain_native_durability(evidence);
             let final_binding = containment.revalidate_binding(&authority)?;
             target.revalidate_socket()?;
             BackendConnectionReceipt::new(
@@ -1251,7 +1275,8 @@ impl MysqlInstanceManager {
             socket,
             self.config.member_index(),
             self.config.member().clone(),
-        ))
+        )
+        .with_durability_qualification(self.native_durability_qualified.clone()))
     }
 
     pub(crate) fn topology_binding(
@@ -1414,6 +1439,18 @@ impl MysqlInstanceManager {
         &mut self,
         generation: &MysqlBuildAbortGeneration,
     ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
+        let deadline = checked_deadline(
+            self.config.timeouts().shutdown(),
+            LifecycleOperation::Shutdown,
+        )?;
+        self.retire_owned_generation_before(generation, deadline)
+    }
+
+    pub(crate) fn retire_owned_generation_before(
+        &mut self,
+        generation: &MysqlBuildAbortGeneration,
+        deadline: Instant,
+    ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
         if generation.owner_generation != self.owner_generation
             || generation.process_generation != self.process_generation
             || generation.process_id != self.child.as_ref().map(Child::id)
@@ -1430,10 +1467,12 @@ impl MysqlInstanceManager {
 
         let mut complete = true;
         if let Some(child) = self.child.as_mut() {
-            if terminate_and_reap(child, self.config.timeouts().shutdown()).is_err() {
+            let deadline = deadline.min(checked_deadline(
+                self.config.timeouts().shutdown(),
+                LifecycleOperation::Shutdown,
+            )?);
+            if terminate_and_reap_before(child, deadline).is_err() {
                 complete = false;
-                let _ = child.kill();
-                let _ = child.wait();
             }
             if child.try_wait().ok().flatten().is_some() {
                 self.child = None;
@@ -1453,7 +1492,9 @@ impl MysqlInstanceManager {
         if self.child.is_none() {
             if self.revalidate_roots().is_ok() && !self.cleanup_quarantined {
                 if let Some(scratch) = self.scratch_root.as_ref() {
-                    if remove_owned_root(scratch, LifecycleOperation::ScratchCleanup).is_ok() {
+                    if ensure_cleanup_deadline(deadline, LifecycleOperation::ScratchCleanup).is_ok()
+                        && remove_owned_root(scratch, LifecycleOperation::ScratchCleanup).is_ok()
+                    {
                         self.scratch_root = None;
                     } else {
                         complete = false;
@@ -1794,6 +1835,7 @@ async fn poll_member_receipt(
         }
         let evidence =
             crate::service::control::read_member_view(target.clone(), &authority, deadline).await?;
+        let evidence = containment.instance.retain_native_durability(evidence);
         let final_binding = containment.revalidate_binding(&authority)?;
         target.revalidate_socket()?;
         let receipt = if build_cross_parent {
@@ -2297,6 +2339,24 @@ mod tests {
             authority,
         };
 
+        let mut substituted = generation.clone();
+        substituted.process_generation += 1;
+        assert!(manager.force_retire_owned_generation(&substituted).is_err());
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        let started = Instant::now();
+        let expired = manager
+            .retire_owned_generation_before(&generation, started)
+            .unwrap();
+        assert!(!expired.is_complete());
+        assert!(!expired.process_absent());
+        assert!(
+            manager.child.is_some(),
+            "unreaped ownership must be retained"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "expired cleanup must not block in wait()"
+        );
         let receipt = manager.force_retire_owned_generation(&generation).unwrap();
         assert!(receipt.process_absent());
         assert_eq!(receipt.retired_process_id(), Some(pid));
