@@ -158,6 +158,15 @@ pub fn assert_process_absent(pid: u32) -> Result<(), String> {
 }
 
 pub fn assert_no_application_store(root: &Path) -> Result<(), String> {
+    assert_no_application_store_with_native_schemas(root, &[])
+}
+
+/// Native fixture SQL schemas are user data, not orchestration stores. Only
+/// exact top-level directory names are exempted; their contents are scanned.
+pub fn assert_no_application_store_with_native_schemas(
+    root: &Path,
+    native_schemas: &[&str],
+) -> Result<(), String> {
     if !root.exists() {
         return Ok(());
     }
@@ -173,6 +182,12 @@ pub fn assert_no_application_store(root: &Path) -> Result<(), String> {
                 )
             })?;
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            let native_schema = directory == root
+                && native_schemas.contains(&name.as_str())
+                && entry
+                    .file_type()
+                    .map_err(|error| error.to_string())?
+                    .is_dir();
             for forbidden in [
                 "kuberic",
                 "journal",
@@ -183,7 +198,7 @@ pub fn assert_no_application_store(root: &Path) -> Result<(), String> {
                 "operation-store",
                 "operation_store",
             ] {
-                if name.contains(forbidden) {
+                if !native_schema && name.contains(forbidden) {
                     return Err(format!(
                         "unexpected application durability artifact {}",
                         entry.path().display()

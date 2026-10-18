@@ -330,7 +330,7 @@ impl MysqlInstanceManager {
             }
             Err(prior) => {
                 self.state = MysqlInstanceState::Faulted;
-                if self.child.is_some() {
+                if self.child.is_some() || self.config.retain_containment_evidence() {
                     return Err(prior);
                 }
                 match self.cleanup_all_roots() {
@@ -2733,6 +2733,46 @@ mod tests {
             drop(manager);
             fs::remove_dir_all(parent).unwrap();
         }
+    }
+
+    #[test]
+    fn failed_hosted_initialization_keeps_evidence_without_authorizing_reuse() {
+        let parent = std::env::temp_dir().join(format!(
+            "fi-{}-{}",
+            std::process::id(),
+            CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = MysqlInstanceConfig::new(
+            "/usr/bin/sleep",
+            "/usr/bin/env",
+            parent.join("d"),
+            parent.join("s"),
+            MysqlOperationTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .with_retained_containment_evidence();
+        let mut manager = MysqlInstanceManager::new(config);
+        // A real product-verification rejection, not a simulated native success.
+        assert!(manager.initialize().is_err());
+        assert_eq!(manager.state, MysqlInstanceState::Faulted);
+        assert!(parent.join("d").is_dir());
+        assert!(parent.join("s/version.out").is_file());
+        assert!(manager.initialize().is_err());
+        manager
+            .contain_before(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert!(parent.join("s.retained/version.out").is_file());
+        assert!(parent.join("d").is_dir());
+        drop(manager);
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[tokio::test]

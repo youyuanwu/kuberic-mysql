@@ -13,6 +13,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,7 +48,8 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
 
 use live_support::{
-    APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_process_absent, assert_tcp_refuses,
+    APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_no_application_store,
+    assert_no_application_store_with_native_schemas, assert_process_absent, assert_tcp_refuses,
     preflight_oracle_mysql_8_4_11,
 };
 
@@ -63,6 +65,150 @@ fn hosted_new_factory_initial_primary_progress_and_native_access() {
         let cleanup = fixture.shutdown().await;
         result.and(cleanup)
     });
+}
+
+#[test]
+fn native_schema_allowlist_still_rejects_nested_or_sibling_private_stores() {
+    let root = FixtureRoot::new("hosted-scan").unwrap();
+    let schema = root.path().join("kuberic_proxy_qualification");
+    std::fs::create_dir(&schema).unwrap();
+    std::fs::write(schema.join("hosted.ibd"), b"fixture-native-data").unwrap();
+    assert_no_application_store_with_native_schemas(root.path(), &["kuberic_proxy_qualification"])
+        .unwrap();
+    std::fs::write(schema.join("receipt.json"), b"forbidden").unwrap();
+    assert!(
+        assert_no_application_store_with_native_schemas(
+            root.path(),
+            &["kuberic_proxy_qualification"]
+        )
+        .is_err()
+    );
+    std::fs::remove_file(schema.join("receipt.json")).unwrap();
+    std::fs::write(root.path().join("kuberic-metadata.json"), b"forbidden").unwrap();
+    assert!(
+        assert_no_application_store_with_native_schemas(
+            root.path(),
+            &["kuberic_proxy_qualification"]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn hosted_graceful_close_contains_exact_child_and_retains_native_evidence() {
+    run_native(terminal_scenario(false));
+}
+
+#[test]
+fn hosted_abort_contains_exact_child_and_retains_native_evidence() {
+    run_native(terminal_scenario(true));
+}
+
+#[test]
+fn hosted_interrupted_open_after_real_server_spawn_is_contained() {
+    run_native(async {
+        let mut fixture = HostedFixture::new("hosted-cut").await?;
+        let mut foreign = ForeignChild::new()?;
+        let result = fixture.interrupt_open().await;
+        let cleanup = fixture.shutdown().await;
+        let unaffected = foreign.assert_live();
+        result.and(cleanup).and(unaffected)
+    });
+}
+
+async fn terminal_scenario(abort: bool) -> TestResult {
+    let mut fixture = HostedFixture::new(if abort {
+        "hosted-abort"
+    } else {
+        "hosted-close"
+    })
+    .await?;
+    let mut foreign = ForeignChild::new()?;
+    let result = async {
+        fixture.fresh_primary().await?;
+        // Terminal assertions start from a genuinely admitted, live proxy.
+        let before = std::fs::read(fixture.root.path().join("d/auto.cnf")).map_err(failure)?;
+        let started = Instant::now();
+        tokio::time::timeout(
+            TERMINAL_BUDGET,
+            fixture.execute(if abort {
+                PublicOperationProgram::Abort
+            } else {
+                PublicOperationProgram::Close
+            }),
+        )
+        .await
+        .map_err(failure)??;
+        require(
+            started.elapsed() < TERMINAL_BUDGET,
+            "terminal callback exceeded fixture budget",
+        )?;
+        fixture.assert_contained_evidence()?;
+        require(
+            std::fs::read(fixture.root.path().join("d/auto.cnf")).map_err(failure)? == before,
+            "native data identity changed on termination",
+        )?;
+        require(
+            fixture
+                .root
+                .path()
+                .join("d/kuberic_proxy_qualification/hosted.ibd")
+                .is_file(),
+            "committed native table was not retained",
+        )?;
+        // Do not replace a closed driver's rejected live progress with cached
+        // or literal zero. Testing dispatch separates cleanup from wire reports.
+        let error = fixture
+            .handle
+            .public_v1_report()
+            .await
+            .err()
+            .ok_or("closed driver unexpectedly supplied a live host report")?;
+        require(
+            error.to_string().to_ascii_lowercase().contains("closed"),
+            "terminal report failed for an unexpected reason",
+        )?;
+        eprintln!(
+            "terminal {} completed in {:?}; subsequent live report rejects: {error}",
+            if abort { "Abort" } else { "Close" },
+            started.elapsed()
+        );
+        foreign.assert_live()?;
+        Ok(())
+    }
+    .await;
+    let cleanup = fixture.shutdown().await;
+    result.and(cleanup).and(foreign.assert_live())
+}
+
+/// A retained unrelated child, signalled only by its own fixture owner.
+struct ForeignChild(Child);
+
+impl ForeignChild {
+    fn new() -> TestResult<Self> {
+        Command::new("/usr/bin/sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(Self)
+            .map_err(failure)
+    }
+
+    fn assert_live(&mut self) -> TestResult {
+        require(
+            self.0.try_wait().map_err(failure)?.is_none(),
+            "unrelated child was terminated",
+        )
+    }
+}
+
+impl Drop for ForeignChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn run_native(future: impl Future<Output = TestResult> + Send + 'static) {
@@ -157,7 +303,7 @@ impl HostedFixture {
         );
         let attempt = AttemptContext::new(
             AttemptId::new(format!("{label}-attempt")).map_err(failure)?,
-            Instant::now() + Duration::from_secs(300),
+            Instant::now() + Duration::from_secs(600),
             Duration::from_secs(20),
         )
         .map_err(failure)?;
@@ -197,8 +343,8 @@ impl HostedFixture {
             topology,
             MysqlMemberIndex::First,
             MysqlOperationTimeouts::new(
-                Duration::from_secs(90),
-                Duration::from_secs(60),
+                Duration::from_secs(180),
+                Duration::from_secs(120),
                 Duration::from_secs(15),
                 Duration::from_secs(5),
             )
@@ -606,6 +752,107 @@ impl HostedFixture {
         Ok(())
     }
 
+    fn assert_contained_evidence(&self) -> TestResult {
+        let pid = self.pid.ok_or("no observed actual server PID")?;
+        assert_process_absent(pid)?;
+        assert_tcp_refuses(self.sql)?;
+        assert_tcp_refuses(self.proxy)?;
+        require(
+            !self.root.path().join("s").exists(),
+            "active runtime path was not retired",
+        )?;
+        require(
+            self.root.path().join("d/auto.cnf").is_file(),
+            "initialized native data was lost",
+        )?;
+        for log in [
+            "mysqld.err",
+            "mysqld.out",
+            "initialize.out",
+            "initialize.err",
+            "version.out",
+        ] {
+            require(
+                self.root.path().join("s.retained").join(log).is_file(),
+                "native log evidence was lost",
+            )?;
+        }
+        assert_no_application_store_with_native_schemas(
+            &self.root.path().join("d"),
+            &["kuberic_proxy_qualification"],
+        )?;
+        assert_no_application_store(&self.root.path().join("s.retained"))?;
+        Ok(())
+    }
+
+    async fn interrupt_open(&mut self) -> TestResult {
+        let intent = self.intent(PublicOperationProgram::Open {
+            replica: self.identity.clone(),
+            existing: false,
+        });
+        let handle = self.handle.clone();
+        let mut opening = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+        let defaults = format!(
+            "--defaults-file={}",
+            self.root.path().join("s/my.cnf").display()
+        );
+        // Initialization precedes the cut; allow the existing native fixture's
+        // initialization budget on a constrained host. Settlement remains 45s.
+        let observed = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                if opening.is_finished() {
+                    return Err(
+                        "Open completed before a proven startup interruption cut".to_owned()
+                    );
+                }
+                if let Some(pid) = actual_starting_server(&defaults)? {
+                    require(
+                        self.root.path().join("d/auto.cnf").is_file(),
+                        "server spawn preceded native initialization",
+                    )?;
+                    require(!opening.is_finished(), "Open won the interruption race")?;
+                    self.pid = Some(pid);
+                    // Same production AttemptContext, not RPC-client cancellation
+                    // or a synthetic generic containment witness.
+                    self.attempt.cancel();
+                    eprintln!(
+                        "cancelled real ApplicationOpen after actual mysqld spawn: pid={pid}"
+                    );
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .map_err(failure)
+        .and_then(|r| r);
+        if observed.is_err() {
+            self.attempt.cancel();
+        }
+        let settled = match tokio::time::timeout(TERMINAL_BUDGET, &mut opening).await {
+            Ok(result) => result.map_err(failure),
+            Err(error) => {
+                opening.abort();
+                let joined = opening.await;
+                return Err(format!(
+                    "interrupted Open did not settle: {error}; aborted task acknowledgment: {joined:?}"
+                ));
+            }
+        }?;
+        observed?;
+        require(
+            settled.is_err(),
+            "cancelled real startup was falsely reported successful",
+        )?;
+        eprintln!("interrupted public Open outcome: {settled:?}");
+        self.assert_contained_evidence()?;
+        require(
+            !self.root.path().join("s.retained/mysql.sock").exists(),
+            "interrupted startup retained a live socket name",
+        )?;
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> TestResult {
         self.service.abort();
         self.running.shutdown();
@@ -619,6 +866,33 @@ impl HostedFixture {
         assert_tcp_refuses(self.proxy)?;
         Ok(())
     }
+}
+
+fn actual_starting_server(defaults: &str) -> TestResult<Option<u32>> {
+    for entry in std::fs::read_dir("/proc").map_err(failure)? {
+        let entry = entry.map_err(failure)?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(executable) = std::fs::read_link(entry.path().join("exe")) else {
+            continue;
+        };
+        if executable != Path::new(MYSQLD) {
+            continue;
+        }
+        let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let arguments = command.split(|byte| *byte == 0).collect::<Vec<_>>();
+        if arguments.contains(&defaults.as_bytes())
+            && !arguments
+                .iter()
+                .any(|arg| arg.starts_with(b"--initialize") || *arg == b"--version")
+        {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
 }
 
 impl Drop for HostedFixture {
