@@ -201,7 +201,7 @@ remain subject to the `<108` encoded-byte limit.
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql -E 'test(reopen) or test(durability_lifetime)'
+  -p kuberic-mysql --lib -E 'test(reopen) or test(durability_lifetime) or test(terminal_)'
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests --test service_reopen_live_mysql_8_4_11
 ```

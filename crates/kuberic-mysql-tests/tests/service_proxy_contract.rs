@@ -1263,6 +1263,97 @@ async fn stale_generation_cannot_revoke_or_replace_the_published_listener() {
     fixture.cleanup().await;
 }
 
+struct PanicFirstSessionAccess {
+    calls: AtomicU32,
+}
+
+impl MysqlProxyAccessGuard for PanicFirstSessionAccess {
+    fn access_granted(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async {
+            // First call is listener admission; the next is the actual
+            // authenticated session's command access check.
+            assert_ne!(
+                self.calls.fetch_add(1, Ordering::AcqRel),
+                1,
+                "injected session access panic"
+            );
+            true
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_task_failure_does_not_bypass_ordinary_revocation_fence() {
+    let mut fixture = Fixture::new(
+        "proxy-panic-revoke",
+        BackendPlan {
+            auth: AuthMode::Fast,
+            block_query: false,
+        },
+    )
+    .await;
+    fixture
+        .proxy
+        .bind_access_guard(Arc::new(PanicFirstSessionAccess {
+            calls: AtomicU32::new(0),
+        }))
+        .unwrap();
+    let address = fixture.publish();
+    let mut client = authenticate(address, "application_local", CLIENT_CAPABILITIES).await;
+    write_packet(&mut client, 0, b"\x03SELECT 1").await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.proxy.snapshot().diagnostics().ambiguities() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "accept task never observed session JoinError"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        fixture.proxy.snapshot().accepting(),
+        "root remains live before explicit revoke"
+    );
+    assert!(fixture.backend_commands.lock().unwrap().is_empty());
+    // No manual seal: valid-generation revoke itself must fence before refusing
+    // success for the observed, permanently unprovable task history.
+    assert!(matches!(
+        fixture
+            .proxy
+            .revoke(
+                &mut fixture.control,
+                &fixture.authority,
+                nonzero(1),
+                &fixture.attempt,
+            )
+            .await,
+        Err(MysqlProxyError::InvalidState)
+    ));
+    assert!(!fixture.proxy.snapshot().accepting());
+    assert!(TcpStream::connect(address).await.is_err());
+    assert_eq!(fixture.proxy.snapshot().sessions(), 0);
+    assert!(fixture.backend_commands.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .proxy
+            .rearm(address, &fixture.attempt)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .proxy
+            .cleanup_account(&mut fixture.control, &fixture.authority, &fixture.attempt,)
+            .await
+            .is_err()
+    );
+    assert!(fixture.proxy.account_active());
+    assert_eq!(fixture.control.removed, 0);
+    wait_backend_settled(&fixture.backend_settled, 1).await;
+    drop(client);
+    fixture.backend.abort();
+    let _ = fixture.backend.await;
+}
+
 #[test]
 fn diagnostics_redact_application_secret() {
     let credential = ApplicationCredential::new(

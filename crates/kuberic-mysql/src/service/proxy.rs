@@ -1112,9 +1112,6 @@ impl MysqlClientProxy {
         generation: NonZeroU64,
         attempt: &AttemptContext,
     ) -> Result<MysqlProxyContainmentReceipt, MysqlProxyError> {
-        if self.shared.lock().task_failure {
-            return Err(MysqlProxyError::InvalidState);
-        }
         if self.published_generation != Some(generation)
             || self.shared.lock().generation != Some(generation)
         {
