@@ -1660,8 +1660,15 @@ stage.
 Stages 0 and 1, the native observation and process/topology slices, the native
 feasibility gate, the MySQL-owned Stage 2 member-local
 lifecycle/progress/gateway/controlled-handoff foundation, and the bounded
-Public V1 adapter and process-local direct custom Build are delivered. The
-first Stage 3 closed retained-owner reopen primitive is also delivered; this
+Public V1 adapter and process-local direct custom Build are delivered. A
+[one-fresh-member production-service hosted lifecycle gate](mysql-hosted-lifecycle.md)
+also qualifies actual public host New/Open, custom factory registration,
+bundled singleton formation, provider-backed reports, native proxy access,
+Close/Abort and post-server-spawn cancellation with exact-child containment
+and retained native evidence. Its generic initialization/dispatch testing
+facade does not qualify authenticated control transport or controller
+acceptance; it does not expand Stage 2 into hosted Build or recovery.
+The first Stage 3 closed retained-owner reopen primitive is also delivered; this
 does not complete Stage 3.
 Production-controller custom-Build dispatch, restart-resumable effects, and
 every later stage remain delivery contracts rather than current feature

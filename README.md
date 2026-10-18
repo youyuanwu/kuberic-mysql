@@ -150,6 +150,24 @@ therefore has an empty peer list.
 Its versioned non-secret replication endpoint carries only the native member
 UUID, SQL member address, and Group Replication address.
 
+The [hosted lifecycle gate](docs/mysql-hosted-lifecycle.md) runs the actual
+production service in a real public `ReplicaHost`/`RunningReplica` at the same
+pin, initially for **one fresh member**. It covers New/Open and actual custom
+factory registration, the existing bundled `InitialPrimary` role/configuration
+route, registered provider-backed progress, native application proxy admission
+and DML, Close, Abort, and cancellation after actual mysqld server spawn.
+Generic store/history initialization and dispatch use the runtime's testing
+facade: this is not authenticated control-wire or controller acceptance.
+Only genuine host admission opens native application access.
+
+Production service terminal containment retains data and moves its exact owned
+runtime directory to the original path plus `.retained`, preserving native
+logs/binlogs without leaving the active runtime name. It never overwrites an
+existing destination or grants reopen authority. Later live host reports reject
+the closed driver rather than return synthetic progress. These hosted tests do
+not qualify Existing/cold recovery, controller Build, serving replay, or
+production deployment.
+
 The custom `PrimaryReplicator::build_replica` implementation transfers one
 fresh idle target through Group Replication distributed recovery. It binds the
 callback to the exact source and target identities, process sessions, storage
@@ -438,6 +456,19 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
   --test kuberic_public_v1_build_live_mysql_8_4_11
 ```
+
+The separate serial **real-host** gate uses the production service and the
+existing public lifecycle, not direct-driver callbacks or a replacement service:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
+  -p kuberic-mysql-tests \
+  --test kuberic_public_v1_hosted_live_mysql_8_4_11
+```
+
+It enforces the same exact Oracle MySQL 8.4.11 preflight. Native data and logs
+remain in the printed compact fixture roots for inspection, including on
+failure; dispose of them only after owned-child termination is established.
 
 Production-shared progress/Remove admission, retirement ledger, cleanup
 checkpoint, deadline and contention reducers also run without MySQL:
