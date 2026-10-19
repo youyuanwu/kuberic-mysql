@@ -61,6 +61,26 @@ pub struct FixtureRoot {
 }
 
 impl FixtureRoot {
+    /// Retain diagnostics and refuse to replace evidence, including on collision.
+    pub fn new_retained(label: &str) -> Result<Self, String> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "resolve workspace root".to_owned())?;
+        let target = workspace.join("target");
+        fs::create_dir_all(&target).map_err(|error| format!("create target: {error}"))?;
+        let short_label = &label[..label.len().min(12)];
+        let root = target.join(format!("km-{short_label}-{}", std::process::id()));
+        fs::create_dir(&root)
+            .map_err(|error| format!("create nonreplacing fixture {}: {error}", root.display()))?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("protect fixture {}: {error}", root.display()))?;
+        Ok(Self {
+            root,
+            preserve_on_drop: true,
+        })
+    }
+
     pub fn new(label: &str) -> Result<Self, String> {
         Ok(Self {
             root: fresh_fixture_root(label)?,
