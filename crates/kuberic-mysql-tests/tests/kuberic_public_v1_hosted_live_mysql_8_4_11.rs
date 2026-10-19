@@ -1,10 +1,12 @@
 //! Real production service/ReplicaHost qualification at the pinned public API.
 //!
-//! Only generic store/history initialization and operation dispatch use the
-//! runtime's testing facade. This is not bearer-wire or controller/recovery
-//! acceptance coverage. No replacement service, direct driver, or fake provider
-//! participates in the hosted lifecycle.
+//! Existing `hosted_*` cases use the testing facade for generic initialization
+//! and dispatch. `authenticated::*` cases instead use ordinary bearer RPCs,
+//! including initialization, and assert unsuccessful terminal wire results.
+//! Neither route claims controller/recovery acceptance.
 
+#[path = "hosted_authenticated/mod.rs"]
+mod authenticated;
 #[path = "service_live_support/mod.rs"]
 mod live_support;
 
@@ -255,6 +257,7 @@ struct HostedFixture {
     service: Arc<MysqlPublicV1Service>,
     running: RunningReplica,
     handle: ReplicaHandle,
+    wire: Option<authenticated::WireControl>,
     identity: ReplicaIdentity,
     configuration: ConfigurationDescriptor,
     attempt: AttemptContext,
@@ -268,9 +271,12 @@ struct HostedFixture {
 
 impl HostedFixture {
     async fn new(label: &str) -> TestResult<Self> {
+        Self::new_with_transport(label, false).await
+    }
+
+    async fn new_with_transport(label: &str, ordinary: bool) -> TestResult<Self> {
         preflight_oracle_mysql_8_4_11()?;
-        let mut root = FixtureRoot::new(label)?;
-        root.preserve();
+        let root = FixtureRoot::new_retained(label)?;
         eprintln!("retained hosted fixture: {}", root.path().display());
         let mut ports = ReservedPorts::allocate()?;
         let sql = ports.sql_addresses();
@@ -367,24 +373,26 @@ impl HostedFixture {
         ]);
         let agent_root = root.path().join("k");
         // This creates generic runtime state only. Never inspect its private store.
-        drop(
-            SqliteStore::create_public_v1_with_application_paths(
-                SqliteStore::metadata_database_path(&agent_root),
-                PublicV1Identity::new(1),
-                StorageIdentity {
-                    schema_version: SCHEMA_VERSION,
-                    resource_uid: resource.clone(),
-                    pod_uid: pod.clone(),
-                    pvc_uid: pvc.clone(),
-                    initialization_id,
-                    local_identity: identity.clone(),
-                    effective_policy: EffectivePolicy::fixed(1, 30)
-                        .ok_or("invalid fixture policy")?,
-                },
-                paths.clone(),
-            )
-            .map_err(failure)?,
-        );
+        if !ordinary {
+            drop(
+                SqliteStore::create_public_v1_with_application_paths(
+                    SqliteStore::metadata_database_path(&agent_root),
+                    PublicV1Identity::new(1),
+                    StorageIdentity {
+                        schema_version: SCHEMA_VERSION,
+                        resource_uid: resource.clone(),
+                        pod_uid: pod.clone(),
+                        pvc_uid: pvc.clone(),
+                        initialization_id: initialization_id.clone(),
+                        local_identity: identity.clone(),
+                        effective_policy: EffectivePolicy::fixed(1, 30)
+                            .ok_or("invalid fixture policy")?,
+                    },
+                    paths.clone(),
+                )
+                .map_err(failure)?,
+            );
+        }
         let service = Arc::new(MysqlPublicV1Service::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -392,32 +400,46 @@ impl HostedFixture {
         let address = listener.local_addr().map_err(failure)?;
         ports.release();
         drop(proxy_reservation);
-        let running = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource.clone(),
-                replica_id: identity.replica_id,
-                pod_uid: pod.clone(),
-                pvc_uid: pvc.clone(),
-                data_root: agent_root,
-                replication_address: address,
-                bearer_token: "hosted-fixture-not-wire-authenticated".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
+        let process_config = ReplicaProcessConfig {
+            resource_uid: resource.clone(),
+            replica_id: identity.replica_id,
+            pod_uid: pod.clone(),
+            pvc_uid: pvc.clone(),
+            data_root: agent_root,
+            replication_address: address,
+            bearer_token: format!("disposable-hosted-control-{}", std::process::id()),
+            rpc_deadline: Duration::from_secs(2),
+            transport_window_capacity: 8,
+        };
+        let host = ReplicaHost::new(
+            process_config.clone(),
             service.clone(),
             ApplicationStorageState::FreshEmpty,
             Arc::new(SingleResolver { address }),
         )
-        .with_application_storage_paths(paths)
-        .start(listener)
-        .await
-        .map_err(failure)?;
+        .with_application_storage_paths(paths);
+        let (running, wire) = if ordinary {
+            let (running, wire) = authenticated::WireControl::start(
+                host,
+                listener,
+                process_config,
+                &identity,
+                &configuration,
+                initialization_id.to_string(),
+                root.path(),
+            )
+            .await?;
+            (running, Some(wire))
+        } else {
+            (host.start(listener).await.map_err(failure)?, None)
+        };
         let handle = running.handle();
         let mut fixture = Self {
             root,
             service,
             running,
             handle,
+            wire,
             identity: identity.clone(),
             configuration,
             attempt,
@@ -428,6 +450,9 @@ impl HostedFixture {
             application_user,
             application_password,
         };
+        if fixture.wire.is_some() {
+            return Ok(fixture);
+        }
         let generation = PublicProtocolGeneration::new(1);
         let history_id = derive_history_initialization_id(&resource, generation);
         let history = derive_bootstrap_history(&resource, generation, &history_id);
@@ -463,7 +488,7 @@ impl HostedFixture {
             identity: PublicV1Identity::new(1),
             operation_id: OperationId::new(format!("hosted-op-{}", self.revision)),
             revision: self.revision,
-            process_session_id: self.handle.process_session_id(),
+            process_session_id: self.process_session_id(),
             class,
             input_digest: program.digest(),
             replay_disposition: program.replay_disposition(),
@@ -474,7 +499,21 @@ impl HostedFixture {
 
     async fn execute(&mut self, program: PublicOperationProgram) -> TestResult {
         let intent = self.intent(program);
-        self.handle.execute_public_v1(intent).await.map_err(failure)
+        self.execute_intent(intent).await
+    }
+
+    fn process_session_id(&self) -> kuberic_runtime::protocol::types::ProcessSessionId {
+        match &self.wire {
+            Some(wire) => wire.session.clone(),
+            None => self.handle.process_session_id(),
+        }
+    }
+
+    async fn execute_intent(&self, intent: PublicOperationIntent) -> TestResult {
+        match &self.wire {
+            Some(wire) => wire.execute(intent).await.map(|_| ()).map_err(failure),
+            None => self.handle.execute_public_v1(intent).await.map_err(failure),
+        }
     }
 
     async fn open(&mut self) -> TestResult<PublicV1AgentReport> {
@@ -507,10 +546,12 @@ impl HostedFixture {
                 .is_some_and(|a| a.contains("mysql")),
             "missing custom native endpoint",
         )?;
-        require(
-            self.handle.public_v1_provider_writer_count() == 0,
-            "progress-only provider acquired writer",
-        )?;
+        if self.wire.is_none() {
+            require(
+                self.handle.public_v1_provider_writer_count() == 0,
+                "progress-only provider acquired writer",
+            )?;
+        }
         require(
             report.progress.first == 0 && report.progress.last == 0,
             "fresh-empty zero proof differs",
@@ -546,15 +587,14 @@ impl HostedFixture {
             identity: PublicV1Identity::new(1),
             operation_id: OperationId::new(format!("hosted-primary-{}", self.revision)),
             revision: self.revision,
-            process_session_id: self.handle.process_session_id(),
+            process_session_id: self.process_session_id(),
             class: PublicOperationClass::Authority,
             input_digest: lifecycle.digest(),
             replay_disposition: PublicOperationReplayDisposition::Convergent,
             lifecycle: Some(lifecycle),
             program: None,
         };
-        self.handle
-            .execute_public_v1(intent)
+        self.execute_intent(intent)
             .await
             .map_err(|e| format!("real host InitialPrimary: {e}"))
     }
@@ -651,7 +691,10 @@ impl HostedFixture {
     }
 
     async fn report(&self) -> TestResult<PublicV1AgentReport> {
-        let report = self.handle.public_v1_report().await.map_err(failure)?;
+        let report = match &self.wire {
+            Some(wire) => wire.report().await.map_err(failure)?,
+            None => self.handle.public_v1_report().await.map_err(failure)?,
+        };
         report.validate().map_err(failure)?;
         eprintln!(
             "host report: session={} creation={} sequence={} role={:?} read={:?} write={:?} progress={:?} completed={}",

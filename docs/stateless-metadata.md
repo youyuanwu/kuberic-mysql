@@ -16,6 +16,16 @@ transitions. It does not claim restart continuation, durable effect recovery,
 survivor adoption, Clone/reseed, production-controller custom-Build dispatch,
 automated failover, repair, or Kubernetes integration.
 
+The [fresh hosted lifecycle gate](mysql-hosted-lifecycle.md) additionally
+qualifies ordinary authenticated generic initialization, New/Open, singleton
+formation, real Granted proxy DML and complete-GTID progress without a private
+MySQL store. Unauthorized/stale requests are rejected with nonmutation checks.
+Ordinary Close/Abort and subsequent GetStatus return
+`Unavailable: runtime is closed`; exact native containment and retained
+identity/data/logs are independently proved before fallback. This bounded
+qualification does not supply successful terminal wire acknowledgment,
+replay/restart authority or production-controller acceptance.
+
 The delivered `kuberic_mysql::adapter` module already satisfies the
 application-state part of this proposal: it accepts one observation request,
 keeps only attempt-local state, and returns typed evidence without opening a
@@ -556,6 +566,12 @@ shutdown invokes Replicator abort before application abort; both are
 synchronous containment operations.
 
 ### Lost acknowledgement
+
+For the delivered ordinary hosted Close/Abort path, the exact pinned runtime
+constructs a live report after terminal callbacks; the closed driver rejects it.
+The observed unsuccessful RPC plus independent containment is not a public
+completion receipt. The broader replay/recovery contract below is not qualified
+by that observation and must not be inferred from retained native diagnostics.
 
 Every public operation has an operation ID and canonical immutable input. If
 the agent committed completion but its response was lost, replay returns the

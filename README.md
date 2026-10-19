@@ -156,8 +156,13 @@ pin, initially for **one fresh member**. It covers New/Open and actual custom
 factory registration, the existing bundled `InitialPrimary` role/configuration
 route, registered provider-backed progress, native application proxy admission
 and DML, Close, Abort, and cancellation after actual mysqld server spawn.
-Generic store/history initialization and dispatch use the runtime's testing
-facade: this is not authenticated control-wire or controller acceptance.
+Existing `hosted_*` cases use the runtime's testing facade. Separate ordinary
+authenticated cases now cover generic initialization through New/Open, singleton
+formation, Granted proxy DML, independently cross-checked complete-GTID progress,
+and unauthorized/stale rejection without native mutation. Ordinary Close/Abort
+and subsequent GetStatus explicitly return `Unavailable: runtime is closed`;
+independent containment is proved before fallback cleanup. This is **not
+successful terminal wire acknowledgment** or controller/recovery acceptance.
 Only genuine host admission opens native application access.
 
 Production service terminal containment retains data and moves its exact owned

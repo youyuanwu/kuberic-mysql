@@ -4,28 +4,45 @@ This is a bounded host-local qualification slice, not a production deployment
 or restart-recovery claim. It runs the **actual** `MysqlPublicV1Service` in
 `ReplicaHost`/`RunningReplica` on Kuberic
 [`be4f83b43567c59f48472025d55dd731efecc4c6`](https://github.com/youyuanwu/kuberic/tree/be4f83b43567c59f48472025d55dd731efecc4c6).
-The test dependency enables that pin's existing `testing` feature solely for
-generic store/history initialization, public operation dispatch and observation.
-It does not replace the production service, factory, registered provider, native
-MySQL, access guard or client proxy.
+The target contains two explicitly separate routes: existing `hosted_*` cases
+use the pin's testing facade for generic initialization/dispatch/observation;
+the `authenticated::*` native cases use ordinary authenticated control RPCs
+for all of those steps. Neither replaces the production service, factory,
+registered provider, native MySQL, access guard or client proxy. This delivery
+adds executable qualification and documentation, **not a production runtime fix**.
+
+**Terminal limitation:** ordinary authenticated Close and Abort return
+gRPC `Unavailable: runtime is closed`, as does subsequent live GetStatus.
+Tests assert these unsuccessful RPCs and independently prove native containment
+before fallback cleanup. Passing this gate is **not successful terminal wire
+acknowledgment**, a completion receipt, or permission to retry/recover a closed
+owner. PostgreSQL parity refers to closed-driver semantics established by source
+comparison, not an executed PostgreSQL wire result.
 
 ## Executable journey
 
-The [Rust-owned hosted fixture](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L270-L453)
+The [Rust-owned hosted fixture](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L277-L489)
 creates a generic agent root separate from the native data/runtime roots.
-Initializing application-path bindings select `OpenMode::New`; generic history
-and storage are initialized through the existing testing facade. No private
-store is inspected and no MySQL recovery receipt database is created. This
-setup is **not bearer-authenticated wire, Kubernetes/controller accepted-status,
-or recovery-authority evidence**.
+Its ordinary branch never executes testing store/history initialization.
+The [ordinary adapter](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L39-L249)
+starts the genuinely uninitialized host, gets authenticated status, sends
+`InitializeAgentStore`, drops that client, awaits readiness and reconnects.
+The initialized report supplies genuine history/storage identity and a new
+process session. Native `d`/`s` remain absent throughout generic initialization.
+Initializing application-path bindings then select `OpenMode::New`.
+No private store is inspected and no MySQL recovery receipt database is created.
+Ordinary requests are generated `AgentControlClient` RPCs encoded through the
+public command serializer, not fabricated accepted envelopes.
 
-The positive [New/formation journey](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L480-L651)
+The shared [New/formation journey](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L519-L690)
 establishes:
 
 1. Actual service Open and registered Replicator Open, non-pending host-created
    creation ID, custom MySQL replication endpoint, exact replica/session, and
-   zero provider-writer leases. Production registration uses the **same driver
+   closed initial access. Production registration uses the **same driver
    allocation** for the factory and its progress-only StateProvider.
+   Zero provider-writer leases are additionally inspected only by the old
+   testing-facade cases, not claimed as ordinary wire evidence.
 2. An initial closed-access Recovery report with independently qualified `0/0`
    only for **New + freshly initialized empty owner + closed access**. A direct
    native GTID read confirms emptiness. Unknown/reopened progress is not zero.
@@ -48,14 +65,46 @@ The fixture configures three explicit topology slots/seeds as required by the
 native configuration but instantiates **one member**, not three hosts or a
 failover group. It uses no direct driver call to supply a hosted result.
 
+### Ordinary rejection and independent progress evidence
+
+Both [ordinary terminal scenarios](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L285-L364)
+first run the full positive journey. Missing and incorrect control bearer
+credentials return Unauthenticated before native roots exist; valid Open then
+succeeds. Both missing/wrong-bearer probes have a five-second local deadline;
+timeout is a returned scenario error that still runs awaited cleanup.
+After DML, [independent sampling](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L438-L548)
+brackets ordinary progress/report with quiet native snapshots. It compares
+complete parsed executed/purged GTIDs and native identity, projects only the
+qualified complete history, and requires nonzero equality to both host applied
+(`last`) and independently provider-sampled committed (`first`) values.
+The driver/provider commitment proof is not replaced by the fixture's query.
+
+[Stale session, durable target and authority revision requests](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L550-L634)
+each return FailedPrecondition. New operation IDs and structurally consistent
+envelopes distinguish stale authority from malformed input or exact retries.
+Progress requests avoid the runtime's deliberate pre-admission access fence
+for mutating programs. Before/after assertions compare exact PID/start time,
+path device/inodes, auto.cnf, native UUID, full executed/purged GTIDs, group
+membership/view/read-only state, committed rows, and public
+identity/history/storage/session/creation/progress/Granted access. Rejected
+IDs must not become completed operations. Valid newer Progress and proxy
+SELECT still succeed afterward. This is bounded currentness coverage, not a
+claim that every stale mutating-program shape leaves access unchanged.
+
 ## Terminal and interrupted startup evidence
 
-Separate [Close and Abort scenarios](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L97-L180)
-begin from the admitted, live native proxy after DML. Public terminal dispatch
-must succeed within the fixture's measured 45-second terminal budget. Tests
-independently check the exact native PID is absent, native SQL/proxy listeners
-are closed, native identity/table data and logs remain, and an unrelated child
-is still live.
+The ordinary Close/Abort cases begin from admitted proxy DML and proved
+progress, send the same ordinary authenticated Execute RPC, and require the
+exact unsuccessful terminal/status result described above. The terminal RPC has
+a measured 45-second budget. **Before** service-abort/host-shutdown fallback,
+tests independently check the exact native PID is absent, native SQL/proxy
+listeners are closed, native identity/table data and logs remain, and an
+unrelated child is still live. Scenario, shutdown/containment and foreign-child
+errors are aggregated; unexpected success also returns through awaited cleanup.
+
+The existing [testing-dispatched Close/Abort cases](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L99-L183)
+separately assert successful callback dispatch plus independent containment.
+They are not ordinary wire acknowledgment evidence.
 
 After terminal cleanup, asking the registered closed driver for a new live host
 report explicitly fails. No cached pair or literal zero is substituted.
@@ -64,7 +113,7 @@ pin's ordinary wire Execute response constructs a report even after terminal
 operations, so these tests **do not claim successful terminal wire
 acknowledgment**.
 
-The [startup interruption scenario](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L788-L897)
+The testing-dispatched [startup interruption scenario](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L831-L897)
 observes `/usr/sbin/mysqld` with the exact fixture defaults-file after native
 initialization, excludes initializer/version processes, verifies Open is still
 pending, then cancels the same production `AttemptContext`. It awaits the real
@@ -73,6 +122,9 @@ Cancelling before application Open, merely dropping an RPC client, or injecting
 after Open completed would not pass this test. Initialization observation has
 the existing 180-second native allowance; post-cut settlement has 45 seconds.
 There is no retry-until-pass loop or fabricated generic containment witness.
+Ordinary generic initialization has separate cooperative startup cancellation
+and bounded settlement, including shutdown/join if readiness races cancellation;
+setup and cleanup errors remain distinct.
 
 ## Native evidence retention
 
@@ -102,14 +154,27 @@ integrity and apt candidate/repository; missing prerequisites **fail**, not skip
 See [repository prerequisites](../README.md#prerequisites).
 
 ```bash
+CARGO_BUILD_JOBS=1 cargo test --locked --offline \
+  -p kuberic-mysql-tests \
+  --test kuberic_public_v1_hosted_live_mysql_8_4_11 \
+  -- --test-threads=1 --nocapture
+
+# Equivalent existing serial, zero-retry nextest profile:
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
   --test kuberic_public_v1_hosted_live_mysql_8_4_11
 ```
 
-The existing profile runs native tests serially without retries. Compact roots
-keep UDS paths below 108 bytes and use the shared fixture helper that creates
-missing target parents for archive consumers. Each native fixture prints and
+The target contains eleven tests: six existing cases, two ordinary native cases,
+and three deterministic retained-root/negative-result/timeout regressions. Neither native
+route skips missing prerequisites. The runtime test dependency still enables
+`testing` for the old cases; its presence is not evidence the ordinary cases
+use it. Use one build job and one target tree; do not run native fixtures
+concurrently.
+
+Compact roots keep UDS paths below 108 bytes. The shared retained-root helper
+creates missing target parents for archive consumers but refuses an existing
+fixture root instead of deleting evidence. Each native fixture prints and
 preserves its root, including native logs/data; generic state remains under
 `k`, native data under `d`, and retired native runtime under `s.retained`.
 Only the fixture's concrete child owner signals/reaps its child. No process-name
