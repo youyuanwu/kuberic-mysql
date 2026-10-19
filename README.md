@@ -25,7 +25,7 @@ per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
 infrastructure, not production topology owners. The normal crate surface
 includes the public adapter against `kuberic-runtime` pinned exactly to commit
-`be4f83b43567c59f48472025d55dd731efecc4c6`; no private managed lifecycle,
+`8c659536bdf31040aa13d787427ff1601e261bf5`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
 ## Status
@@ -89,7 +89,7 @@ is added.
 The [recovery authority contract](docs/mysql-recovery-authority.md) records the
 next contract-only Stage 3 slice: exact upstream accepted-envelope and physical
 retained-owner handoff requirements. Conversion to a fresh unassigned,
-access-closed generic replicator remains blocked; no runtime API or pin changes.
+access-closed generic replicator remains blocked; that contract adds no runtime API.
 
 The same module now exposes `MysqlReplicator`, a one-member lifecycle engine
 that owns one `MysqlInstanceManager` and enforces open, newer epoch, role,
