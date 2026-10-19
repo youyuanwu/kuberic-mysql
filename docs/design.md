@@ -15,7 +15,7 @@ MySQL-owned Stage 2 integration foundation, and a bounded Kuberic Public V1
 adapter. The publish-disabled `kuberic-mysql` crate exposes these as the
 `core`, `adapter`, and `service` modules, including the public
 service/factory/replicator bundle against `kuberic-runtime` pinned exactly to
-`8c659536bdf31040aa13d787427ff1601e261bf5`. The native adapter observes exactly
+`dabe144670303b22b1fe13f5ced78ab57ad3f98c`. The native adapter observes exactly
 one caller-selected Oracle MySQL Community Server 8.4.11 through a private
 Unix-domain socket. The service owns one fresh, restart-stateless process
 generation, composes exactly three fresh generations for the older topology

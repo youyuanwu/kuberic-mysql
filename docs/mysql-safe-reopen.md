@@ -176,7 +176,7 @@ adapter process requires reset, not reconstruction from saved evidence.
 ## Public Kuberic boundary and pin
 
 Both crates and Cargo.lock now pin
-`8c659536bdf31040aa13d787427ff1601e261bf5`. The historical 2026-10-18 assessment
+`dabe144670303b22b1fe13f5ced78ab57ad3f98c`. The historical 2026-10-18 assessment
 checked the former pin `be4f83b43567c59f48472025d55dd731efecc4c6` against immutable upstream
 `c0e52ee6ef361d86cf9e984e1f0682bc1f479013`, then checked the complete delta to
 `11d804425bbdbe7759dfd18208a0d73ce667a9f4`, including controller admission,

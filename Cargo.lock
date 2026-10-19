@@ -1513,7 +1513,7 @@ dependencies = [
 [[package]]
 name = "kuberic-controller"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic?rev=8c659536bdf31040aa13d787427ff1601e261bf5#8c659536bdf31040aa13d787427ff1601e261bf5"
+source = "git+https://github.com/youyuanwu/kuberic?rev=dabe144670303b22b1fe13f5ced78ab57ad3f98c#dabe144670303b22b1fe13f5ced78ab57ad3f98c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1569,7 +1569,7 @@ dependencies = [
 [[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic?rev=8c659536bdf31040aa13d787427ff1601e261bf5#8c659536bdf31040aa13d787427ff1601e261bf5"
+source = "git+https://github.com/youyuanwu/kuberic?rev=dabe144670303b22b1fe13f5ced78ab57ad3f98c#dabe144670303b22b1fe13f5ced78ab57ad3f98c"
 dependencies = [
  "async-trait",
  "base64 0.23.1",

@@ -3,7 +3,7 @@
 This is a bounded host-local qualification slice, not a production deployment
 or restart-recovery claim. It runs the **actual** `MysqlPublicV1Service` in
 `ReplicaHost`/`RunningReplica` on Kuberic
-[`8c659536bdf31040aa13d787427ff1601e261bf5`](https://github.com/youyuanwu/kuberic/tree/8c659536bdf31040aa13d787427ff1601e261bf5).
+[`dabe144670303b22b1fe13f5ced78ab57ad3f98c`](https://github.com/youyuanwu/kuberic/tree/dabe144670303b22b1fe13f5ced78ab57ad3f98c).
 The target contains two explicitly separate routes: existing `hosted_*` cases
 use the pin's testing facade for generic initialization/dispatch/observation;
 the `authenticated::*` native cases use ordinary authenticated control RPCs
@@ -146,8 +146,8 @@ owner, continue Build, or serve replay.
 
 ## Upstream in-process harness applicability
 
-The 2026-10-19 pin adds the public
-[`kuberic_controller::test_util`](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/docs/features/kuberic/in-process-testing.md)
+The current 2026-10-19 pin includes the public
+[`kuberic_controller::test_util`](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/docs/features/kuberic/in-process-testing.md)
 harness behind the controller's dev-only `test-util` feature. It runs the
 production reconciler and authenticated agent RPCs against real hosted
 applications, with a private Kubernetes resource implementation rather than a
@@ -155,7 +155,7 @@ real cluster. It is a useful foundation, but **not a drop-in replacement for
 the MySQL fixtures**.
 
 The public
-[`ApplicationFactory`](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/application.rs#L11-L86)
+[`ApplicationFactory`](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-controller/src/test_util/application.rs#L11-L86)
 is now implemented by the
 [MySQL integration probe](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4_11.rs).
 It constructs inert production `MysqlPublicV1Service` instances, classifies
@@ -168,23 +168,24 @@ or launch MySQL.
 
 The current boundaries are concrete:
 
-- **Fresh Open fails before MySQL starts.** With actual fresh native storage
-  bindings, generic initialization selects `OpenMode::New`. The production
-  controller instead requests `Open(existing=true)`, which the host rejects
-  as `agent store identity mismatch: open context changed`. The probe below
-  executes this boundary; it is not an Existing/restart attempt.
+- **Fresh New Open now succeeds.** The current pin includes
+  [youyuanwu/kuberic#183](https://github.com/youyuanwu/kuberic/pull/183), fixing
+  [youyuanwu/kuberic#179](https://github.com/youyuanwu/kuberic/issues/179).
+  Actual fresh native storage bindings select New, and the production controller
+  honors the host-reported mode. The probe below executes three successful New
+  Opens, not Existing/restart adoption.
 - The harness creates a
-  [three-replica persisted set](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/cluster.rs#L164-L192),
+  [three-replica persisted set](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-controller/src/test_util/cluster.rs#L164-L192),
   not the existing single-member hosted journey. Production controller Build
-  [first installs target inbound authority](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/cluster_api.rs#L2849-L2892).
+  [first installs target inbound authority](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-controller/src/cluster_api.rs#L2925-L2968).
   The agent's
-  [installation path](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/hosting.rs#L631-L641)
+  [installation path](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-runtime/src/host/hosting.rs#L652-L663)
   still requires the built-in private `StatelessRuntimeControl`; MySQL's custom
   factory does not attach it, so that path returns `NotOpen` before source Build.
   The newly public harness does not remove this controller-integration gap.
   This remains source-traced evidence: the executed probe does not reach Build.
 - Network isolation and armed Build-dial faults
-  [require an acknowledged built-in routed engine](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/cluster.rs#L2183-L2252).
+  [require an acknowledged built-in routed engine](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-controller/src/test_util/cluster.rs#L2199-L2268).
   They reject unsupported custom engines rather than cutting MySQL's native
   Group Replication/recovery sockets.
 - Contained restart reuses storage, whereas
@@ -192,38 +193,38 @@ The current boundaries are concrete:
   deliberately rejects `Existing`. Harness restart/failover controls do not
   implement retained-owner recovery or authorize native adoption.
 
-### Executed fresh-Open boundary
+### Executed fresh-New Open
 
-The unignored `controller_fresh_open_boundary_keeps_native_state_absent` case
+The unignored `controller_fresh_new_open_starts_and_contains_native_members` case
 uses public `TestCluster::step` and detached observations, not direct custom
 callbacks, private stores, or authority-mutating handles. Both the runtime and
 the new controller dev-dependency use the exact same Git revision.
 
-The source chain explaining the observed failure is:
+The case stops after all three members have exact current-process successful
+New Open receipts and replication endpoints. It verifies each receipt's New
+program digest, session, history, and storage incarnation; reporting Existing
+after initialization describes a future Open, not an Existing application
+callback. Missing receipts, a still-New reported storage mode, and substituted
+Existing Open digests reject. All members must remain unassigned with external
+application access closed, before any formation or voting-configuration claim.
 
-- [Factory storage bindings reach the real host](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/cluster.rs#L1136-L1147).
-- [Generic initialization marks those bindings initializing](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/service.rs#L314-L321),
-  and [the host selects New](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/service.rs#L715-L727).
-- [The controller hardcodes Existing for an unopened member](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/evaluator/public_v1_topology.rs#L182-L189).
-- [The lifecycle interpreter rejects the mode mismatch before application Open](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/public_lifecycle_program.rs#L227-L239).
+Each member has a live native PID and a native `auto.cnf` identity under the
+originally absent owned data root. After `finish(result)`, all three exact PIDs
+must be absent, SQL/group/application proxy endpoints must refuse connections,
+every factory drain must be acknowledged, and the harness-owned application
+roots must be removed. Repeated factory drain remains successful. PID files
+are read only for assertions; process signaling remains with the actual service
+owners, never a PID-file lookup. This qualifies native startup and containment
+through the real controller/host path, **not formation, replication, DML, or
+controller Build**.
 
-The case requires the exact pending controller Open command with `existing=true`,
-three valid host reports without replication endpoints, no successful completion
-credit, and the exact rejection above. Arbitrary errors, missing diagnostics,
-deadlines, or cleanup failures do not satisfy the probe. All three native
-application directories must remain empty before and after cleanup, and their
-SQL, group, and application proxy endpoints must refuse connections. This proves
-construction and acknowledged drain of real production services and hosts,
-**not mysqld startup, formation, replication, or native-child containment**.
-
-Every normal scenario result is consumed by `finish(result)`. The expected
-scenario error deliberately retains the harness-owned storage and redacted
-diagnostics; the case separately requires zero pending drain owners and a
-successful factory drain for every service. A nonreplacing
-`probe-diagnostics.json` is written outside the native application directories
-under that retained scenario root. It is diagnostic output, never recovery
-authority. Retained generic state can contain disposable credentials; it stays
-local and is not uploaded or checked in.
+Every normal scenario result is consumed by `finish(result)`. Successful
+finalization drains the actual hosts and native services, then releases owned
+fixture storage. Failure retains the harness-owned storage and native logs;
+a nonreplacing `probe-diagnostics.json` preserves redacted diagnostics outside
+the native application directories. It is diagnostic output, never recovery
+authority. Retained generic state can contain disposable credentials and is
+not uploaded or checked in. Timeouts and cleanup failures fail the case.
 
 The test re-executes its own test binary with a private short `/tmp` storage
 root and a two-worker Tokio runtime. Only the child environment's
@@ -233,14 +234,13 @@ even with the harness's UUID/PVC/application directory layout. The child unsets
 `KUBERIC_WORKSPACE_TESTS`; downstream consumers must not request upstream's
 repository-owned configuration.
 
-The immediate upstream prerequisite is consistent fresh/New controller dispatch
-for real application storage bindings, not removal of those bindings or
-permission for MySQL to adopt Existing. Once that is available, extend the
-probe to actual fresh formation and the separately traced Build-authority
-boundary. Keep the existing native and ordinary authenticated gates; no
-upstream or MySQL production implementation is changed here.
+Fresh/New dispatch is now verified, without removing storage bindings or
+permitting MySQL Existing adoption. Fresh formation and the separately traced
+Build-authority boundary remain future qualification work. Keep the existing
+native and ordinary authenticated gates; no upstream or MySQL production
+implementation is changed here.
 
-Run the new two-case target with the same mandatory MySQL prerequisites below:
+Run the positive native target with the same mandatory MySQL prerequisites below:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
@@ -249,6 +249,20 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
 
 The existing workspace nextest archive and qualification partitions discover
 this target automatically. No separate CI gate or Cargo feature is added.
+
+### Historical fresh-Open mismatch
+
+The original probe at `8c659536bdf31040aa13d787427ff1601e261bf5` reproduced
+`agent store identity mismatch: open context changed` before application Open
+or native startup. That negative assertion has been replaced by the positive
+fresh-New gate above. These links preserve the historical source trace, not
+the behavior at the current pin:
+
+- [Factory storage bindings reached the real host](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/cluster.rs#L1136-L1147).
+- [Generic initialization marked those bindings initializing](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/service.rs#L314-L321),
+  and [the host selected New](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/service.rs#L715-L727).
+- [The controller hardcoded Existing for an unopened member](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/evaluator/public_v1_topology.rs#L182-L189).
+- [The lifecycle interpreter rejected the mode mismatch before application Open](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/public_lifecycle_program.rs#L227-L239).
 
 ## Running the gate
 

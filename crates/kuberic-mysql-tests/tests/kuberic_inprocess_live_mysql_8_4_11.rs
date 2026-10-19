@@ -23,24 +23,24 @@ use kuberic_mysql::service::{
     MysqlOperationTimeouts, MysqlPublicV1Service, MysqlPublicV1ServiceConfig, MysqlTopologyConfig,
 };
 use kuberic_runtime::StatefulServiceReplica;
+use kuberic_runtime::application::OpenMode;
 use kuberic_runtime::host::ApplicationStorageState;
-use kuberic_runtime::protocol::public_operations::{PublicOperationProgram, PublicV1CallKind};
+use kuberic_runtime::protocol::public_operations::{
+    PublicOperationProgram, PublicV1AgentReport, PublicV1CallKind, PublicV1OperationResult,
+};
 use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
-use serde_json::Value;
 
 use live_support::{
     APPARMOR_EXEC, MYSQL_X_PORT, MYSQLD, ReservedPorts, assert_no_application_store,
-    assert_tcp_refuses, preflight_oracle_mysql_8_4_11,
+    assert_process_absent, assert_tcp_refuses, preflight_oracle_mysql_8_4_11,
 };
 
 const GROUP_UUID: &str = "03e84887-4d65-42d0-b941-0f691cb0aa16";
 const CHILD_MODE: &str = "KUBERIC_MYSQL_INPROCESS_PROBE_CHILD";
-const NATIVE_TEST: &str = "controller_fresh_open_boundary_keeps_native_state_absent";
-const EXPECTED_BOUNDARY: &str = "current-pin fresh MySQL controller Open boundary";
-const OPEN_MISMATCH: &str = "agent store identity mismatch: open context changed";
+const NATIVE_TEST: &str = "controller_fresh_new_open_starts_and_contains_native_members";
 
 #[test]
-fn controller_fresh_open_boundary_keeps_native_state_absent() -> Result<()> {
+fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> {
     if std::env::var_os(CHILD_MODE).is_some() {
         preflight_oracle_mysql_8_4_11().map_err(anyhow::Error::msg)?;
         return tokio::runtime::Builder::new_multi_thread()
@@ -56,18 +56,32 @@ fn controller_fresh_open_boundary_keeps_native_state_absent() -> Result<()> {
     let root = tempfile::Builder::new()
         .prefix("")
         .rand_bytes(3)
-        .tempdir_in("/tmp")?
-        .keep();
-    eprintln!("retained MySQL in-process probe root: {}", root.display());
+        .tempdir_in("/tmp")?;
+    eprintln!("MySQL in-process probe storage: {}", root.path().display());
     let output = Command::new(std::env::current_exe()?)
         .args(["--exact", NATIVE_TEST, "--nocapture"])
         .env(CHILD_MODE, "1")
-        .env("CARGO_TARGET_DIR", &root)
+        .env("CARGO_TARGET_DIR", root.path())
         .env_remove("KUBERIC_WORKSPACE_TESTS")
-        .output()?;
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let retained = root.keep();
+            return Err(anyhow::Error::new(error).context(format!(
+                "probe child I/O failed; retained storage: {}",
+                retained.display()
+            )));
+        }
+    };
     eprintln!("{}", String::from_utf8_lossy(&output.stdout));
     eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-    ensure!(output.status.success(), "native probe child failed");
+    if !output.status.success() {
+        bail!(
+            "native probe child failed; retained storage: {}",
+            root.keep().display()
+        );
+    }
     Ok(())
 }
 
@@ -88,10 +102,16 @@ struct FactoryState {
 struct NativeMember {
     service: Arc<MysqlPublicV1Service>,
     root: PathBuf,
+    pid_path: PathBuf,
     sql: SocketAddr,
     group: SocketAddr,
     proxy: SocketAddr,
     drained: bool,
+}
+
+struct NativeEvidence {
+    member: NativeMember,
+    pid: u32,
 }
 
 impl MysqlFactory {
@@ -194,6 +214,7 @@ impl MysqlFactory {
             .map_err(native_error)?,
         )
         .map_err(native_error)?;
+        let pid_path = instance.runtime().pid().to_owned();
         let config = MysqlPublicV1ServiceConfig::new(
             partition,
             instance,
@@ -221,6 +242,7 @@ impl MysqlFactory {
         state.members.push(NativeMember {
             service: service.clone(),
             root: root.to_owned(),
+            pid_path,
             sql: self.topology.members()[slot].sql_address(),
             group: self.topology.members()[slot].group_replication_address(),
             proxy: self.proxies[slot],
@@ -238,6 +260,25 @@ impl MysqlFactory {
             "not all MySQL services were constructed"
         );
         Ok(state.members.clone())
+    }
+
+    fn native_evidence(&self) -> Result<Vec<NativeEvidence>> {
+        self.members()?
+            .into_iter()
+            .map(|member| {
+                let pid = std::fs::read_to_string(&member.pid_path)?.trim().parse()?;
+                ensure!(
+                    Path::new(&format!("/proc/{pid}")).exists(),
+                    "native child is absent"
+                );
+                ensure!(
+                    member.root.join("d/auto.cnf").is_file(),
+                    "native identity is absent"
+                );
+                assert_no_application_store(&member.root.join("d")).map_err(anyhow::Error::msg)?;
+                Ok(NativeEvidence { member, pid })
+            })
+            .collect()
     }
 }
 
@@ -300,161 +341,131 @@ async fn controller_probe() -> Result<()> {
     let mut cluster = TestCluster::builder(factory.clone())
         .name("mysql-probe")
         .image("in-process/mysql-native")
-        .scenario_timeout(Duration::from_secs(60))
+        .scenario_timeout(Duration::from_secs(480))
         .teardown_timeout(Duration::from_secs(60))
         .start()
         .await?;
-    let result = drive_until_open_rejection(&mut cluster, &factory).await;
-    let evidence = match result {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            let failure = cluster.finish(Err::<(), _>(error)).await;
-            if let Err(error) = &failure {
-                print_diagnostics(error);
-            }
-            failure?;
-            bail!("failed probe unexpectedly finalized successfully");
-        }
+    let (result, evidence) = match drive_until_fresh_open(&mut cluster, &factory).await {
+        Ok(evidence) => (Ok(()), Some(evidence)),
+        Err(error) => (Err(error), None),
     };
-    let error = cluster
-        .finish(Err::<(), _>(TestError::new(
-            ErrorKind::Application,
-            EXPECTED_BOUNDARY,
-        )))
-        .await
-        .err()
-        .context("unsupported Open unexpectedly finalized successfully")?;
-    print_diagnostics(&error);
-    ensure!(
-        error.kind() == ErrorKind::Application,
-        "scenario had an unexpected or unacknowledged cleanup failure: {error}"
-    );
-    let diagnostics = error
-        .diagnostics()
-        .context("missing retained diagnostics")?;
-    assert_open_boundary(diagnostics)?;
-    let retained = diagnostics["retainedStorage"]
-        .as_str()
-        .context("missing retained storage path")?;
-    ensure!(
-        Path::new(retained).is_dir(),
-        "diagnostics were not retained"
-    );
-    serde_json::to_writer_pretty(
-        std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(Path::new(retained).join("probe-diagnostics.json"))?,
-        diagnostics,
-    )?;
+    if let Err(error) = cluster.finish(result).await {
+        print_diagnostics(&error);
+        if let Err(retention) = retain_diagnostics(&error) {
+            return Err(anyhow::Error::new(error).context(format!(
+                "additionally failed to retain redacted diagnostics: {retention:#}"
+            )));
+        }
+        return Err(error.into());
+    }
     ensure!(
         factory.members()?.iter().all(|member| member.drained),
         "factory cleanup was not acknowledged for every service"
     );
-    for member in evidence {
+    for native in evidence.context("successful finish lost native evidence")? {
+        assert_process_absent(native.pid).map_err(anyhow::Error::msg)?;
+        let member = native.member;
         for address in [member.sql, member.group, member.proxy] {
             assert_tcp_refuses(address).map_err(anyhow::Error::msg)?;
         }
         ensure!(
-            std::fs::read_dir(&member.root)?
-                .next()
-                .transpose()?
-                .is_none(),
-            "rejected Open created native state"
+            !member.root.exists(),
+            "successful harness finish retained application storage"
         );
-        assert_no_application_store(&member.root).map_err(anyhow::Error::msg)?;
         factory.shutdown_and_drain(member.service).await?;
     }
     Ok(())
 }
 
-async fn drive_until_open_rejection(
+async fn drive_until_fresh_open(
     cluster: &mut TestCluster<MysqlFactory>,
     factory: &MysqlFactory,
-) -> Result<Vec<NativeMember>> {
+) -> Result<Vec<NativeEvidence>> {
     loop {
-        let before = cluster.observe().await?;
-        let pending = before
-            .set()
-            .status
-            .as_ref()
-            .and_then(|status| status.public_v1_transition.as_ref())
-            .map(|transition| transition.transition().map_err(anyhow::Error::msg))
-            .transpose()?;
         cluster.step().await?;
-        let after = cluster.observe().await?;
-        if let Some(pending) = pending
-            && pending.intent.call_kind == PublicV1CallKind::Open
-            && after.reconcile_errors() > before.reconcile_errors()
+        let observation = cluster.observe().await?;
+        if observation.reports().count() == 3
+            && observation
+                .reports()
+                .all(|(_, report)| report.has_current_open_endpoint())
         {
-            let status = after
-                .set()
-                .status
-                .as_ref()
-                .context("missing controller status")?;
-            let current = status
-                .public_v1_transition
-                .as_ref()
-                .context("failed Open lost its accepted transition")?;
-            ensure!(current.operation_id == pending.intent.operation_id);
-            ensure!(pending.evidence.completed_operations.is_empty());
-            let command = status
-                .public_v1_operation
-                .as_ref()
-                .context("missing controller Open command")?
-                .command()
-                .map_err(anyhow::Error::msg)?;
-            ensure!(command.intent.operation_id == pending.intent.operation_id);
             ensure!(
-                matches!(
-                    &command.intent.program,
-                    Some(PublicOperationProgram::Open { replica, existing: true })
-                        if replica == &command.target
-                ),
-                "controller did not request Existing for the fresh member"
-            );
-            ensure!(
-                after.failures().is_empty(),
+                observation.failures().is_empty(),
                 "host observations were unavailable"
             );
-            ensure!(after.reports().count() == 3, "missing exact host reports");
-            for (_, report) in after.reports() {
-                report.validate().map_err(anyhow::Error::msg)?;
-                ensure!(
-                    !report.completed_operations.iter().any(|completion| {
-                        completion.operation_id == pending.intent.operation_id
-                    }),
-                    "rejected Open received completion credit"
-                );
-                ensure!(
-                    report.replication_address.is_none(),
-                    "a member unexpectedly opened"
-                );
+            for (_, report) in observation.reports() {
+                assert_fresh_open_report(report)?;
+                assert_rejects_changed_open_evidence(report)?;
                 ensure!(
                     report.role == ReplicaRole::None
                         && report.read_status != AccessStatus::Granted
                         && report.write_status != AccessStatus::Granted,
-                    "failed Open published role or application access"
+                    "fresh-Open probe unexpectedly entered role or application admission"
                 );
             }
-            eprintln!(
-                "controller Open {} rejected before native startup",
-                current.operation_id
-            );
-            let members = factory.members()?;
-            for member in &members {
-                ensure!(
-                    std::fs::read_dir(&member.root)?
-                        .next()
-                        .transpose()?
-                        .is_none(),
-                    "failed Open had native effects"
-                );
-            }
-            return Ok(members);
+            eprintln!("three controller-driven New Opens completed with exact native evidence");
+            return factory.native_evidence();
         }
     }
+}
+
+fn assert_fresh_open_report(report: &PublicV1AgentReport) -> Result<()> {
+    report.validate().map_err(anyhow::Error::msg)?;
+    ensure!(
+        report.open_mode == OpenMode::Existing,
+        "initialized storage still reports New"
+    );
+    ensure!(
+        report.has_current_open_endpoint(),
+        "missing current-process Open endpoint"
+    );
+    let digest = PublicOperationProgram::Open {
+        replica: report.replica.clone(),
+        existing: false,
+    }
+    .digest();
+    ensure!(
+        report.completed_operations.iter().any(|completion| {
+            completion.call_kind == PublicV1CallKind::Open
+                && completion.process_session_id == report.process_session_id
+                && completion.storage_incarnation == report.storage_incarnation
+                && completion.history == report.history
+                && completion.input_digest == digest
+                && completion.result == PublicV1OperationResult::Succeeded
+        }),
+        "missing exact successful New Open receipt"
+    );
+    Ok(())
+}
+
+fn assert_rejects_changed_open_evidence(report: &PublicV1AgentReport) -> Result<()> {
+    let mut missing = report.clone();
+    missing.completed_operations.clear();
+    ensure!(
+        assert_fresh_open_report(&missing).is_err(),
+        "missing Open receipt passed"
+    );
+    let mut uninitialized = report.clone();
+    uninitialized.open_mode = OpenMode::New;
+    ensure!(
+        assert_fresh_open_report(&uninitialized).is_err(),
+        "uninitialized mode passed"
+    );
+    let mut changed = report.clone();
+    for completion in &mut changed.completed_operations {
+        if completion.call_kind == PublicV1CallKind::Open {
+            completion.input_digest = PublicOperationProgram::Open {
+                replica: report.replica.clone(),
+                existing: true,
+            }
+            .digest();
+        }
+    }
+    ensure!(
+        assert_fresh_open_report(&changed).is_err(),
+        "Existing Open receipt passed as New"
+    );
+    Ok(())
 }
 
 fn print_diagnostics(error: &TestError) {
@@ -464,36 +475,20 @@ fn print_diagnostics(error: &TestError) {
     }
 }
 
-fn assert_open_boundary(diagnostics: &Value) -> Result<()> {
-    ensure!(
-        diagnostics["lastReconcileError"]
-            .as_str()
-            .is_some_and(|error| error.contains(OPEN_MISMATCH)),
-        "controller failed for a different reason"
-    );
-    ensure!(
-        diagnostics["pendingTaskOwners"].as_u64() == Some(0),
-        "native/host cleanup still has pending owners"
-    );
+fn retain_diagnostics(error: &TestError) -> Result<()> {
+    let diagnostics = error
+        .diagnostics()
+        .context("missing retained diagnostics")?;
+    let root = diagnostics["retainedStorage"]
+        .as_str()
+        .context("missing retained storage path")?;
+    serde_json::to_writer_pretty(
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(Path::new(root).join("probe-diagnostics.json"))?,
+        diagnostics,
+    )?;
     Ok(())
-}
-
-#[test]
-fn unrelated_or_missing_diagnostics_do_not_satisfy_open_boundary() {
-    for diagnostics in [
-        serde_json::json!({}),
-        serde_json::json!({"lastReconcileError":"deadline elapsed","pendingTaskOwners":0}),
-        serde_json::json!({"lastReconcileError":"application factory failed","pendingTaskOwners":0}),
-        serde_json::json!({"lastReconcileError":"runtime is not open","pendingTaskOwners":0}),
-        serde_json::json!({"lastReconcileError":OPEN_MISMATCH,"pendingTaskOwners":1}),
-    ] {
-        assert!(assert_open_boundary(&diagnostics).is_err());
-    }
-    assert!(
-        assert_open_boundary(&serde_json::json!({
-            "lastReconcileError":OPEN_MISMATCH,
-            "pendingTaskOwners":0
-        }))
-        .is_ok()
-    );
 }

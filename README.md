@@ -25,7 +25,7 @@ per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
 infrastructure, not production topology owners. The normal crate surface
 includes the public adapter against `kuberic-runtime` pinned exactly to commit
-`8c659536bdf31040aa13d787427ff1601e261bf5`; no private managed lifecycle,
+`dabe144670303b22b1fe13f5ced78ab57ad3f98c`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
 ## Status
@@ -173,14 +173,15 @@ the closed driver rather than return synthetic progress. These hosted tests do
 not qualify Existing/cold recovery, controller Build, serving replay, or
 production deployment.
 
-The [controller-driven in-process probe](docs/mysql-hosted-lifecycle.md#executed-fresh-open-boundary)
+The [controller-driven in-process probe](docs/mysql-hosted-lifecycle.md#executed-fresh-new-open)
 now supplies a real MySQL `ApplicationFactory` to upstream's public test
-infrastructure. It captures an earlier fresh-start boundary: the controller
-requests Existing while the host selects New for the actual fresh native
-storage bindings, so Open rejects before mysqld starts. The probe requires that
-exact rejection, unchanged empty native roots, and acknowledged host/factory
-cleanup with retained local diagnostics. It does **not** qualify cluster
-formation or execute controller Build; the existing native gates remain.
+infrastructure. At the current pin, the earlier controller Existing/New mismatch
+is fixed: all three fresh native members start through controller-driven New
+Open, with exact current-process receipts and initialized storage-mode evidence.
+The probe verifies native process absence and host/factory cleanup afterward,
+retaining local diagnostics on failure. It stops before role/configuration and
+does **not** qualify cluster formation or execute controller Build; the existing
+native gates remain.
 
 The custom `PrimaryReplicator::build_replica` implementation transfers one
 fresh idle target through Group Replication distributed recovery. It binds the
