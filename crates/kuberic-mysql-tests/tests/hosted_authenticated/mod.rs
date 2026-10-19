@@ -377,6 +377,17 @@ fn rpc_error<T>(result: Result<T, tonic::Status>, context: &str) -> TestResult<t
     }
 }
 
+async fn bounded_rpc_error<T>(
+    future: impl Future<Output = Result<T, tonic::Status>>,
+    budget: Duration,
+    context: &str,
+) -> TestResult<tonic::Status> {
+    let result = tokio::time::timeout(budget, future)
+        .await
+        .map_err(|_| format!("{context}: RPC deadline elapsed"))?;
+    rpc_error(result, context)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct NativeSnapshot {
     pid: u32,
@@ -408,10 +419,12 @@ impl HostedFixture {
                 None => tonic::Request::new(request.clone()),
                 Some(token) => authenticated(request.clone(), token),
             };
-            let error = rpc_error(
-                wire.client.clone().execute(request).await,
+            let error = bounded_rpc_error(
+                wire.client.clone().execute(request),
+                Duration::from_secs(5),
                 "unauthorized ordinary Open admitted",
-            )?;
+            )
+            .await?;
             require(
                 error.code() == tonic::Code::Unauthenticated,
                 "unexpected unauthorized ordinary Open result",
@@ -647,4 +660,29 @@ fn unexpected_rpc_success_preserves_cleanup_and_noninterference_failures() {
     )
     .unwrap();
     assert_closed(&error).unwrap();
+}
+
+#[test]
+fn stalled_negative_rpc_returns_through_cleanup_aggregation() {
+    run_native(async {
+        let primary = bounded_rpc_error(
+            std::future::pending::<Result<(), tonic::Status>>(),
+            Duration::from_millis(1),
+            "stalled unauthenticated probe",
+        )
+        .await
+        .map(|_| ());
+        let result = finish_scenario(
+            primary,
+            Err("cleanup failure".into()),
+            Err("foreign child failure".into()),
+        );
+        require(
+            result.err().as_deref()
+                == Some(
+                    "scenario: stalled unauthenticated probe: RPC deadline elapsed; shutdown/containment: cleanup failure; foreign child: foreign child failure",
+                ),
+            "timed-out RPC bypassed returned-error cleanup aggregation",
+        )
+    });
 }

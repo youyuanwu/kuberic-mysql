@@ -70,14 +70,16 @@ failover group. It uses no direct driver call to supply a hosted result.
 Both [ordinary terminal scenarios](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L285-L364)
 first run the full positive journey. Missing and incorrect control bearer
 credentials return Unauthenticated before native roots exist; valid Open then
-succeeds. After DML, [independent sampling](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L425-L535)
+succeeds. Both missing/wrong-bearer probes have a five-second local deadline;
+timeout is a returned scenario error that still runs awaited cleanup.
+After DML, [independent sampling](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L438-L548)
 brackets ordinary progress/report with quiet native snapshots. It compares
 complete parsed executed/purged GTIDs and native identity, projects only the
 qualified complete history, and requires nonzero equality to both host applied
 (`last`) and independently provider-sampled committed (`first`) values.
 The driver/provider commitment proof is not replaced by the fixture's query.
 
-[Stale session, durable target and authority revision requests](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L537-L621)
+[Stale session, durable target and authority revision requests](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L550-L634)
 each return FailedPrecondition. New operation IDs and structurally consistent
 envelopes distinguish stale authority from malformed input or exact retries.
 Progress requests avoid the runtime's deliberate pre-admission access fence
@@ -163,8 +165,8 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   --test kuberic_public_v1_hosted_live_mysql_8_4_11
 ```
 
-The target contains ten tests: six existing cases, two ordinary native cases,
-and two deterministic retained-root/negative-result regressions. Neither native
+The target contains eleven tests: six existing cases, two ordinary native cases,
+and three deterministic retained-root/negative-result/timeout regressions. Neither native
 route skips missing prerequisites. The runtime test dependency still enables
 `testing` for the old cases; its presence is not evidence the ordinary cases
 use it. Use one build job and one target tree; do not run native fixtures
