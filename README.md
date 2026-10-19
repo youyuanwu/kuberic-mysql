@@ -179,9 +179,15 @@ infrastructure. At the current pin, the earlier controller Existing/New mismatch
 is fixed: all three fresh native members start through controller-driven New
 Open, with exact current-process receipts and initialized storage-mode evidence.
 The probe verifies native process absence and host/factory cleanup afterward,
-retaining local diagnostics on failure. It stops before role/configuration and
-does **not** qualify cluster formation or execute controller Build; the existing
-native gates remain.
+retaining local diagnostics on failure. Its separate
+[fresh-formation boundary case](docs/mysql-hosted-lifecycle.md#executed-fresh-primary-role-boundary)
+continues through the controller's standalone Primary-role dispatch. Before a
+configuration proof exists, MySQL rejects committed-progress reporting with the
+exact applicable-configuration error; the controller accepts no Role or later
+formation/Build credit. All native members remain unformed, with empty GTIDs and
+closed application proxies, and acknowledged cleanup contains them. This is
+**executed fail-closed boundary qualification, not successful cluster formation
+or controller Build**; the existing native gates remain.
 
 The custom `PrimaryReplicator::build_replica` implementation transfers one
 fresh idle target through Group Replication distributed recovery. It binds the

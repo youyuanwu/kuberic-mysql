@@ -13,8 +13,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
+use kuberic_controller::crd::{KubericSetStatus, PublicV1OperationStatus};
 use kuberic_controller::test_util::{
-    ApplicationFactory, CreatedApplication, ErrorKind, ReplicaContext, TestCluster, TestError,
+    ApplicationFactory, CreatedApplication, ErrorKind, ObservationFailureKind, ReplicaContext,
+    TestCluster, TestError,
 };
 use kuberic_mysql::core::{AttemptId, ConfiguredGtidLineage, CredentialGeneration};
 use kuberic_mysql::service::{
@@ -25,10 +27,14 @@ use kuberic_mysql::service::{
 use kuberic_runtime::StatefulServiceReplica;
 use kuberic_runtime::application::OpenMode;
 use kuberic_runtime::host::ApplicationStorageState;
+use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationProgram, PublicV1AgentReport, PublicV1CallKind, PublicV1OperationResult,
+    PublicOperationClass, PublicOperationProgram, PublicV1AcceptedOperationCompletion,
+    PublicV1AgentReport, PublicV1CallKind, PublicV1OperationResult,
 };
-use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
+use kuberic_runtime::protocol::types::{AccessStatus, Epoch, ReplicaRole};
+use mysql_async::prelude::Queryable;
+use mysql_async::{Conn, OptsBuilder};
 
 use live_support::{
     APPARMOR_EXEC, MYSQL_X_PORT, MYSQLD, ReservedPorts, assert_no_application_store,
@@ -37,10 +43,53 @@ use live_support::{
 
 const GROUP_UUID: &str = "03e84887-4d65-42d0-b941-0f691cb0aa16";
 const CHILD_MODE: &str = "KUBERIC_MYSQL_INPROCESS_PROBE_CHILD";
-const NATIVE_TEST: &str = "controller_fresh_new_open_starts_and_contains_native_members";
+const ROLE_PROGRESS_ERROR: &str =
+    "Primary committed progress requires an applicable configuration proof";
 
 #[test]
 fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> {
+    run_native_probe(
+        "controller_fresh_new_open_starts_and_contains_native_members",
+        false,
+    )
+}
+
+#[test]
+fn controller_fresh_primary_role_requires_configuration_progress_proof() -> Result<()> {
+    run_native_probe(
+        "controller_fresh_primary_role_requires_configuration_progress_proof",
+        true,
+    )
+}
+
+#[test]
+fn formation_boundary_rejects_unrelated_errors() {
+    for message in [
+        "agent report: Unavailable(\"Execute timed out\")",
+        "agent report: Unavailable(\"runtime is closed\")",
+        r#"agent report: Unavailable("code: 'The system is not in a state required for the operation's execution', message: \"invalid replication evidence: Primary committed progress requires an applicable configuration proof\"")"#,
+        ROLE_PROGRESS_ERROR,
+        "Primary committed progress requires a different proof",
+    ] {
+        let error = TestError::with_source(
+            ErrorKind::Fatal,
+            "harness operation failed",
+            anyhow::anyhow!("{message}"),
+        );
+        assert!(assert_role_progress_rejection(&error).is_err());
+    }
+    for kind in [
+        ErrorKind::Deadline,
+        ErrorKind::Cleanup,
+        ErrorKind::Application,
+    ] {
+        assert!(
+            assert_role_progress_rejection(&TestError::new(kind, ROLE_PROGRESS_ERROR)).is_err()
+        );
+    }
+}
+
+fn run_native_probe(native_test: &str, formation: bool) -> Result<()> {
     if std::env::var_os(CHILD_MODE).is_some() {
         preflight_oracle_mysql_8_4_11().map_err(anyhow::Error::msg)?;
         return tokio::runtime::Builder::new_multi_thread()
@@ -48,7 +97,7 @@ fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> 
             .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()?
-            .block_on(controller_probe());
+            .block_on(controller_probe(formation));
     }
 
     // Only the child harness storage uses this short path, not Cargo compilation.
@@ -59,7 +108,7 @@ fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> 
         .tempdir_in("/tmp")?;
     eprintln!("MySQL in-process probe storage: {}", root.path().display());
     let output = Command::new(std::env::current_exe()?)
-        .args(["--exact", NATIVE_TEST, "--nocapture"])
+        .args(["--exact", native_test, "--nocapture"])
         .env(CHILD_MODE, "1")
         .env("CARGO_TARGET_DIR", root.path())
         .env_remove("KUBERIC_WORKSPACE_TESTS")
@@ -280,6 +329,41 @@ impl MysqlFactory {
             })
             .collect()
     }
+
+    async fn assert_native_unformed(&self) -> Result<()> {
+        for member in self.members()? {
+            assert_tcp_refuses(member.proxy).map_err(anyhow::Error::msg)?;
+            let mut connection = Conn::new(
+                OptsBuilder::default()
+                    .ip_or_hostname("127.0.0.1")
+                    .tcp_port(1)
+                    .socket(Some(
+                        member
+                            .root
+                            .join("s/mysql.sock")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ))
+                    .user(Some("root")),
+            )
+            .await?;
+            let evidence: (u8, String, u64) = connection
+                .query_first(
+                    "SELECT @@GLOBAL.group_replication_bootstrap_group, \
+                     @@GLOBAL.gtid_executed, \
+                     (SELECT COUNT(*) FROM performance_schema.replication_group_members \
+                      WHERE MEMBER_STATE <> 'OFFLINE')",
+                )
+                .await?
+                .context("missing native formation evidence")?;
+            connection.disconnect().await?;
+            ensure!(
+                evidence == (0, String::new(), 0),
+                "role-boundary member bootstrapped, joined a group, or had native transactions: {evidence:?}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -336,7 +420,7 @@ fn native_error(error: impl std::fmt::Debug) -> anyhow::Error {
     anyhow::anyhow!("{error:?}")
 }
 
-async fn controller_probe() -> Result<()> {
+async fn controller_probe(formation: bool) -> Result<()> {
     let factory = MysqlFactory::new()?;
     let mut cluster = TestCluster::builder(factory.clone())
         .name("mysql-probe")
@@ -346,7 +430,14 @@ async fn controller_probe() -> Result<()> {
         .start()
         .await?;
     let (result, evidence) = match drive_until_fresh_open(&mut cluster, &factory).await {
-        Ok(evidence) => (Ok(()), Some(evidence)),
+        Ok(evidence) => {
+            let result = if formation {
+                drive_until_formation_boundary(&mut cluster, &factory).await
+            } else {
+                Ok(())
+            };
+            (result, Some(evidence))
+        }
         Err(error) => (Err(error), None),
     };
     if let Err(error) = cluster.finish(result).await {
@@ -374,6 +465,218 @@ async fn controller_probe() -> Result<()> {
         );
         factory.shutdown_and_drain(member.service).await?;
     }
+    Ok(())
+}
+
+async fn drive_until_formation_boundary(
+    cluster: &mut TestCluster<MysqlFactory>,
+    factory: &MysqlFactory,
+) -> Result<()> {
+    let initial = cluster.observe().await?;
+    ensure!(
+        initial.failures().is_empty(),
+        "fresh reports became unavailable"
+    );
+    let initial_errors = initial.reconcile_errors();
+    let fresh = initial
+        .reports()
+        .map(|(_, report)| report.clone())
+        .collect::<Vec<_>>();
+    loop {
+        cluster.step().await?;
+        let observation = cluster.observe().await?;
+        if observation.reconcile_errors() == initial_errors && observation.failures().is_empty() {
+            continue;
+        }
+        ensure!(
+            observation.reconcile_errors() > initial_errors,
+            "report failed without an observed controller rejection"
+        );
+        let status = observation
+            .set()
+            .status
+            .as_ref()
+            .context("missing controller status")?;
+        let command = assert_pending_primary_role(status, &fresh)?;
+        assert_rejects_changed_role_evidence(status, &fresh)?;
+        ensure!(
+            observation.credentials_consistent(),
+            "controller/host credentials changed"
+        );
+        let [failure] = observation.failures() else {
+            bail!("expected only the intended Primary report to be unavailable");
+        };
+        ensure!(
+            failure.kind() == ObservationFailureKind::Unavailable
+                && failure.instance_id() == command.target.instance_id.as_str(),
+            "an unrelated replica or observation failed"
+        );
+        assert_role_progress_rejection(failure.error().context("missing report rejection")?)?;
+        ensure!(
+            observation.reports().count() == 2,
+            "healthy peer reports are missing"
+        );
+        for (_, report) in observation.reports() {
+            assert_fresh_open_report(report)?;
+            ensure!(
+                fresh.iter().any(|opened| {
+                    opened.replica == report.replica
+                        && opened.process_session_id == report.process_session_id
+                        && opened.storage_incarnation == report.storage_incarnation
+                        && opened.replicator_creation_id == report.replicator_creation_id
+                }) && report.role == ReplicaRole::None
+                    && report.read_status != AccessStatus::Granted
+                    && report.write_status != AccessStatus::Granted
+                    && report
+                        .completed_operations
+                        .iter()
+                        .all(|completion| completion.call_kind == PublicV1CallKind::Open),
+                "peer changed identity or received formation/admission credit"
+            );
+        }
+        cluster.probe(factory.assert_native_unformed()).await?;
+        eprintln!(
+            "controller Primary role reached the exact unconfigured-progress guard; \
+             only three New Opens were accepted, all native members remain unformed and closed"
+        );
+        return Ok(());
+    }
+}
+
+fn assert_pending_primary_role(
+    status: &KubericSetStatus,
+    fresh: &[PublicV1AgentReport],
+) -> Result<PublicV1OperationCommand> {
+    ensure!(
+        fresh.len() == 3
+            && status.public_v1_topology.is_none()
+            && status.public_v1_session_renewal.is_none()
+            && status.public_v1_replacement.is_none(),
+        "formation boundary has unexpected topology or recovery authority"
+    );
+    let authority = status
+        .public_v1_authority
+        .as_ref()
+        .context("missing accepted authority")?
+        .authority()
+        .map_err(anyhow::Error::msg)?;
+    let transition = status
+        .public_v1_transition
+        .as_ref()
+        .context("missing frozen transition")?
+        .transition()
+        .map_err(anyhow::Error::msg)?;
+    let command = status
+        .public_v1_operation
+        .as_ref()
+        .context("missing pending operation")?
+        .command()
+        .map_err(anyhow::Error::msg)?;
+    let program = PublicOperationProgram::Role {
+        epoch: Epoch::new(0, 1),
+        role: ReplicaRole::Primary,
+    };
+    ensure!(
+        command.target.replica_id.value() == 1
+            && command.intent.program.as_ref() == Some(&program)
+            && command.intent.lifecycle.is_none()
+            && command.intent.class == PublicOperationClass::Authority
+            && command.intent.input_digest == program.digest(),
+        "first rejected operation is not the exact standalone fresh Primary role"
+    );
+    let target = fresh
+        .iter()
+        .find(|report| report.replica == command.target)
+        .context("pending Primary is not a fresh-open member")?;
+    ensure!(
+        command.intent.identity == target.identity
+            && command.intent.process_session_id == target.process_session_id
+            && transition.evidence == authority
+            && transition.intent.operation_id == command.intent.operation_id
+            && transition.intent.revision == command.intent.revision
+            && transition.intent.call_kind == PublicV1CallKind::Role
+            && transition.intent.source.storage_incarnation == target.storage_incarnation
+            && transition.intent.process_session_id == target.process_session_id
+            && transition.intent.history == target.history
+            && transition.intent.input_digest == command.intent.input_digest,
+        "pending Role differs from exact accepted session/storage/history authority"
+    );
+    ensure!(
+        authority.completed_operations.len() == 3,
+        "controller credited an operation beyond the three New Opens"
+    );
+    for report in fresh {
+        assert_fresh_open_report(report)?;
+        ensure!(
+            report.history == authority.history
+                && report.completed_operations.iter().any(|completion| {
+                    completion.call_kind == PublicV1CallKind::Open
+                        && completion.result == PublicV1OperationResult::Succeeded
+                        && command.intent.revision > completion.revision
+                        && authority.completed_operations.contains(
+                            &PublicV1AcceptedOperationCompletion::from_completion(completion),
+                        )
+                }),
+            "controller lacks exact accepted New Open evidence"
+        );
+    }
+    Ok(command)
+}
+
+fn assert_rejects_changed_role_evidence(
+    status: &KubericSetStatus,
+    fresh: &[PublicV1AgentReport],
+) -> Result<()> {
+    let mut missing = status.clone();
+    missing.public_v1_operation = None;
+    ensure!(
+        assert_pending_primary_role(&missing, fresh).is_err(),
+        "missing Role passed"
+    );
+    let mut changed = status.clone();
+    let mut command = assert_pending_primary_role(status, fresh)?;
+    command.intent.program = Some(PublicOperationProgram::Epoch {
+        epoch: Epoch::new(0, 1),
+    });
+    command.intent.input_digest = command.intent.program.as_ref().unwrap().digest();
+    changed.public_v1_operation =
+        Some(PublicV1OperationStatus::from_command(&command).map_err(anyhow::Error::msg)?);
+    ensure!(
+        assert_pending_primary_role(&changed, fresh).is_err(),
+        "Epoch substituted for Role passed"
+    );
+    let mut changed = status.clone();
+    changed
+        .public_v1_authority
+        .as_mut()
+        .context("missing authority")?
+        .completed_operation_count += 1;
+    ensure!(
+        assert_pending_primary_role(&changed, fresh).is_err(),
+        "changed completion credit passed"
+    );
+    let mut changed = fresh.to_vec();
+    changed[0].process_session_id = changed[1].process_session_id.clone();
+    ensure!(
+        assert_pending_primary_role(status, &changed).is_err(),
+        "substituted session passed"
+    );
+    Ok(())
+}
+
+fn assert_role_progress_rejection(error: &TestError) -> Result<()> {
+    let expected = format!(
+        "agent report: Invalid({:?})",
+        format!(
+            "code: 'The system is not in a state required for the operation's execution', \
+             message: \"invalid replication evidence: {ROLE_PROGRESS_ERROR}\""
+        )
+    );
+    let sources = error.sources().map(ToString::to_string).collect::<Vec<_>>();
+    ensure!(
+        error.kind() == ErrorKind::Fatal && sources == [expected],
+        "unexpected report rejection, not the exact Primary progress guard: {error}; {sources:?}"
+    );
     Ok(())
 }
 
