@@ -175,8 +175,9 @@ adapter process requires reset, not reconstruction from saved evidence.
 
 ## Public Kuberic boundary and pin
 
-Keep exact pin `be4f83b43567c59f48472025d55dd731efecc4c6` in both crates and
-Cargo.lock. The 2026-10-18 assessment rechecked that pin against immutable upstream
+Both crates and Cargo.lock now pin
+`8c659536bdf31040aa13d787427ff1601e261bf5`. The historical 2026-10-18 assessment
+checked the former pin `be4f83b43567c59f48472025d55dd731efecc4c6` against immutable upstream
 `c0e52ee6ef361d86cf9e984e1f0682bc1f479013`, then checked the complete delta to
 `11d804425bbdbe7759dfd18208a0d73ce667a9f4`, including controller admission,
 authenticated agent dispatch, lifecycle/factory attachment, logical renewal,
@@ -185,11 +186,12 @@ accepted-envelope/retained-native-owner handoff was found. The unselected SF V1
 substrate does not solve this gap. The
 [recovery authority contract](mysql-recovery-authority.md) records exact public
 evidence, required authority/custody sequencing, failure rules and future gates;
-it is a contract-only deliverable, not runtime integration or a reason to repin.
+it is a contract-only deliverable, not runtime integration. The later dependency
+update does not enable hosted `Existing` or native-owner recovery.
 
 Kuberic already owns generic durable operation intent/completion and a
 [replacement-session protocol](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/protocol/public_operations.rs#L1158-L1446).
-Its ordinary [OpenContext](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/application.rs#L13-L44)
+At that assessment, its ordinary [OpenContext](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/application.rs#L13-L44)
 and [factory context](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/replicator/mod.rs#L677-L788)
 do not supply the custom MySQL callback with a full accepted recovery envelope,
 predecessor physical retirement capability and epoch/configuration/operation

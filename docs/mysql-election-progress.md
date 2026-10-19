@@ -7,8 +7,8 @@ projection, researched on 2026-10-16. This status records the selected design;
 it does not expand the lifecycle behavior delivered by the current adapter.
 The historical comparison below intentionally retains its reviewed Kuberic
 commit. The delivered adapter is now pinned to
-`be4f83b43567c59f48472025d55dd731efecc4c6` (upstream main resolved once on
-2026-10-17 and frozen for both crates).
+`8c659536bdf31040aa13d787427ff1601e261bf5` (upstream main resolved once on
+2026-10-19 and frozen for both crates).
 
 The first Stage 3 [closed retained-owner reopen](mysql-safe-reopen.md) compares
 complete structured executed/purged sets, including nonprojectable shapes.
@@ -294,9 +294,9 @@ binding fail closed. Idle Build targets still require both fields to be
 
 Current contract sources:
 
-- [Kuberic replication trait contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/replicator/traits.rs)
-- [Kuberic provider contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/kuberic-runtime/src/traits.rs)
-- [SF semantics and quiet-copy proof boundary](https://github.com/youyuanwu/kuberic/blob/be4f83b43567c59f48472025d55dd731efecc4c6/docs/features/kuberic/service-fabric-api-semantics.md)
+- [Kuberic replication trait contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/replicator/traits.rs)
+- [Kuberic provider contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/traits.rs)
+- [SF semantics and quiet-copy proof boundary](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/docs/features/kuberic/service-fabric-api-semantics.md)
 
 The adapter also does not supply durable cross-restart `HistoryContext`,
 restart adoption, retained-binlog catch-up capability, arbitrary differing

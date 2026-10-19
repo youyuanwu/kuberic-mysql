@@ -3,7 +3,7 @@
 This is a bounded host-local qualification slice, not a production deployment
 or restart-recovery claim. It runs the **actual** `MysqlPublicV1Service` in
 `ReplicaHost`/`RunningReplica` on Kuberic
-[`be4f83b43567c59f48472025d55dd731efecc4c6`](https://github.com/youyuanwu/kuberic/tree/be4f83b43567c59f48472025d55dd731efecc4c6).
+[`8c659536bdf31040aa13d787427ff1601e261bf5`](https://github.com/youyuanwu/kuberic/tree/8c659536bdf31040aa13d787427ff1601e261bf5).
 The target contains two explicitly separate routes: existing `hosted_*` cases
 use the pin's testing facade for generic initialization/dispatch/observation;
 the `authenticated::*` native cases use ordinary authenticated control RPCs
@@ -143,6 +143,52 @@ direct qualification, Build/Remove and graceful closed-reopen semantics are
 not opted into this service-only policy. A retained diagnostic directory is
 neither a journal/adoption record nor permission to open Existing, restart an
 owner, continue Build, or serve replay.
+
+## Upstream in-process harness applicability
+
+The 2026-10-19 pin adds the public
+[`kuberic_controller::test_util`](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/docs/features/kuberic/in-process-testing.md)
+harness behind the controller's dev-only `test-util` feature. It runs the
+production reconciler and authenticated agent RPCs against real hosted
+applications, with a private Kubernetes resource implementation rather than a
+real cluster. It is a useful foundation, but **not a drop-in replacement for
+the MySQL fixtures**.
+
+The public
+[`ApplicationFactory`](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/application.rs#L11-L86)
+can construct an inert `MysqlPublicV1Service`, classify its actual native roots
+and supply owned data/runtime storage bindings. Its async `shutdown_and_drain`
+is the right place for application-owned cleanup after host drain. A MySQL
+adapter would still own exact native children, credentials, topology/port
+reservations, compact UDS paths and native-specific deadlines; the symbolic
+application image does not install or launch MySQL.
+
+The current boundaries are concrete:
+
+- The harness creates a
+  [three-replica persisted set](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/cluster.rs#L164-L192),
+  not the existing single-member hosted journey. Production controller Build
+  [first installs target inbound authority](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/cluster_api.rs#L2849-L2892).
+  The agent's
+  [installation path](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-runtime/src/host/hosting.rs#L631-L641)
+  still requires the built-in private `StatelessRuntimeControl`; MySQL's custom
+  factory does not attach it, so that path returns `NotOpen` before source Build.
+  The newly public harness does not remove this controller-integration gap.
+- Network isolation and armed Build-dial faults
+  [require an acknowledged built-in routed engine](https://github.com/youyuanwu/kuberic/blob/8c659536bdf31040aa13d787427ff1601e261bf5/kuberic-controller/src/test_util/cluster.rs#L2183-L2252).
+  They reject unsupported custom engines rather than cutting MySQL's native
+  Group Replication/recovery sockets.
+- Contained restart reuses storage, whereas
+  [MySQL service Open](../crates/kuberic-mysql/src/service/kuberic/service.rs#L345-L350)
+  deliberately rejects `Existing`. Harness restart/failover controls do not
+  implement retained-owner recovery or authorize native adoption.
+
+This is a source-level applicability assessment, not an executed MySQL
+`TestCluster` journey. Keep the existing native and ordinary authenticated
+gates. A future controller-driven MySQL factory/journey should qualify fresh
+formation and the exact Build authority boundary first, without substituting
+direct custom callbacks for controller dispatch. Any eventual controller
+dev-dependency must use the same exact Git revision as `kuberic-runtime`.
 
 ## Running the gate
 

@@ -8,8 +8,12 @@ Assessed on 2026-10-18 against dependency pin
 `c0e52ee6ef361d86cf9e984e1f0682bc1f479013` (H, “Port unselected SF V1 copy
 enumeration and reliable sending”, #169), and subsequently observed current main
 `11d804425bbdbe7759dfd18208a0d73ce667a9f4` (U, “Port unselected SF V1 copy
-build gates and retargeting”, #170). Keep P; no repin is justified by this
-assessment. Later upstream changes require a new immutable-contract check.
+build gates and retargeting”, #170). That assessment did not justify a repin.
+The current dependency is now
+`8c659536bdf31040aa13d787427ff1601e261bf5`; P/H/U remain historical evidence,
+not aliases for the current pin. The later
+[in-process harness assessment](mysql-hosted-lifecycle.md#upstream-in-process-harness-applicability)
+does not qualify this recovery contract.
 
 The target is deliberately narrow: move an **exactly retained closed reopened
 MySQL owner** into one fresh generic replicator, initially unassigned and
