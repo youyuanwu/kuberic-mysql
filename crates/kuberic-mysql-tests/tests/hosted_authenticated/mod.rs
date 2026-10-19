@@ -310,21 +310,20 @@ async fn ordinary_terminal(abort: bool) -> TestResult {
             PublicOperationProgram::Close
         });
         let started = Instant::now();
-        let error = tokio::time::timeout(
-            TERMINAL_BUDGET,
-            fixture.wire.as_ref().unwrap().execute(terminal),
-        )
-        .await
-        .map_err(failure)?
-        .expect_err("ordinary terminal RPC unexpectedly acknowledged success");
-        assert_closed(&error)?;
-        let status_error = fixture
-            .wire
-            .as_ref()
-            .unwrap()
-            .report()
+        let error = rpc_error(
+            tokio::time::timeout(
+                TERMINAL_BUDGET,
+                fixture.wire.as_ref().unwrap().execute(terminal),
+            )
             .await
-            .expect_err("closed member supplied live ordinary status");
+            .map_err(failure)?,
+            "ordinary terminal RPC unexpectedly acknowledged success",
+        )?;
+        assert_closed(&error)?;
+        let status_error = rpc_error(
+            fixture.wire.as_ref().unwrap().report().await,
+            "closed member supplied live ordinary status",
+        )?;
         assert_closed(&status_error)?;
         // All proof precedes emergency service abort, host shutdown and Drop.
         fixture.assert_contained_evidence()?;
@@ -371,6 +370,13 @@ fn assert_closed(error: &tonic::Status) -> TestResult {
     )
 }
 
+fn rpc_error<T>(result: Result<T, tonic::Status>, context: &str) -> TestResult<tonic::Status> {
+    match result {
+        Ok(_) => Err(context.to_owned()),
+        Err(error) => Ok(error),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct NativeSnapshot {
     pid: u32,
@@ -402,12 +408,10 @@ impl HostedFixture {
                 None => tonic::Request::new(request.clone()),
                 Some(token) => authenticated(request.clone(), token),
             };
-            let error = wire
-                .client
-                .clone()
-                .execute(request)
-                .await
-                .expect_err("unauthorized ordinary Open admitted");
+            let error = rpc_error(
+                wire.client.clone().execute(request).await,
+                "unauthorized ordinary Open admitted",
+            )?;
             require(
                 error.code() == tonic::Code::Unauthenticated,
                 "unexpected unauthorized ordinary Open result",
@@ -554,10 +558,7 @@ impl HostedFixture {
                 }
             };
             let request = wire.request(target, intent)?;
-            let error = wire
-                .send(request)
-                .await
-                .expect_err("stale ordinary request admitted");
+            let error = rpc_error(wire.send(request).await, "stale ordinary request admitted")?;
             require(
                 error.code() == tonic::Code::FailedPrecondition
                     && error.message().contains(expected),
@@ -626,4 +627,24 @@ fn retained_root_collision_never_deletes_existing_evidence() {
     std::fs::write(&evidence, b"retained").unwrap();
     assert!(FixtureRoot::new_retained("auth-collide").is_err());
     assert_eq!(std::fs::read(evidence).unwrap(), b"retained");
+}
+
+#[test]
+fn unexpected_rpc_success_preserves_cleanup_and_noninterference_failures() {
+    let primary = rpc_error(Ok(()), "unexpected RPC success").map(|_| ());
+    let result = finish_scenario(
+        primary,
+        Err("cleanup failure".into()),
+        Err("foreign child failure".into()),
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "scenario: unexpected RPC success; shutdown/containment: cleanup failure; foreign child: foreign child failure"
+    );
+    let error = rpc_error::<()>(
+        Err(tonic::Status::unavailable("runtime is closed")),
+        "success",
+    )
+    .unwrap();
+    assert_closed(&error).unwrap();
 }
