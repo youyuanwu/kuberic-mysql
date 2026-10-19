@@ -173,6 +173,15 @@ the closed driver rather than return synthetic progress. These hosted tests do
 not qualify Existing/cold recovery, controller Build, serving replay, or
 production deployment.
 
+The [controller-driven in-process probe](docs/mysql-hosted-lifecycle.md#executed-fresh-open-boundary)
+now supplies a real MySQL `ApplicationFactory` to upstream's public test
+infrastructure. It captures an earlier fresh-start boundary: the controller
+requests Existing while the host selects New for the actual fresh native
+storage bindings, so Open rejects before mysqld starts. The probe requires that
+exact rejection, unchanged empty native roots, and acknowledged host/factory
+cleanup with retained local diagnostics. It does **not** qualify cluster
+formation or execute controller Build; the existing native gates remain.
+
 The custom `PrimaryReplicator::build_replica` implementation transfers one
 fresh idle target through Group Replication distributed recovery. It binds the
 callback to the exact source and target identities, process sessions, storage
