@@ -2,7 +2,7 @@ use super::*;
 use crate::service::MemberNativeEvidence;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ProofScope {
+pub(super) struct ProofScope {
     binding: Option<PublicBinding>,
     epoch: Option<MysqlReplicaEpoch>,
     role: Option<MysqlReplicaRole>,
@@ -18,10 +18,13 @@ struct ProofScope {
     pending_join: bool,
     native_identity: crate::service::MysqlReplicaIdentity,
     native_successor: bool,
+    idle_preparation: IdleBuildPreparation,
+    access: Option<MysqlAccessIntent>,
+    proxy: ProxyState,
 }
 
 impl ProofScope {
-    fn capture(state: &DriverState) -> Self {
+    pub(super) fn capture(state: &DriverState) -> Self {
         Self {
             binding: state.binding.clone(),
             epoch: state.engine.epoch(),
@@ -44,6 +47,9 @@ impl ProofScope {
             pending_join: state.engine.pending_build().is_some(),
             native_identity: state.engine.identity().clone(),
             native_successor: state.engine.has_pending_build_successor(),
+            idle_preparation: state.idle_build_preparation.clone(),
+            access: state.engine.access_intent(),
+            proxy: state.proxy.clone(),
         }
     }
 }
@@ -300,12 +306,17 @@ impl MysqlPublicV1Replicator {
 
     pub(super) async fn coherent_committed_sample(&self, state: &mut DriverState) -> Result<i64> {
         Self::require_native_durability(state)?;
-        if state.fresh_open_progress.is_some()
-            && state.engine.configuration().is_none()
-            && state.engine.epoch().is_none()
-            && state.last_reported_progress == Some(0)
-        {
-            return Ok(0);
+        if state.fresh_open_progress.is_some() {
+            let sampled = state
+                .fresh_sample
+                .take()
+                .ok_or_else(|| unproved("no coherent fresh historical sample"))?;
+            if sampled != ProofScope::capture(state) || state.last_reported_progress != Some(0) {
+                return Err(unproved("fresh historical sample scope changed"));
+            }
+            let value = Self::sample_fresh_progress(state).await?;
+            state.fresh_sample = Some(sampled);
+            return Ok(value);
         }
         let retained = state
             .committed_sample
@@ -333,6 +344,30 @@ impl MysqlPublicV1Replicator {
             ));
         }
         Ok(retained.value)
+    }
+
+    pub(super) async fn sample_fresh_progress(state: &mut DriverState) -> Result<i64> {
+        require_bound_open(state)?;
+        require_not_cleanup_only(state)?;
+        if state.fresh_open_progress.is_none()
+            || state.current_configuration.is_some()
+            || state.pending_configuration.is_some()
+            || state.pending_native_configuration.is_some()
+            || state.pending_build_binding.is_some()
+            || state.build_generation.status() != BuildGenerationStatus::Available
+            || !matches!(state.proxy, ProxyState::Unprepared | ProxyState::Revoked)
+        {
+            return Err(unproved(
+                "fresh historical evidence is no longer applicable",
+            ));
+        }
+        let progress = state
+            .engine
+            .revalidate_fresh_progress()
+            .await
+            .map_err(map_mysql)?;
+        Self::require_native_durability(state)?;
+        Ok(progress.value())
     }
 }
 

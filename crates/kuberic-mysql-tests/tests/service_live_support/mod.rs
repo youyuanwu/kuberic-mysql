@@ -82,10 +82,9 @@ impl FixtureRoot {
     }
 
     pub fn new(label: &str) -> Result<Self, String> {
-        Ok(Self {
-            root: fresh_fixture_root(label)?,
-            preserve_on_drop: false,
-        })
+        let mut fixture = Self::new_retained(label)?;
+        fixture.preserve_on_drop = false;
+        Ok(fixture)
     }
 
     pub fn path(&self) -> &Path {
@@ -107,11 +106,46 @@ impl FixtureRoot {
 
 impl Drop for FixtureRoot {
     fn drop(&mut self) {
-        if self.preserve_on_drop {
+        if self.preserve_on_drop || std::thread::panicking() {
+            eprintln!(
+                "retaining native fixture diagnostics: {}",
+                self.root.display()
+            );
             return;
         }
+
         let _ = fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn failed_fixture_is_preserved_and_collision_cannot_replace_it() {
+        let label = "retain-check";
+        let mut fixture = FixtureRoot::new(label).unwrap();
+        let root = fixture.path().to_path_buf();
+        fs::write(root.join("diagnostic"), "retained").unwrap();
+        std::thread::spawn(move || {
+            let _owned = fixture;
+            panic!("controlled fixture unwind");
+        })
+        .join()
+        .unwrap_err();
+        assert_eq!(
+            fs::read_to_string(root.join("diagnostic")).unwrap(),
+            "retained"
+        );
+        assert!(FixtureRoot::new(label).is_err());
+        // This test alone owns the newly created diagnostic root.
+        fixture = FixtureRoot {
+            root,
+            preserve_on_drop: false,
+        };
+        fixture.remove().unwrap();
     }
 }
 

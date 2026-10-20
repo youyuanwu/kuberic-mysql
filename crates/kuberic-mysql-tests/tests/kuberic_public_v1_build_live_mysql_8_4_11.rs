@@ -110,6 +110,64 @@ fn dropped_remove_before_effects_is_retryable() {
     run_live_scenario(false, false, 21);
 }
 
+#[test]
+fn fresh_role_epoch_and_idle_reports_are_coherent_without_admission() {
+    run_live_scenario(false, false, 30);
+}
+
+#[test]
+fn fresh_history_change_between_scalar_and_provider_cannot_return_zero() {
+    run_live_scenario(false, false, 31);
+}
+
+#[test]
+fn fresh_durability_loss_cannot_be_restored_into_zero_progress() {
+    run_live_scenario(false, false, 32);
+}
+
+#[test]
+fn cancelled_fresh_query_retires_qualification_and_releases_ownership() {
+    run_live_scenario(false, false, 33);
+}
+
+#[test]
+fn abort_during_fresh_query_contains_the_exact_owner() {
+    run_live_scenario(false, false, 34);
+}
+
+#[test]
+fn native_unwind_retains_owned_scratch_diagnostics_without_reuse() {
+    assert!(
+        std::panic::catch_unwind(|| run_live_scenario(false, false, 35)).is_err(),
+        "controlled native unwind must reach the fixture's panic path"
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target")
+        .join(format!("km-public-build-{}", std::process::id()));
+    for member in 1..=3 {
+        assert!(!root.join(format!("member-{member}-scratch")).exists());
+        let retained = root.join(format!("member-{member}-scratch.retained"));
+        assert!(retained.is_dir());
+        for log in ["mysqld.err", "mysqld.out"] {
+            assert!(retained.join(log).is_file(), "missing retained {log}");
+        }
+        assert!(
+            root.join(format!("member-{member}-data/auto.cnf"))
+                .is_file()
+        );
+    }
+    assert!(
+        FixtureRoot::new("public-build-live").is_err(),
+        "a later fixture must not replace retained native evidence"
+    );
+    // This deliberately failed fixture remains local for diagnostic review.
+    eprintln!("verified retained native unwind: {}", root.display());
+}
+
 fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
     run_live_scenario(interrupt_second, omit_source_progress, 0);
 }
@@ -214,6 +272,14 @@ async fn run_custom_build_fixture(
         .await;
         assert_tcp_login_rejected(sql[index], &format!("kms_app_{index}"), None).await;
     }
+    if proof_case >= 30 {
+        qualify_fresh_lifecycle(&drivers, &root, &proxy, proof_case).await;
+        for driver in drivers.iter().rev() {
+            driver.close().await.unwrap();
+        }
+        fixture.remove().unwrap();
+        return;
+    }
     drivers[0].update_epoch(epoch).await.unwrap();
     kuberic_runtime::application::StateProvider::update_epoch(drivers[0].as_ref(), epoch, 0)
         .await
@@ -259,6 +325,7 @@ async fn run_custom_build_fixture(
             .change_role(epoch, ReplicaRole::IdleSecondary)
             .await
             .unwrap();
+        assert_fresh_pair(drivers[target].as_ref()).await;
 
         let socket = instance_socket(&root, 0);
         commit_marker(&socket, &format!("build_marker_{target}")).await;
@@ -1201,6 +1268,146 @@ fn instance_socket(root: &Path, index: usize) -> std::path::PathBuf {
         .join("mysql.sock")
 }
 
+async fn assert_fresh_pair(driver: &MysqlPublicV1Replicator) {
+    assert_eq!(driver.current_progress().await.unwrap(), 0);
+    assert_eq!(
+        kuberic_runtime::application::StateProvider::last_committed_lsn(driver)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+async fn qualify_fresh_lifecycle(
+    drivers: &[Arc<MysqlPublicV1Replicator>],
+    root: &Path,
+    proxies: &[SocketAddr],
+    case: u8,
+) {
+    use kuberic_runtime::application::StateProvider;
+    for (index, driver) in drivers.iter().enumerate() {
+        assert_fresh_pair(driver.as_ref()).await;
+        assert_eq!(group_member_count(&instance_socket(root, index)).await, 0);
+        assert_tcp_refuses(proxies[index]).unwrap();
+    }
+    let driver = drivers[0].as_ref();
+    let epoch = Epoch::new(0, 1);
+    driver
+        .change_role(epoch, ReplicaRole::Primary)
+        .await
+        .unwrap();
+    assert_fresh_pair(driver).await;
+    driver
+        .change_role(epoch, ReplicaRole::Primary)
+        .await
+        .unwrap();
+    Replicator::update_epoch(driver, epoch).await.unwrap();
+    StateProvider::update_epoch(driver, epoch, 0).await.unwrap();
+    assert_fresh_pair(driver).await;
+    match case {
+        30 => {
+            assert!(matches!(
+                PrimaryReplicator::on_data_loss(driver).await,
+                Err(RuntimeError::InvalidReplication(message))
+                    if message == "MySQL Public V1 data-loss acceptance is unsupported"
+            ));
+            assert!(matches!(
+                StateProvider::on_data_loss(driver).await,
+                Err(RuntimeError::InvalidReplication(message))
+                    if message == "MySQL Public V1 StateProvider rejects data-loss acceptance"
+            ));
+            assert!(StateProvider::get_copy_context(driver).await.is_err());
+            assert_eq!(driver.catch_up_capability().await.unwrap(), INVALID_LSN);
+            assert!(
+                driver
+                    .change_role(epoch, ReplicaRole::ActiveSecondary)
+                    .await
+                    .is_err()
+            );
+            let newer = Epoch::new(0, 2);
+            Replicator::update_epoch(driver, newer).await.unwrap();
+            assert!(StateProvider::last_committed_lsn(driver).await.is_err());
+            assert!(StateProvider::update_epoch(driver, newer, 0).await.is_err());
+            assert!(
+                driver
+                    .change_role(epoch, ReplicaRole::Primary)
+                    .await
+                    .is_err()
+            );
+            // A newer epoch also invalidates the previously accepted role.
+            assert!(driver.current_progress().await.is_err());
+            driver
+                .change_role(newer, ReplicaRole::Primary)
+                .await
+                .unwrap();
+            assert_fresh_pair(driver).await;
+            let idle = drivers[1].as_ref();
+            Replicator::update_epoch(idle, epoch).await.unwrap();
+            // The old pre-epoch pair cannot be silently retagged.
+            assert!(StateProvider::last_committed_lsn(idle).await.is_err());
+            assert_fresh_pair(idle).await;
+            idle.change_role(epoch, ReplicaRole::IdleSecondary)
+                .await
+                .unwrap();
+            assert!(StateProvider::last_committed_lsn(idle).await.is_err());
+            assert_fresh_pair(idle).await;
+            idle.change_role(epoch, ReplicaRole::IdleSecondary)
+                .await
+                .unwrap();
+            assert_fresh_pair(idle).await;
+        }
+        31 => {
+            let mut admin = root_connection(&instance_socket(root, 0)).await;
+            admin
+                .query_drop("SET GLOBAL super_read_only=OFF")
+                .await
+                .unwrap();
+            admin.query_drop("SET GLOBAL read_only=OFF").await.unwrap();
+            commit_marker(&instance_socket(root, 0), "unformed-history").await;
+            admin
+                .query_drop("SET GLOBAL super_read_only=ON")
+                .await
+                .unwrap();
+            admin.disconnect().await.unwrap();
+            assert!(StateProvider::last_committed_lsn(driver).await.is_err());
+            assert!(driver.current_progress().await.is_err());
+            assert!(StateProvider::update_epoch(driver, epoch, 0).await.is_err());
+        }
+        32 => {
+            let mut admin = root_connection(&instance_socket(root, 0)).await;
+            admin.query_drop("SET GLOBAL sync_binlog=0").await.unwrap();
+            assert!(driver.current_progress().await.is_err());
+            admin.query_drop("SET GLOBAL sync_binlog=1").await.unwrap();
+            admin.disconnect().await.unwrap();
+            assert!(driver.current_progress().await.is_err());
+            assert!(StateProvider::last_committed_lsn(driver).await.is_err());
+            assert!(StateProvider::update_epoch(driver, epoch, 0).await.is_err());
+        }
+        33 | 34 => {
+            let mut query = Box::pin(driver.current_progress());
+            assert!(
+                poll_fn(|cx| Poll::Ready(query.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            if case == 34 {
+                driver.abort();
+            }
+            drop(query);
+            assert!(driver.current_progress().await.is_err());
+            assert!(StateProvider::last_committed_lsn(driver).await.is_err());
+            if case == 34 {
+                assert!(!instance_socket(root, 0).exists());
+            }
+        }
+        35 => panic!("controlled native fixture unwind"),
+        _ => unreachable!(),
+    }
+    for proxy in proxies {
+        assert_tcp_refuses(*proxy).unwrap();
+    }
+}
+
 async fn commit_marker(socket: &Path, marker: &str) {
     let mut connection = root_connection(socket).await;
     connection
@@ -1250,7 +1457,10 @@ async fn root_connection(socket: &Path) -> Conn {
 async fn group_member_count(socket: &Path) -> usize {
     let mut connection = root_connection(socket).await;
     let count = connection
-        .query_first::<u64, _>("SELECT COUNT(*) FROM performance_schema.replication_group_members")
+        .query_first::<u64, _>(
+            "SELECT COUNT(*) FROM performance_schema.replication_group_members \
+             WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID <> ''",
+        )
         .await
         .unwrap()
         .unwrap_or(0);

@@ -97,6 +97,57 @@ fn scope(
         pending_join: target && !installed,
         native_identity: native.identity().clone(),
         native_successor: !target && !installed,
+        idle_preparation: IdleBuildPreparation::default(),
+        access: Some(MysqlAccessIntent::new(NonZeroU64::MIN, false, false)),
+        proxy: ProxyState::Unprepared,
+    }
+}
+
+#[test]
+fn paired_scope_cannot_retag_binding_lifecycle_build_or_access_changes() {
+    let owned = completed_fixture();
+    let next = successor(&owned);
+    let original = scope(&owned, &next, true, false);
+    for dimension in 0..18 {
+        let mut changed = original.clone();
+        match dimension {
+            0 => {
+                changed.binding.as_mut().unwrap().identity =
+                    information(2, ReplicaRole::ActiveSecondary).identity
+            }
+            1 => {
+                changed.binding.as_mut().unwrap().process_session =
+                    PublicProcessSessionId::new("replaced-session")
+            }
+            2 => changed.binding.as_mut().unwrap().public_storage = None,
+            3 => {
+                changed
+                    .binding
+                    .as_mut()
+                    .unwrap()
+                    .settings
+                    .replication_address = "replaced-endpoint".into()
+            }
+            4 => changed.epoch = None,
+            5 => changed.role = Some(MysqlReplicaRole::Primary),
+            6 => changed.current = Some(next.clone()),
+            7 => changed.pending = Some(next.clone()),
+            8 => changed.build = None,
+            9 => changed.generation += 1,
+            10 => changed.authority = owned.binding.source_authority.clone(),
+            11 => changed.status = BuildGenerationStatus::NeedsRebuild,
+            12 => changed.public_epoch = Some(Epoch::new(0, 99)),
+            13 => changed.mapped_epoch_matches = false,
+            14 => changed.admitted_role = None,
+            15 => changed
+                .idle_preparation
+                .admit_role(owned.binding.epoch)
+                .unwrap(),
+            16 => changed.access = Some(MysqlAccessIntent::new(NonZeroU64::MIN, true, true)),
+            17 => changed.proxy = ProxyState::Revoked,
+            _ => unreachable!(),
+        }
+        assert_ne!(original, changed, "scope dimension {dimension}");
     }
 }
 

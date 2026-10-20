@@ -697,6 +697,28 @@ impl MysqlInstanceManager {
             .map_err(MemberTransitionError::Native)
     }
 
+    pub(crate) async fn verify_fresh_history(
+        &mut self,
+        authority: &MemberMutationAuthority,
+        attempt: &AttemptContext,
+    ) -> Result<(), MemberTransitionError> {
+        let target = self.prepare_member_effect_target(authority, attempt)?;
+        let deadline = Self::member_effect_deadline(attempt)?;
+        crate::service::control::verify_fresh_history(
+            target.clone(),
+            authority,
+            deadline.instant(),
+        )
+        .await?;
+        attempt
+            .admit_work()
+            .map_err(member_attempt_admission_error)?;
+        self.revalidate_member_effect_binding(authority)?;
+        self.prepare_control_target()?;
+        target.revalidate_socket()?;
+        Ok(())
+    }
+
     pub(crate) async fn remove_build_recovery_account(
         &mut self,
         authority: &MemberMutationAuthority,
@@ -1745,8 +1767,15 @@ impl MysqlInstanceManager {
         if self.child.is_none() {
             if self.revalidate_roots().is_ok() && !self.cleanup_quarantined {
                 if let Some(scratch) = self.scratch_root.as_ref() {
-                    if ensure_cleanup_deadline(deadline, LifecycleOperation::ScratchCleanup).is_ok()
-                        && remove_owned_root(scratch, LifecycleOperation::ScratchCleanup).is_ok()
+                    if ensure_cleanup_deadline(deadline, LifecycleOperation::ScratchCleanup)
+                        .and_then(|()| {
+                            if self.config.retain_containment_evidence() {
+                                retain_owned_runtime_evidence(scratch)
+                            } else {
+                                remove_owned_root(scratch, LifecycleOperation::ScratchCleanup)
+                            }
+                        })
+                        .is_ok()
                     {
                         self.scratch_root = None;
                     } else {
@@ -3214,6 +3243,90 @@ mod tests {
         assert_eq!(receipt.cleanup(), AttemptCleanupState::Failed);
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
         fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn exact_generation_retirement_preserves_opt_in_diagnostics_and_rejects_collision() {
+        for (retain, collision) in [(false, false), (true, false), (true, true)] {
+            let parent = std::env::temp_dir().join(format!(
+                "kms-retire-log-{}-{}",
+                std::process::id(),
+                CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = MysqlInstanceConfig::new_topology_member(
+                "/usr/bin/sleep",
+                "/usr/bin/env",
+                parent.join("data"),
+                parent.join("scratch"),
+                topology(),
+                MysqlMemberIndex::First,
+                MysqlOperationTimeouts::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if retain {
+                config = config.with_retained_containment_evidence();
+            }
+            let roots = config
+                .create_layout()
+                .unwrap_or_else(|_| panic!("test layout"));
+            fs::write(roots.scratch.path().join("mysqld.err"), "diagnostics").unwrap();
+            fs::write(roots.data.path().join("native"), "data").unwrap();
+            let retained = parent.join("scratch.retained");
+            if collision {
+                fs::create_dir(&retained).unwrap();
+                fs::write(retained.join("foreign"), "untouched").unwrap();
+            }
+            let authority = test_authority(&config);
+            let mut manager = MysqlInstanceManager::new(config);
+            manager.data_root = Some(roots.data);
+            manager.scratch_root = Some(roots.scratch);
+            manager.state = MysqlInstanceState::Initialized;
+            let generation = MysqlBuildAbortGeneration {
+                owner_generation: manager.owner_generation,
+                process_generation: manager.process_generation,
+                process_id: None,
+                server_id: manager.config.member().server_id(),
+                group_uuid: manager.config.member().group_uuid().to_owned(),
+                sql_address: manager.config.member().sql_address(),
+                group_replication_address: manager.config.member().group_replication_address(),
+                authority,
+            };
+            let receipt = manager.force_retire_owned_generation(&generation).unwrap();
+            assert_eq!(receipt.is_complete(), !collision);
+            assert_eq!(
+                fs::read_to_string(parent.join("data/native")).unwrap(),
+                "data"
+            );
+            if collision {
+                assert_eq!(
+                    fs::read_to_string(retained.join("foreign")).unwrap(),
+                    "untouched"
+                );
+                assert_eq!(
+                    fs::read_to_string(parent.join("scratch/mysqld.err")).unwrap(),
+                    "diagnostics"
+                );
+            } else {
+                assert!(!parent.join("scratch").exists());
+                assert_eq!(retained.exists(), retain);
+                if retain {
+                    assert_eq!(
+                        fs::read_to_string(retained.join("mysqld.err")).unwrap(),
+                        "diagnostics"
+                    );
+                }
+            }
+            drop(manager);
+            fs::remove_dir_all(parent).unwrap();
+        }
     }
 
     fn test_authority(config: &MysqlInstanceConfig) -> MemberMutationAuthority {

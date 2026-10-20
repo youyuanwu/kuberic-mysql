@@ -102,7 +102,7 @@ impl MysqlPublicV1ServiceConfig {
         let attempt = fresh.attempt.clone();
         let group_replication_address = fresh.group_replication_address;
         let input = MysqlFreshMemberInput::new(
-            fresh.instance,
+            fresh.instance.with_retained_containment_evidence(),
             native_identity,
             fresh.lineage,
             fresh.credentials,

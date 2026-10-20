@@ -1313,6 +1313,44 @@ impl MysqlReplicator<MysqlInstanceManager> {
         self.effects.native_durability_qualified()
     }
 
+    pub(crate) async fn revalidate_fresh_progress(
+        &mut self,
+    ) -> Result<QualifiedProgress, MysqlReplicatorError> {
+        self.require_open_active()?;
+        self.admit_work()?;
+        if !self.fresh_prepared_owner
+            || self.owned_authority.as_ref() != self.authority.as_ref()
+            || self
+                .access
+                .is_none_or(|intent| intent.read() || intent.write())
+            || self.configuration.is_some()
+            || self.native_evidence.is_some()
+            || self.progress.is_some()
+            || self.pending_build.is_some()
+            || self.pending_build_successor.is_some()
+            || self
+                .role
+                .is_some_and(|role| role != MysqlReplicaRole::Primary)
+            || (self.role.is_some() && self.role_epoch != self.epoch)
+        {
+            return Err(MysqlReplicatorError::InvalidConfiguration);
+        }
+        let authority = self.authority().clone();
+        // A failed or cancelled observation cannot leave an older fresh
+        // qualification usable. Only fully settled readback restores it.
+        self.fresh_prepared_owner = false;
+        self.effects
+            .verify_fresh_history(&authority, &self.attempt)
+            .await
+            .map_err(MysqlReplicatorError::MemberTransition)?;
+        self.admit_work()?;
+        self.fresh_prepared_owner = true;
+        match project_progress(&self.lineage, &GtidSet::empty()) {
+            ProgressProjection::Projectable(progress) => Ok(progress),
+            ProgressProjection::NonProjectable(_) => unreachable!("empty history projects"),
+        }
+    }
+
     pub(crate) async fn verify_build_target_fresh(
         &mut self,
         build: &BuildAttemptContext,
@@ -1431,6 +1469,7 @@ impl MysqlReplicator<MysqlInstanceManager> {
         .map_err(MysqlReplicatorError::MemberTransition)?;
         let input = FreshJoinInput::for_build_request(request.clone(), source, peers)
             .map_err(MysqlReplicatorError::MemberTransition)?;
+        self.fresh_prepared_owner = false;
         let receipt = self
             .effects
             .join_build_member(input, recovery, build, target_generation)
@@ -3099,6 +3138,9 @@ where
             Some(configuration.member_intent()),
             source,
         )?;
+        // Even an interrupted native configuration effect retires initial
+        // fresh eligibility; clearing configuration later cannot recreate it.
+        self.fresh_prepared_owner = false;
         let evidence = match effect {
             ConfigurationEffect::Observe => {
                 let receipt = match self
