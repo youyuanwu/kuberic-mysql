@@ -105,48 +105,60 @@ fn scope(
 
 #[test]
 fn paired_scope_cannot_retag_binding_lifecycle_build_or_access_changes() {
+    type ScopeMutation<'a> = (&'static str, &'a dyn Fn(&mut ProofScope));
+
     let owned = completed_fixture();
     let next = successor(&owned);
     let original = scope(&owned, &next, true, false);
-    for dimension in 0..18 {
+    let mutations: &[ScopeMutation<'_>] = &[
+        ("replica identity", &|s| {
+            s.binding.as_mut().unwrap().identity =
+                information(2, ReplicaRole::ActiveSecondary).identity;
+        }),
+        ("process session", &|s| {
+            s.binding.as_mut().unwrap().process_session =
+                PublicProcessSessionId::new("replaced-session");
+        }),
+        ("storage", &|s| {
+            s.binding.as_mut().unwrap().public_storage = None;
+        }),
+        ("replication endpoint", &|s| {
+            s.binding.as_mut().unwrap().settings.replication_address = "replaced-endpoint".into();
+        }),
+        ("native epoch", &|s| s.epoch = None),
+        ("native role", &|s| {
+            s.role = Some(MysqlReplicaRole::Primary);
+        }),
+        ("current configuration", &|s| {
+            s.current = Some(next.clone());
+        }),
+        ("pending configuration", &|s| {
+            s.pending = Some(next.clone());
+        }),
+        ("build binding", &|s| s.build = None),
+        ("build generation", &|s| s.generation += 1),
+        ("native authority", &|s| {
+            s.authority = owned.binding.source_authority.clone();
+        }),
+        ("build status", &|s| {
+            s.status = BuildGenerationStatus::NeedsRebuild;
+        }),
+        ("public epoch", &|s| {
+            s.public_epoch = Some(Epoch::new(0, 99));
+        }),
+        ("epoch mapping", &|s| s.mapped_epoch_matches = false),
+        ("admitted role", &|s| s.admitted_role = None),
+        ("idle preparation", &|s| {
+            s.idle_preparation.admit_role(owned.binding.epoch).unwrap();
+        }),
+        ("access", &|s| {
+            s.access = Some(MysqlAccessIntent::new(NonZeroU64::MIN, true, true));
+        }),
+        ("proxy state", &|s| s.proxy = ProxyState::Revoked),
+    ];
+    for (dimension, mutate) in mutations {
         let mut changed = original.clone();
-        match dimension {
-            0 => {
-                changed.binding.as_mut().unwrap().identity =
-                    information(2, ReplicaRole::ActiveSecondary).identity
-            }
-            1 => {
-                changed.binding.as_mut().unwrap().process_session =
-                    PublicProcessSessionId::new("replaced-session")
-            }
-            2 => changed.binding.as_mut().unwrap().public_storage = None,
-            3 => {
-                changed
-                    .binding
-                    .as_mut()
-                    .unwrap()
-                    .settings
-                    .replication_address = "replaced-endpoint".into()
-            }
-            4 => changed.epoch = None,
-            5 => changed.role = Some(MysqlReplicaRole::Primary),
-            6 => changed.current = Some(next.clone()),
-            7 => changed.pending = Some(next.clone()),
-            8 => changed.build = None,
-            9 => changed.generation += 1,
-            10 => changed.authority = owned.binding.source_authority.clone(),
-            11 => changed.status = BuildGenerationStatus::NeedsRebuild,
-            12 => changed.public_epoch = Some(Epoch::new(0, 99)),
-            13 => changed.mapped_epoch_matches = false,
-            14 => changed.admitted_role = None,
-            15 => changed
-                .idle_preparation
-                .admit_role(owned.binding.epoch)
-                .unwrap(),
-            16 => changed.access = Some(MysqlAccessIntent::new(NonZeroU64::MIN, true, true)),
-            17 => changed.proxy = ProxyState::Revoked,
-            _ => unreachable!(),
-        }
+        mutate(&mut changed);
         assert_ne!(original, changed, "scope dimension {dimension}");
     }
 }
@@ -171,15 +183,18 @@ fn composed_transition_proof_is_exact_in_staged_source_first_and_installed_state
         &owned.successor,
         "cccccccc-cccc-cccc-cccc-cccccccccccc:1-7",
     );
-    for phase in 0..3 {
-        let applicable = if phase == 0 {
-            vec![*owned.callback.source_configuration.clone(), next.clone()]
-        } else {
-            vec![next.clone()]
-        };
+    for (phase, installed, applicable) in [
+        (
+            "staged",
+            false,
+            vec![*owned.callback.source_configuration.clone(), next.clone()],
+        ),
+        ("source-first", false, vec![next.clone()]),
+        ("installed", true, vec![next.clone()]),
+    ] {
         for target in [false, true] {
             let peer = information(if target { 3 } else { 2 }, ReplicaRole::ActiveSecondary);
-            let valid = scope(&owned, &next, target, phase == 2);
+            let valid = scope(&owned, &next, target, installed);
             let observed = evidence(
                 valid.authority.clone(),
                 &owned.successor,
@@ -225,7 +240,7 @@ fn composed_transition_proof_is_exact_in_staged_source_first_and_installed_state
                 );
                 assert_eq!(peer.current_progress, 7, "advertised scalar is unchanged");
             }
-            if phase != 2 {
+            if !installed {
                 let mut changed_scope = valid.clone();
                 changed_scope.generation += 1;
                 assert!(
