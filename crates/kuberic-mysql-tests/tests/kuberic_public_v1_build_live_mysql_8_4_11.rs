@@ -40,105 +40,161 @@ use live_support::{
 
 const GROUP_UUID: &str = "b5a47b3f-bf9f-4c7c-8420-495d5a52cb09";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scenario {
+    Build(BuildScenario),
+    Remove(RemoveScenario),
+    Fresh(FreshScenario),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildScenario {
+    ExplicitProgress,
+    OmittedProgress,
+    DropSecondBuild,
+    StaleTargetEpoch,
+    UndurableRetryHistory,
+    SuccessorViewChurn,
+    MissingConfiguredVoter,
+    UndurableProviderEpoch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoveScenario {
+    FirstCompletedIdle,
+    SecondCompletedIdle,
+    StaleTargetEpoch,
+    SubstitutedTargetIncarnation,
+    InterruptedAfterNativeLeave,
+    DroppedBeforeEffects,
+}
+
+impl RemoveScenario {
+    fn target_index(self) -> usize {
+        match self {
+            Self::FirstCompletedIdle
+            | Self::StaleTargetEpoch
+            | Self::SubstitutedTargetIncarnation => 1,
+            Self::SecondCompletedIdle
+            | Self::InterruptedAfterNativeLeave
+            | Self::DroppedBeforeEffects => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FreshScenario {
+    RoleEpochAndIdleReports,
+    HistoryChangedBetweenReports,
+    DurabilityLost,
+    CancelQuery,
+    AbortDuringQuery,
+    NativeUnwind,
+}
+
 #[test]
 fn custom_primary_builds_two_fresh_secondaries() {
-    run_live_fixture(false, false);
+    run_live_scenario(Scenario::Build(BuildScenario::ExplicitProgress));
 }
 
 #[test]
 fn custom_primary_builds_two_fresh_secondaries_with_omitted_progress() {
-    run_live_fixture(false, true);
+    run_live_scenario(Scenario::Build(BuildScenario::OmittedProgress));
 }
 
 #[test]
 fn custom_second_build_drop_is_contained() {
-    run_live_fixture(true, false);
+    run_live_scenario(Scenario::Build(BuildScenario::DropSecondBuild));
 }
 
 #[test]
 fn stale_source_first_target_epoch_cannot_supply_commitment() {
-    run_live_scenario(false, false, 1);
+    run_live_scenario(Scenario::Build(BuildScenario::StaleTargetEpoch));
 }
 
 #[test]
 fn exact_build_retry_cannot_requalify_observed_undurable_history() {
-    run_live_scenario(false, false, 2);
+    run_live_scenario(Scenario::Build(BuildScenario::UndurableRetryHistory));
 }
 
 #[test]
 fn completed_idle_successor_view_churn_and_missing_voter_are_rejected() {
-    run_live_scenario(false, false, 3);
+    run_live_scenario(Scenario::Build(BuildScenario::SuccessorViewChurn));
 }
 
 #[test]
 fn missing_configured_voter_cannot_supply_a_retained_commitment() {
-    run_live_scenario(false, false, 4);
+    run_live_scenario(Scenario::Build(BuildScenario::MissingConfiguredVoter));
 }
 
 #[test]
 fn provider_epoch_rejects_native_latch_before_driver_progress_reentry() {
-    run_live_scenario(false, false, 5);
+    run_live_scenario(Scenario::Build(BuildScenario::UndurableProviderEpoch));
 }
 
 #[test]
 fn remove_first_completed_idle_retires_only_its_exact_owner() {
-    run_live_scenario(false, false, 10);
+    run_live_scenario(Scenario::Remove(RemoveScenario::FirstCompletedIdle));
 }
 
 #[test]
 fn remove_second_completed_idle_preserves_primary_and_admitted_secondary() {
-    run_live_scenario(false, false, 11);
+    run_live_scenario(Scenario::Remove(RemoveScenario::SecondCompletedIdle));
 }
 
 #[test]
 fn remove_rejects_stale_target_epoch_without_retirement() {
-    run_live_scenario(false, false, 12);
+    run_live_scenario(Scenario::Remove(RemoveScenario::StaleTargetEpoch));
 }
 
 #[test]
 fn stale_remove_does_not_retire_substituted_target_incarnation() {
-    run_live_scenario(false, false, 13);
+    run_live_scenario(Scenario::Remove(
+        RemoveScenario::SubstitutedTargetIncarnation,
+    ));
 }
 
 #[test]
 fn interrupted_remove_after_native_leave_is_contained_not_successful() {
-    run_live_scenario(false, false, 20);
+    run_live_scenario(Scenario::Remove(
+        RemoveScenario::InterruptedAfterNativeLeave,
+    ));
 }
 
 #[test]
 fn dropped_remove_before_effects_is_retryable() {
-    run_live_scenario(false, false, 21);
+    run_live_scenario(Scenario::Remove(RemoveScenario::DroppedBeforeEffects));
 }
 
 #[test]
 fn fresh_role_epoch_and_idle_reports_are_coherent_without_admission() {
-    run_live_scenario(false, false, 30);
+    run_live_scenario(Scenario::Fresh(FreshScenario::RoleEpochAndIdleReports));
 }
 
 #[test]
 fn fresh_history_change_between_scalar_and_provider_cannot_return_zero() {
-    run_live_scenario(false, false, 31);
+    run_live_scenario(Scenario::Fresh(FreshScenario::HistoryChangedBetweenReports));
 }
 
 #[test]
 fn fresh_durability_loss_cannot_be_restored_into_zero_progress() {
-    run_live_scenario(false, false, 32);
+    run_live_scenario(Scenario::Fresh(FreshScenario::DurabilityLost));
 }
 
 #[test]
 fn cancelled_fresh_query_retires_qualification_and_releases_ownership() {
-    run_live_scenario(false, false, 33);
+    run_live_scenario(Scenario::Fresh(FreshScenario::CancelQuery));
 }
 
 #[test]
 fn abort_during_fresh_query_contains_the_exact_owner() {
-    run_live_scenario(false, false, 34);
+    run_live_scenario(Scenario::Fresh(FreshScenario::AbortDuringQuery));
 }
 
 #[test]
 fn native_unwind_retains_owned_scratch_diagnostics_without_reuse() {
     require_controlled_native_unwind(std::panic::catch_unwind(|| {
-        run_live_scenario(false, false, 35)
+        run_live_scenario(Scenario::Fresh(FreshScenario::NativeUnwind))
     }));
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -202,11 +258,21 @@ fn native_unwind_checkpoint_cannot_absorb_an_unrelated_worker_failure() {
     assert!(std::panic::catch_unwind(|| require_controlled_native_unwind(Ok(()))).is_err());
 }
 
-fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
-    run_live_scenario(interrupt_second, omit_source_progress, 0);
+#[test]
+fn removal_scenarios_choose_the_exact_completed_build() {
+    for (scenario, expected_target) in [
+        (RemoveScenario::FirstCompletedIdle, 1),
+        (RemoveScenario::SecondCompletedIdle, 2),
+        (RemoveScenario::StaleTargetEpoch, 1),
+        (RemoveScenario::SubstitutedTargetIncarnation, 1),
+        (RemoveScenario::InterruptedAfterNativeLeave, 2),
+        (RemoveScenario::DroppedBeforeEffects, 2),
+    ] {
+        assert_eq!(scenario.target_index(), expected_target, "{scenario:?}");
+    }
 }
 
-fn run_live_scenario(interrupt_second: bool, omit_source_progress: bool, proof_case: u8) {
+fn run_live_scenario(scenario: Scenario) {
     let result = std::thread::Builder::new()
         .name("mysql-public-build-live".into())
         .stack_size(8 * 1024 * 1024)
@@ -215,22 +281,14 @@ fn run_live_scenario(interrupt_second: bool, omit_source_progress: bool, proof_c
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(run_custom_build_fixture(
-                    interrupt_second,
-                    omit_source_progress,
-                    proof_case,
-                ));
+                .block_on(run_custom_build_fixture(scenario));
         })
         .unwrap()
         .join();
     propagate_worker_panic(result);
 }
 
-async fn run_custom_build_fixture(
-    interrupt_second: bool,
-    omit_source_progress: bool,
-    proof_case: u8,
-) {
+async fn run_custom_build_fixture(scenario: Scenario) {
     preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
     let mut fixture = FixtureRoot::new("public-build-live").unwrap();
     let root = fixture.path().to_path_buf();
@@ -306,14 +364,15 @@ async fn run_custom_build_fixture(
         .await;
         assert_tcp_login_rejected(sql[index], &format!("kms_app_{index}"), None).await;
     }
-    if proof_case >= 30 {
-        qualify_fresh_lifecycle(&drivers, &root, &proxy, proof_case).await;
+    if let Scenario::Fresh(fresh) = scenario {
+        qualify_fresh_lifecycle(&drivers, &root, &proxy, fresh).await;
         for driver in drivers.iter().rev() {
             driver.close().await.unwrap();
         }
         fixture.remove().unwrap();
         return;
     }
+    let omit_source_progress = scenario == Scenario::Build(BuildScenario::OmittedProgress);
     drivers[0].update_epoch(epoch).await.unwrap();
     kuberic_runtime::application::StateProvider::update_epoch(drivers[0].as_ref(), epoch, 0)
         .await
@@ -372,7 +431,7 @@ async fn run_custom_build_fixture(
             &sessions,
             &storage,
         );
-        if interrupt_second && target == 2 {
+        if scenario == Scenario::Build(BuildScenario::DropSecondBuild) && target == 2 {
             let mut build_future = Box::pin(drivers[0].build_replica(build));
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
@@ -427,7 +486,9 @@ async fn run_custom_build_fixture(
         Box::pin(drivers[0].build_replica(build.clone()))
             .await
             .unwrap();
-        if proof_case >= 10 && (target == 2 || matches!(proof_case, 10 | 12 | 13)) {
+        if let Scenario::Remove(remove) = scenario
+            && target == remove.target_index()
+        {
             assert!(drivers[0].remove_replica(ReplicaId::new(99)).await.is_err());
             assert!(
                 drivers[0]
@@ -444,7 +505,7 @@ async fn run_custom_build_fixture(
                     "active membership removal is not the idle callback"
                 );
             }
-            if proof_case == 12 {
+            if remove == RemoveScenario::StaleTargetEpoch {
                 drivers[target]
                     .change_role(epoch, ReplicaRole::ActiveSecondary)
                     .await
@@ -466,7 +527,7 @@ async fn run_custom_build_fixture(
                 fixture.remove().unwrap();
                 return;
             }
-            if proof_case == 13 {
+            if remove == RemoveScenario::SubstitutedTargetIncarnation {
                 drivers[target].close().await.unwrap();
                 let mut replacement_fixture = FixtureRoot::new("public-repl").unwrap();
                 let replacement_root = replacement_fixture.path().to_path_buf();
@@ -507,7 +568,7 @@ async fn run_custom_build_fixture(
                 fixture.remove().unwrap();
                 return;
             }
-            if proof_case == 21 {
+            if remove == RemoveScenario::DroppedBeforeEffects {
                 let mut removed =
                     Box::pin(drivers[0].remove_replica(identities[target].replica_id));
                 assert!(
@@ -519,7 +580,7 @@ async fn run_custom_build_fixture(
                 assert!(instance_socket(&root, target).exists());
                 qualified_progress(drivers[0].as_ref()).await;
             }
-            if proof_case == 20 {
+            if remove == RemoveScenario::InterruptedAfterNativeLeave {
                 let mut removed =
                     Box::pin(drivers[0].remove_replica(identities[target].replica_id));
                 let deadline = Instant::now() + Duration::from_secs(90);
@@ -609,7 +670,7 @@ async fn run_custom_build_fixture(
         Box::pin(drivers[0].build_replica(build.clone()))
             .await
             .unwrap();
-        if proof_case == 2 {
+        if scenario == Scenario::Build(BuildScenario::UndurableRetryHistory) {
             let mut admin = root_connection(&instance_socket(&root, 0)).await;
             admin.query_drop("SET GLOBAL sync_binlog=0").await.unwrap();
             commit_marker(&instance_socket(&root, 0), "invalid-retry-history").await;
@@ -623,7 +684,7 @@ async fn run_custom_build_fixture(
             fixture.remove().unwrap();
             return;
         }
-        if proof_case == 3 {
+        if scenario == Scenario::Build(BuildScenario::SuccessorViewChurn) {
             let mut admin = root_connection(&instance_socket(&root, 0)).await;
             admin
                 .query_drop(
@@ -756,7 +817,7 @@ async fn run_custom_build_fixture(
             .update_current_replica_set_configuration(source_configuration)
             .await
             .unwrap();
-        if proof_case == 1 {
+        if scenario == Scenario::Build(BuildScenario::StaleTargetEpoch) {
             let before = qualified_progress(drivers[0].as_ref()).await;
             assert_eq!(
                 kuberic_runtime::application::StateProvider::last_committed_lsn(
@@ -925,7 +986,7 @@ async fn run_custom_build_fixture(
             .unwrap(),
         fresh_pair
     );
-    if proof_case == 4 {
+    if scenario == Scenario::Build(BuildScenario::MissingConfiguredVoter) {
         drivers[2].close().await.unwrap();
         assert!(drivers[0].current_progress().await.is_err());
         assert!(
@@ -942,7 +1003,7 @@ async fn run_custom_build_fixture(
         return;
     }
 
-    if proof_case == 5 {
+    if scenario == Scenario::Build(BuildScenario::UndurableProviderEpoch) {
         let committed = qualified_progress(drivers[0].as_ref()).await;
         let next = Epoch::new(0, 2);
         drivers[0].update_epoch(next).await.unwrap();
@@ -1326,7 +1387,7 @@ async fn qualify_fresh_lifecycle(
     drivers: &[Arc<MysqlPublicV1Replicator>],
     root: &Path,
     proxies: &[SocketAddr],
-    case: u8,
+    scenario: FreshScenario,
 ) {
     use kuberic_runtime::application::StateProvider;
     // Real host/controller observations may poll separate owners concurrently.
@@ -1362,8 +1423,8 @@ async fn qualify_fresh_lifecycle(
     Replicator::update_epoch(driver, epoch).await.unwrap();
     StateProvider::update_epoch(driver, epoch, 0).await.unwrap();
     assert_fresh_pair(driver).await;
-    match case {
-        30 => {
+    match scenario {
+        FreshScenario::RoleEpochAndIdleReports => {
             assert!(matches!(
                 PrimaryReplicator::on_data_loss(driver).await,
                 Err(RuntimeError::InvalidReplication(message))
@@ -1428,7 +1489,7 @@ async fn qualify_fresh_lifecycle(
                 .unwrap();
             assert_fresh_pair(idle).await;
         }
-        31 => {
+        FreshScenario::HistoryChangedBetweenReports => {
             let mut admin = root_connection(&instance_socket(root, 0)).await;
             admin
                 .query_drop("SET GLOBAL super_read_only=OFF")
@@ -1445,7 +1506,7 @@ async fn qualify_fresh_lifecycle(
             assert!(driver.current_progress().await.is_err());
             assert!(StateProvider::update_epoch(driver, epoch, 0).await.is_err());
         }
-        32 => {
+        FreshScenario::DurabilityLost => {
             let mut admin = root_connection(&instance_socket(root, 0)).await;
             admin.query_drop("SET GLOBAL sync_binlog=0").await.unwrap();
             assert!(driver.current_progress().await.is_err());
@@ -1455,25 +1516,24 @@ async fn qualify_fresh_lifecycle(
             assert!(StateProvider::last_committed_lsn(driver).await.is_err());
             assert!(StateProvider::update_epoch(driver, epoch, 0).await.is_err());
         }
-        33 | 34 => {
+        FreshScenario::CancelQuery | FreshScenario::AbortDuringQuery => {
             let mut query = Box::pin(driver.current_progress());
             assert!(
                 poll_fn(|cx| Poll::Ready(query.as_mut().poll(cx)))
                     .await
                     .is_pending()
             );
-            if case == 34 {
+            if scenario == FreshScenario::AbortDuringQuery {
                 driver.abort();
             }
             drop(query);
             assert!(driver.current_progress().await.is_err());
             assert!(StateProvider::last_committed_lsn(driver).await.is_err());
-            if case == 34 {
+            if scenario == FreshScenario::AbortDuringQuery {
                 assert!(!instance_socket(root, 0).exists());
             }
         }
-        35 => std::panic::panic_any(NativeUnwindCheckpoint),
-        _ => unreachable!(),
+        FreshScenario::NativeUnwind => std::panic::panic_any(NativeUnwindCheckpoint),
     }
     for proxy in proxies {
         assert_tcp_refuses(*proxy).unwrap();
