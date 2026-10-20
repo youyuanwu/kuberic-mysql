@@ -8,8 +8,9 @@ The target contains two explicitly separate routes: existing `hosted_*` cases
 use the pin's testing facade for generic initialization/dispatch/observation;
 the `authenticated::*` native cases use ordinary authenticated control RPCs
 for all of those steps. Neither replaces the production service, factory,
-registered provider, native MySQL, access guard or client proxy. This delivery
-adds executable qualification and documentation, **not a production runtime fix**.
+registered provider, native MySQL, access guard or client proxy. The adapter
+corrects fresh reporting and terminal ownership locally; no upstream runtime,
+private engine or controller authority is patched.
 
 **Terminal limitation:** ordinary authenticated Close and Abort return
 gRPC `Unavailable: runtime is closed`, as does subsequent live GetStatus.
@@ -48,9 +49,9 @@ establishes:
    native GTID read confirms emptiness. Unknown/reopened progress is not zero.
 3. The existing public `InitialPrimary` lifecycle (`NotPossible` data loss),
    whose role, implicit epoch and singleton configuration callbacks complete
-   before the final projection refresh. This avoids the unconfigured
-   intermediate progress boundary of standalone fresh Primary/epoch calls; it
-   adds no API or authority bypass.
+   before the final projection refresh. Standalone initial Primary/epoch
+   reporting is separately qualified by the real-controller gate below;
+   neither route adds an API or authority bypass.
 4. Actual Granted read/write status and successful application authentication,
    INSERT and SELECT through the production proxy. Native-direct application
    login and unauthorized proxy logins fail. A valid proxy command after each
@@ -130,7 +131,7 @@ setup and cleanup errors remain distinct.
 
 The [production service constructor](../crates/kuberic-mysql/src/service/kuberic/service.rs#L203-L220)
 selects an in-memory retention policy. After exact owned-child termination and
-root revalidation, [terminal containment](../crates/kuberic-mysql/src/service/instance.rs#L1632-L1671)
+root revalidation, [terminal containment](../crates/kuberic-mysql/src/service/instance.rs#L1656-L1695)
 atomically renames the owned runtime root to its complete basename plus
 `.retained`. It validates retained device/inode ownership and uses nonreplacing
 directory-relative rename; a destination collision fails containment rather
@@ -138,11 +139,25 @@ than overwriting foreign evidence. The active runtime name really is absent.
 No cleanup receipt claims that retained native files were deleted.
 
 Failed production-service initialization after root claim also retains faulted roots for
-diagnosis; unusable partial data is **not** reusable. Default direct manager,
-direct qualification, Build/Remove and graceful closed-reopen semantics are
-not opted into this service-only policy. A retained diagnostic directory is
+diagnosis; unusable partial data is **not** reusable. Direct Public V1
+qualification now opts into the same policy, including exact-generation Build
+retirement. Default low-level manager opt-out behavior is unchanged.
+The outer fixture refuses replacement and retains failed/panicking runs; a
+controlled three-native-owner unwind verifies that native logs survive actual
+containment, not merely the outer directory. A retained diagnostic directory is
 neither a journal/adoption record nor permission to open Existing, restart an
 owner, continue Build, or serve replay.
+
+Service-level terminal qualification additionally covers failed Close followed
+by Close/Abort, dropped Close followed by Abort, and two concurrent Close
+callers. The exact driver remains retained rather than disappearing before an
+await. If native reaping succeeds but scratch settlement fails, only the
+previously attested same-generation, authority and attempt may retry physical
+cleanup; owned roots are revalidated and no missing child is dereferenced.
+These are mechanical containment obligations, not a private recovery journal
+or successful ordinary terminal acknowledgment
+([service ownership](../crates/kuberic-mysql/src/service/kuberic/service.rs#L438-L493),
+[exact cleanup custody](../crates/kuberic-mysql/src/service/instance.rs#L1923-L1967)).
 
 ## Upstream in-process harness applicability
 
@@ -174,12 +189,12 @@ The current boundaries are concrete:
   Actual fresh native storage bindings select New, and the production controller
   honors the host-reported mode. The probe below executes three successful New
   Opens, not Existing/restart adoption.
-- **Fresh formation reaches an earlier role/progress boundary.** The separate
-  case below drives beyond those Opens into the real controller's standalone
-  Primary-role command. MySQL requires an applicable configuration before
-  reporting Primary committed progress, so Execute and current target GetStatus
-  reject before the controller can advance to Epoch, Configuration, or Build.
-  No successful formation or controller Build is claimed.
+- **Initial Role/Epoch reporting succeeds; multi-member bootstrap remains
+  bounded.** The separate case below obtains controller acceptance of the
+  standalone Primary Role and Epoch with truthful zero reports and closed
+  access, then executes the exact singleton-only fresh-bootstrap rejection on
+  the proposed three-member Configuration. No formation or controller Build
+  success is claimed.
 - The harness creates a
   [three-replica persisted set](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-controller/src/test_util/cluster.rs#L164-L192),
   not the existing single-member hosted journey. Production controller Build
@@ -195,7 +210,7 @@ The current boundaries are concrete:
   They reject unsupported custom engines rather than cutting MySQL's native
   Group Replication/recovery sockets.
 - Contained restart reuses storage, whereas
-  [MySQL service Open](../crates/kuberic-mysql/src/service/kuberic/service.rs#L345-L350)
+  [MySQL service Open](../crates/kuberic-mysql/src/service/kuberic/service.rs#L341-L354)
   deliberately rejects `Existing`. Harness restart/failover controls do not
   implement retained-owner recovery or authorize native adoption.
 
@@ -244,77 +259,67 @@ Fresh/New dispatch is now verified, without removing storage bindings or
 permitting MySQL Existing adoption. The separate case below captures the first
 executed formation boundary; successful formation and the later source-only
 Build-authority boundary remain unresolved. Keep the existing native and ordinary
-authenticated gates; these probes change no upstream or MySQL production
-implementation.
+authenticated gates. Upstream remains unchanged; the adapter's local corrections
+do not supply missing controller formation/Build authority.
 
 ### Executed fresh Primary-role boundary
 
 The unignored
-`controller_fresh_primary_role_requires_configuration_progress_proof` case
-first establishes the same three exact successful New Opens. It then continues
-public `TestCluster::step` reconciliation, without directly dispatching callbacks,
-changing generic stores, or supplying fake built-in runtime control.
-
-At the current pin the first executed boundary is **earlier than Build**:
+`controller_fresh_primary_reports_before_exact_multimember_configuration_boundary`
+case first establishes the same three exact successful New Opens, then
+continues public `TestCluster::step`, without manual callback dispatch, generic
+store mutation or fake built-in runtime control.
 
 1. The controller's
-   [fresh operation sequence](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-controller/src/evaluator/public_v1_topology.rs#L987-L1040)
-   sends a standalone `Role { epoch: 0/1, role: Primary }` for replica 1 before
-   its separate Epoch and Configuration programs. It does not use the grouped
-   InitialPrimary lifecycle recipe qualified by the existing singleton gate.
-2. The MySQL driver accepts fresh formation role intent, but deliberately
-   [rejects Primary committed progress before configuration proof](../crates/kuberic-mysql/src/service/kuberic/driver.rs#L2191-L2211).
-   The host's
-   [post-operation projection refresh](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-runtime/src/host/hosting.rs#L568-L570)
-   and
-   [live report projection](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-runtime/src/host/hosting.rs#L687-L697)
-   both sample registered progress. Executed controller diagnostics show the
-   Execute rejection, and the persistent gate asserts the exact current
-   GetStatus rejection:
-   `invalid replication evidence: Primary committed progress requires an applicable configuration proof`.
-3. The controller retains the exact pending Role command and frozen transition;
-   accepted authority contains only the three New Open completions. There is no
-   controller-accepted Role, Epoch, Configuration, InitialPrimary, or Build
-   completion and no persisted admitted topology. The Role program can already
-   be completed in the generic agent store before
-   [post-operation refresh fails](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-runtime/src/host/service.rs#L725-L757):
-   controller acceptance and live progress reporting, not absence of local
-   callback effects, are the boundary being qualified.
+   [fresh sequence](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-controller/src/evaluator/public_v1_topology.rs#L987-L1040)
+   sends initial Primary Role, Epoch, then Configuration at epoch 0/1.
+   Initial Primary-before-configuration is legitimate, not an upstream ordering
+   defect. Both adapter reporting paths now
+   [revalidate exact fresh history](../crates/kuberic-mysql/src/service/kuberic/proof.rs#L329-L398);
+   successful Role and Epoch completions enter accepted controller authority.
+2. All three public reports remain queryable at `0/0` with closed access.
+   The pinned custom host deliberately
+   [projects None/Recovery until readiness](https://github.com/youyuanwu/kuberic/blob/dabe144670303b22b1fe13f5ced78ab57ad3f98c/kuberic-runtime/src/host/hosting.rs#L571-L630),
+   even though the Primary Role callback succeeded. That policy is not changed
+   or confused with the native role-intent receipt.
+3. The first later executed rejection is the driver's
+   [singleton-only fresh bootstrap guard](../crates/kuberic-mysql/src/service/kuberic/driver.rs#L2591-L2607)
+   on the proposed three-member Configuration:
+   `invalid replication evidence: fresh MySQL bootstrap requires exactly the local Primary member`.
+   The frozen command/transition retains exact target, session, storage,
+   history, epoch, revision, digest and three-member descriptor. Accepted
+   authority contains exactly Open×3 + Role + Epoch, with no admitted topology,
+   configuration or Build success. Normal 294-byte public storage fences now
+   pass lossless translation rather than failing an unrelated component limit.
 
-The gate validates the canonical command/transition/authority, matching target
-identity, process session, storage incarnation, history, revision and digest,
-and all three exact accepted New Open receipts. Exactly the intended Primary's
-report must be unavailable with the precise invalid-evidence error; both peers
-must retain fresh identities, New Open receipts, unassigned roles and closed
-access. The unavailable target gets **no synthetic zero progress or successful
-report**.
+The [gate](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4_11.rs#L510-L1005)
+checks both positive receipts and negative evidence mutations. Wrong operation,
+missing command, changed credit, substituted session/storage/history, missing
+Epoch completion, changed progress/role/access, timeout and unrelated error
+cannot qualify. Earlier native-Open RPC retries are not proof of the boundary.
 
-An error count increase after the established Opens is required. Earlier
-native-Open RPC retries are not evidence of this boundary. Timeout, closed
-runtime, unrelated rejection, a different operation, substituted session,
-missing pending command, and changed completion credit cannot satisfy the gate.
+The pinned public report does not include the unsuccessful configuration
+completion. To observe the exact production-controller dispatch rejection, the
+test intentionally calls public `finish` with a bounded diagnostic-capture
+marker, then verifies the **full exact** `lastReconcileError` chain from
+redacted diagnostics. The marker is not successful evidence by itself.
+The finish result must be Application, not Cleanup, have zero pending task
+owners, and acknowledge every factory drain. Captured PIDs and SQL/group/proxy
+listeners must be absent; active runtime names disappear while native data and
+logs remain. This expected-rejection fixture is retained locally, unlike the
+positive Open gate's released storage. No private runtime state is altered.
 
-Read-only queries over each owned native UDS independently verify empty
-`gtid_executed`, bootstrap-group disabled, and no non-OFFLINE Group Replication
-members. All application proxies refuse connections. These checks do not rely
-on a target public report or infer application admission from native
-`read_only`/`super_read_only` flags.
+Before teardown, independent owned-UDS reads prove empty native executed
+history, bootstrap disabled and no active group; all proxies refuse connects.
+No access is inferred from native read-only flags or an advertised endpoint.
+These checks do **not** prove formation or controller Build. The earlier
+overbroad role-progress rejection at base commit `4586630` is superseded by this
+qualified correction, not reclassified as a required native ordering.
 
-After the exact expected boundary is established, `finish(Ok(()))` must acknowledge
-host/factory drain. Every captured native PID and SQL/group/proxy listener must
-be absent, application roots removed, and repeat drain successful, just as for
-the positive Open gate. Successful boundary runs release their short fixture
-root. Any unexpected error or cleanup failure fails and retains diagnostics and
-native logs; arbitrary errors and scenario deadlines never count as success.
-The additional non-native
-`formation_boundary_rejects_unrelated_errors` case checks negative error matches.
-
-Resolving this requires a coherent controller/custom-replicator formation
-sequence, not relaxing MySQL's progress guard or inventing committed progress.
-Even after that, initial multi-member configuration must respect native
-singleton bootstrap and exact secondary Build admission. The private inbound
-Build-authority attachment, native transport faults and Existing recovery remain
-separate later boundaries; this case does not execute them.
+Singleton bootstrap, later exact secondary Build admission, the separately
+unavailable public custom inbound-Build attachment, native fault routing and
+Existing recovery remain independent boundaries. The latter paths are not
+executed by this controller gate.
 
 Run both native controller cases and the negative error checks with the same
 mandatory MySQL prerequisites below:
@@ -362,12 +367,22 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   --test kuberic_public_v1_hosted_live_mysql_8_4_11
 ```
 
-The target contains eleven tests: six existing cases, two ordinary native cases,
-and three deterministic retained-root/negative-result/timeout regressions. Neither native
+The target contains sixteen cases, including the existing hosted/ordinary
+journeys, New-only rejection, service Close failure/drop/concurrency, and
+deterministic retention/negative-result/timeout checks. Neither native
 route skips missing prerequisites. The runtime test dependency still enables
 `testing` for the old cases; its presence is not evidence the ordinary cases
 use it. Use one build job and one target tree; do not run native fixtures
 concurrently.
+
+Current scoped qualification passed all **21 direct Build/Remove/progress**
+and **16 hosted/authenticated** cases in one serial, zero-nextest-retry
+selection; the complete controller target also passed separately with related
+identity/ownership checks. The earlier reported
+`remove_second_completed_idle_preserves_primary_and_admitted_secondary`
+failure followed by an isolated pass remains an undiagnosed historical
+observation. Its current broad-run pass does not establish the prior cause or
+a clean historical/full-native-workspace baseline.
 
 Compact roots keep UDS paths below 108 bytes. The shared retained-root helper
 creates missing target parents for archive consumers but refuses an existing

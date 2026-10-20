@@ -119,36 +119,6 @@ impl Drop for FixtureRoot {
     }
 }
 
-#[cfg(test)]
-mod retention_tests {
-    use super::*;
-
-    #[test]
-    fn failed_fixture_is_preserved_and_collision_cannot_replace_it() {
-        let label = "retain-check";
-        let mut fixture = FixtureRoot::new(label).unwrap();
-        let root = fixture.path().to_path_buf();
-        fs::write(root.join("diagnostic"), "retained").unwrap();
-        std::thread::spawn(move || {
-            let _owned = fixture;
-            panic!("controlled fixture unwind");
-        })
-        .join()
-        .unwrap_err();
-        assert_eq!(
-            fs::read_to_string(root.join("diagnostic")).unwrap(),
-            "retained"
-        );
-        assert!(FixtureRoot::new(label).is_err());
-        // This test alone owns the newly created diagnostic root.
-        fixture = FixtureRoot {
-            root,
-            preserve_on_drop: false,
-        };
-        fixture.remove().unwrap();
-    }
-}
-
 pub struct ReservedPorts {
     listeners: Vec<TcpListener>,
     addresses: [SocketAddr; 6],
@@ -407,5 +377,35 @@ fn checked_output(command: &mut Command, context: &str) -> Result<Vec<u8>, Strin
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ))
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn failed_fixture_is_preserved_and_collision_cannot_replace_it() {
+        let label = "retain-check";
+        let mut fixture = FixtureRoot::new(label).unwrap();
+        let root = fixture.path().to_path_buf();
+        fs::write(root.join("diagnostic"), "retained").unwrap();
+        std::thread::spawn(move || {
+            let _owned = fixture;
+            panic!("controlled fixture unwind");
+        })
+        .join()
+        .unwrap_err();
+        assert_eq!(
+            fs::read_to_string(root.join("diagnostic")).unwrap(),
+            "retained"
+        );
+        assert!(FixtureRoot::new(label).is_err());
+        // This test alone owns the newly created diagnostic root.
+        fixture = FixtureRoot {
+            root,
+            preserve_on_drop: false,
+        };
+        fixture.remove().unwrap();
     }
 }

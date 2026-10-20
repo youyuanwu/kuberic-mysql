@@ -124,9 +124,14 @@ driver allocation as the factory's required progress-only provider; the
 factory verifies pointer identity and still returns no `StateReplicator`.
 After successful `Replicator::open`, the adapter retains `0` only from the
 explicit `OpenMode::New` + freshly initialized empty owner + closed-access
-proof; the pinned host can therefore refresh applied and committed progress
-before role/configuration. Unknown pre-configuration progress still fails
-closed. Later primary `current_progress` independently proves its frozen,
+proof. Both scalar and provider reads reobserve exact owned, durable, empty
+executed/purged history without a native group. This supports initial
+Primary/epoch and fresh idle preparation **before configuration**, without
+quorum or application access. Pair scopes cannot be retagged across lifecycle
+changes; failed/cancelled in-progress native fresh observations retire that
+qualification, not return cached zero. Unknown history or a formerly configured
+Primary lacking applicable commitment proof still fails closed.
+Later configured primary `current_progress` independently proves its frozen,
 complete GTID boundary on **every applicable public voter**, with exact live
 owner/configuration/session/storage/view checks. This is stronger than a write
 quorum, not a relabeling of local execution or a native statistics column.
@@ -169,7 +174,10 @@ Production service terminal containment retains data and moves its exact owned
 runtime directory to the original path plus `.retained`, preserving native
 logs/binlogs without leaving the active runtime name. It never overwrites an
 existing destination or grants reopen authority. Later live host reports reject
-the closed driver rather than return synthetic progress. These hosted tests do
+the closed driver rather than return synthetic progress. Service Close retains
+its exact driver through failure, cancellation and concurrent calls; physical
+cleanup after reaping remains bound to previously attested generation/roots,
+not new live authority. These hosted tests do
 not qualify Existing/cold recovery, controller Build, serving replay, or
 production deployment.
 
@@ -182,12 +190,15 @@ The probe verifies native process absence and host/factory cleanup afterward,
 retaining local diagnostics on failure. Its separate
 [fresh-formation boundary case](docs/mysql-hosted-lifecycle.md#executed-fresh-primary-role-boundary)
 continues through the controller's standalone Primary-role dispatch. Before a
-configuration proof exists, MySQL rejects committed-progress reporting with the
-exact applicable-configuration error; the controller accepts no Role or later
-formation/Build credit. All native members remain unformed, with empty GTIDs and
-closed application proxies, and acknowledged cleanup contains them. This is
-**executed fail-closed boundary qualification, not successful cluster formation
-or controller Build**; the existing native gates remain.
+configuration exists, initial Role and Epoch now complete with coherent zero
+progress and closed access. The pinned host deliberately reports `None/Recovery`
+until readiness, despite those successful callback receipts. The first later
+executed rejection is the exact **singleton-only fresh bootstrap** guard on the
+controller's three-member Configuration. The gate verifies exact authority,
+the full controller error chain and independent native containment; timeout
+cannot pass. This is **not successful cluster formation or controller Build**.
+Normal composite public storage fences are preserved losslessly with a separate
+2048-byte bound; individual identity domains retain their 255-byte limit.
 
 The custom `PrimaryReplicator::build_replica` implementation transfers one
 fresh idle target through Group Replication distributed recovery. It binds the
@@ -258,8 +269,9 @@ Revoke, Epoch, refreshed Configuration staging, CatchUp, Role/native transfer,
 then application Role, without inventing a `previous` callback value. Catch-up
 captures a fresh qualified local boundary and independent all-voter proof
 while a current engine configuration exists. A cached post-epoch scalar is
-not commitment authority: a Primary without an applicable native
-configuration cannot complete that wait or publish committed progress.
+not commitment authority: a formerly configured Primary without an applicable
+native configuration cannot complete that wait or publish configured
+commitment. The separately revalidated initial-empty boundary is not that cache.
 Already-formed planned-swap translation is not a claim of qualified custom
 controller cutover through that gap. Before a newer epoch mutates the engine, any prepared or
 published proxy generation is physically revoked through the native-backed
