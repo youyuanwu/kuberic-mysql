@@ -1484,6 +1484,224 @@ pub(crate) async fn verify_build_target_fresh(
     disconnect(connection, result, deadline).await
 }
 
+/// Reobserves unformed history, not a native view, quorum, or enrollment.
+/// Both snapshots must independently qualify the exact already enrolled owner.
+pub(crate) async fn verify_fresh_history(
+    target: OwnedControlTarget,
+    authority: &MemberMutationAuthority,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    verify_member_authority(&target, authority).map_err(member_error_as_topology)?;
+    let mut session = MysqlControlConnector.connect(&target, deadline).await?;
+    let result = async {
+        validate_member_product(&mut session, authority, deadline).await?;
+        read_fresh_history(
+            &mut session,
+            authority.local().server_uuid().as_str(),
+            authority.group_name().as_str(),
+            deadline,
+        )
+        .await
+    }
+    .await;
+    disconnect(session, result, deadline).await
+}
+
+type FreshHistorySnapshot = (String, String, u64, String, String);
+
+trait FreshHistoryRead {
+    async fn profile(&mut self, deadline: Instant) -> Result<bool, MysqlTopologyError>;
+    async fn snapshot(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<FreshHistorySnapshot, MysqlTopologyError>;
+}
+
+impl FreshHistoryRead for MysqlControlSession {
+    async fn profile(&mut self, deadline: Instant) -> Result<bool, MysqlTopologyError> {
+        read_durable_profile(self, deadline).await
+    }
+
+    async fn snapshot(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<FreshHistorySnapshot, MysqlTopologyError> {
+        query_one_mysql(
+            &mut self.connection,
+            "SELECT @@GLOBAL.server_uuid, @@GLOBAL.group_replication_group_name, \
+             (SELECT COUNT(*) FROM performance_schema.replication_group_members \
+              WHERE MEMBER_ID IS NOT NULL AND MEMBER_ID <> ''), \
+             @@GLOBAL.gtid_executed, @@GLOBAL.gtid_purged",
+            deadline,
+            ControlStage::InspectExistingHistory,
+        )
+        .await
+    }
+}
+
+async fn read_fresh_history(
+    session: &mut impl FreshHistoryRead,
+    server_uuid: &str,
+    group: &str,
+    deadline: Instant,
+) -> Result<(), MysqlTopologyError> {
+    for _ in 0..2 {
+        // The concrete profile reader latches violations before later awaits.
+        if !session.profile(deadline).await? {
+            return Err(MysqlTopologyError::ControlProtocol(
+                ControlStage::ReadExecutedHistory,
+            ));
+        }
+        let snapshot = session.snapshot(deadline).await?;
+        validate_fresh_snapshot_for(&snapshot, server_uuid, group)?;
+    }
+    if !session.profile(deadline).await? {
+        return Err(MysqlTopologyError::ControlProtocol(
+            ControlStage::ReadExecutedHistory,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fresh_snapshot_for(
+    snapshot: &(String, String, u64, String, String),
+    server_uuid: &str,
+    group: &str,
+) -> Result<(), MysqlTopologyError> {
+    if snapshot.0 != server_uuid || snapshot.1 != group || snapshot.2 != 0 {
+        return Err(MysqlTopologyError::TopologyState(
+            TopologyStateError::ExistingGroupState,
+        ));
+    }
+    for history in [&snapshot.3, &snapshot.4] {
+        let history = GtidSet::from_str(history).map_err(|_| {
+            MysqlTopologyError::ControlProtocol(ControlStage::InspectExistingHistory)
+        })?;
+        if !history.entries().is_empty() {
+            return Err(MysqlTopologyError::TopologyState(
+                TopologyStateError::ExistingTransactionHistory,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fresh_history_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_snapshots_reject_every_native_identity_membership_and_history_mutation() {
+        let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let group = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let valid = (uuid.into(), group.into(), 0, String::new(), String::new());
+        assert!(validate_fresh_snapshot_for(&valid, uuid, group).is_ok());
+        for dimension in 0..7 {
+            let mut changed = valid.clone();
+            match dimension {
+                0 => changed.0 = group.into(),
+                1 => changed.1 = uuid.into(),
+                2 => changed.2 = 1,
+                3 => changed.3 = format!("{uuid}:1"),
+                4 => changed.4 = format!("{uuid}:1"),
+                5 => changed.3 = "unknown".into(),
+                6 => changed.4 = "unknown".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_fresh_snapshot_for(&changed, uuid, group).is_err(),
+                "dimension {dimension}"
+            );
+        }
+    }
+
+    struct ScriptedFreshRead {
+        step: usize,
+        fail: usize,
+        stall: bool,
+    }
+
+    impl ScriptedFreshRead {
+        async fn next(&mut self) -> Result<(), MysqlTopologyError> {
+            self.step += 1;
+            if self.step == self.fail {
+                if self.stall {
+                    std::future::pending::<()>().await;
+                }
+                return Err(MysqlTopologyError::ControlProtocol(
+                    ControlStage::ReadExecutedHistory,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl FreshHistoryRead for ScriptedFreshRead {
+        async fn profile(&mut self, _: Instant) -> Result<bool, MysqlTopologyError> {
+            self.next().await?;
+            Ok(true)
+        }
+        async fn snapshot(
+            &mut self,
+            _: Instant,
+        ) -> Result<FreshHistorySnapshot, MysqlTopologyError> {
+            self.next().await?;
+            Ok((
+                "owner".into(),
+                "group".into(),
+                0,
+                String::new(),
+                String::new(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_read_errors_deadlines_and_cancellation_at_each_await_never_complete() {
+        for fail in 1..=5 {
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            let mut read = ScriptedFreshRead {
+                step: 0,
+                fail,
+                stall: false,
+            };
+            assert!(
+                read_fresh_history(&mut read, "owner", "group", deadline)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(read.step, fail);
+            let mut read = ScriptedFreshRead {
+                step: 0,
+                fail,
+                stall: true,
+            };
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    read_fresh_history(&mut read, "owner", "group", deadline),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(read.step, fail);
+            let mut read = ScriptedFreshRead {
+                step: 0,
+                fail,
+                stall: true,
+            };
+            let mut future = Box::pin(read_fresh_history(&mut read, "owner", "group", deadline));
+            assert!(
+                std::future::poll_fn(|cx| { std::task::Poll::Ready(future.as_mut().poll(cx)) })
+                    .await
+                    .is_pending()
+            );
+            drop(future);
+            assert_eq!(read.step, fail);
+        }
+    }
+}
+
 pub(crate) async fn remove_build_recovery_account(
     target: OwnedControlTarget,
     authority: &MemberMutationAuthority,

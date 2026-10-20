@@ -238,7 +238,18 @@ set.
 
 ## Current Delivery Boundary
 
-The adapter first samples qualified local `gtid_executed` under exact native
+An exactly owned fresh New replica may report historical zero during initial
+Primary/epoch or fresh idle preparation before configuration. Both scalar and
+provider reads reobserve actual empty executed **and purged** history, absent
+native membership and lifetime-qualified durability, with closed engine/proxy
+authority. Provider reads must match the retained scalar scope; role/epoch/
+configuration/Build/access changes cannot silently retag it. Native effect
+adoption and failed/cancelled fresh observation retire eligibility. This is
+inherited empty history, not a newly configured quorum or a serving grant
+([fresh native observation](../crates/kuberic-mysql/src/service/control.rs#L1489-L1595),
+[sample scope](../crates/kuberic-mysql/src/service/kuberic/proof.rs#L329-L398)).
+
+For formed owners, the adapter samples qualified local `gtid_executed` under exact native
 authority, role, configuration, process, storage, view, and receipt checks.
 That observation alone establishes applied history, not primary quorum
 commitment. For a primary, a separate bounded proof holds every exact public
@@ -265,7 +276,9 @@ overwrite that pair. A secondary's accepted/applied result is not retained as
 provider commitment: without an independently proved sample the provider
 explicitly rejects. Epoch input is bound to the immediate predecessor and
 post-revocation boundary, with a separate fresh-empty proof, not scalar
-equality under unrelated authority.
+equality under unrelated authority. Completed-idle, active-before-configuration
+and admitted-secondary tests each assert the exact unproved-provider boundary;
+their scalar success is not successful hosted secondary reporting.
 
 Fresh-secondary Build freezes and proves a complete structured GTID source
 boundary and uses scalar progress only as the pinned Public V1 invocation and

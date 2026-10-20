@@ -2,7 +2,7 @@ use super::*;
 use crate::service::MemberNativeEvidence;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ProofScope {
+pub(super) struct ProofScope {
     binding: Option<PublicBinding>,
     epoch: Option<MysqlReplicaEpoch>,
     role: Option<MysqlReplicaRole>,
@@ -18,10 +18,13 @@ struct ProofScope {
     pending_join: bool,
     native_identity: crate::service::MysqlReplicaIdentity,
     native_successor: bool,
+    idle_preparation: IdleBuildPreparation,
+    access: Option<MysqlAccessIntent>,
+    proxy: ProxyState,
 }
 
 impl ProofScope {
-    fn capture(state: &DriverState) -> Self {
+    pub(super) fn capture(state: &DriverState) -> Self {
         Self {
             binding: state.binding.clone(),
             epoch: state.engine.epoch(),
@@ -44,6 +47,9 @@ impl ProofScope {
             pending_join: state.engine.pending_build().is_some(),
             native_identity: state.engine.identity().clone(),
             native_successor: state.engine.has_pending_build_successor(),
+            idle_preparation: state.idle_build_preparation.clone(),
+            access: state.engine.access_intent(),
+            proxy: state.proxy.clone(),
         }
     }
 }
@@ -147,6 +153,25 @@ impl MysqlPublicV1Replicator {
     pub(super) fn acquire_proof_permit(&self) -> Result<BuildGroupPermit> {
         BuildGroupPermit::try_acquire(self.group_key.clone())
             .ok_or(RuntimeError::ReconfigurationPending)
+    }
+
+    /// Only stable, unformed owner-local reads may bypass the peer-proof
+    /// permit. A leased/transitioning owner remains fail-fast. Callers recheck
+    /// after acquiring their local lease before using either proof path.
+    pub(super) fn progress_permit(&self) -> Result<Option<BuildGroupPermit>> {
+        let slot = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = slot.as_ref().ok_or(RuntimeError::ReconfigurationPending)?;
+        if state.fresh_open_progress.is_some()
+            && state.engine.configuration().is_none()
+            && state.engine.pending_build().is_none()
+        {
+            Ok(None)
+        } else {
+            self.acquire_proof_permit().map(Some)
+        }
     }
 
     pub(super) fn proof_deadline(&self) -> Instant {
@@ -300,12 +325,17 @@ impl MysqlPublicV1Replicator {
 
     pub(super) async fn coherent_committed_sample(&self, state: &mut DriverState) -> Result<i64> {
         Self::require_native_durability(state)?;
-        if state.fresh_open_progress.is_some()
-            && state.engine.configuration().is_none()
-            && state.engine.epoch().is_none()
-            && state.last_reported_progress == Some(0)
-        {
-            return Ok(0);
+        if state.fresh_open_progress.is_some() {
+            let sampled = state
+                .fresh_sample
+                .take()
+                .ok_or_else(|| unproved("no coherent fresh historical sample"))?;
+            if sampled != ProofScope::capture(state) || state.last_reported_progress != Some(0) {
+                return Err(unproved("fresh historical sample scope changed"));
+            }
+            let value = Self::sample_fresh_progress(state).await?;
+            state.fresh_sample = Some(sampled);
+            return Ok(value);
         }
         let retained = state
             .committed_sample
@@ -333,6 +363,36 @@ impl MysqlPublicV1Replicator {
             ));
         }
         Ok(retained.value)
+    }
+
+    pub(super) async fn sample_fresh_progress(state: &mut DriverState) -> Result<i64> {
+        require_bound_open(state)?;
+        require_not_cleanup_only(state)?;
+        if state.fresh_open_progress.is_none()
+            || state.current_configuration.is_some()
+            || state.pending_configuration.is_some()
+            || state.pending_native_configuration.is_some()
+            || state.pending_build_binding.is_some()
+            || state.build_generation.status() != BuildGenerationStatus::Available
+            || !matches!(state.proxy, ProxyState::Unprepared | ProxyState::Revoked)
+        {
+            return Err(unproved(
+                "fresh historical evidence is no longer applicable",
+            ));
+        }
+        let scope = ProofScope::capture(state);
+        let progress = state
+            .engine
+            .revalidate_fresh_progress()
+            .await
+            .map_err(map_mysql)?;
+        Self::require_native_durability(state)?;
+        if scope != ProofScope::capture(state) {
+            return Err(unproved(
+                "fresh owner scope changed during native observation",
+            ));
+        }
+        Ok(progress.value())
     }
 }
 

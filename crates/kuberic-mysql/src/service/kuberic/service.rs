@@ -102,7 +102,7 @@ impl MysqlPublicV1ServiceConfig {
         let attempt = fresh.attempt.clone();
         let group_replication_address = fresh.group_replication_address;
         let input = MysqlFreshMemberInput::new(
-            fresh.instance,
+            fresh.instance.with_retained_containment_evidence(),
             native_identity,
             fresh.lineage,
             fresh.credentials,
@@ -261,12 +261,9 @@ impl MysqlPublicV1Service {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.closed {
-            return false;
-        }
         debug_assert!(state.driver.is_none());
         state.driver = Some(driver);
-        true
+        !state.closed
     }
 
     fn finish_successful_open(&self) -> bool {
@@ -336,18 +333,14 @@ impl MysqlPublicV1Service {
         if let Some(attempt) = state.opening_attempt.take() {
             attempt.cancel();
         }
-        state.driver.take()
+        state.driver.clone()
     }
 }
 
 #[async_trait]
 impl StatefulServiceReplica for MysqlPublicV1Service {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
-        if context.mode != OpenMode::New {
-            return Err(RuntimeError::InvalidReplication(
-                "MySQL Public V1 restart adoption is unsupported".into(),
-            ));
-        }
+        require_fresh_open_mode(context.mode)?;
         if context
             .partition
             .get_partition_information()
@@ -457,11 +450,10 @@ impl StatefulServiceReplica for MysqlPublicV1Service {
                 if let Some(attempt) = &state.opening_attempt {
                     attempt.cancel();
                 }
-                if state.opening {
-                    (state.driver.clone(), true)
-                } else {
-                    (state.driver.take(), false)
-                }
+                // Keep the exact forwarding owner through success, failure,
+                // cancellation and concurrent terminal callers. The driver
+                // serializes settlement and retains any terminal diagnostic.
+                (state.driver.clone(), state.opening)
             };
             if opening {
                 if let Some(driver) = driver {
@@ -500,6 +492,15 @@ impl Drop for MysqlPublicV1Service {
     fn drop(&mut self) {
         self.abort();
     }
+}
+
+fn require_fresh_open_mode(mode: OpenMode) -> Result<()> {
+    if mode != OpenMode::New {
+        return Err(RuntimeError::InvalidReplication(
+            "MySQL Public V1 restart adoption is unsupported".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_service_bindings(
@@ -544,6 +545,16 @@ mod tests {
     use crate::core::AttemptId;
     use crate::service::AttemptCancellationState;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_new_open_is_supported_without_restart_adoption() {
+        assert!(require_fresh_open_mode(OpenMode::New).is_ok());
+        assert!(matches!(
+            require_fresh_open_mode(OpenMode::Existing),
+            Err(RuntimeError::InvalidReplication(message))
+                if message == "MySQL Public V1 restart adoption is unsupported"
+        ));
+    }
 
     #[test]
     fn service_bindings_reject_empty_partition_and_dynamic_or_public_proxy() {

@@ -85,6 +85,25 @@ fn opaque_values_enforce_byte_bounds_and_controls() {
 }
 
 #[test]
+fn composite_storage_preserves_long_exact_fences_with_a_separate_byte_bound() {
+    let value = format!("public-storage:{}", "é".repeat(900));
+    assert_eq!(StorageBinding::new(&value).unwrap().as_str(), value);
+    assert!(StorageBinding::new("s".repeat(2048)).is_ok());
+    assert!(matches!(
+        StorageBinding::new("s".repeat(2049)),
+        Err(error) if matches!(
+            error.kind(),
+            IdentityErrorKind::TooLong { maximum: 2048, actual: 2049 }
+        )
+    ));
+    assert!(StorageBinding::new("é".repeat(1025)).is_err());
+    assert!(StorageBinding::new("bad\nstorage").is_err());
+    assert!(StorageBinding::new("").is_err());
+    assert!(ReplicaIncarnation::new("i".repeat(256)).is_err());
+    assert!(ProcessSessionId::new("p".repeat(256)).is_err());
+}
+
+#[test]
 fn uuid_values_validate_and_canonicalize() {
     let uuid = ServerUuid::new("A0B1C2D3-E4F5-6789-ABCD-EF0123456789").unwrap();
     assert_eq!(uuid.as_str(), "a0b1c2d3-e4f5-6789-abcd-ef0123456789");

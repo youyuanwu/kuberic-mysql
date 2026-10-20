@@ -917,6 +917,43 @@ mod tests {
     }
 
     #[test]
+    fn controller_sized_storage_incarnation_preserves_every_canonical_component() {
+        let replica = ReplicaIdentity {
+            replica_id: KubericReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            agent_generation: AgentGeneration::new("b".repeat(64)),
+        };
+        let storage = ReplicaStorageIncarnationContext {
+            replica: replica.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new(replica.instance_id.as_str()),
+                pvc_uid: PvcUid::new("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+            },
+            storage_generation: StorageGeneration::new(format!("storage-init-{}", "d".repeat(64))),
+        };
+        let original = translate_storage_binding(&storage, &replica).unwrap();
+        assert_eq!(original.as_str().len(), 294);
+        for value in [
+            replica.instance_id.as_str(),
+            replica.agent_generation.as_str(),
+            "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            storage.storage_generation.as_str(),
+        ] {
+            assert!(original.as_str().contains(value), "complete field lost");
+        }
+        let mut changed = storage.clone();
+        changed.storage_generation =
+            StorageGeneration::new(format!("storage-init-{}", "e".repeat(64)));
+        assert_ne!(
+            original,
+            translate_storage_binding(&changed, &replica).unwrap()
+        );
+        let mut changed = storage;
+        changed.replica.instance_id = ReplicaInstanceId::new("foreign-instance");
+        assert!(translate_storage_binding(&changed, &replica).is_err());
+    }
+
+    #[test]
     fn incomplete_public_identities_never_default() {
         let mut replica = identity(1);
         replica.replica_id = KubericReplicaId::new(0);
