@@ -2176,11 +2176,11 @@ impl Replicator for MysqlPublicV1Replicator {
     }
 
     async fn current_progress(&self) -> Result<i64> {
-        let _permit = self.acquire_proof_permit()?;
+        let permit = self.progress_permit()?;
         let deadline = self.proof_deadline();
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            self.current_progress_proved(deadline),
+            self.current_progress_proved(deadline, permit.is_some()),
         )
         .await
         .map_err(|_| RuntimeError::OperationCancelled)?
@@ -2195,7 +2195,7 @@ impl Replicator for MysqlPublicV1Replicator {
 }
 
 impl MysqlPublicV1Replicator {
-    async fn current_progress_proved(&self, deadline: Instant) -> Result<i64> {
+    async fn current_progress_proved(&self, deadline: Instant, has_permit: bool) -> Result<i64> {
         let mut state = self.lease().await;
         require_bound_open(&state)?;
         Self::require_native_durability(&mut state)?;
@@ -2205,16 +2205,28 @@ impl MysqlPublicV1Replicator {
         ) {
             return Err(RuntimeError::ReconfigurationPending);
         }
+        if state.engine.configuration().is_none()
+            && state.engine.pending_build().is_none()
+            && state.fresh_open_progress.is_some()
+        {
+            // Unformed history is owner-local. Holding the cross-member proof
+            // permit while doing native I/O would reject concurrent status
+            // polls on other fresh owners. The local lease and before/after
+            // scope checks fence reservation/Build changes instead.
+            state.fresh_sample = None;
+            let value = Self::sample_fresh_progress(&mut state).await?;
+            state.fresh_sample = Some(proof::ProofScope::capture(&state));
+            retain_reported_progress(&mut state.last_reported_progress, value);
+            return Ok(value);
+        }
+        let _permit = if has_permit {
+            None
+        } else {
+            Some(self.acquire_proof_permit()?)
+        };
         if state.engine.configuration().is_none() {
             if state.engine.pending_build().is_some() {
                 let (value, _) = Self::sample_native_progress(&mut state).await?;
-                retain_reported_progress(&mut state.last_reported_progress, value);
-                return Ok(value);
-            }
-            if state.fresh_open_progress.is_some() {
-                state.fresh_sample = None;
-                let value = Self::sample_fresh_progress(&mut state).await?;
-                state.fresh_sample = Some(proof::ProofScope::capture(&state));
                 retain_reported_progress(&mut state.last_reported_progress, value);
                 return Ok(value);
             }
@@ -2256,7 +2268,6 @@ impl MysqlPublicV1Replicator {
 #[async_trait]
 impl StateProvider for MysqlPublicV1Replicator {
     async fn update_epoch(&self, epoch: Epoch, previous_epoch_last_lsn: i64) -> Result<()> {
-        let _permit = self.acquire_proof_permit()?;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.proof_deadline()),
             async {
@@ -2285,13 +2296,18 @@ impl StateProvider for MysqlPublicV1Replicator {
     }
 
     async fn last_committed_lsn(&self) -> Result<i64> {
-        let _permit = self.acquire_proof_permit()?;
+        let permit = self.progress_permit()?;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.proof_deadline()),
             async {
                 let mut state = self.lease().await;
                 require_bound_open(&state)?;
                 require_not_cleanup_only(&state)?;
+                let _permit = if permit.is_some() || state.fresh_open_progress.is_some() {
+                    None
+                } else {
+                    Some(self.acquire_proof_permit()?)
+                };
                 self.coherent_committed_sample(&mut state).await
             },
         )

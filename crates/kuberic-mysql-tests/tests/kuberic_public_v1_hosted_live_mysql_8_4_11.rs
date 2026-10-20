@@ -70,6 +70,31 @@ fn hosted_new_factory_initial_primary_progress_and_native_access() {
 }
 
 #[test]
+fn hosted_existing_open_rejects_without_creating_native_roots() {
+    run_native(async {
+        let mut fixture = HostedFixture::new("no-existing").await?;
+        let result = async {
+            let error = fixture.execute(PublicOperationProgram::Open {
+                replica: fixture.identity.clone(),
+                existing: true,
+            }).await.expect_err("Existing Open cannot adopt native storage");
+            require(
+                error == r#"CommandRejected("public operation did not complete successfully: Some(Failed(\"agent store identity mismatch: open context changed\"))")"#,
+                &format!("wrong Existing rejection: {error}"),
+            )?;
+            require(
+                !fixture.root.path().join("d").exists()
+                    && !fixture.root.path().join("s").exists(),
+                "unsupported Existing created native roots",
+            )?;
+            Ok(())
+        }.await;
+        let cleanup = fixture.shutdown().await;
+        finish_scenario(result, cleanup, Ok(()))
+    });
+}
+
+#[test]
 fn native_schema_allowlist_still_rejects_nested_or_sibling_private_stores() {
     let root = FixtureRoot::new("hosted-scan").unwrap();
     let schema = root.path().join("kuberic_proxy_qualification");
@@ -115,6 +140,95 @@ fn hosted_interrupted_open_after_real_server_spawn_is_contained() {
         let cleanup = fixture.shutdown().await;
         let unaffected = foreign.assert_live();
         finish_scenario(result, cleanup, unaffected)
+    });
+}
+
+#[test]
+fn service_close_failure_remains_an_exact_obligation_on_retry_and_abort() {
+    run_native(async {
+        let mut fixture = HostedFixture::new("close-fail").await?;
+        let result = async {
+            fixture.open().await?;
+            // Our own new empty destination creates a real retention failure,
+            // not a simulated success or a substituted native owner.
+            let collision = fixture.root.path().join("s.retained");
+            std::fs::create_dir(&collision).map_err(failure)?;
+            require(
+                fixture.service.close().await.is_err(),
+                "Close ignored collision",
+            )?;
+            require(
+                fixture.service.close().await.is_err(),
+                "retry returned vacuous success",
+            )?;
+            std::fs::remove_dir(&collision).map_err(failure)?;
+            fixture.service.abort();
+            fixture.assert_contained_evidence()?;
+            require(
+                fixture.service.close().await.is_err(),
+                "settled containment erased an earlier terminal failure",
+            )?;
+            Ok(())
+        }
+        .await;
+        let cleanup = fixture.shutdown().await;
+        finish_scenario(result, cleanup, Ok(()))
+    });
+}
+
+#[test]
+fn dropped_service_close_still_forwards_abort_to_the_exact_live_driver() {
+    run_native(async {
+        let mut fixture = HostedFixture::new("close-drop").await?;
+        let result = async {
+            fixture.fresh_primary().await?;
+            let mut close = Box::pin(fixture.service.close());
+            require(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "Close did not reach asynchronous native/proxy settlement",
+            )?;
+            drop(close);
+            fixture.service.abort();
+            fixture.assert_contained_evidence()?;
+            Ok(())
+        }
+        .await;
+        let cleanup = fixture.shutdown().await;
+        finish_scenario(result, cleanup, Ok(()))
+    });
+}
+
+#[test]
+fn concurrent_service_close_callers_wait_for_the_same_native_settlement() {
+    run_native(async {
+        let mut fixture = HostedFixture::new("close-both").await?;
+        let result = async {
+            fixture.fresh_primary().await?;
+            let mut first = Box::pin(fixture.service.close());
+            require(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "first Close never entered asynchronous settlement",
+            )?;
+            let mut second = Box::pin(fixture.service.close());
+            require(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "second Close acknowledged success before first settled",
+            )?;
+            let (first, second) = tokio::join!(first, second);
+            first.map_err(failure)?;
+            second.map_err(failure)?;
+            fixture.assert_contained_evidence()?;
+            Ok(())
+        }
+        .await;
+        let cleanup = fixture.shutdown().await;
+        finish_scenario(result, cleanup, Ok(()))
     });
 }
 

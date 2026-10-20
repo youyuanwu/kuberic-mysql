@@ -569,14 +569,7 @@ async fn run_custom_build_fixture(
             fixture.remove().unwrap();
             return;
         }
-        assert!(
-            kuberic_runtime::application::StateProvider::last_committed_lsn(
-                drivers[target].as_ref()
-            )
-            .await
-            .is_err(),
-            "a built secondary's local accepted tail is not provider commitment"
-        );
+        assert_secondary_pair_unavailable(drivers[target].as_ref()).await;
         // A terminal exact retry is served from the retained complete
         // binding, but only after fresh Primary/authority/boundary proof.
         Box::pin(drivers[0].build_replica(build.clone()))
@@ -713,6 +706,7 @@ async fn run_custom_build_fixture(
             .change_role(epoch, ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
+        assert_secondary_pair_unavailable(drivers[target].as_ref()).await;
         drivers[0]
             .update_catch_up_replica_set_configuration(
                 source_configuration.clone(),
@@ -811,6 +805,7 @@ async fn run_custom_build_fixture(
                 .update_current_replica_set_configuration(local_configuration)
                 .await
                 .unwrap();
+            assert_secondary_pair_unavailable(drivers[existing].as_ref()).await;
         }
     }
 
@@ -1268,6 +1263,21 @@ fn instance_socket(root: &Path, index: usize) -> std::path::PathBuf {
         .join("mysql.sock")
 }
 
+async fn assert_secondary_pair_unavailable(driver: &MysqlPublicV1Replicator) {
+    assert!(
+        qualified_progress(driver).await >= 0,
+        "accepted history must be projectable"
+    );
+    assert!(
+        matches!(
+            kuberic_runtime::application::StateProvider::last_committed_lsn(driver).await,
+            Err(RuntimeError::InvalidReplication(message))
+                if message == "MySQL committed progress is unproved: no independently proved committed sample"
+        ),
+        "local accepted history must not be silently promoted to commitment"
+    );
+}
+
 async fn assert_fresh_pair(driver: &MysqlPublicV1Replicator) {
     assert_eq!(driver.current_progress().await.unwrap(), 0);
     assert_eq!(
@@ -1285,6 +1295,20 @@ async fn qualify_fresh_lifecycle(
     case: u8,
 ) {
     use kuberic_runtime::application::StateProvider;
+    // Real host/controller observations may poll separate owners concurrently.
+    // Fresh history has no peer proof and must not monopolize the group permit.
+    let (first, second, third) = tokio::join!(
+        drivers[0].current_progress(),
+        drivers[1].current_progress(),
+        drivers[2].current_progress(),
+    );
+    assert_eq!((first.unwrap(), second.unwrap(), third.unwrap()), (0, 0, 0));
+    let (first, second, third) = tokio::join!(
+        StateProvider::last_committed_lsn(drivers[0].as_ref()),
+        StateProvider::last_committed_lsn(drivers[1].as_ref()),
+        StateProvider::last_committed_lsn(drivers[2].as_ref()),
+    );
+    assert_eq!((first.unwrap(), second.unwrap(), third.unwrap()), (0, 0, 0));
     for (index, driver) in drivers.iter().enumerate() {
         assert_fresh_pair(driver.as_ref()).await;
         assert_eq!(group_member_count(&instance_socket(root, index)).await, 0);
@@ -1317,6 +1341,7 @@ async fn qualify_fresh_lifecycle(
                     if message == "MySQL Public V1 StateProvider rejects data-loss acceptance"
             ));
             assert!(StateProvider::get_copy_context(driver).await.is_err());
+            assert!(driver.change_role(epoch, ReplicaRole::None).await.is_err());
             assert_eq!(driver.catch_up_capability().await.unwrap(), INVALID_LSN);
             assert!(
                 driver

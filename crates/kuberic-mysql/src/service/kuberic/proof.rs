@@ -155,6 +155,25 @@ impl MysqlPublicV1Replicator {
             .ok_or(RuntimeError::ReconfigurationPending)
     }
 
+    /// Only stable, unformed owner-local reads may bypass the peer-proof
+    /// permit. A leased/transitioning owner remains fail-fast. Callers recheck
+    /// after acquiring their local lease before using either proof path.
+    pub(super) fn progress_permit(&self) -> Result<Option<BuildGroupPermit>> {
+        let slot = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = slot.as_ref().ok_or(RuntimeError::ReconfigurationPending)?;
+        if state.fresh_open_progress.is_some()
+            && state.engine.configuration().is_none()
+            && state.engine.pending_build().is_none()
+        {
+            Ok(None)
+        } else {
+            self.acquire_proof_permit().map(Some)
+        }
+    }
+
     pub(super) fn proof_deadline(&self) -> Instant {
         self.attempt.work_deadline().min(
             Instant::now()
@@ -361,12 +380,18 @@ impl MysqlPublicV1Replicator {
                 "fresh historical evidence is no longer applicable",
             ));
         }
+        let scope = ProofScope::capture(state);
         let progress = state
             .engine
             .revalidate_fresh_progress()
             .await
             .map_err(map_mysql)?;
         Self::require_native_durability(state)?;
+        if scope != ProofScope::capture(state) {
+            return Err(unproved(
+                "fresh owner scope changed during native observation",
+            ));
+        }
         Ok(progress.value())
     }
 }

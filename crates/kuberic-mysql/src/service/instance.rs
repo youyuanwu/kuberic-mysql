@@ -93,6 +93,9 @@ pub struct MysqlInstanceManager {
     unsupported_application_capability: bool,
     proxy_issuance: Option<std::sync::Arc<MysqlProxyIssuance>>,
     proxy_issuance_sealed: bool,
+    // Mechanical cleanup custody only: captured while the child is attested,
+    // never authority to reopen, report progress, or serve.
+    terminal_binding: Option<(u64, MemberMutationAuthority)>,
 }
 
 /// Private construction custody, never derived from caller-constructible receipts.
@@ -136,6 +139,7 @@ impl MysqlInstanceManager {
             unsupported_application_capability: false,
             proxy_issuance: None,
             proxy_issuance_sealed: false,
+            terminal_binding: None,
         }
     }
 
@@ -546,6 +550,7 @@ impl MysqlInstanceManager {
             };
         }
         self.process_generation = next_generation;
+        self.terminal_binding = None;
         self.state = MysqlInstanceState::Running;
         Ok(())
     }
@@ -1453,14 +1458,11 @@ impl MysqlInstanceManager {
             self.state = MysqlInstanceState::Faulted;
             return Err(MysqlTopologyError::OwnershipContextLoss);
         }
-        if attest_child(
-            self.child
-                .as_mut()
-                .expect("running state retains the exact child"),
-            &self.config,
-        )
-        .is_err()
-        {
+        let Some(child) = self.child.as_mut() else {
+            self.state = MysqlInstanceState::Faulted;
+            return Err(MysqlTopologyError::OwnershipContextLoss);
+        };
+        if attest_child(child, &self.config).is_err() {
             self.state = MysqlInstanceState::Faulted;
             return Err(MysqlTopologyError::OwnershipContextLoss);
         }
@@ -1668,6 +1670,7 @@ impl MysqlInstanceManager {
             attest_child(child, &self.config)?;
             terminate_and_reap_before(child, deadline)?;
             self.child = None;
+            self.state = MysqlInstanceState::Faulted;
             wait_for_absence_before(self.config.runtime().socket(), deadline)?;
         }
         self.revalidate_roots()?;
@@ -1922,8 +1925,38 @@ impl MysqlMemberEffectBoundary for MysqlInstanceManager {
         authority: &MemberMutationAuthority,
         attempt: &AttemptContext,
     ) -> Result<crate::service::MemberContainmentReceipt, MysqlInstanceError> {
-        self.revalidate_member_effect_binding(authority)
-            .map_err(map_containment_binding_error)?;
+        if attempt.attempt() != authority.attempt() {
+            return Err(MysqlInstanceError::Ownership(
+                crate::service::OwnershipError::RootMismatch,
+            ));
+        }
+        if self.child.is_some() {
+            self.revalidate_member_effect_binding(authority)
+                .map_err(map_containment_binding_error)?;
+            self.terminal_binding = Some((self.process_generation, authority.clone()));
+        } else {
+            // A prior exact terminal call may have reaped the child before
+            // scratch settlement failed. Resume only that retained generation's
+            // cleanup, never synthesize a new live binding from the caller.
+            if self.terminal_binding.as_ref() != Some(&(self.process_generation, authority.clone()))
+            {
+                return Err(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::RootMismatch,
+                ));
+            }
+            self.data_root
+                .as_ref()
+                .ok_or(MysqlInstanceError::Ownership(
+                    crate::service::OwnershipError::RootMismatch,
+                ))?
+                .revalidate()
+                .map_err(MysqlInstanceError::Ownership)?;
+            if let Some(scratch) = self.scratch_root.as_ref() {
+                scratch
+                    .revalidate()
+                    .map_err(MysqlInstanceError::Ownership)?;
+            }
+        }
         let cleanup = self.contain_with_attempt(attempt)?;
         self.containment_receipt(authority, cleanup)
     }
@@ -3327,6 +3360,91 @@ mod tests {
             drop(manager);
             fs::remove_dir_all(parent).unwrap();
         }
+    }
+
+    #[test]
+    fn childless_terminal_retry_requires_retained_exact_generation_and_owned_roots() {
+        let parent = std::env::temp_dir().join(format!(
+            "kms-close-retry-{}-{}",
+            std::process::id(),
+            CLEANUP_SERIAL.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = MysqlInstanceConfig::new_topology_member(
+            "/usr/bin/sleep",
+            "/usr/bin/env",
+            parent.join("data"),
+            parent.join("scratch"),
+            topology(),
+            MysqlMemberIndex::First,
+            MysqlOperationTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .with_retained_containment_evidence();
+        let authority = test_authority(&config);
+        let roots = config
+            .create_layout()
+            .unwrap_or_else(|_| panic!("test layout"));
+        fs::write(
+            roots.scratch.path().join("mysqld.err"),
+            "pending diagnostics",
+        )
+        .unwrap();
+        let mut manager = MysqlInstanceManager::new(config);
+        manager.data_root = Some(roots.data);
+        manager.scratch_root = Some(roots.scratch);
+        manager.state = MysqlInstanceState::Faulted;
+        let attempt = AttemptContext::new(
+            authority.attempt().clone(),
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(manager.contain_member_exact(&authority, &attempt).is_err());
+        manager.terminal_binding = Some((manager.process_generation + 1, authority.clone()));
+        assert!(manager.contain_member_exact(&authority, &attempt).is_err());
+        manager.terminal_binding = Some((manager.process_generation, authority.clone()));
+        let other_attempt = AttemptContext::new(
+            AttemptId::new("unrelated-cleanup").unwrap(),
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(
+            manager
+                .contain_member_exact(&authority, &other_attempt)
+                .is_err()
+        );
+        for root in ["data", "scratch"] {
+            let original = parent.join(root);
+            let owned = parent.join(format!("{root}-owned"));
+            fs::rename(&original, &owned).unwrap();
+            fs::create_dir(&original).unwrap();
+            assert!(manager.contain_member_exact(&authority, &attempt).is_err());
+            assert!(owned.is_dir(), "substituted roots must not be removed");
+            fs::remove_dir(&original).unwrap();
+            fs::rename(&owned, &original).unwrap();
+        }
+        attempt.cancel(); // cleanup, not new live work, remains applicable.
+        let receipt = manager.contain_member_exact(&authority, &attempt).unwrap();
+        assert!(receipt.is_complete());
+        assert!(!parent.join("scratch").exists());
+        assert!(parent.join("scratch.retained/mysqld.err").is_file());
+        assert!(
+            manager
+                .contain_member_exact(&authority, &attempt)
+                .unwrap()
+                .is_complete()
+        );
+        drop(manager);
+        fs::remove_dir_all(parent).unwrap();
     }
 
     fn test_authority(config: &MysqlInstanceConfig) -> MemberMutationAuthority {

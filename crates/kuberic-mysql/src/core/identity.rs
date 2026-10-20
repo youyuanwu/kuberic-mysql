@@ -6,16 +6,20 @@ use core::str::FromStr;
 use crate::core::error::{IdentityError, IdentityErrorKind, IdentityField};
 
 const MAX_OPAQUE_BYTES: usize = 255;
+// Storage fences encode a composite public incarnation (replica, process
+// incarnation, storage identity and generation), not one opaque component.
+// Preserve its complete canonical representation without hashing/truncation.
+const MAX_STORAGE_BINDING_BYTES: usize = 2048;
 
-fn validate_opaque(field: IdentityField, value: &str) -> Result<(), IdentityError> {
+fn validate_opaque(field: IdentityField, value: &str, maximum: usize) -> Result<(), IdentityError> {
     if value.is_empty() {
         return Err(IdentityError::new(field, IdentityErrorKind::Empty));
     }
-    if value.len() > MAX_OPAQUE_BYTES {
+    if value.len() > maximum {
         return Err(IdentityError::new(
             field,
             IdentityErrorKind::TooLong {
-                maximum: MAX_OPAQUE_BYTES,
+                maximum,
                 actual: value.len(),
             },
         ));
@@ -31,6 +35,9 @@ fn validate_opaque(field: IdentityField, value: &str) -> Result<(), IdentityErro
 
 macro_rules! opaque_identity {
     ($name:ident, $field:ident, $docs:literal) => {
+        opaque_identity!($name, $field, $docs, MAX_OPAQUE_BYTES);
+    };
+    ($name:ident, $field:ident, $docs:literal, $maximum:expr) => {
         #[doc = $docs]
         #[derive(Clone, Debug, Eq, Hash, PartialEq)]
         pub struct $name(String);
@@ -39,7 +46,7 @@ macro_rules! opaque_identity {
             /// Validates and constructs the identity.
             pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
                 let value = value.into();
-                validate_opaque(IdentityField::$field, &value)?;
+                validate_opaque(IdentityField::$field, &value, $maximum)?;
                 Ok(Self(value))
             }
 
@@ -93,7 +100,8 @@ opaque_identity!(
 opaque_identity!(
     StorageBinding,
     Storage,
-    "An opaque storage binding identity."
+    "An exact composite storage binding identity, bounded to 2048 bytes.",
+    MAX_STORAGE_BINDING_BYTES
 );
 opaque_identity!(GroupName, GroupName, "A Group Replication group identity.");
 opaque_identity!(

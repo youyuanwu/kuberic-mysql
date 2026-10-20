@@ -15,8 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use kuberic_controller::crd::{KubericSetStatus, PublicV1OperationStatus};
 use kuberic_controller::test_util::{
-    ApplicationFactory, CreatedApplication, ErrorKind, ObservationFailureKind, ReplicaContext,
-    TestCluster, TestError,
+    ApplicationFactory, CreatedApplication, ErrorKind, ReplicaContext, TestCluster, TestError,
 };
 use kuberic_mysql::core::{AttemptId, ConfiguredGtidLineage, CredentialGeneration};
 use kuberic_mysql::service::{
@@ -29,8 +28,9 @@ use kuberic_runtime::application::OpenMode;
 use kuberic_runtime::host::ApplicationStorageState;
 use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationClass, PublicOperationProgram, PublicV1AcceptedOperationCompletion,
-    PublicV1AgentReport, PublicV1CallKind, PublicV1OperationResult,
+    PublicOperationClass, PublicOperationProgram, PublicProgressRole,
+    PublicV1AcceptedOperationCompletion, PublicV1AgentReport, PublicV1CallKind,
+    PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, ReplicaRole};
 use mysql_async::prelude::Queryable;
@@ -43,8 +43,8 @@ use live_support::{
 
 const GROUP_UUID: &str = "03e84887-4d65-42d0-b941-0f691cb0aa16";
 const CHILD_MODE: &str = "KUBERIC_MYSQL_INPROCESS_PROBE_CHILD";
-const ROLE_PROGRESS_ERROR: &str =
-    "Primary committed progress requires an applicable configuration proof";
+const CONFIGURATION_ERROR: &str =
+    "invalid replication evidence: fresh MySQL bootstrap requires exactly the local Primary member";
 
 #[test]
 fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> {
@@ -55,9 +55,10 @@ fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> 
 }
 
 #[test]
-fn controller_fresh_primary_role_requires_configuration_progress_proof() -> Result<()> {
+fn controller_fresh_primary_reports_before_exact_multimember_configuration_boundary() -> Result<()>
+{
     run_native_probe(
-        "controller_fresh_primary_role_requires_configuration_progress_proof",
+        "controller_fresh_primary_reports_before_exact_multimember_configuration_boundary",
         true,
     )
 }
@@ -65,27 +66,20 @@ fn controller_fresh_primary_role_requires_configuration_progress_proof() -> Resu
 #[test]
 fn formation_boundary_rejects_unrelated_errors() {
     for message in [
-        "agent report: Unavailable(\"Execute timed out\")",
-        "agent report: Unavailable(\"runtime is closed\")",
-        r#"agent report: Unavailable("code: 'The system is not in a state required for the operation's execution', message: \"invalid replication evidence: Primary committed progress requires an applicable configuration proof\"")"#,
-        ROLE_PROGRESS_ERROR,
-        "Primary committed progress requires a different proof",
+        "Execute timed out",
+        "runtime is closed",
+        "invalid replication evidence: Primary committed progress requires an applicable configuration proof",
+        "fresh MySQL bootstrap requires exactly the local Primary member",
+        "invalid replication evidence: fresh MySQL bootstrap requires a different member",
     ] {
-        let error = TestError::with_source(
-            ErrorKind::Fatal,
-            "harness operation failed",
-            anyhow::anyhow!("{message}"),
-        );
-        assert!(assert_role_progress_rejection(&error).is_err());
+        assert!(assert_configuration_rejection(message).is_err());
     }
-    for kind in [
-        ErrorKind::Deadline,
-        ErrorKind::Cleanup,
-        ErrorKind::Application,
+    for result in [
+        PublicV1OperationResult::Succeeded,
+        PublicV1OperationResult::Ambiguous(CONFIGURATION_ERROR.into()),
+        PublicV1OperationResult::Cancelled,
     ] {
-        assert!(
-            assert_role_progress_rejection(&TestError::new(kind, ROLE_PROGRESS_ERROR)).is_err()
-        );
+        assert!(assert_configuration_rejection(&format!("{result:?}")).is_err());
     }
 }
 
@@ -112,7 +106,7 @@ fn run_native_probe(native_test: &str, formation: bool) -> Result<()> {
         .env(CHILD_MODE, "1")
         .env("CARGO_TARGET_DIR", root.path())
         .env_remove("KUBERIC_WORKSPACE_TESTS")
-        .output();
+        .status();
     let output = match output {
         Ok(output) => output,
         Err(error) => {
@@ -123,11 +117,15 @@ fn run_native_probe(native_test: &str, formation: bool) -> Result<()> {
             )));
         }
     };
-    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
-    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
+    if !output.success() {
         bail!(
             "native probe child failed; retained storage: {}",
+            root.keep().display()
+        );
+    }
+    if formation {
+        eprintln!(
+            "bounded configuration diagnostics retained: {}",
             root.keep().display()
         );
     }
@@ -440,7 +438,39 @@ async fn controller_probe(formation: bool) -> Result<()> {
         }
         Err(error) => (Err(error), None),
     };
-    if let Err(error) = cluster.finish(result).await {
+    let capture_boundary = formation && result.is_ok();
+    let finished = cluster
+        .finish(if capture_boundary {
+            Err(anyhow::anyhow!(
+                "capture exact bounded configuration rejection"
+            ))
+        } else {
+            result
+        })
+        .await;
+    if capture_boundary {
+        // The public harness exposes its exact controller dispatch error only
+        // through failure diagnostics. Capture it deliberately, not by waiting
+        // for a deadline or modifying private runtime/controller state.
+        let error = finished.expect_err("diagnostic capture unexpectedly succeeded");
+        ensure!(
+            error.kind() == ErrorKind::Application,
+            "diagnostic capture had cleanup failure"
+        );
+        let diagnostics = error
+            .diagnostics()
+            .context("missing controller diagnostics")?;
+        ensure!(
+            diagnostics["pendingTaskOwners"] == 0,
+            "native task owners did not drain"
+        );
+        assert_configuration_rejection(
+            diagnostics["lastReconcileError"]
+                .as_str()
+                .context("missing exact controller rejection")?,
+        )?;
+        retain_diagnostics(&error)?;
+    } else if let Err(error) = finished {
         print_diagnostics(&error);
         if let Err(retention) = retain_diagnostics(&error) {
             return Err(anyhow::Error::new(error).context(format!(
@@ -459,10 +489,19 @@ async fn controller_probe(formation: bool) -> Result<()> {
         for address in [member.sql, member.group, member.proxy] {
             assert_tcp_refuses(address).map_err(anyhow::Error::msg)?;
         }
-        ensure!(
-            !member.root.exists(),
-            "successful harness finish retained application storage"
-        );
+        if capture_boundary {
+            ensure!(
+                !member.root.join("s").exists()
+                    && member.root.join("s.retained/mysqld.err").is_file()
+                    && member.root.join("d/auto.cnf").is_file(),
+                "bounded rejection lost containment or retained native evidence"
+            );
+        } else {
+            ensure!(
+                !member.root.exists(),
+                "successful harness finish retained application storage"
+            );
+        }
         factory.shutdown_and_drain(member.service).await?;
     }
     Ok(())
@@ -472,49 +511,48 @@ async fn drive_until_formation_boundary(
     cluster: &mut TestCluster<MysqlFactory>,
     factory: &MysqlFactory,
 ) -> Result<()> {
-    let initial = cluster.observe().await?;
+    let mut observation = cluster.observe().await?;
     ensure!(
-        initial.failures().is_empty(),
+        observation.failures().is_empty(),
         "fresh reports became unavailable"
     );
-    let initial_errors = initial.reconcile_errors();
-    let fresh = initial
+    let initial_errors = observation.reconcile_errors();
+    let fresh = observation
         .reports()
         .map(|(_, report)| report.clone())
         .collect::<Vec<_>>();
+    let mut role_command = None;
+    let mut role_reported = false;
     loop {
-        cluster.step().await?;
-        let observation = cluster.observe().await?;
-        if observation.reconcile_errors() == initial_errors && observation.failures().is_empty() {
-            continue;
-        }
-        ensure!(
-            observation.reconcile_errors() > initial_errors,
-            "report failed without an observed controller rejection"
-        );
         let status = observation
             .set()
             .status
             .as_ref()
             .context("missing controller status")?;
-        let command = assert_pending_primary_role(status, &fresh)?;
-        assert_rejects_changed_role_evidence(status, &fresh)?;
+        if role_command.is_none()
+            && let Some(operation) = status.public_v1_operation.as_ref()
+            && matches!(
+                operation
+                    .command()
+                    .map_err(anyhow::Error::msg)?
+                    .intent
+                    .program,
+                Some(PublicOperationProgram::Role {
+                    role: ReplicaRole::Primary,
+                    ..
+                })
+            )
+        {
+            role_command = Some(assert_pending_primary_role(status, &fresh)?);
+            assert_rejects_changed_role_evidence(status, &fresh)?;
+        }
+        cluster.step().await?;
+        observation = cluster.observe().await?;
         ensure!(
-            observation.credentials_consistent(),
-            "controller/host credentials changed"
-        );
-        let [failure] = observation.failures() else {
-            bail!("expected only the intended Primary report to be unavailable");
-        };
-        ensure!(
-            failure.kind() == ObservationFailureKind::Unavailable
-                && failure.instance_id() == command.target.instance_id.as_str(),
-            "an unrelated replica or observation failed"
-        );
-        assert_role_progress_rejection(failure.error().context("missing report rejection")?)?;
-        ensure!(
-            observation.reports().count() == 2,
-            "healthy peer reports are missing"
+            observation.credentials_consistent()
+                && observation.failures().is_empty()
+                && observation.reports().count() == 3,
+            "fresh continuation lost exact host credentials or queryable reports"
         );
         for (_, report) in observation.reports() {
             assert_fresh_open_report(report)?;
@@ -524,20 +562,88 @@ async fn drive_until_formation_boundary(
                         && opened.process_session_id == report.process_session_id
                         && opened.storage_incarnation == report.storage_incarnation
                         && opened.replicator_creation_id == report.replicator_creation_id
-                }) && report.role == ReplicaRole::None
+                        && opened.history == report.history
+                }) && report.progress.first == 0
+                    && report.progress.last == 0
                     && report.read_status != AccessStatus::Granted
-                    && report.write_status != AccessStatus::Granted
-                    && report
-                        .completed_operations
-                        .iter()
-                        .all(|completion| completion.call_kind == PublicV1CallKind::Open),
-                "peer changed identity or received formation/admission credit"
+                    && report.write_status != AccessStatus::Granted,
+                "fresh report changed owner/history/progress or gained admission"
             );
+            if let Some(command) = role_command.as_ref()
+                && report.replica == command.target
+                && report.completed_operations.iter().any(|completion| {
+                    completion.operation_id == command.intent.operation_id
+                        && completion.revision == command.intent.revision
+                        && completion.input_digest == command.intent.input_digest
+                        && completion.call_kind == PublicV1CallKind::Role
+                        && completion.result == PublicV1OperationResult::Succeeded
+                })
+            {
+                // The pinned custom host projects serving readiness into its
+                // public role: before epoch+configuration it deliberately
+                // reports None/Recovery despite a successful Role receipt.
+                ensure!(
+                    report.role == ReplicaRole::None
+                        && report.progress.role == PublicProgressRole::Recovery,
+                    "initial Role receipt unexpectedly granted configured reporting"
+                );
+                role_reported = true;
+            } else {
+                ensure!(
+                    report.role == ReplicaRole::None
+                        && report
+                            .completed_operations
+                            .iter()
+                            .all(|completion| { completion.call_kind == PublicV1CallKind::Open }),
+                    "an unrelated member received role or lifecycle credit"
+                );
+            }
         }
+        let status = observation
+            .set()
+            .status
+            .as_ref()
+            .context("missing boundary status")?;
+        if status.public_v1_operation.is_none() {
+            continue;
+        }
+        if observation.reconcile_errors() == initial_errors {
+            continue;
+        }
+        // Exact authority below rejects unrelated/wrong-stage failure.
+        ensure!(
+            role_reported,
+            "later rejection preceded successful initial Primary report"
+        );
+        let role = role_command
+            .as_ref()
+            .context("missing frozen initial Role")?;
+        assert_pending_configuration_boundary(
+            status,
+            &fresh,
+            &observation
+                .reports()
+                .map(|(_, report)| report.clone())
+                .collect::<Vec<_>>(),
+            role,
+        )?;
+        assert_rejects_changed_configuration_evidence(
+            status,
+            &fresh,
+            &observation
+                .reports()
+                .map(|(_, report)| report.clone())
+                .collect::<Vec<_>>(),
+            role,
+        )?;
         cluster.probe(factory.assert_native_unformed()).await?;
         eprintln!(
-            "controller Primary role reached the exact unconfigured-progress guard; \
-             only three New Opens were accepted, all native members remain unformed and closed"
+            "controller accepted three New Opens, standalone Primary Role and Epoch; \
+             coherent fresh reports remain zero and closed; exact multi-member \
+             configuration rejected before native formation ({} reconciliation errors observed)",
+            observation
+                .reconcile_errors()
+                .saturating_sub(initial_errors),
         );
         return Ok(());
     }
@@ -582,7 +688,7 @@ fn assert_pending_primary_role(
             && command.intent.lifecycle.is_none()
             && command.intent.class == PublicOperationClass::Authority
             && command.intent.input_digest == program.digest(),
-        "first rejected operation is not the exact standalone fresh Primary role"
+        "initial operation is not the exact standalone fresh Primary role"
     );
     let target = fresh
         .iter()
@@ -664,19 +770,229 @@ fn assert_rejects_changed_role_evidence(
     Ok(())
 }
 
-fn assert_role_progress_rejection(error: &TestError) -> Result<()> {
+fn assert_configuration_rejection(error: &str) -> Result<()> {
+    let callback = format!("runtime error: {CONFIGURATION_ERROR}");
+    let rejected = format!(
+        "command rejected: Public V1 operation did not complete successfully: Some(Failed({callback:?}))"
+    );
     let expected = format!(
-        "agent report: Invalid({:?})",
-        format!(
-            "code: 'The system is not in a state required for the operation's execution', \
-             message: \"invalid replication evidence: {ROLE_PROGRESS_ERROR}\""
-        )
+        "agent returned invalid evidence: agent is unavailable: code: \
+         'The system is not in a state required for the operation's execution', message: {rejected:?}"
     );
-    let sources = error.sources().map(ToString::to_string).collect::<Vec<_>>();
     ensure!(
-        error.kind() == ErrorKind::Fatal && sources == [expected],
-        "unexpected report rejection, not the exact Primary progress guard: {error}; {sources:?}"
+        error == expected,
+        "not the exact fresh multi-member configuration rejection: {error}"
     );
+    Ok(())
+}
+
+fn assert_pending_configuration_boundary(
+    status: &KubericSetStatus,
+    fresh: &[PublicV1AgentReport],
+    reports: &[PublicV1AgentReport],
+    role: &PublicV1OperationCommand,
+) -> Result<()> {
+    ensure!(
+        status.public_v1_topology.is_none()
+            && status.public_v1_session_renewal.is_none()
+            && status.public_v1_replacement.is_none(),
+        "unexpected topology/recovery authority at configuration boundary"
+    );
+    let authority = status
+        .public_v1_authority
+        .as_ref()
+        .context("missing authority")?
+        .authority()
+        .map_err(anyhow::Error::msg)?;
+    let transition = status
+        .public_v1_transition
+        .as_ref()
+        .context("missing transition")?
+        .transition()
+        .map_err(anyhow::Error::msg)?;
+    let command = status
+        .public_v1_operation
+        .as_ref()
+        .context("missing configuration operation")?
+        .command()
+        .map_err(anyhow::Error::msg)?;
+    let Some(PublicOperationProgram::Configuration(configuration)) =
+        command.intent.program.as_ref()
+    else {
+        bail!("later rejected operation is not Configuration");
+    };
+    ensure!(
+        command.target == role.target
+            && command.intent.identity == role.intent.identity
+            && command.intent.process_session_id == role.intent.process_session_id
+            && command.intent.lifecycle.is_none()
+            && command.intent.class == PublicOperationClass::Authority
+            && command.intent.input_digest == command.intent.program.as_ref().unwrap().digest()
+            && configuration.previous.is_none()
+            && configuration.current.epoch == Epoch::new(0, 1)
+            && configuration.current.primary_id == role.target.replica_id
+            && configuration.current.members.len() == 3
+            && configuration.replicas.len() == 2
+            && configuration.replicas.iter().all(|replica| {
+                fresh.iter().any(|opened| {
+                    opened.replica == replica.identity
+                        && opened.process_session_id == replica.process_session_id
+                        && Some(&opened.storage_incarnation) == replica.storage_incarnation.as_ref()
+                        && opened.replication_address.as_deref()
+                            == Some(replica.replication_address.as_str())
+                        && replica.current_progress == opened.progress.last
+                        && replica.catch_up_capability == opened.progress.first
+                })
+            })
+            && configuration.current.members.iter().all(|member| {
+                fresh.iter().any(|report| report.replica == member.identity)
+                    && member.role
+                        == if member.identity == role.target {
+                            ReplicaRole::Primary
+                        } else {
+                            ReplicaRole::ActiveSecondary
+                        }
+            }),
+        "configuration target/program/descriptor differs from exact fresh authority"
+    );
+    let primary = reports
+        .iter()
+        .find(|report| report.replica == command.target)
+        .context("missing queryable Primary report")?;
+    let opened = fresh
+        .iter()
+        .find(|report| report.replica == command.target)
+        .context("configuration target not freshly opened")?;
+    ensure!(
+        primary.identity == opened.identity
+            && primary.process_session_id == opened.process_session_id
+            && primary.storage_incarnation == opened.storage_incarnation
+            && primary.history == opened.history
+            && primary.replicator_creation_id == opened.replicator_creation_id
+            && primary.role == ReplicaRole::None
+            && primary.progress.role == PublicProgressRole::Recovery
+            && primary.progress.first == 0
+            && primary.progress.last == 0
+            && primary.read_status != AccessStatus::Granted
+            && primary.write_status != AccessStatus::Granted
+            && transition.evidence == authority
+            && transition.intent.operation_id == command.intent.operation_id
+            && transition.intent.revision == command.intent.revision
+            && transition.intent.call_kind == PublicV1CallKind::Configuration
+            && transition.intent.source.storage_incarnation == primary.storage_incarnation
+            && transition.intent.process_session_id == primary.process_session_id
+            && transition.intent.history == primary.history
+            && transition.intent.input_digest == command.intent.input_digest
+            && authority.completed_operations.len() == 5,
+        "configuration differs from frozen accepted Open/Role/Epoch authority"
+    );
+    for opened in fresh {
+        ensure!(
+            opened.completed_operations.iter().any(|completion| {
+                completion.call_kind == PublicV1CallKind::Open
+                    && completion.result == PublicV1OperationResult::Succeeded
+                    && authority.completed_operations.contains(
+                        &PublicV1AcceptedOperationCompletion::from_completion(completion),
+                    )
+            }),
+            "accepted fresh Open was lost at configuration boundary"
+        );
+    }
+    for (kind, digest) in [
+        (PublicV1CallKind::Role, role.intent.input_digest.clone()),
+        (
+            PublicV1CallKind::Epoch,
+            PublicOperationProgram::Epoch {
+                epoch: Epoch::new(0, 1),
+            }
+            .digest(),
+        ),
+    ] {
+        ensure!(
+            primary.completed_operations.iter().any(|completion| {
+                completion.call_kind == kind
+                    && completion.input_digest == digest
+                    && completion.result == PublicV1OperationResult::Succeeded
+                    && completion.process_session_id == primary.process_session_id
+                    && completion.storage_incarnation == primary.storage_incarnation
+                    && completion.history == primary.history
+                    && authority.completed_operations.contains(
+                        &PublicV1AcceptedOperationCompletion::from_completion(completion),
+                    )
+            }),
+            "controller did not accept exact successful {kind:?}"
+        );
+    }
+    ensure!(
+        primary.completed_operations.len() == 3
+            && primary
+                .completed_operations
+                .iter()
+                .all(|completion| matches!(
+                    completion.call_kind,
+                    PublicV1CallKind::Open | PublicV1CallKind::Role | PublicV1CallKind::Epoch
+                )),
+        "configuration unexpectedly received report completion credit"
+    );
+    Ok(())
+}
+
+fn assert_rejects_changed_configuration_evidence(
+    status: &KubericSetStatus,
+    fresh: &[PublicV1AgentReport],
+    reports: &[PublicV1AgentReport],
+    role: &PublicV1OperationCommand,
+) -> Result<()> {
+    let check = |status: &KubericSetStatus, reports: &[PublicV1AgentReport]| {
+        assert_pending_configuration_boundary(status, fresh, reports, role)
+    };
+    let mut changed = status.clone();
+    changed.public_v1_operation = None;
+    ensure!(
+        check(&changed, reports).is_err(),
+        "missing Configuration passed"
+    );
+    let mut changed = status.clone();
+    changed.public_v1_operation =
+        Some(PublicV1OperationStatus::from_command(role).map_err(anyhow::Error::msg)?);
+    ensure!(
+        check(&changed, reports).is_err(),
+        "Role substituted for Configuration passed"
+    );
+    let mut changed = status.clone();
+    changed
+        .public_v1_authority
+        .as_mut()
+        .unwrap()
+        .completed_operation_count += 1;
+    ensure!(
+        check(&changed, reports).is_err(),
+        "changed accepted completion count passed"
+    );
+    let primary = reports
+        .iter()
+        .position(|report| report.replica == role.target)
+        .unwrap();
+    for dimension in 0..8 {
+        let mut changed = reports.to_vec();
+        match dimension {
+            0 => changed[primary].process_session_id = fresh[1].process_session_id.clone(),
+            1 => changed[primary].storage_incarnation = fresh[1].storage_incarnation.clone(),
+            2 => changed[primary].history.data_loss_number += 1,
+            3 => changed[primary]
+                .completed_operations
+                .retain(|c| c.call_kind != PublicV1CallKind::Epoch),
+            4 => changed[primary].completed_operations.clear(),
+            5 => changed[primary].progress.first = 1,
+            6 => changed[primary].role = ReplicaRole::ActiveSecondary,
+            7 => changed[primary].write_status = AccessStatus::Granted,
+            _ => unreachable!(),
+        }
+        ensure!(
+            check(status, &changed).is_err(),
+            "changed configuration evidence dimension {dimension} passed"
+        );
+    }
     Ok(())
 }
 
