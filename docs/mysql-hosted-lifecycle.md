@@ -375,10 +375,13 @@ route skips missing prerequisites. The runtime test dependency still enables
 use it. Use one build job and one target tree; do not run native fixtures
 concurrently.
 
-Current scoped qualification passed all **21 direct Build/Remove/progress**
+Recorded scoped qualification passed **21 direct Build/Remove/progress**
 and **16 hosted/authenticated** cases in one serial, zero-nextest-retry
 selection; the complete controller target also passed separately with related
-identity/ownership checks. The earlier reported
+identity/ownership checks. Final-review hardening then verified the exact native
+unwind checkpoint, rejection of unrelated worker panics, and both provider-copy
+rejection callbacks in a focused three-case rerun. No full-native-workspace
+result is inferred from these selections. The earlier reported
 `remove_second_completed_idle_preserves_primary_and_admitted_secondary`
 failure followed by an isolated pass remains an undiagnosed historical
 observation. Its current broad-run pass does not establish the prior cause or

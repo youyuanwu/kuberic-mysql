@@ -137,10 +137,9 @@ fn abort_during_fresh_query_contains_the_exact_owner() {
 
 #[test]
 fn native_unwind_retains_owned_scratch_diagnostics_without_reuse() {
-    assert!(
-        std::panic::catch_unwind(|| run_live_scenario(false, false, 35)).is_err(),
-        "controlled native unwind must reach the fixture's panic path"
-    );
+    require_controlled_native_unwind(std::panic::catch_unwind(|| {
+        run_live_scenario(false, false, 35)
+    }));
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -168,12 +167,47 @@ fn native_unwind_retains_owned_scratch_diagnostics_without_reuse() {
     eprintln!("verified retained native unwind: {}", root.display());
 }
 
+/// Only the designated checkpoint emits this typed panic payload.
+#[derive(Debug)]
+struct NativeUnwindCheckpoint;
+
+fn require_controlled_native_unwind(result: std::thread::Result<()>) {
+    let payload = result.expect_err("controlled native unwind checkpoint was not reached");
+    if !payload.is::<NativeUnwindCheckpoint>() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn propagate_worker_panic(result: std::thread::Result<()>) {
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+fn native_unwind_checkpoint_cannot_absorb_an_unrelated_worker_failure() {
+    let joined = std::thread::spawn(|| std::panic::panic_any("unrelated worker failure")).join();
+    let propagated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        propagate_worker_panic(joined);
+    }));
+    let unexpected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        require_controlled_native_unwind(propagated);
+    }))
+    .expect_err("unrelated native worker failure was absorbed");
+    assert_eq!(
+        unexpected.downcast_ref::<&str>().copied(),
+        Some("unrelated worker failure"),
+    );
+    require_controlled_native_unwind(Err(Box::new(NativeUnwindCheckpoint)));
+    assert!(std::panic::catch_unwind(|| require_controlled_native_unwind(Ok(()))).is_err());
+}
+
 fn run_live_fixture(interrupt_second: bool, omit_source_progress: bool) {
     run_live_scenario(interrupt_second, omit_source_progress, 0);
 }
 
 fn run_live_scenario(interrupt_second: bool, omit_source_progress: bool, proof_case: u8) {
-    std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .name("mysql-public-build-live".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
@@ -188,8 +222,8 @@ fn run_live_scenario(interrupt_second: bool, omit_source_progress: bool, proof_c
                 ));
         })
         .unwrap()
-        .join()
-        .unwrap();
+        .join();
+    propagate_worker_panic(result);
 }
 
 async fn run_custom_build_fixture(
@@ -1340,7 +1374,20 @@ async fn qualify_fresh_lifecycle(
                 Err(RuntimeError::InvalidReplication(message))
                     if message == "MySQL Public V1 StateProvider rejects data-loss acceptance"
             ));
-            assert!(StateProvider::get_copy_context(driver).await.is_err());
+            assert!(matches!(
+                StateProvider::get_copy_context(driver).await,
+                Err(RuntimeError::InvalidReplication(message))
+                    if message == "MySQL Public V1 exposes no application copy bytes"
+            ));
+            assert!(matches!(
+                StateProvider::get_copy_state(
+                    driver,
+                    0,
+                    Box::pin(tonic::codegen::tokio_stream::empty()),
+                ).await,
+                Err(RuntimeError::InvalidReplication(message))
+                    if message == "MySQL Public V1 exposes no application copy state"
+            ));
             assert!(driver.change_role(epoch, ReplicaRole::None).await.is_err());
             assert_eq!(driver.catch_up_capability().await.unwrap(), INVALID_LSN);
             assert!(
@@ -1425,7 +1472,7 @@ async fn qualify_fresh_lifecycle(
                 assert!(!instance_socket(root, 0).exists());
             }
         }
-        35 => panic!("controlled native fixture unwind"),
+        35 => std::panic::panic_any(NativeUnwindCheckpoint),
         _ => unreachable!(),
     }
     for proxy in proxies {
