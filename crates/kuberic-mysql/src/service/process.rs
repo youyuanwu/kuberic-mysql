@@ -118,10 +118,13 @@ fn verify_product_inner(
     let mut output = String::new();
     log.read_to_string(&mut output)
         .map_err(|_| MysqlInstanceError::Product(ProductError::UnsupportedIdentity))?;
-    let exact = output.contains("Ver 8.4.11 ")
+    let supported = output
+        .split_once("Ver ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(crate::adapter::is_supported_server_version)
         && output.contains(" for Linux on x86_64 ")
         && output.contains("(MySQL Community Server - GPL)");
-    if !exact {
+    if !supported {
         return Err(MysqlInstanceError::Product(
             ProductError::UnsupportedIdentity,
         ));

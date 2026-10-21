@@ -20,14 +20,14 @@ use tokio::time::sleep;
 
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_process_absent, assert_tcp_refuses,
-    preflight_oracle_mysql_8_4_11,
+    preflight_oracle_mysql_8_4,
 };
 
 const GROUP_UUID: &str = "a4d98271-1959-45da-91c4-ff9a85b1d430";
 
 #[tokio::test(flavor = "current_thread")]
-async fn one_member_proxy_matches_oracle_mysql_8_4_11() {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+async fn one_member_proxy_matches_oracle_mysql_8_4() {
+    preflight_oracle_mysql_8_4().unwrap_or_else(|error| panic!("{error}"));
     let mut fixture =
         FixtureRoot::new("service-proxy-live").unwrap_or_else(|error| panic!("{error}"));
     let root = fixture.path().to_path_buf();

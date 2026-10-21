@@ -68,11 +68,14 @@ async fn valid_success_and_authority_closure() {
 
 async fn product_and_binding_precedence() {
     for (fixture, issue) in [
-        ("other-oracle-patch", ProductIssue::UnsupportedPatch),
+        (
+            "unsupported-oracle-version",
+            ProductIssue::UnsupportedVersion,
+        ),
         ("non-oracle-lookalike", ProductIssue::NonOracleCommunity),
     ] {
         let mut steps = success_steps();
-        steps[0] = result_step(QueryId::Mysql8411ProductIdentityV1, fixture);
+        steps[0] = result_step(QueryId::Mysql84ProductIdentityV1, fixture);
         mutate_step(&mut steps, 0, |result| {
             result.rows[0][4] = bytes("dddddddd-dddd-dddd-dddd-dddddddddddd");
         });
@@ -186,7 +189,7 @@ async fn socket_transport_authentication_and_permissions() {
 
 async fn absent_malformed_unsupported_and_schema_cases() {
     let mut absent = success_steps();
-    absent[2] = result_step(QueryId::Mysql8411GroupMembersV1, "plugin-absent-members");
+    absent[2] = result_step(QueryId::Mysql84GroupMembersV1, "plugin-absent-members");
     let (report, _) = observe_steps("gate-absent", absent).await;
     assert!(matches!(report.outcome(), ObservationOutcome::Absent(_)));
     assert_eq!(
@@ -197,10 +200,7 @@ async fn absent_malformed_unsupported_and_schema_cases() {
     );
 
     let mut malformed = success_steps();
-    malformed[4] = result_step(
-        QueryId::Mysql8411ExecutedGtidsV1,
-        "unexpected-required-null",
-    );
+    malformed[4] = result_step(QueryId::Mysql84ExecutedGtidsV1, "unexpected-required-null");
     let (report, _) = observe_steps("gate-malformed", malformed).await;
     assert!(matches!(
         report.outcome(),
@@ -211,7 +211,7 @@ async fn absent_malformed_unsupported_and_schema_cases() {
     ));
 
     let mut unsupported = success_steps();
-    unsupported[2] = result_step(QueryId::Mysql8411GroupMembersV1, "future-member-role");
+    unsupported[2] = result_step(QueryId::Mysql84GroupMembersV1, "future-member-role");
     let (report, _) = observe_steps("gate-unsupported", unsupported).await;
     assert!(matches!(
         report.outcome(),
@@ -226,10 +226,7 @@ async fn absent_malformed_unsupported_and_schema_cases() {
     ));
 
     let mut schema = success_steps();
-    schema[2] = result_step(
-        QueryId::Mysql8411GroupMembersV1,
-        "members-schema-type-drift",
-    );
+    schema[2] = result_step(QueryId::Mysql84GroupMembersV1, "members-schema-type-drift");
     let (report, _) = observe_steps("gate-schema", schema).await;
     assert!(matches!(
         report.outcome(),
@@ -313,14 +310,14 @@ async fn coherence_mutations_and_row_reordering() {
 
 async fn collection_stage_connection_loss() {
     let queries = [
-        QueryId::Mysql8411ProductIdentityV1,
-        QueryId::Mysql8411LocalStateV1,
-        QueryId::Mysql8411GroupMembersV1,
-        QueryId::Mysql8411LocalMemberStatsV1,
-        QueryId::Mysql8411ExecutedGtidsV1,
-        QueryId::Mysql8411LocalStateV1,
-        QueryId::Mysql8411GroupMembersV1,
-        QueryId::Mysql8411LocalMemberStatsV1,
+        QueryId::Mysql84ProductIdentityV1,
+        QueryId::Mysql84LocalStateV1,
+        QueryId::Mysql84GroupMembersV1,
+        QueryId::Mysql84LocalMemberStatsV1,
+        QueryId::Mysql84ExecutedGtidsV1,
+        QueryId::Mysql84LocalStateV1,
+        QueryId::Mysql84GroupMembersV1,
+        QueryId::Mysql84LocalMemberStatsV1,
     ];
     for (index, query) in queries.into_iter().enumerate() {
         let mut steps = success_steps();

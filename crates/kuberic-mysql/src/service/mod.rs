@@ -1,7 +1,7 @@
 //! Bounded, restart-stateless ownership of local Oracle MySQL processes.
 //!
 //! [`MysqlInstanceManager`] owns one fresh Oracle MySQL Community Server
-//! 8.4.11 generation. [`MysqlTopologyManager`] composes exactly three existing
+//! 8.4 generation. [`MysqlTopologyManager`] composes exactly three existing
 //! instance managers for one designated bootstrap and two sequential fresh
 //! joins. Each transition is admitted from exact enrolled process, storage,
 //! endpoint, credential-generation, native-identity, view, and structured GTID

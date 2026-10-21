@@ -22,6 +22,7 @@ pub use diagnostic::{
     IdentityField, NativeSurface, ObservationStage, PlaceholderKind, ProductIssue, SchemaIssue,
     ServerErrorClass, SocketIssue, SqlState,
 };
+pub use kuberic_mysql::adapter::is_supported_server_version;
 pub use observer::MysqlObserver;
 pub use query::{ColumnContract, ColumnKind, QueryId};
 pub use report::ObservationReport;

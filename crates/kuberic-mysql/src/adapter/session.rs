@@ -230,7 +230,7 @@ mod tests {
             assert_eq!(query.first(), Some(&0x03));
             assert_eq!(
                 std::str::from_utf8(&query[1..]).expect("Phase 3 query SQL"),
-                QueryId::Mysql8411ProductIdentityV1.sql()
+                QueryId::Mysql84ProductIdentityV1.sql()
             );
             server_query_seen.store(true, Ordering::Release);
 
@@ -277,7 +277,7 @@ mod tests {
         let admitted = Arc::new(AtomicBool::new(false));
         let completion_admitted = Arc::clone(&admitted);
         let query = async {
-            let result = session.query(QueryId::Mysql8411ProductIdentityV1).await?;
+            let result = session.query(QueryId::Mysql84ProductIdentityV1).await?;
             completion_admitted.store(true, Ordering::Release);
             Ok::<_, SessionError>(result)
         };

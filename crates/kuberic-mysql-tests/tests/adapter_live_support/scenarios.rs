@@ -120,7 +120,7 @@ pub async fn run_all(
             name: "live-product-version".to_owned(),
             origin: EvidenceOriginKind::NativeRequired,
             mode: ScenarioMode::DirectSetup,
-            passed: baseline.product.version == "8.4.11"
+            passed: kuberic_mysql::adapter::is_supported_server_version(&baseline.product.version)
                 && baseline.product.version_comment == "MySQL Community Server - GPL",
             detail: format!(
                 "{} / {}",
@@ -300,11 +300,11 @@ pub fn validate_fixture_origin_contract(
     })?;
     match case.evidence_origin.category.as_str() {
         "native-required" => {
-            if case.evidence_origin.qualification.as_deref() != Some("required-live-8.4.11") {
+            if case.evidence_origin.qualification.as_deref() != Some("required-live-8.4") {
                 return Err(QualificationError::new(
                     QualificationCode::OriginMismatch,
                     "native fixture qualification tag",
-                    format!("{} missing required-live-8.4.11", case.scenario),
+                    format!("{} missing required-live-8.4", case.scenario),
                 ));
             }
             Ok(EvidenceOriginKind::NativeRequired)
@@ -462,7 +462,7 @@ async fn run_scripted_scenarios() -> Vec<ScenarioResult> {
             replace_query_step(
                 &mut steps,
                 0,
-                pending_step(QueryId::Mysql8411ProductIdentityV1).action,
+                pending_step(QueryId::Mysql84ProductIdentityV1).action,
             );
             ScriptedConnector::new(ScriptClock::new(10), steps, Default::default())
         })
@@ -582,7 +582,7 @@ async fn observe_live_on_socket(
                 error.to_string(),
             )
         })?,
-        ObservationProvenance::new("live-mysql-8.4.11", binding.parts().attempt.clone())
+        ObservationProvenance::new("live-mysql-8.4", binding.parts().attempt.clone())
             .expect("stable provenance"),
         public_adapter::ClockContext::new(
             SystemClock {
@@ -764,9 +764,9 @@ fn execute_fixture(case: &FixtureCase) -> crate::AdapterDiagnostic {
 
     let result = case.raw();
     let decoded = match case.query() {
-        QueryId::Mysql8411ProductIdentityV1 => crate::decode::decode_product(&result).map(|_| None),
-        QueryId::Mysql8411LocalStateV1 => crate::decode::decode_local_state(&result).map(|_| None),
-        QueryId::Mysql8411GroupMembersV1 => {
+        QueryId::Mysql84ProductIdentityV1 => crate::decode::decode_product(&result).map(|_| None),
+        QueryId::Mysql84LocalStateV1 => crate::decode::decode_local_state(&result).map(|_| None),
+        QueryId::Mysql84GroupMembersV1 => {
             crate::decode::decode_members(&result).map(|evidence| match evidence {
                 crate::decode::MembershipEvidence::Absent => {
                     Some(crate::AdapterDiagnostic::Absent {
@@ -779,7 +779,7 @@ fn execute_fixture(case: &FixtureCase) -> crate::AdapterDiagnostic {
                 crate::decode::MembershipEvidence::Active(_) => None,
             })
         }
-        QueryId::Mysql8411LocalMemberStatsV1 => {
+        QueryId::Mysql84LocalMemberStatsV1 => {
             crate::decode::decode_view(&result).map(|evidence| match evidence {
                 crate::decode::ViewEvidence::Absent => Some(crate::AdapterDiagnostic::Absent {
                     surface: crate::NativeSurface::LocalMemberStats,
@@ -790,7 +790,7 @@ fn execute_fixture(case: &FixtureCase) -> crate::AdapterDiagnostic {
                 crate::decode::ViewEvidence::Active { .. } => None,
             })
         }
-        QueryId::Mysql8411ExecutedGtidsV1 => {
+        QueryId::Mysql84ExecutedGtidsV1 => {
             crate::decode::decode_executed_gtids(&result).map(|_| None)
         }
     };
@@ -839,8 +839,8 @@ fn diagnostic_name(diagnostic: &crate::AdapterDiagnostic) -> &'static str {
             code: 1142,
             ..
         } => "StatsServer1142",
-        crate::AdapterDiagnostic::Product(crate::ProductIssue::UnsupportedPatch) => {
-            "UnsupportedPatch"
+        crate::AdapterDiagnostic::Product(crate::ProductIssue::UnsupportedVersion) => {
+            "UnsupportedVersion"
         }
         crate::AdapterDiagnostic::Product(crate::ProductIssue::NonOracleCommunity) => {
             "NonOracleCommunity"

@@ -24,7 +24,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
 use tokio::time::sleep;
 
-const ORACLE_PACKAGE: &str = "mysql-community-server-core=8.4.11-1ubuntu24.04";
+const ORACLE_PACKAGE: &str = "mysql-community-server-core (Oracle MySQL 8.4 LTS)";
 const CLEANUP_RESERVE: Duration = Duration::from_secs(120);
 static NEXT_TRANSACTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -1516,7 +1516,7 @@ impl<'a> MysqlNativeQualification<'a> {
                 })
                 .await
                 .map_err(|_| {
-                    "authoritative applier GTID barrier was unavailable on Oracle 8.4.11".to_owned()
+                    "authoritative applier GTID barrier was unavailable on Oracle 8.4".to_owned()
                 })??;
             if let Some(text) = applying {
                 return validate_applying_gtid(
@@ -1527,8 +1527,7 @@ impl<'a> MysqlNativeQualification<'a> {
             }
             if Instant::now() >= barrier_deadline {
                 return Err(
-                    "authoritative applier GTID barrier was unavailable on Oracle 8.4.11"
-                        .to_owned(),
+                    "authoritative applier GTID barrier was unavailable on Oracle 8.4".to_owned(),
                 );
             }
             sleep(Duration::from_millis(25)).await;

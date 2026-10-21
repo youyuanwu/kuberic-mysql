@@ -2,7 +2,7 @@
 
 ## Delivered boundary
 
-The bounded Stage 3 primitives reopen existing Oracle MySQL 8.4.11 data
+The bounded Stage 3 primitives reopen existing Oracle MySQL 8.4 data
 under a **new, closed native child**, after an exactly owned quiet graceful stop.
 It does not recover after loss of the adapter owner, restore serving, or make
 the Public V1 service accept `OpenMode::Existing`.
@@ -202,8 +202,9 @@ stops before that integration boundary.
 
 ## Qualification and nonclaims
 
-The live prerequisite is exactly Oracle MySQL Community Server 8.4.11 on Linux
-x86-64, package `mysql-community-server-core=8.4.11-1ubuntu24.04`. Use the normal
+The live prerequisite is Oracle MySQL Community Server 8.4.x on Linux
+x86-64, package `mysql-community-server-core` from Oracle's 8.4 LTS repository.
+The exact installed patch is reported, not pinned. Use the normal
 project fixture, stopped system MySQL, no foreign mysqld, one Cargo target tree,
 `CARGO_BUILD_JOBS=1` and serial nextest tests. The short sibling fixture roots
 also work for archive consumers whose checkout has no `target/`; UDS paths
@@ -213,7 +214,7 @@ remain subject to the `<108` encoded-byte limit.
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql --lib -E 'test(reopen) or test(durability_lifetime) or test(terminal_)'
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-tests --test service_reopen_live_mysql_8_4_11
+  -p kuberic-mysql-tests --test service_reopen_live_mysql_8_4
 ```
 
 Live checks exercise the actual production API, retained acknowledged data and
@@ -251,4 +252,4 @@ durability, security or failover claim follows from this host-local primitive.
   and [exclusive diagnostics, instance.rs:2330–2372](../crates/kuberic-mysql/src/service/instance.rs#L2330-L2372).
 - [Inactive native snapshots, control.rs:42–191](../crates/kuberic-mysql/src/service/control.rs#L42-L191)
   and [monotonic durability reader, control.rs:698–729](../crates/kuberic-mysql/src/service/control.rs#L698-L729).
-- [Actual terminal production-API qualification, service_reopen_live_mysql_8_4_11.rs:393–875](../crates/kuberic-mysql-tests/tests/service_reopen_live_mysql_8_4_11.rs#L393-L875).
+- [Actual terminal production-API qualification, service_reopen_live_mysql_8_4.rs:393–875](../crates/kuberic-mysql-tests/tests/service_reopen_live_mysql_8_4.rs#L393-L875).

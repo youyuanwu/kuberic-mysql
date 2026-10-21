@@ -5,7 +5,7 @@ use core::str::FromStr;
 
 use crate::core::{IdentityErrorKind, ServerUuid};
 
-/// Largest sequence number accepted by qualified Oracle MySQL 8.4.11.
+/// Largest sequence number accepted by the qualified Oracle MySQL 8.4 contract.
 pub const MAX_SEQUENCE: u64 = 9_223_372_036_854_775_806;
 
 /// A validated GTID transaction tag.

@@ -139,12 +139,14 @@ pub async fn bring_group_replication_online(
 }
 
 fn validate_product(product: &ProductFields) -> Result<(), QualificationError> {
-    if product.version != "8.4.11" || product.version_comment != "MySQL Community Server - GPL" {
+    if !kuberic_mysql::adapter::is_supported_server_version(&product.version)
+        || product.version_comment != "MySQL Community Server - GPL"
+    {
         return Err(QualificationError::new(
             QualificationCode::UnsupportedVersion,
             "Oracle MySQL product",
             format!(
-                "expected Oracle MySQL Community 8.4.11, found {} / {}",
+                "expected Oracle MySQL Community 8.4 LTS, found {} / {}",
                 product.version, product.version_comment
             ),
         ));
@@ -216,7 +218,7 @@ async fn query_product(
             Option<String>,
             Option<String>,
             Option<String>,
-        ), _>(crate::query::QueryId::Mysql8411ProductIdentityV1.sql())
+        ), _>(crate::query::QueryId::Mysql84ProductIdentityV1.sql())
         .await
         .map_err(|error| {
             QualificationError::new(
@@ -246,7 +248,7 @@ async fn query_online_identity(
 ) -> Result<OnlineIdentity, QualificationError> {
     let local = connection
         .query_first::<(Option<String>, Option<String>, Option<i64>, Option<i64>), _>(
-            crate::query::QueryId::Mysql8411LocalStateV1.sql(),
+            crate::query::QueryId::Mysql84LocalStateV1.sql(),
         )
         .await
         .map_err(|error| {
@@ -265,7 +267,7 @@ async fn query_online_identity(
         })?;
     let member = connection
         .query_first::<(String, String, Option<i64>, String, String), _>(
-            crate::query::QueryId::Mysql8411GroupMembersV1.sql(),
+            crate::query::QueryId::Mysql84GroupMembersV1.sql(),
         )
         .await
         .map_err(|error| {
@@ -283,9 +285,7 @@ async fn query_online_identity(
             )
         })?;
     let view = connection
-        .query_first::<(String, String), _>(
-            crate::query::QueryId::Mysql8411LocalMemberStatsV1.sql(),
-        )
+        .query_first::<(String, String), _>(crate::query::QueryId::Mysql84LocalMemberStatsV1.sql())
         .await
         .map_err(|error| {
             QualificationError::new(

@@ -21,7 +21,7 @@ progress, a synthetic zero, or admission of a new generation.
 
 ## Executable journey
 
-The [Rust-owned hosted fixture](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L277-L489)
+The [Rust-owned hosted fixture](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4.rs#L277-L489)
 creates a generic agent root separate from the native data/runtime roots.
 Its ordinary branch never executes testing store/history initialization.
 The [ordinary adapter](../crates/kuberic-mysql-tests/tests/hosted_authenticated/mod.rs#L39-L249)
@@ -34,7 +34,7 @@ No private store is inspected and no MySQL recovery receipt database is created.
 Ordinary requests are generated `AgentControlClient` RPCs encoded through the
 public command serializer, not fabricated accepted envelopes.
 
-The shared [New/formation journey](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L519-L690)
+The shared [New/formation journey](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4.rs#L519-L690)
 establishes:
 
 1. Actual service Open and registered Replicator Open, non-pending host-created
@@ -109,7 +109,7 @@ listeners are closed, native identity/table data and logs remain, and an
 unrelated child is still live. Scenario, shutdown/containment and foreign-child
 errors are aggregated; unexpected RPC outcomes also return through awaited cleanup.
 
-The existing [testing-dispatched Close/Abort cases](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L99-L183)
+The existing [testing-dispatched Close/Abort cases](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4.rs#L99-L183)
 separately assert successful callback dispatch, failed terminal report queries
 and independent containment. Ordinary acknowledgment is established only by
 the authenticated cases.
@@ -120,7 +120,7 @@ non-serving status response rather than failing the whole report. No cached
 pair or literal zero is substituted. This supersedes the earlier pin's
 `Unavailable: runtime is closed` whole-RPC outcome.
 
-The testing-dispatched [startup interruption scenario](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4_11.rs#L831-L897)
+The testing-dispatched [startup interruption scenario](../crates/kuberic-mysql-tests/tests/kuberic_public_v1_hosted_live_mysql_8_4.rs#L831-L897)
 observes `/usr/sbin/mysqld` with the exact fixture defaults-file after native
 initialization, excludes initializer/version processes, verifies Open is still
 pending, then cancels the same production `AttemptContext`. It awaits the real
@@ -178,7 +178,7 @@ the MySQL fixtures**.
 The public
 [`ApplicationFactory`](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/test_util/application.rs#L11-L86)
 is now implemented by the
-[MySQL integration probe](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4_11.rs).
+[MySQL integration probe](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4.rs).
 It constructs inert production `MysqlPublicV1Service` instances, classifies
 their actual native roots and supplies owned data/runtime storage bindings.
 Its async `shutdown_and_drain` calls the production service's repeatable Close
@@ -293,7 +293,7 @@ store mutation or fake built-in runtime control.
    [NativeRuntimeControl requirement](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L792-L819)
    has no public custom-engine attachment.
 
-The [gate](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4_11.rs)
+The [gate](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4.rs)
 checks exact receipts and rejects changed operation/credit,
 session/storage/history, missing Epoch, changed progress/role/access, and
 unavailable query outcomes. Timeout and an unrelated `NotOpen` string cannot
@@ -335,7 +335,7 @@ mandatory MySQL prerequisites below:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-tests --test kuberic_inprocess_live_mysql_8_4_11
+  -p kuberic-mysql-tests --test kuberic_inprocess_live_mysql_8_4
 ```
 
 The existing workspace nextest archive and qualification partitions discover
@@ -357,26 +357,27 @@ the behavior at the current pin:
 
 ## Running the gate
 
-Install and verify the exact Oracle MySQL Community
-`mysql-community-server-core=8.4.11-1ubuntu24.04`, `/usr/sbin/mysqld`,
+Install and verify Oracle MySQL Community 8.4.x,
+`mysql-community-server-core` from Oracle's 8.4 LTS repository, `/usr/sbin/mysqld`,
 `/usr/bin/aa-exec`, inactive system mysql service, no foreign mysqld and no
 MySQL X listener. The existing preflight additionally checks package ownership,
-integrity and apt candidate/repository; missing prerequisites **fail**, not skip.
+integrity, supported installed version and APT repository. A newer candidate
+does not invalidate an installed supported patch; missing prerequisites **fail**, not skip.
 See [repository prerequisites](../README.md#prerequisites).
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo test --locked --offline \
   -p kuberic-mysql-tests \
-  --test kuberic_public_v1_hosted_live_mysql_8_4_11 \
+  --test kuberic_public_v1_hosted_live_mysql_8_4 \
   -- --test-threads=1 --nocapture
 
 # Equivalent existing serial, zero-retry nextest profile:
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
-  --test kuberic_public_v1_hosted_live_mysql_8_4_11
+  --test kuberic_public_v1_hosted_live_mysql_8_4
 ```
 
-The target contains sixteen cases, including the existing hosted/ordinary
+The target covers the existing hosted/ordinary
 journeys, New-only rejection, service Close failure/drop/concurrency, and
 deterministic retention/negative-result/timeout checks. Neither native
 route skips missing prerequisites. The runtime test dependency still enables
@@ -384,7 +385,8 @@ route skips missing prerequisites. The runtime test dependency still enables
 use it. Use one build job and one target tree; do not run native fixtures
 concurrently.
 
-At the 2026-10-21 pin, the complete controller and hosted/authenticated targets
+Before the release-line policy change, at the 2026-10-21 Kuberic pin the complete
+controller and hosted/authenticated targets
 passed together: **20 cases**, including successful ordinary Close and Abort
 receipts and the exact later inbound-Build rejection. A separate selection
 passed **87 cases**, covering adapter/control/identity units, public contracts,

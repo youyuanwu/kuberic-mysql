@@ -191,7 +191,7 @@ async fn collect<C: ObservationClock>(
     let product = match query(
         request,
         session,
-        QueryId::Mysql8411ProductIdentityV1,
+        QueryId::Mysql84ProductIdentityV1,
         runtime_deadline,
         deadline,
         DeadlineStage::ProductIdentity,
@@ -226,7 +226,7 @@ async fn collect<C: ObservationClock>(
     let result = match query(
         request,
         session,
-        QueryId::Mysql8411ExecutedGtidsV1,
+        QueryId::Mysql84ExecutedGtidsV1,
         runtime_deadline,
         deadline,
         DeadlineStage::ExecutedGtids,
@@ -277,7 +277,7 @@ async fn collect_snapshot<C: ObservationClock>(
     let local_result = query(
         request,
         session,
-        QueryId::Mysql8411LocalStateV1,
+        QueryId::Mysql84LocalStateV1,
         runtime_deadline,
         deadline,
         local_stage,
@@ -291,7 +291,7 @@ async fn collect_snapshot<C: ObservationClock>(
     let members_result = query(
         request,
         session,
-        QueryId::Mysql8411GroupMembersV1,
+        QueryId::Mysql84GroupMembersV1,
         runtime_deadline,
         deadline,
         members_stage,
@@ -305,7 +305,7 @@ async fn collect_snapshot<C: ObservationClock>(
     let view_result = query(
         request,
         session,
-        QueryId::Mysql8411LocalMemberStatsV1,
+        QueryId::Mysql84LocalMemberStatsV1,
         runtime_deadline,
         deadline,
         view_stage,

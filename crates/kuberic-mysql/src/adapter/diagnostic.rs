@@ -138,13 +138,13 @@ pub enum EvidenceIssue {
     },
 }
 
-/// Why exact Oracle Community 8.4.11 discrimination failed.
+/// Why Oracle Community 8.4 LTS discrimination failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProductIssue {
     /// The product did not identify Oracle MySQL Community Server.
     NonOracleCommunity,
-    /// The Oracle patch differed from 8.4.11.
-    UnsupportedPatch,
+    /// The version was outside the supported 8.4 release line or malformed.
+    UnsupportedVersion,
     /// The native archive platform fields differed from Linux x86-64.
     UnsupportedPlatform,
 }

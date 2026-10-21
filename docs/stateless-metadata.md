@@ -113,8 +113,8 @@ The runner invalidates bootstrap/join credit on entry, reserves cleanup time,
 and contains all members on cancellation or mismatch. It writes no metadata
 and is absent from the normal library API.
 
-This proves selected Oracle MySQL 8.4.11 native history and crash behavior
-only. It is not restart continuation: losing the runner, its exact children,
+This proves selected Oracle MySQL 8.4 native history and crash behavior on the
+reported installed patch only. It is not restart continuation: losing the runner, its exact children,
 or its attempt context still requires fixture reset. It provides no survivor
 discovery, adoption, durable workflow cursor, effect recovery, public receipt,
 or authority after a component restart.
@@ -391,7 +391,7 @@ retained set using `gtid_executed`, `gtid_purged`, and the exact binary-log
 inventory/retention profile. Purged history may preserve applied progress
 while making incremental recovery unavailable.
 
-The Oracle 8.4.11 gate verifies the configured one-source shape through the
+The Oracle 8.4 LTS gate verifies the configured one-source shape through the
 named primary, membership, process-restart, and purge transitions. The
 delivered production boundary now projects empty history or the exact
 one-source contiguous tail and returns deterministic typed incompatibility for

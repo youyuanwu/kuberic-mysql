@@ -2,8 +2,8 @@
   "fixture_schema": "kuberic.mysql.native-result/v1",
   "cases": [
     {
-      "scenario": "other-oracle-patch",
-      "query_id": "Mysql8411ProductIdentityV1",
+      "scenario": "unsupported-oracle-version",
+      "query_id": "Mysql84ProductIdentityV1",
       "columns": [
         {"name": "version", "kind": "VarString", "nullable": true},
         {"name": "version_comment", "kind": "VarString", "nullable": true},
@@ -11,13 +11,13 @@
         {"name": "version_compile_os", "kind": "VarString", "nullable": true},
         {"name": "server_uuid", "kind": "VarString", "nullable": true}
       ],
-      "rows": [["8.4.10", "MySQL Community Server - GPL", "x86_64", "Linux", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]],
-      "expected": {"core_class": "Unsupported", "diagnostic": "UnsupportedPatch"},
-      "evidence_origin": {"category": "synthetic", "derivation": "Change only the qualified patch field."}
+      "rows": [["8.0.10", "MySQL Community Server - GPL", "x86_64", "Linux", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]],
+      "expected": {"core_class": "Unsupported", "diagnostic": "UnsupportedVersion"},
+      "evidence_origin": {"category": "synthetic", "derivation": "Change the minor version to an unsupported release line."}
     },
     {
       "scenario": "non-oracle-lookalike",
-      "query_id": "Mysql8411ProductIdentityV1",
+      "query_id": "Mysql84ProductIdentityV1",
       "columns": [
         {"name": "version", "kind": "VarString", "nullable": true},
         {"name": "version_comment", "kind": "VarString", "nullable": true},
@@ -31,7 +31,7 @@
     },
     {
       "scenario": "unexpected-required-null",
-      "query_id": "Mysql8411ExecutedGtidsV1",
+      "query_id": "Mysql84ExecutedGtidsV1",
       "columns": [{"name": "gtid_executed", "kind": "VarString", "nullable": true}],
       "rows": [[null]],
       "expected": {"core_class": "Malformed", "diagnostic": "RequiredNull"},
@@ -39,7 +39,7 @@
     },
     {
       "scenario": "incomplete-members-row",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -53,7 +53,7 @@
     },
     {
       "scenario": "members-schema-type-drift",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "VarString", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -67,7 +67,7 @@
     },
     {
       "scenario": "duplicate-member-id",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -84,7 +84,7 @@
     },
     {
       "scenario": "duplicate-member-address",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -101,7 +101,7 @@
     },
     {
       "scenario": "duplicate-local-stats-row",
-      "query_id": "Mysql8411LocalMemberStatsV1",
+      "query_id": "Mysql84LocalMemberStatsV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "view_id", "kind": "String", "nullable": false}
@@ -115,7 +115,7 @@
     },
     {
       "scenario": "malformed-read-only-switch",
-      "query_id": "Mysql8411LocalStateV1",
+      "query_id": "Mysql84LocalStateV1",
       "columns": [
         {"name": "group_name", "kind": "VarString", "nullable": true},
         {"name": "group_replication_address", "kind": "VarString", "nullable": true},
@@ -128,7 +128,7 @@
     },
     {
       "scenario": "future-member-role",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -142,7 +142,7 @@
     },
     {
       "scenario": "future-additional-column",
-      "query_id": "Mysql8411LocalMemberStatsV1",
+      "query_id": "Mysql84LocalMemberStatsV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "view_id", "kind": "String", "nullable": false},
@@ -154,7 +154,7 @@
     },
     {
       "scenario": "invalid-empty-group-name",
-      "query_id": "Mysql8411LocalStateV1",
+      "query_id": "Mysql84LocalStateV1",
       "columns": [
         {"name": "group_name", "kind": "VarString", "nullable": true},
         {"name": "group_replication_address", "kind": "VarString", "nullable": true},
@@ -167,7 +167,7 @@
     },
     {
       "scenario": "stopped-placeholder-invalid-member-id",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -181,7 +181,7 @@
     },
     {
       "scenario": "stopped-placeholder-invalid-host",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -195,7 +195,7 @@
     },
     {
       "scenario": "stopped-placeholder-invalid-port",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},

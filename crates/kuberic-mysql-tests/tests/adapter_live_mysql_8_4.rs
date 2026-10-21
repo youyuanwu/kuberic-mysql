@@ -17,7 +17,7 @@ mod live_support;
 mod phase4_common;
 
 #[tokio::test(flavor = "current_thread")]
-async fn qualify_oracle_mysql_8_4_11() {
+async fn qualify_oracle_mysql_8_4() {
     live_support::run()
         .await
         .unwrap_or_else(|error| panic!("{error}"));

@@ -52,7 +52,7 @@ use mysql_async::{Conn, OptsBuilder};
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_no_application_store,
     assert_no_application_store_with_native_schemas, assert_process_absent, assert_tcp_refuses,
-    preflight_oracle_mysql_8_4_11,
+    preflight_oracle_mysql_8_4,
 };
 
 const GROUP_UUID: &str = "b5a47b3f-bf9f-4c7c-8420-495d5a52cb09";
@@ -378,7 +378,7 @@ impl HostedFixture {
     }
 
     async fn new_with_transport(label: &str, ordinary: bool) -> TestResult<Self> {
-        preflight_oracle_mysql_8_4_11()?;
+        preflight_oracle_mysql_8_4()?;
         let root = FixtureRoot::new_retained(label)?;
         eprintln!("retained hosted fixture: {}", root.path().display());
         let mut ports = ReservedPorts::allocate()?;

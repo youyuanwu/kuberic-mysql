@@ -587,7 +587,7 @@ fn unsupported_product_identity_fails_and_releases_fresh_roots() {
     let root = TestRoot::new("product");
     fs::write(
         &root.launcher,
-        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift 2\necho 'Ver 8.4.12 for Linux on x86_64 (MySQL Community Server - GPL)'\n",
+        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift 2\necho 'Ver 9.4.12 for Linux on x86_64 (MySQL Community Server - GPL)'\n",
     )
     .unwrap();
     fs::set_permissions(&root.launcher, fs::Permissions::from_mode(0o700)).unwrap();

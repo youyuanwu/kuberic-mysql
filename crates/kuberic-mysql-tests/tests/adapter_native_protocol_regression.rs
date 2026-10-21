@@ -177,7 +177,7 @@ async fn dirty_native_disconnect_is_dropped_when_the_same_deadline_is_exhausted(
     assert!(
         tokio::time::timeout_at(
             query_deadline,
-            session.query(QueryId::Mysql8411ProductIdentityV1)
+            session.query(QueryId::Mysql84ProductIdentityV1)
         )
         .await
         .is_err(),
@@ -290,7 +290,7 @@ async fn protocol_server(
     assert_eq!(product.first(), Some(&0x03));
     assert_eq!(
         std::str::from_utf8(&product[1..]).expect("product SQL"),
-        QueryId::Mysql8411ProductIdentityV1.sql()
+        QueryId::Mysql84ProductIdentityV1.sql()
     );
     if matches!(stall, StallPoint::ProductQuery) {
         ready.notify_one();
@@ -299,7 +299,7 @@ async fn protocol_server(
     }
 
     write_packet(&mut stream, 1, &[0x05]).await;
-    for (index, contract) in QueryId::Mysql8411ProductIdentityV1
+    for (index, contract) in QueryId::Mysql84ProductIdentityV1
         .columns()
         .iter()
         .enumerate()

@@ -1,11 +1,11 @@
 #[path = "service_replicator_live_support/mod.rs"]
 mod replicator_live_support;
 
-use replicator_live_support::{HandoffStage, ReplicatorLiveFixture, preflight_oracle_mysql_8_4_11};
+use replicator_live_support::{HandoffStage, ReplicatorLiveFixture, preflight_oracle_mysql_8_4};
 
 #[tokio::test(flavor = "current_thread")]
 async fn controlled_handoff_closes_source_before_target_publication() {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|error| panic!("{error}"));
     let evidence = ReplicatorLiveFixture::prepare()
         .await
         .unwrap_or_else(|error| panic!("{error}"))
@@ -63,7 +63,7 @@ async fn controlled_handoff_closes_source_before_target_publication() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn prepared_and_published_owner_failures_use_exact_fixture_cleanup() {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|error| panic!("{error}"));
     for publish in [false, true] {
         ReplicatorLiveFixture::prepare()
             .await

@@ -55,8 +55,8 @@ impl DecodeError {
 }
 
 pub(crate) fn decode_product(result: &RawResult) -> Result<ProductIdentity, DecodeError> {
-    validate_schema(QueryId::Mysql8411ProductIdentityV1, result)?;
-    let row = single_row(QueryId::Mysql8411ProductIdentityV1, result)?;
+    validate_schema(QueryId::Mysql84ProductIdentityV1, result)?;
+    let row = single_row(QueryId::Mysql84ProductIdentityV1, result)?;
     let version = required_text(row, 0, "version", NativeSurface::ProductIdentity)?;
     let comment = required_text(row, 1, "version_comment", NativeSurface::ProductIdentity)?;
     let machine = required_text(
@@ -72,9 +72,9 @@ pub(crate) fn decode_product(result: &RawResult) -> Result<ProductIdentity, Deco
             ProductIssue::NonOracleCommunity,
         )));
     }
-    if version != "8.4.11" {
+    if !crate::adapter::is_supported_server_version(version) {
         return Err(DecodeError::new(AdapterDiagnostic::Product(
-            ProductIssue::UnsupportedPatch,
+            ProductIssue::UnsupportedVersion,
         )));
     }
     if machine != "x86_64" || operating_system != "Linux" {
@@ -106,8 +106,8 @@ pub(crate) fn validate_server_identity(
 }
 
 pub(crate) fn decode_local_state(result: &RawResult) -> Result<LocalEvidence, DecodeError> {
-    validate_schema(QueryId::Mysql8411LocalStateV1, result)?;
-    let row = single_row(QueryId::Mysql8411LocalStateV1, result)?;
+    validate_schema(QueryId::Mysql84LocalStateV1, result)?;
+    let row = single_row(QueryId::Mysql84LocalStateV1, result)?;
     let group_name = GroupName::new(required_text(
         row,
         0,
@@ -134,7 +134,7 @@ pub(crate) fn decode_local_state(result: &RawResult) -> Result<LocalEvidence, De
 }
 
 pub(crate) fn decode_members(result: &RawResult) -> Result<MembershipEvidence, DecodeError> {
-    validate_schema(QueryId::Mysql8411GroupMembersV1, result)?;
+    validate_schema(QueryId::Mysql84GroupMembersV1, result)?;
     if result.rows.is_empty() {
         return Ok(MembershipEvidence::Absent);
     }
@@ -152,7 +152,7 @@ pub(crate) fn decode_members(result: &RawResult) -> Result<MembershipEvidence, D
     let mut member_ids = HashSet::with_capacity(result.rows.len());
     let mut member_addresses = HashSet::with_capacity(result.rows.len());
     for (index, row) in result.rows.iter().enumerate() {
-        ensure_complete_row(QueryId::Mysql8411GroupMembersV1, row, index)?;
+        ensure_complete_row(QueryId::Mysql84GroupMembersV1, row, index)?;
         let id = MemberId::new(required_text(
             row,
             0,
@@ -194,7 +194,7 @@ pub(crate) fn decode_members(result: &RawResult) -> Result<MembershipEvidence, D
 }
 
 pub(crate) fn decode_view(result: &RawResult) -> Result<ViewEvidence, DecodeError> {
-    validate_schema(QueryId::Mysql8411LocalMemberStatsV1, result)?;
+    validate_schema(QueryId::Mysql84LocalMemberStatsV1, result)?;
     if result.rows.is_empty() {
         return Ok(ViewEvidence::Absent);
     }
@@ -205,7 +205,7 @@ pub(crate) fn decode_view(result: &RawResult) -> Result<ViewEvidence, DecodeErro
         }));
     }
     let row = &result.rows[0];
-    ensure_complete_row(QueryId::Mysql8411LocalMemberStatsV1, row, 0)?;
+    ensure_complete_row(QueryId::Mysql84LocalMemberStatsV1, row, 0)?;
     let member_id = MemberId::new(required_text(
         row,
         0,
@@ -224,8 +224,8 @@ pub(crate) fn decode_view(result: &RawResult) -> Result<ViewEvidence, DecodeErro
 }
 
 pub(crate) fn decode_executed_gtids(result: &RawResult) -> Result<GtidSet, DecodeError> {
-    validate_schema(QueryId::Mysql8411ExecutedGtidsV1, result)?;
-    let row = single_row(QueryId::Mysql8411ExecutedGtidsV1, result)?;
+    validate_schema(QueryId::Mysql84ExecutedGtidsV1, result)?;
+    let row = single_row(QueryId::Mysql84ExecutedGtidsV1, result)?;
     let value = required_text(row, 0, "gtid_executed", NativeSurface::ExecutedGtids)?;
     GtidSet::from_str(value).map_err(|error| {
         DecodeError::new(AdapterDiagnostic::Evidence {

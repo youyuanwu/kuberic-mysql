@@ -39,7 +39,7 @@ use tokio::io::AsyncReadExt;
 
 use live_support::{
     APPARMOR_EXEC, MYSQL_X_PORT, MYSQLD, ReservedPorts, assert_no_application_store,
-    assert_process_absent, assert_tcp_refuses, preflight_oracle_mysql_8_4_11,
+    assert_process_absent, assert_tcp_refuses, preflight_oracle_mysql_8_4,
 };
 
 const GROUP_UUID: &str = "03e84887-4d65-42d0-b941-0f691cb0aa16";
@@ -85,7 +85,7 @@ fn formation_boundary_rejects_unrelated_errors() {
 
 fn run_native_probe(native_test: &str, formation: bool) -> Result<()> {
     if std::env::var_os(CHILD_MODE).is_some() {
-        preflight_oracle_mysql_8_4_11().map_err(anyhow::Error::msg)?;
+        preflight_oracle_mysql_8_4().map_err(anyhow::Error::msg)?;
         return tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_stack_size(8 * 1024 * 1024)

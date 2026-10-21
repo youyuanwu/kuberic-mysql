@@ -4,3 +4,4 @@ pub(crate) mod decode;
 pub(crate) mod diagnostic;
 #[path = "../../../kuberic-mysql/src/adapter/query.rs"]
 pub(crate) mod query;
+pub use kuberic_mysql::adapter::is_supported_server_version;
