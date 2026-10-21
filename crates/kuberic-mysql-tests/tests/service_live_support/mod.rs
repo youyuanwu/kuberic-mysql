@@ -9,14 +9,13 @@ use std::process::Command;
 use std::time::Duration;
 
 const EXPECTED_PACKAGE: &str = "mysql-community-server-core";
-const EXPECTED_VERSION: &str = "8.4.11-1ubuntu24.04";
 const EXPECTED_REPOSITORY_HOST: &str = "repo.mysql.com";
 const EXPECTED_REPOSITORY_COMPONENT: &str = "mysql-8.4-lts";
 pub const MYSQLD: &str = "/usr/sbin/mysqld";
 pub const APPARMOR_EXEC: &str = "/usr/bin/aa-exec";
 pub const MYSQL_X_PORT: u16 = 33060;
 
-pub fn preflight_oracle_mysql_8_4_11() -> Result<(), String> {
+pub fn preflight_oracle_mysql_8_4() -> Result<(), String> {
     if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
         return Err("live qualification requires Linux x86-64".to_owned());
     }
@@ -25,9 +24,10 @@ pub fn preflight_oracle_mysql_8_4_11() -> Result<(), String> {
     verify_mysql_service_stopped()?;
     verify_no_foreign_mysqld()?;
     verify_package_owner()?;
-    verify_installed_version()?;
+    let version = verify_installed_version()?;
     verify_package_files()?;
-    verify_apt_policy()?;
+    verify_apt_policy(&version)?;
+    eprintln!("MySQL qualification package: {EXPECTED_PACKAGE}={version}");
     assert_tcp_refuses(SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::LOCALHOST,
         MYSQL_X_PORT,
@@ -164,13 +164,30 @@ impl ReservedPorts {
 }
 
 pub fn assert_tcp_refuses(address: SocketAddr) -> Result<(), String> {
-    match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
-        Ok(stream) => {
-            drop(stream);
-            Err(format!("unexpected TCP listener at {address}"))
+    for _ in 0..3 {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
+            Ok(stream) => {
+                let local = stream.local_addr().map_err(|error| error.to_string())?;
+                let peer = stream.peer_addr().map_err(|error| error.to_string())?;
+                drop(stream);
+                // Linux can connect an ephemeral socket to itself without a listener.
+                if local == peer {
+                    eprintln!("resampling TCP absence after a self-connection at {address}");
+                    continue;
+                }
+                return Err(format!(
+                    "unexpected TCP listener at {address} (local={local}, peer={peer})"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(()),
+            Err(error) => {
+                return Err(format!("cannot qualify TCP refusal at {address}: {error}"));
+            }
         }
-        Err(_) => Ok(()),
     }
+    Err(format!(
+        "TCP absence at {address} remained ambiguous after self-connections"
+    ))
 }
 
 pub fn assert_process_absent(pid: u32) -> Result<(), String> {
@@ -300,7 +317,7 @@ fn verify_package_owner() -> Result<(), String> {
     }
 }
 
-fn verify_installed_version() -> Result<(), String> {
+fn verify_installed_version() -> Result<String, String> {
     let output = checked_output(
         Command::new("dpkg-query").args([
             "-W",
@@ -310,11 +327,17 @@ fn verify_installed_version() -> Result<(), String> {
         "query installed MySQL package",
     )?;
     let value = String::from_utf8_lossy(&output);
-    let expected = format!("{EXPECTED_PACKAGE}\t{EXPECTED_VERSION}\tinstall ok installed");
-    if value.trim() == expected {
-        Ok(())
+    let fields = value.trim().split('\t').collect::<Vec<_>>();
+    if let [package, version, "install ok installed"] = fields.as_slice()
+        && *package == EXPECTED_PACKAGE
+        && kuberic_mysql::adapter::is_supported_package_version(version)
+    {
+        Ok((*version).to_owned())
     } else {
-        Err(format!("expected {expected}, found {}", value.trim()))
+        Err(format!(
+            "expected installed {EXPECTED_PACKAGE} from Oracle MySQL 8.4 LTS, found {}",
+            value.trim()
+        ))
     }
 }
 
@@ -335,26 +358,35 @@ fn verify_package_files() -> Result<(), String> {
     }
 }
 
-fn verify_apt_policy() -> Result<(), String> {
+fn verify_apt_policy(expected_version: &str) -> Result<(), String> {
     let output = checked_output(
         Command::new("apt-cache").args(["policy", EXPECTED_PACKAGE]),
         "query MySQL APT policy",
     )?;
     let policy = String::from_utf8_lossy(&output);
+    validate_apt_policy(&policy, expected_version)
+}
+
+fn validate_apt_policy(policy: &str, expected_version: &str) -> Result<(), String> {
     let installed = policy
         .lines()
         .find_map(|line| line.trim().strip_prefix("Installed: "))
         .ok_or_else(|| "APT policy omitted installed version".to_owned())?;
-    let candidate = policy
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Candidate: "))
-        .ok_or_else(|| "APT policy omitted candidate version".to_owned())?;
-    if installed != EXPECTED_VERSION || candidate != EXPECTED_VERSION {
+    if installed != expected_version
+        || !kuberic_mysql::adapter::is_supported_package_version(installed)
+    {
         return Err(format!(
-            "expected installed/candidate {EXPECTED_VERSION}, found {installed}/{candidate}"
+            "expected installed Oracle MySQL 8.4 package {expected_version}, found {installed}"
         ));
     }
-    if !policy.contains(EXPECTED_REPOSITORY_HOST) || !policy.contains(EXPECTED_REPOSITORY_COMPONENT)
+
+    if kuberic_mysql::adapter::apt_repository_for_version(
+        policy,
+        installed,
+        EXPECTED_REPOSITORY_HOST,
+        EXPECTED_REPOSITORY_COMPONENT,
+    )
+    .is_none()
     {
         return Err(format!(
             "APT policy omitted {EXPECTED_REPOSITORY_HOST} {EXPECTED_REPOSITORY_COMPONENT}"
@@ -377,6 +409,46 @@ fn checked_output(command: &mut Command, context: &str) -> Result<Vec<u8>, Strin
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ))
+    }
+}
+
+#[cfg(test)]
+mod package_policy_tests {
+    use super::{assert_tcp_refuses, validate_apt_policy};
+
+    #[test]
+    fn tcp_absence_rejects_a_live_listener_then_accepts_its_refusal() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(assert_tcp_refuses(address).is_err());
+        drop(listener);
+        assert_tcp_refuses(address).unwrap();
+    }
+
+    #[test]
+    fn newer_candidate_does_not_disqualify_an_installed_supported_patch() {
+        let policy = "mysql-community-server-core:\n\
+          Installed: 8.4.11-1ubuntu24.04\n\
+          Candidate: 8.4.13-1ubuntu24.04\n\
+          Version table:\n\
+         *** 8.4.11-1ubuntu24.04 500\n\
+                500 http://repo.mysql.com/apt/ubuntu noble/mysql-8.4-lts amd64 Packages\n";
+        assert!(validate_apt_policy(policy, "8.4.11-1ubuntu24.04").is_ok());
+        assert!(validate_apt_policy(policy, "8.4.13-1ubuntu24.04").is_err());
+        assert!(
+            validate_apt_policy(
+                &policy.replace("repo.mysql.com", "mirror.example.invalid"),
+                "8.4.11-1ubuntu24.04",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_apt_policy(
+                &policy.replace("*** 8.4.11-1ubuntu24.04", "8.4.13-1ubuntu24.04"),
+                "8.4.11-1ubuntu24.04",
+            )
+            .is_err()
+        );
     }
 }
 

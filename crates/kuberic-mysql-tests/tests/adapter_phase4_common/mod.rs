@@ -375,19 +375,19 @@ pub fn binding() -> ExactBinding {
 pub fn success_steps() -> Vec<ScriptStep> {
     vec![
         result_step(
-            QueryId::Mysql8411ProductIdentityV1,
-            "oracle-community-8.4.11-product",
+            QueryId::Mysql84ProductIdentityV1,
+            "oracle-community-8.4-product",
         ),
-        result_step(QueryId::Mysql8411LocalStateV1, "online-local-state"),
-        result_step(QueryId::Mysql8411GroupMembersV1, "online-members"),
-        result_step(QueryId::Mysql8411LocalMemberStatsV1, "online-local-view"),
+        result_step(QueryId::Mysql84LocalStateV1, "online-local-state"),
+        result_step(QueryId::Mysql84GroupMembersV1, "online-members"),
+        result_step(QueryId::Mysql84LocalMemberStatsV1, "online-local-view"),
         result_step(
-            QueryId::Mysql8411ExecutedGtidsV1,
+            QueryId::Mysql84ExecutedGtidsV1,
             "native-tagged-and-newline-gtids",
         ),
-        result_step(QueryId::Mysql8411LocalStateV1, "online-local-state"),
-        result_step(QueryId::Mysql8411GroupMembersV1, "online-members"),
-        result_step(QueryId::Mysql8411LocalMemberStatsV1, "online-local-view"),
+        result_step(QueryId::Mysql84LocalStateV1, "online-local-state"),
+        result_step(QueryId::Mysql84GroupMembersV1, "online-members"),
+        result_step(QueryId::Mysql84LocalMemberStatsV1, "online-local-view"),
     ]
 }
 

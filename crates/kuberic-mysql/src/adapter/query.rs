@@ -1,4 +1,4 @@
-//! Oracle MySQL 8.4.11 selected-query contracts.
+//! Oracle MySQL 8.4 LTS selected-query contracts.
 
 use crate::adapter::diagnostic::NativeSurface;
 
@@ -83,58 +83,58 @@ const GTID_COLUMNS: &[ColumnContract] = &[ColumnContract::new(
     true,
 )];
 
-/// A stable identifier for one Oracle MySQL 8.4.11 query.
+/// A stable identifier for one Oracle MySQL 8.4 query.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum QueryId {
     /// Product, platform, and native server identity.
-    Mysql8411ProductIdentityV1,
+    Mysql84ProductIdentityV1,
     /// Configured group, local GR address, and access switches.
-    Mysql8411LocalStateV1,
+    Mysql84LocalStateV1,
     /// Complete Group Replication membership.
-    Mysql8411GroupMembersV1,
+    Mysql84GroupMembersV1,
     /// Bound local member's native view identity.
-    Mysql8411LocalMemberStatsV1,
+    Mysql84LocalMemberStatsV1,
     /// Local executed GTID set.
-    Mysql8411ExecutedGtidsV1,
+    Mysql84ExecutedGtidsV1,
 }
 
 impl QueryId {
     /// Every query in required collection order.
     pub const ALL: [Self; 5] = [
-        Self::Mysql8411ProductIdentityV1,
-        Self::Mysql8411LocalStateV1,
-        Self::Mysql8411GroupMembersV1,
-        Self::Mysql8411LocalMemberStatsV1,
-        Self::Mysql8411ExecutedGtidsV1,
+        Self::Mysql84ProductIdentityV1,
+        Self::Mysql84LocalStateV1,
+        Self::Mysql84GroupMembersV1,
+        Self::Mysql84LocalMemberStatsV1,
+        Self::Mysql84ExecutedGtidsV1,
     ];
 
     /// Returns the exact read-only SQL.
     #[must_use]
     pub const fn sql(self) -> &'static str {
         match self {
-            Self::Mysql8411ProductIdentityV1 => {
+            Self::Mysql84ProductIdentityV1 => {
                 "SELECT @@version AS version, @@version_comment AS version_comment, \
 @@version_compile_machine AS version_compile_machine, \
 @@version_compile_os AS version_compile_os, \
 @@GLOBAL.server_uuid AS server_uuid"
             }
-            Self::Mysql8411LocalStateV1 => {
+            Self::Mysql84LocalStateV1 => {
                 "SELECT @@GLOBAL.group_replication_group_name AS group_name, \
 @@GLOBAL.group_replication_local_address AS group_replication_address, \
 @@GLOBAL.read_only AS read_only, \
 @@GLOBAL.super_read_only AS super_read_only"
             }
-            Self::Mysql8411GroupMembersV1 => {
+            Self::Mysql84GroupMembersV1 => {
                 "SELECT MEMBER_ID AS member_id, MEMBER_HOST AS member_host, \
 MEMBER_PORT AS member_port, MEMBER_STATE AS member_state, MEMBER_ROLE AS member_role \
 FROM performance_schema.replication_group_members ORDER BY MEMBER_ID"
             }
-            Self::Mysql8411LocalMemberStatsV1 => {
+            Self::Mysql84LocalMemberStatsV1 => {
                 "SELECT MEMBER_ID AS member_id, VIEW_ID AS view_id \
 FROM performance_schema.replication_group_member_stats \
 WHERE MEMBER_ID = @@GLOBAL.server_uuid"
             }
-            Self::Mysql8411ExecutedGtidsV1 => "SELECT @@GLOBAL.gtid_executed AS gtid_executed",
+            Self::Mysql84ExecutedGtidsV1 => "SELECT @@GLOBAL.gtid_executed AS gtid_executed",
         }
     }
 
@@ -142,11 +142,11 @@ WHERE MEMBER_ID = @@GLOBAL.server_uuid"
     #[must_use]
     pub const fn columns(self) -> &'static [ColumnContract] {
         match self {
-            Self::Mysql8411ProductIdentityV1 => PRODUCT_COLUMNS,
-            Self::Mysql8411LocalStateV1 => LOCAL_STATE_COLUMNS,
-            Self::Mysql8411GroupMembersV1 => MEMBERS_COLUMNS,
-            Self::Mysql8411LocalMemberStatsV1 => STATS_COLUMNS,
-            Self::Mysql8411ExecutedGtidsV1 => GTID_COLUMNS,
+            Self::Mysql84ProductIdentityV1 => PRODUCT_COLUMNS,
+            Self::Mysql84LocalStateV1 => LOCAL_STATE_COLUMNS,
+            Self::Mysql84GroupMembersV1 => MEMBERS_COLUMNS,
+            Self::Mysql84LocalMemberStatsV1 => STATS_COLUMNS,
+            Self::Mysql84ExecutedGtidsV1 => GTID_COLUMNS,
         }
     }
 
@@ -154,11 +154,11 @@ WHERE MEMBER_ID = @@GLOBAL.server_uuid"
     #[must_use]
     pub const fn surface(self) -> NativeSurface {
         match self {
-            Self::Mysql8411ProductIdentityV1 => NativeSurface::ProductIdentity,
-            Self::Mysql8411LocalStateV1 => NativeSurface::LocalState,
-            Self::Mysql8411GroupMembersV1 => NativeSurface::GroupMembers,
-            Self::Mysql8411LocalMemberStatsV1 => NativeSurface::LocalMemberStats,
-            Self::Mysql8411ExecutedGtidsV1 => NativeSurface::ExecutedGtids,
+            Self::Mysql84ProductIdentityV1 => NativeSurface::ProductIdentity,
+            Self::Mysql84LocalStateV1 => NativeSurface::LocalState,
+            Self::Mysql84GroupMembersV1 => NativeSurface::GroupMembers,
+            Self::Mysql84LocalMemberStatsV1 => NativeSurface::LocalMemberStats,
+            Self::Mysql84ExecutedGtidsV1 => NativeSurface::ExecutedGtids,
         }
     }
 }

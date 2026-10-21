@@ -219,7 +219,7 @@ pub enum LifecycleOperation {
 pub enum ProductError {
     /// Version inspection did not complete successfully.
     InspectionFailed,
-    /// The inspected executable was not exact Oracle MySQL 8.4.11 for Linux
+    /// The inspected executable was not Oracle MySQL 8.4.x for Linux
     /// x86-64.
     UnsupportedIdentity,
 }
@@ -637,7 +637,7 @@ pub enum TopologyEvidenceError {
     UnrepresentableClock,
     /// Required post-effect evidence was not collected.
     Missing,
-    /// Product identity differed from the qualified Oracle MySQL 8.4.11
+    /// Product identity differed from the supported Oracle MySQL 8.4
     /// profile.
     ProductMismatch,
     /// Exact retained ownership context was lost.

@@ -22,7 +22,7 @@ use mysql_async::{Conn, OptsBuilder};
 
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQL_X_PORT, MYSQLD, ReservedPorts, assert_no_application_store,
-    assert_process_absent, assert_tcp_refuses, preflight_oracle_mysql_8_4_11,
+    assert_process_absent, assert_tcp_refuses, preflight_oracle_mysql_8_4,
 };
 
 fn attempt(name: &str) -> AttemptContext {
@@ -92,7 +92,7 @@ async fn connect(socket: &std::path::Path) -> Conn {
 }
 
 fn fresh(label: &str) -> (FixtureRoot, MysqlInstanceManager) {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|e| panic!("{e}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|e| panic!("{e}"));
     fresh_after_preflight(label)
 }
 
@@ -391,7 +391,7 @@ impl kuberic_mysql::service::MysqlProxyAccessGuard for ReopenAdmissionGate {
 
 #[tokio::test(flavor = "current_thread")]
 async fn proxy_terminal_proof_rejects_wrong_manager_and_frozen_incarnation_session() {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|e| panic!("{e}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|e| panic!("{e}"));
     let (mut owner_root, mut owner) = fresh_after_preflight("ph-owner");
     let (mut other_root, other) = fresh_after_preflight("ph-other");
     let budget = attempt("proxy-proof-owner");
@@ -470,7 +470,7 @@ async fn proxy_terminal_proof_rejects_wrong_manager_and_frozen_incarnation_sessi
 async fn proxy_terminal_surrender_cancellation_and_unpolled_pending_drop_contain_exact_child() {
     use std::future::Future;
     for cut in ["unpolled", "pending", "cancelled"] {
-        preflight_oracle_mysql_8_4_11().unwrap_or_else(|e| panic!("{e}"));
+        preflight_oracle_mysql_8_4().unwrap_or_else(|e| panic!("{e}"));
         let (mut fixture, mut manager) = fresh_after_preflight(&format!("ph-drop-{cut}"));
         let (mut foreign_fixture, mut foreign) = fresh_after_preflight("ph-retained");
         let foreign_pid = pid(foreign.config().runtime().pid());
@@ -841,7 +841,7 @@ async fn proxy_terminal_handoff_reopens_published_unpublished_revoked_and_rearme
 
 #[tokio::test(flavor = "current_thread")]
 async fn proxy_terminal_build_tcp_profile_cannot_issue_proxy_or_reopen_proof() {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|e| panic!("{e}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|e| panic!("{e}"));
     let (mut fixture, mut manager) = fresh_profile_after_preflight("ph-build", true);
     let budget = attempt("build-rejection");
     let native = enroll_proxy(&mut manager, &budget).await;

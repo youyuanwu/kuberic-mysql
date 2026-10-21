@@ -35,7 +35,7 @@ use tokio::time::sleep;
 
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_tcp_refuses,
-    preflight_oracle_mysql_8_4_11,
+    preflight_oracle_mysql_8_4,
 };
 
 const GROUP_UUID: &str = "b5a47b3f-bf9f-4c7c-8420-495d5a52cb09";
@@ -289,7 +289,7 @@ fn run_live_scenario(scenario: Scenario) {
 }
 
 async fn run_custom_build_fixture(scenario: Scenario) {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|error| panic!("{error}"));
     let mut fixture = FixtureRoot::new("public-build-live").unwrap();
     let root = fixture.path().to_path_buf();
     let mut ports = ReservedPorts::allocate().unwrap();

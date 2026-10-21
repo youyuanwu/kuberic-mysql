@@ -2,7 +2,7 @@
 //!
 //! Existing `hosted_*` cases use the testing facade for generic initialization
 //! and dispatch. `authenticated::*` cases instead use ordinary bearer RPCs,
-//! including initialization, and assert unsuccessful terminal wire results.
+//! including initialization, and assert terminal receipts with failed live queries.
 //! Neither route claims controller/recovery acceptance.
 
 #[path = "hosted_authenticated/mod.rs"]
@@ -32,10 +32,10 @@ use kuberic_runtime::host::{
     ReplicaProcessConfig, RunningReplica,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PossibleDataLossIntent, PublicConfiguration, PublicLifecycleInput, PublicLifecycleRecipe,
-    PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
-    PublicOperationReplayDisposition, PublicV1AgentReport, PublicV1CallKind, PublicV1Identity,
-    PublicV1OperationResult,
+    INVALID_LSN, PossibleDataLossIntent, ProgressQueryResult, PublicConfiguration,
+    PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
+    PublicOperationProgram, PublicOperationReplayDisposition, PublicV1AgentReport,
+    PublicV1CallKind, PublicV1Identity, PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
@@ -52,7 +52,7 @@ use mysql_async::{Conn, OptsBuilder};
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_no_application_store,
     assert_no_application_store_with_native_schemas, assert_process_absent, assert_tcp_refuses,
-    preflight_oracle_mysql_8_4_11,
+    preflight_oracle_mysql_8_4,
 };
 
 const GROUP_UUID: &str = "b5a47b3f-bf9f-4c7c-8420-495d5a52cb09";
@@ -272,20 +272,9 @@ async fn terminal_scenario(abort: bool) -> TestResult {
                 .is_file(),
             "committed native table was not retained",
         )?;
-        // Do not replace a closed driver's rejected live progress with cached
-        // or literal zero. Testing dispatch separates cleanup from wire reports.
-        let error = fixture
-            .handle
-            .public_v1_report()
-            .await
-            .err()
-            .ok_or("closed driver unexpectedly supplied a live host report")?;
-        require(
-            error.to_string().to_ascii_lowercase().contains("closed"),
-            "terminal report failed for an unexpected reason",
-        )?;
+        assert_terminal_queries(&fixture.report().await?)?;
         eprintln!(
-            "terminal {} completed in {:?}; subsequent live report rejects: {error}",
+            "terminal {} completed in {:?}; report preserves failed closed-driver queries",
             if abort { "Abort" } else { "Close" },
             started.elapsed()
         );
@@ -389,7 +378,7 @@ impl HostedFixture {
     }
 
     async fn new_with_transport(label: &str, ordinary: bool) -> TestResult<Self> {
-        preflight_oracle_mysql_8_4_11()?;
+        preflight_oracle_mysql_8_4()?;
         let root = FixtureRoot::new_retained(label)?;
         eprintln!("retained hosted fixture: {}", root.path().display());
         let mut ports = ReservedPorts::allocate()?;
@@ -667,7 +656,8 @@ impl HostedFixture {
             )?;
         }
         require(
-            report.progress.first == 0 && report.progress.last == 0,
+            report.progress.current() == Some(0)
+                && report.progress.capability() == Some(INVALID_LSN),
             "fresh-empty zero proof differs",
         )?;
         require(
@@ -784,17 +774,20 @@ impl HostedFixture {
         self.execute(PublicOperationProgram::Progress { capability: false })
             .await?;
         let repeated = self.report().await?;
+        let formed_progress = formed
+            .progress
+            .current()
+            .ok_or("formed current progress is unavailable")?;
+        let repeated_progress = repeated
+            .progress
+            .current()
+            .ok_or("repeated current progress is unavailable")?;
         require(
-            repeated.progress.first >= formed.progress.first
-                && repeated.progress.last >= formed.progress.last,
-            "reported durability regressed",
+            repeated.progress.capability() == Some(INVALID_LSN),
+            "unknown native catch-up capability became a commitment claim",
         )?;
         require(
-            repeated.progress.first == repeated.progress.last,
-            "registered applied/committed pair is incoherent",
-        )?;
-        require(
-            repeated.progress.last > formed.progress.last,
+            repeated_progress > formed_progress,
             "real native transactions did not advance hosted progress",
         )?;
         require(
@@ -1074,6 +1067,20 @@ fn finish_scenario(scenario: TestResult, cleanup: TestResult, foreign: TestResul
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn assert_terminal_queries(report: &PublicV1AgentReport) -> TestResult {
+    report.validate().map_err(failure)?;
+    require(
+        report.role == ReplicaRole::None
+            && report.read_status != AccessStatus::Granted
+            && report.write_status != AccessStatus::Granted
+            && report.progress.current_progress
+                == ProgressQueryResult::Failed("runtime is closed".into())
+            && report.progress.catch_up_capability
+                == ProgressQueryResult::Failed("runtime is closed".into()),
+        &format!("terminal report fabricated live progress or access: {report:?}"),
+    )
 }
 
 #[test]

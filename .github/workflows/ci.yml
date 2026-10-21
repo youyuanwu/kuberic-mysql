@@ -77,7 +77,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Install exact Oracle MySQL 8.4.11 package
+      - name: Install Oracle MySQL 8.4 LTS package
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -92,7 +92,9 @@ jobs:
           rm mysql-apt-config_0.8.39-1_all.deb
           grep --quiet 'mysql-8.4-lts' /etc/apt/sources.list.d/mysql.list
           sudo apt-get update
-          sudo apt-get install --yes mysql-community-server-core=8.4.11-1ubuntu24.04
+          sudo apt-get install --yes mysql-community-server-core
+          dpkg-query -W -f='${Package} ${Version}\n' mysql-community-server-core
+          /usr/sbin/mysqld --version
           sudo systemctl disable --now mysql.service || true
           test "$(systemctl is-active mysql.service || true)" != active
 

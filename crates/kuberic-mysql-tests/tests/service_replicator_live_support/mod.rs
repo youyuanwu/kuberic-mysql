@@ -27,7 +27,7 @@ use mysql_async::{Conn, OptsBuilder};
 use tokio::time::sleep;
 
 #[allow(unused_imports)]
-pub use live_support::preflight_oracle_mysql_8_4_11;
+pub use live_support::preflight_oracle_mysql_8_4;
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQLD, ReservedPorts, assert_no_application_store,
     assert_process_absent, assert_tcp_refuses,

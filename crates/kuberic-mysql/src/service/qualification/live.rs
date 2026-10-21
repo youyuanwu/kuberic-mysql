@@ -346,7 +346,7 @@ fn observation_context(label: &str) -> TopologyObservationContext {
         ReplicaId::new(format!("replica-{label}")).unwrap(),
         ReplicaIncarnation::new(format!("incarnation-{serial}")).unwrap(),
         ObservationSessionId::new(format!("observation-{label}-{serial}")).unwrap(),
-        ConfigurationId::new("oracle-mysql-8.4.11-native-qualification").unwrap(),
+        ConfigurationId::new("oracle-mysql-8.4-native-qualification").unwrap(),
         Epoch::new("fresh-fixture").unwrap(),
         AuthorityGeneration::new("native-qualification").unwrap(),
         format!("native-qualification:{label}:{serial}"),
@@ -407,7 +407,12 @@ fn preflight() {
         "dpkg-query",
         &["-W", "-f=${Version}", "mysql-community-server-core"],
     );
-    assert_eq!(version.trim(), "8.4.11-1ubuntu24.04");
+    let version = version.trim();
+    assert!(
+        crate::adapter::is_supported_package_version(version),
+        "expected Oracle MySQL 8.4 LTS, found {version}"
+    );
+    eprintln!("MySQL qualification package: mysql-community-server-core={version}");
     let owner = command_stdout("dpkg-query", &["-S", MYSQLD]);
     assert!(owner.starts_with("mysql-community-server-core:"));
     let launcher_owner = command_stdout("dpkg-query", &["-S", APPARMOR_EXEC]);
@@ -429,11 +434,17 @@ fn preflight() {
         .unwrap();
     assert!(!foreign.success(), "foreign mysqld process is active");
     let policy = command_stdout("apt-cache", &["policy", "mysql-community-server-core"]);
-    assert!(policy.contains("Installed: 8.4.11-1ubuntu24.04"));
-    assert!(policy.contains("Candidate: 8.4.11-1ubuntu24.04"));
-    assert!(policy.contains("8.4.11-1ubuntu24.04"));
-    assert!(policy.contains("repo.mysql.com"));
-    assert!(policy.contains("mysql-8.4-lts"));
+    assert!(policy.contains(&format!("Installed: {version}")));
+    assert!(
+        crate::adapter::apt_repository_for_version(
+            &policy,
+            version,
+            "repo.mysql.com",
+            "mysql-8.4-lts",
+        )
+        .is_some(),
+        "installed MySQL package lacks Oracle 8.4 LTS repository provenance"
+    );
 }
 
 fn assert_no_application_store(root: &Path) {

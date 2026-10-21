@@ -9,6 +9,7 @@ use kuberic_runtime::control::{
     normalize_public_v1_agent_status_report, normalize_uninitialized_agent_status_report, proto,
     public_v1_operation_command_to_proto,
 };
+use kuberic_runtime::protocol::PROTOCOL_VERSION;
 use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::types::ProcessSessionId;
 
@@ -47,7 +48,7 @@ impl WireControl {
     ) -> TestResult<(RunningReplica, Self)> {
         let endpoint = format!("http://{}", config.replication_address);
         let status = proto::GetAgentStatusRequest {
-            protocol_version: 11,
+            protocol_version: PROTOCOL_VERSION,
             resource_uid: config.resource_uid.to_string(),
             replica_id: target.replica_id.value(),
             expected_instance_id: target.instance_id.to_string(),
@@ -69,7 +70,7 @@ impl WireControl {
             let response = client
                 .execute(authenticated(
                     proto::ExecuteCommandRequest {
-                        protocol_version: 11,
+                        protocol_version: PROTOCOL_VERSION,
                         resource_uid: config.resource_uid.to_string(),
                         target: Some(target.clone().into()),
                         expected_process_session_id: uninitialized.process_session_id.clone(),
@@ -196,7 +197,7 @@ impl WireControl {
             intent,
         };
         Ok(proto::ExecuteCommandRequest {
-            protocol_version: 11,
+            protocol_version: PROTOCOL_VERSION,
             resource_uid: self.config.resource_uid.to_string(),
             target: Some(target.into()),
             expected_process_session_id: session,
@@ -309,22 +310,49 @@ async fn ordinary_terminal(abort: bool) -> TestResult {
         } else {
             PublicOperationProgram::Close
         });
+        let before = fixture.report().await?;
         let started = Instant::now();
-        let error = rpc_error(
-            tokio::time::timeout(
-                TERMINAL_BUDGET,
-                fixture.wire.as_ref().unwrap().execute(terminal),
-            )
+        let completed = tokio::time::timeout(
+            TERMINAL_BUDGET,
+            fixture.wire.as_ref().unwrap().execute(terminal.clone()),
+        )
+        .await
+        .map_err(failure)?
+        .map_err(failure)?;
+        let status = fixture
+            .wire
+            .as_ref()
+            .unwrap()
+            .report()
             .await
-            .map_err(failure)?,
-            "ordinary terminal RPC unexpectedly acknowledged success",
-        )?;
-        assert_closed(&error)?;
-        let status_error = rpc_error(
-            fixture.wire.as_ref().unwrap().report().await,
-            "closed member supplied live ordinary status",
-        )?;
-        assert_closed(&status_error)?;
+            .map_err(failure)?;
+        for report in [&completed, &status] {
+            assert_terminal_queries(report)?;
+            require(
+                report.replica == before.replica
+                    && report.process_session_id == before.process_session_id
+                    && report.storage_incarnation == before.storage_incarnation
+                    && report.history == before.history
+                    && report.replicator_creation_id == before.replicator_creation_id
+                    && report.report_sequence > before.report_sequence
+                    && report.completed_operations.iter().any(|completion| {
+                        completion.operation_id == terminal.operation_id
+                            && completion.revision == terminal.revision
+                            && completion.input_digest == terminal.input_digest
+                            && completion.process_session_id == before.process_session_id
+                            && completion.storage_incarnation == before.storage_incarnation
+                            && completion.history == before.history
+                            && completion.call_kind
+                                == if abort {
+                                    PublicV1CallKind::Abort
+                                } else {
+                                    PublicV1CallKind::Close
+                                }
+                            && completion.result == PublicV1OperationResult::Succeeded
+                    }),
+                "terminal wire report lacks exact successful completion/owner evidence",
+            )?;
+        }
         // All proof precedes emergency service abort, host shutdown and Drop.
         fixture.assert_contained_evidence()?;
         require(
@@ -341,14 +369,13 @@ async fn ordinary_terminal(abort: bool) -> TestResult {
         )?;
         foreign.assert_live()?;
         eprintln!(
-            "AUTHENTICATED_TERMINAL={} error={:?}:{} status={:?}:{} elapsed={:?}; \
+            "AUTHENTICATED_TERMINAL={} completion=Succeeded current={:?} \
+             catch_up_capability={:?} elapsed={:?}; \
              PRE_FALLBACK_CONTAINMENT=ok pid={:?} absent, listeners closed, \
              identity/data/logs retained, foreign_pid={} live; root={}",
             if abort { "Abort" } else { "Close" },
-            error.code(),
-            error.message(),
-            status_error.code(),
-            status_error.message(),
+            status.progress.current_progress,
+            status.progress.catch_up_capability,
             started.elapsed(),
             fixture.pid,
             foreign.0.id(),
@@ -527,20 +554,20 @@ impl HostedFixture {
             return Err("independent complete GTIDs are not projectable".into());
         };
         require(
-            report.progress.first == projected.value()
-                && report.progress.last == projected.value()
+            report.progress.current() == Some(projected.value())
+                && report.progress.capability() == Some(INVALID_LSN)
                 && projected.value() > 0,
-            "applied/committed report differs from independent complete native GTIDs",
+            "current progress or unknown capability differs from independent native evidence",
         )?;
         require(before.rows == vec![(1, 42)], "committed native row differs")?;
         eprintln!(
             "INDEPENDENT_PROGRESS=ok uuid={} full_executed={:?} full_purged={:?} \
-             applied={} committed={} projection={} rows={:?}",
+             current={:?} catch_up_capability={:?} projection={} rows={:?}",
             before.uuid,
             before.executed,
             before.purged,
-            report.progress.last,
-            report.progress.first,
+            report.progress.current_progress,
+            report.progress.catch_up_capability,
             projected.value(),
             before.rows,
         );

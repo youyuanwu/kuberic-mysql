@@ -10,7 +10,7 @@ enumeration and reliable sending”, #169), and subsequently observed current ma
 `11d804425bbdbe7759dfd18208a0d73ce667a9f4` (U, “Port unselected SF V1 copy
 build gates and retargeting”, #170). That assessment did not justify a repin.
 The current dependency is now
-`dabe144670303b22b1fe13f5ced78ab57ad3f98c`; P/H/U remain historical evidence,
+`e2a47b6c631c974aa0135e81c3a7e3a439980ded`; P/H/U remain historical evidence,
 not aliases for the current pin. The later
 [in-process harness assessment](mysql-hosted-lifecycle.md#upstream-in-process-harness-applicability)
 does not qualify this recovery contract.
@@ -207,8 +207,8 @@ generic production transfer.
 | Q6: Asynchronous custody (C) | Unpolled/awaiting/cancelled/error/dropped transfer at every cut owns and contains only its exact child; no detached task or foreign-owner interference; explicit attachment-failure outcome. | Orphan/double owner, leaked manager/socket, proof after cancellation, ambiguous success promoted from observed state, failure that deletes retained data, task poison cleared by retry. |
 | Q7: Fresh closed attachment (D) | One real public custom-factory creation, unassigned and closed, no inherited credit; prior proxy remains terminal. | Old role/PC/CC/peers/access, stale progress cache, dummy scalar/provider, commitment/election/donor credit, premature Existing acceptance, endpoint publication or serving. |
 
-Native portions of any future qualification require the existing exact Oracle
-MySQL Community **8.4.11** Linux profile, one Cargo job/target tree and serial
+Native portions of any future qualification require the Oracle
+MySQL Community **8.4 LTS** Linux profile, one Cargo job/target tree and serial
 native tests. Preserve short UDS paths (`<108` encoded bytes), absent-target
 archive fixture handling, exact owned helper cleanup and foreign-process
 noninterference. Native and generic positive/negative tests must exercise the

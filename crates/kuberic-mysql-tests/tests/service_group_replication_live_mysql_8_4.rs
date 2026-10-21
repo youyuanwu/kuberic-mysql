@@ -24,7 +24,7 @@ use tokio::time::sleep;
 
 use live_support::{
     APPARMOR_EXEC, FixtureRoot, MYSQL_X_PORT, MYSQLD, ReservedPorts, assert_no_application_store,
-    assert_process_absent, assert_tcp_refuses, preflight_oracle_mysql_8_4_11,
+    assert_process_absent, assert_tcp_refuses, preflight_oracle_mysql_8_4,
 };
 
 const GROUP_UUID: &str = "d6f6f07e-37e1-4f7a-9105-73c13f634cb3";
@@ -32,7 +32,7 @@ static NEXT_CONTEXT: AtomicU64 = AtomicU64::new(1);
 
 #[tokio::test(flavor = "current_thread")]
 async fn three_fresh_members_bootstrap_join_and_cleanup() {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|error| panic!("{error}"));
     let mut fixture = FixtureRoot::new("service-group-replication-live")
         .unwrap_or_else(|error| panic!("{error}"));
     let root = fixture.path().to_path_buf();
@@ -339,7 +339,7 @@ fn observation_context(label: &str) -> TopologyObservationContext {
         ReplicaId::new(format!("replica-{label}")).unwrap(),
         ReplicaIncarnation::new(format!("incarnation-{serial}")).unwrap(),
         ObservationSessionId::new(format!("observation-{label}-{serial}")).unwrap(),
-        ConfigurationId::new("oracle-mysql-8.4.11-three-member").unwrap(),
+        ConfigurationId::new("oracle-mysql-8.4-three-member").unwrap(),
         Epoch::new("fresh-fixture").unwrap(),
         AuthorityGeneration::new("live-attempt").unwrap(),
         format!("service-group-replication-live:{label}:{serial}"),

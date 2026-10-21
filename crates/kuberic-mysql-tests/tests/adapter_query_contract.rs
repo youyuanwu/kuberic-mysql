@@ -54,62 +54,62 @@ fn exact_versioned_queries_have_explicit_selected_contracts() {
     }
 
     assert!(
-        QueryId::Mysql8411GroupMembersV1
+        QueryId::Mysql84GroupMembersV1
             .sql()
             .contains("performance_schema.replication_group_members")
     );
     assert!(
-        !QueryId::Mysql8411GroupMembersV1
+        !QueryId::Mysql84GroupMembersV1
             .sql()
             .contains("replication_group_member_stats")
     );
     assert!(
-        QueryId::Mysql8411LocalMemberStatsV1
+        QueryId::Mysql84LocalMemberStatsV1
             .sql()
             .contains("performance_schema.replication_group_member_stats")
     );
     assert!(
-        !QueryId::Mysql8411LocalMemberStatsV1
+        !QueryId::Mysql84LocalMemberStatsV1
             .sql()
             .contains("replication_group_members ORDER")
     );
     assert!(
-        QueryId::Mysql8411GroupMembersV1
+        QueryId::Mysql84GroupMembersV1
             .sql()
             .ends_with("ORDER BY MEMBER_ID")
     );
     assert_eq!(
-        QueryId::Mysql8411ProductIdentityV1.sql(),
+        QueryId::Mysql84ProductIdentityV1.sql(),
         "SELECT @@version AS version, @@version_comment AS version_comment, \
 @@version_compile_machine AS version_compile_machine, \
 @@version_compile_os AS version_compile_os, \
 @@GLOBAL.server_uuid AS server_uuid"
     );
     assert_eq!(
-        QueryId::Mysql8411LocalStateV1.sql(),
+        QueryId::Mysql84LocalStateV1.sql(),
         "SELECT @@GLOBAL.group_replication_group_name AS group_name, \
 @@GLOBAL.group_replication_local_address AS group_replication_address, \
 @@GLOBAL.read_only AS read_only, \
 @@GLOBAL.super_read_only AS super_read_only"
     );
     assert_eq!(
-        QueryId::Mysql8411GroupMembersV1.sql(),
+        QueryId::Mysql84GroupMembersV1.sql(),
         "SELECT MEMBER_ID AS member_id, MEMBER_HOST AS member_host, \
 MEMBER_PORT AS member_port, MEMBER_STATE AS member_state, MEMBER_ROLE AS member_role \
 FROM performance_schema.replication_group_members ORDER BY MEMBER_ID"
     );
     assert_eq!(
-        QueryId::Mysql8411LocalMemberStatsV1.sql(),
+        QueryId::Mysql84LocalMemberStatsV1.sql(),
         "SELECT MEMBER_ID AS member_id, VIEW_ID AS view_id \
 FROM performance_schema.replication_group_member_stats \
 WHERE MEMBER_ID = @@GLOBAL.server_uuid"
     );
     assert_eq!(
-        QueryId::Mysql8411ExecutedGtidsV1.sql(),
+        QueryId::Mysql84ExecutedGtidsV1.sql(),
         "SELECT @@GLOBAL.gtid_executed AS gtid_executed"
     );
 
-    let members = QueryId::Mysql8411GroupMembersV1.columns();
+    let members = QueryId::Mysql84GroupMembersV1.columns();
     assert_eq!(
         members
             .iter()
@@ -123,7 +123,7 @@ WHERE MEMBER_ID = @@GLOBAL.server_uuid"
             ("member_role", ColumnKind::String, false),
         ]
     );
-    let stats = QueryId::Mysql8411LocalMemberStatsV1.columns();
+    let stats = QueryId::Mysql84LocalMemberStatsV1.columns();
     assert_eq!(
         stats
             .iter()
@@ -134,12 +134,12 @@ WHERE MEMBER_ID = @@GLOBAL.server_uuid"
             ("view_id", ColumnKind::String, false),
         ]
     );
-    let product = QueryId::Mysql8411ProductIdentityV1.columns();
+    let product = QueryId::Mysql84ProductIdentityV1.columns();
     assert!(product.iter().all(|column| column.nullable()));
-    let local = QueryId::Mysql8411LocalStateV1.columns();
+    let local = QueryId::Mysql84LocalStateV1.columns();
     assert!(local.iter().all(|column| column.nullable()));
     assert_eq!(
-        QueryId::Mysql8411ExecutedGtidsV1
+        QueryId::Mysql84ExecutedGtidsV1
             .columns()
             .iter()
             .map(|column| (column.name(), column.kind(), column.nullable()))
@@ -151,7 +151,7 @@ WHERE MEMBER_ID = @@GLOBAL.server_uuid"
 #[test]
 fn query_contract_has_immutable_oracle_source_provenance() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mysql-8.4.11/query-contract-provenance.toml");
+        .join("tests/fixtures/mysql-8.4/query-contract-provenance.toml");
     let provenance = fs::read_to_string(path).unwrap();
     for required in [
         "kuberic.mysql.query-contract-provenance/v1",
@@ -197,7 +197,7 @@ fn every_fixture_declares_schema_outcome_diagnostic_and_eligible_origin() {
                 "native-required" => {
                     assert_eq!(
                         case.evidence_origin.qualification.as_deref(),
-                        Some("required-live-8.4.11")
+                        Some("required-live-8.4")
                     );
                 }
                 "oracle-owned" => {
@@ -251,7 +251,7 @@ fn every_fixture_expectation_is_executable_and_scenario_specific() {
 #[test]
 fn named_scenarios_reject_the_wrong_origin_category() {
     for scenario in [
-        "oracle-community-8.4.11-product",
+        "oracle-community-8.4-product",
         "stopped-members-placeholder",
         "members-schema-type-drift",
     ] {
@@ -415,9 +415,9 @@ fn execute_fixture(case: &common::FixtureCase) -> AdapterDiagnostic {
 
     let result = case.raw();
     let decoded = match case.query() {
-        QueryId::Mysql8411ProductIdentityV1 => decode::decode_product(&result).map(|_| None),
-        QueryId::Mysql8411LocalStateV1 => decode::decode_local_state(&result).map(|_| None),
-        QueryId::Mysql8411GroupMembersV1 => {
+        QueryId::Mysql84ProductIdentityV1 => decode::decode_product(&result).map(|_| None),
+        QueryId::Mysql84LocalStateV1 => decode::decode_local_state(&result).map(|_| None),
+        QueryId::Mysql84GroupMembersV1 => {
             decode::decode_members(&result).map(|evidence| match evidence {
                 MembershipEvidence::Absent => Some(AdapterDiagnostic::Absent {
                     surface: NativeSurface::GroupMembers,
@@ -426,7 +426,7 @@ fn execute_fixture(case: &common::FixtureCase) -> AdapterDiagnostic {
                 MembershipEvidence::Active(_) => None,
             })
         }
-        QueryId::Mysql8411LocalMemberStatsV1 => {
+        QueryId::Mysql84LocalMemberStatsV1 => {
             decode::decode_view(&result).map(|evidence| match evidence {
                 ViewEvidence::Absent => Some(AdapterDiagnostic::Absent {
                     surface: NativeSurface::LocalMemberStats,
@@ -435,7 +435,7 @@ fn execute_fixture(case: &common::FixtureCase) -> AdapterDiagnostic {
                 ViewEvidence::Active { .. } => None,
             })
         }
-        QueryId::Mysql8411ExecutedGtidsV1 => decode::decode_executed_gtids(&result).map(|_| None),
+        QueryId::Mysql84ExecutedGtidsV1 => decode::decode_executed_gtids(&result).map(|_| None),
     };
     match decoded {
         Ok(Some(diagnostic)) => diagnostic,
@@ -504,8 +504,8 @@ fn diagnostic_name(diagnostic: &AdapterDiagnostic) -> &'static str {
             code: 1142,
             ..
         } => "StatsServer1142",
-        AdapterDiagnostic::Product(diagnostic::ProductIssue::UnsupportedPatch) => {
-            "UnsupportedPatch"
+        AdapterDiagnostic::Product(diagnostic::ProductIssue::UnsupportedVersion) => {
+            "UnsupportedVersion"
         }
         AdapterDiagnostic::Product(diagnostic::ProductIssue::NonOracleCommunity) => {
             "NonOracleCommunity"

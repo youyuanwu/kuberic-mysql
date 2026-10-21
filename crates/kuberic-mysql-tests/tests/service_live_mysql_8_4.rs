@@ -19,7 +19,7 @@ use kuberic_mysql::service::{MysqlInstanceConfig, MysqlInstanceManager, MysqlOpe
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
 
-use live_support::{FixtureRoot, preflight_oracle_mysql_8_4_11};
+use live_support::{FixtureRoot, preflight_oracle_mysql_8_4};
 
 #[derive(Clone)]
 struct SystemClock {
@@ -45,7 +45,7 @@ impl ObservationClock for SystemClock {
 
 #[tokio::test(flavor = "current_thread")]
 async fn one_fresh_owned_instance_lifecycle() {
-    preflight_oracle_mysql_8_4_11().unwrap_or_else(|error| panic!("{error}"));
+    preflight_oracle_mysql_8_4().unwrap_or_else(|error| panic!("{error}"));
     let mut fixture =
         FixtureRoot::new("service-single-live").unwrap_or_else(|error| panic!("{error}"));
     let root = fixture.path().to_path_buf();
@@ -88,7 +88,7 @@ async fn one_fresh_owned_instance_lifecycle() {
         binding.clone(),
         UnixSocketPath::new(&socket).unwrap(),
         ObserverCredentials::new("root", "").unwrap(),
-        ObservationProvenance::new("service-live-mysql-8.4.11", binding.parts().attempt.clone())
+        ObservationProvenance::new("service-live-mysql-8.4", binding.parts().attempt.clone())
             .unwrap(),
         ClockContext::new(clock, ObservationInstant::new(30_000)).unwrap(),
     )

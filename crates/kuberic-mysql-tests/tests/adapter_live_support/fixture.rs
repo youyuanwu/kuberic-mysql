@@ -15,7 +15,6 @@ use tokio::time::sleep;
 use super::{QualificationCode, QualificationError, project_root};
 
 const EXPECTED_PACKAGE_NAME: &str = "mysql-community-server-core";
-const EXPECTED_PACKAGE_VERSION: &str = "8.4.11-1ubuntu24.04";
 const EXPECTED_APT_REPOSITORY_HOST: &str = "repo.mysql.com";
 const EXPECTED_APT_REPOSITORY_COMPONENT: &str = "mysql-8.4-lts";
 const EXPECTED_MYSQLD: &str = "/usr/sbin/mysqld";
@@ -46,7 +45,7 @@ impl QualificationConfig {
             mysqld_path: EXPECTED_MYSQLD.into(),
             apparmor_exec_path: EXPECTED_APPARMOR_EXEC.into(),
             package_name: EXPECTED_PACKAGE_NAME.to_owned(),
-            package_version: EXPECTED_PACKAGE_VERSION.to_owned(),
+            package_version: installed_package_version()?,
             apt_repository_host: EXPECTED_APT_REPOSITORY_HOST.to_owned(),
             apt_repository_component: EXPECTED_APT_REPOSITORY_COMPONENT.to_owned(),
             qualification_root: qualification.join("q"),
@@ -95,11 +94,6 @@ impl QualificationConfig {
         for (label, actual, expected) in [
             ("package name", &self.package_name, EXPECTED_PACKAGE_NAME),
             (
-                "package version",
-                &self.package_version,
-                EXPECTED_PACKAGE_VERSION,
-            ),
-            (
                 "APT repository host",
                 &self.apt_repository_host,
                 EXPECTED_APT_REPOSITORY_HOST,
@@ -117,6 +111,16 @@ impl QualificationConfig {
                     format!("expected {expected}, found {actual}"),
                 ));
             }
+        }
+        if !kuberic_mysql::adapter::is_supported_package_version(&self.package_version) {
+            return Err(QualificationError::new(
+                QualificationCode::UnsupportedVersion,
+                "package version",
+                format!(
+                    "expected Oracle MySQL 8.4 LTS, found {}",
+                    self.package_version
+                ),
+            ));
         }
         let qualification = project_root().join("qualification");
         if !self.qualification_root.starts_with(&qualification) {
@@ -639,6 +643,29 @@ struct AptPolicy {
     repository: String,
 }
 
+fn installed_package_version() -> Result<String, QualificationError> {
+    let output = run_tool(
+        "dpkg-query",
+        &[
+            OsStr::new("-W"),
+            OsStr::new("-f=${Version}"),
+            OsStr::new(EXPECTED_PACKAGE_NAME),
+        ],
+        QualificationCode::ToolUnavailable,
+        "query installed MySQL package version",
+    )?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !kuberic_mysql::adapter::is_supported_package_version(&version) {
+        return Err(QualificationError::new(
+            QualificationCode::UnsupportedVersion,
+            "installed MySQL package",
+            format!("expected Oracle MySQL 8.4 LTS, found {version}"),
+        ));
+    }
+    eprintln!("MySQL qualification package: {EXPECTED_PACKAGE_NAME}={version}");
+    Ok(version)
+}
+
 fn validate_package_owner(
     actual: &str,
     package_name: &str,
@@ -748,61 +775,34 @@ fn parse_apt_policy(
             )
         })?
         .to_owned();
-    if installed != expected_version || candidate != expected_version {
+    if installed != expected_version
+        || !kuberic_mysql::adapter::is_supported_package_version(&installed)
+    {
         return Err(QualificationError::new(
             QualificationCode::PackageMetadataMismatch,
             "APT package version",
             format!(
-                "expected installed/candidate {expected_version}, found installed={installed} candidate={candidate}"
+                "expected installed Oracle MySQL 8.4 package {expected_version}, found installed={installed} candidate={candidate}"
             ),
         ));
     }
-    let lines = policy.lines().collect::<Vec<_>>();
-    let version_index = lines
-        .iter()
-        .position(|line| {
-            line.trim()
-                .trim_start_matches("*** ")
-                .split_whitespace()
-                .next()
-                == Some(expected_version)
-        })
-        .ok_or_else(|| {
-            QualificationError::new(
-                QualificationCode::AptProvenanceMismatch,
-                "APT version stanza",
-                format!("policy omitted version stanza {expected_version}"),
-            )
-        })?;
-    let repository = lines
-        .iter()
-        .skip(version_index + 1)
-        .take_while(|line| {
-            let first = line
-                .trim()
-                .trim_start_matches("*** ")
-                .split_whitespace()
-                .next()
-                .unwrap_or_default();
-            !(first.contains('.')
-                && first
-                    .bytes()
-                    .next()
-                    .is_some_and(|byte| byte.is_ascii_digit()))
-        })
-        .map(|line| line.trim())
-        .find(|line| line.contains(repository_host) && line.contains(repository_component))
-        .ok_or_else(|| {
-            QualificationError::new(
-                QualificationCode::AptProvenanceMismatch,
-                "APT repository provenance",
-                format!(
-                    "policy did not contain host {} and component {}",
-                    repository_host, repository_component
-                ),
-            )
-        })?
-        .to_owned();
+    let repository = kuberic_mysql::adapter::apt_repository_for_version(
+        policy,
+        expected_version,
+        repository_host,
+        repository_component,
+    )
+    .ok_or_else(|| {
+        QualificationError::new(
+            QualificationCode::AptProvenanceMismatch,
+            "APT repository provenance",
+            format!(
+                "policy did not contain host {} and component {}",
+                repository_host, repository_component
+            ),
+        )
+    })?
+    .to_owned();
     Ok(AptPolicy {
         installed,
         candidate,
@@ -1162,21 +1162,20 @@ fn allocate_loopback_port() -> Result<u16, QualificationError> {
 mod tests {
     use super::{
         EXPECTED_APT_REPOSITORY_COMPONENT, EXPECTED_APT_REPOSITORY_HOST, EXPECTED_PACKAGE_NAME,
-        EXPECTED_PACKAGE_VERSION, create_private_directory, parse_apt_policy,
-        reject_foreign_process_names, validate_installed_metadata, validate_package_owner,
-        verify_private_mode,
+        create_private_directory, parse_apt_policy, reject_foreign_process_names,
+        validate_installed_metadata, validate_package_owner, verify_private_mode,
     };
 
     #[test]
-    fn qualification_package_contract_is_exact() {
+    fn qualification_package_origin_is_exact() {
         assert_eq!(EXPECTED_PACKAGE_NAME, "mysql-community-server-core");
-        assert_eq!(EXPECTED_PACKAGE_VERSION, "8.4.11-1ubuntu24.04");
         assert_eq!(EXPECTED_APT_REPOSITORY_HOST, "repo.mysql.com");
         assert_eq!(EXPECTED_APT_REPOSITORY_COMPONENT, "mysql-8.4-lts");
     }
 
     #[test]
     fn package_owner_version_and_apt_origin_are_exact() {
+        let installed_version = "8.4.11-1ubuntu24.04";
         let path = std::path::Path::new("/usr/sbin/mysqld");
         assert!(
             validate_package_owner(
@@ -1193,21 +1192,21 @@ mod tests {
             validate_installed_metadata(
                 "mysql-community-server-core\t8.4.11-1ubuntu24.04\tinstall ok installed",
                 EXPECTED_PACKAGE_NAME,
-                EXPECTED_PACKAGE_VERSION,
+                installed_version,
             )
             .is_ok()
         );
 
         let policy = "mysql-community-server-core:\n\
           Installed: 8.4.11-1ubuntu24.04\n\
-          Candidate: 8.4.11-1ubuntu24.04\n\
+          Candidate: 8.4.13-1ubuntu24.04\n\
           Version table:\n\
          *** 8.4.11-1ubuntu24.04 500\n\
                 500 http://repo.mysql.com/apt/ubuntu noble/mysql-8.4-lts amd64 Packages\n";
         assert!(
             parse_apt_policy(
                 policy,
-                EXPECTED_PACKAGE_VERSION,
+                installed_version,
                 EXPECTED_APT_REPOSITORY_HOST,
                 EXPECTED_APT_REPOSITORY_COMPONENT,
             )
@@ -1233,7 +1232,7 @@ mod tests {
         assert!(
             parse_apt_policy(
                 wrong_stanza,
-                EXPECTED_PACKAGE_VERSION,
+                installed_version,
                 EXPECTED_APT_REPOSITORY_HOST,
                 EXPECTED_APT_REPOSITORY_COMPONENT,
             )
@@ -1242,7 +1241,7 @@ mod tests {
         assert!(
             parse_apt_policy(
                 policy,
-                EXPECTED_PACKAGE_VERSION,
+                installed_version,
                 "packages.example.invalid",
                 EXPECTED_APT_REPOSITORY_COMPONENT,
             )

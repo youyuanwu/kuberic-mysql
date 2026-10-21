@@ -49,7 +49,7 @@ fn binding() -> ExactBinding {
 #[test]
 fn exact_product_and_online_snapshot_decode_into_core_types() {
     let binding = binding();
-    let product = decode::decode_product(&common::fixture("oracle-community-8.4.11-product").raw())
+    let product = decode::decode_product(&common::fixture("oracle-community-8.4-product").raw())
         .expect("qualified product");
     decode::validate_server_identity(&binding, &product).expect("matching server");
     let local = decode::decode_local_state(&common::fixture("online-local-state").raw())
@@ -229,11 +229,17 @@ fn duplicates_missing_local_and_contradictions_never_select_arbitrary_rows() {
 }
 
 #[test]
-fn exact_product_classification_rejects_other_patch_and_lookalike() {
-    let patch = decode::decode_product(&common::fixture("other-oracle-patch").raw()).unwrap_err();
+fn product_classification_accepts_patch_updates_but_rejects_other_lines_and_lookalikes() {
+    for version in ["8.4.11", "8.4.13"] {
+        let mut product = common::fixture("oracle-community-8.4-product").raw();
+        product.rows[0][0] = query::RawValue::Bytes(version.as_bytes().to_vec());
+        decode::decode_product(&product).expect("supported Oracle 8.4 patch");
+    }
+    let patch =
+        decode::decode_product(&common::fixture("unsupported-oracle-version").raw()).unwrap_err();
     assert_eq!(
         patch.diagnostic,
-        AdapterDiagnostic::Product(ProductIssue::UnsupportedPatch)
+        AdapterDiagnostic::Product(ProductIssue::UnsupportedVersion)
     );
     let fork = decode::decode_product(&common::fixture("non-oracle-lookalike").raw()).unwrap_err();
     assert_eq!(
@@ -282,7 +288,7 @@ fn future_values_schema_and_numeric_boundaries_are_explicit() {
 
     let upper =
         decode::decode_executed_gtids(&common::fixture("gtid-boundary-9223372036854775807").raw())
-            .expect_err("native 8.4.11 rejects the value above the qualified maximum");
+            .expect_err("the qualified 8.4 contract rejects the value above the maximum");
     assert!(matches!(
         upper.diagnostic,
         AdapterDiagnostic::Evidence {

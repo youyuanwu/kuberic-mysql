@@ -2944,7 +2944,7 @@ async fn validate_product<S: ControlSession>(
             ControlStage::ProductValidation,
         ));
     };
-    if version != "8.4.11"
+    if !crate::adapter::is_supported_server_version(&version)
         || comment != "MySQL Community Server - GPL"
         || machine != "x86_64"
         || operating_system != "Linux"
@@ -4534,7 +4534,7 @@ mod tests {
                 "SELECT @@version, @@version_comment, @@version_compile_machine, \
                      @@version_compile_os, @@GLOBAL.server_uuid",
                 ControlQueryResult::Product {
-                    version: "8.4.10".to_owned(),
+                    version: "8.0.10".to_owned(),
                     comment: "MySQL Community Server - GPL".to_owned(),
                     machine: "x86_64".to_owned(),
                     operating_system: "Linux".to_owned(),

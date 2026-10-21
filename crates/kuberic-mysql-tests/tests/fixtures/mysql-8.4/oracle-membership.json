@@ -3,7 +3,7 @@
   "cases": [
     {
       "scenario": "plugin-absent-members",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -26,7 +26,7 @@
     },
     {
       "scenario": "never-started-members-placeholder",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -49,7 +49,7 @@
     },
     {
       "scenario": "stopped-members-placeholder",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -72,7 +72,7 @@
     },
     {
       "scenario": "recovering-member",
-      "query_id": "Mysql8411GroupMembersV1",
+      "query_id": "Mysql84GroupMembersV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "member_host", "kind": "String", "nullable": false},
@@ -95,7 +95,7 @@
     },
     {
       "scenario": "never-started-filtered-stats-absent",
-      "query_id": "Mysql8411LocalMemberStatsV1",
+      "query_id": "Mysql84LocalMemberStatsV1",
       "columns": [
         {"name": "member_id", "kind": "String", "nullable": false},
         {"name": "view_id", "kind": "String", "nullable": false}

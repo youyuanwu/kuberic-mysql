@@ -62,7 +62,7 @@ pub struct EvidenceOrigin {
 }
 
 pub fn load_fixture_files() -> Vec<FixtureFile> {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mysql-8.4.11");
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mysql-8.4");
     let mut paths = fs::read_dir(directory)
         .expect("fixture directory")
         .map(|entry| entry.expect("fixture entry").path())
@@ -91,11 +91,11 @@ pub fn fixture(scenario: &str) -> FixtureCase {
 impl FixtureCase {
     pub fn query(&self) -> QueryId {
         match self.query_id.as_str() {
-            "Mysql8411ProductIdentityV1" => QueryId::Mysql8411ProductIdentityV1,
-            "Mysql8411LocalStateV1" => QueryId::Mysql8411LocalStateV1,
-            "Mysql8411GroupMembersV1" => QueryId::Mysql8411GroupMembersV1,
-            "Mysql8411LocalMemberStatsV1" => QueryId::Mysql8411LocalMemberStatsV1,
-            "Mysql8411ExecutedGtidsV1" => QueryId::Mysql8411ExecutedGtidsV1,
+            "Mysql84ProductIdentityV1" => QueryId::Mysql84ProductIdentityV1,
+            "Mysql84LocalStateV1" => QueryId::Mysql84LocalStateV1,
+            "Mysql84GroupMembersV1" => QueryId::Mysql84GroupMembersV1,
+            "Mysql84LocalMemberStatsV1" => QueryId::Mysql84LocalMemberStatsV1,
+            "Mysql84ExecutedGtidsV1" => QueryId::Mysql84ExecutedGtidsV1,
             other => panic!("unknown query id {other}"),
         }
     }
@@ -147,7 +147,7 @@ pub fn validate_required_origin(case: &FixtureCase) -> Result<(), &'static str> 
         | "stopped-members-placeholder"
         | "recovering-member"
         | "never-started-filtered-stats-absent" => "oracle-owned",
-        "other-oracle-patch"
+        "unsupported-oracle-version"
         | "non-oracle-lookalike"
         | "unexpected-required-null"
         | "incomplete-members-row"
@@ -162,7 +162,7 @@ pub fn validate_required_origin(case: &FixtureCase) -> Result<(), &'static str> 
         | "stopped-placeholder-invalid-member-id"
         | "stopped-placeholder-invalid-host"
         | "stopped-placeholder-invalid-port" => "synthetic",
-        "oracle-community-8.4.11-product"
+        "oracle-community-8.4-product"
         | "online-local-state"
         | "online-members"
         | "online-local-view"

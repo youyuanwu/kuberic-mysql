@@ -4,7 +4,7 @@
 observer, bounded lifecycle ownership for fresh Oracle MySQL servers, the
 MySQL-owned Stage 2 integration foundation, and a bounded feature-gated
 Kuberic Public V1 adapter. The delivered native target is Oracle MySQL
-Community Server 8.4.11 on Linux x86-64. Administration and observation use
+Community Server 8.4 LTS on Linux x86-64. Administration and observation use
 private Unix-domain sockets; Group Replication and the bounded application
 gateway use distinct loopback-only endpoints.
 
@@ -25,7 +25,7 @@ per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
 infrastructure, not production topology owners. The normal crate surface
 includes the public adapter against `kuberic-runtime` pinned exactly to commit
-`dabe144670303b22b1fe13f5ced78ab57ad3f98c`; no private managed lifecycle,
+`e2a47b6c631c974aa0135e81c3a7e3a439980ded`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
 ## Status
@@ -42,8 +42,8 @@ module. It provides:
   access closed.
 
 The `kuberic_mysql::adapter` module adds one deadline-bounded, read-only
-observation attempt over a validated UDS. It verifies the exact Oracle 8.4.11
-product, collects opening native state, executed GTIDs, and closing native
+observation attempt over a validated UDS. It verifies the Oracle 8.4 product
+and release line, collects opening native state, executed GTIDs, and closing native
 state on one authenticated session, and returns a typed core outcome plus a
 secret-free diagnostic. Transport, authentication, permission, absence,
 malformed, unsupported, stale, and incoherent results remain
@@ -159,22 +159,23 @@ The [hosted lifecycle gate](docs/mysql-hosted-lifecycle.md) runs the actual
 production service in a real public `ReplicaHost`/`RunningReplica` at the same
 pin, initially for **one fresh member**. It covers New/Open and actual custom
 factory registration, the existing bundled `InitialPrimary` role/configuration
-route, registered provider-backed progress, native application proxy admission
+route, native-proved current progress, native application proxy admission
 and DML, Close, Abort, and cancellation after actual mysqld server spawn.
 Existing `hosted_*` cases use the runtime's testing facade. Separate ordinary
 authenticated cases now cover generic initialization through New/Open, singleton
 formation, Granted proxy DML, independently cross-checked complete-GTID progress,
 and unauthorized/stale rejection without native mutation. Ordinary Close/Abort
-and subsequent GetStatus explicitly return `Unavailable: runtime is closed`;
-independent containment is proved before fallback cleanup. This is **not
-successful terminal wire acknowledgment** or controller/recovery acceptance.
+return exact successful completion receipts; subsequent GetStatus preserves
+typed failed closed-driver queries rather than inventing live progress.
+Independent containment is proved before fallback cleanup. This is not
+controller Build or recovery acceptance.
 Only genuine host admission opens native application access.
 
 Production service terminal containment retains data and moves its exact owned
 runtime directory to the original path plus `.retained`, preserving native
 logs/binlogs without leaving the active runtime name. It never overwrites an
-existing destination or grants reopen authority. Later live host reports reject
-the closed driver rather than return synthetic progress. Service Close retains
+existing destination or grants reopen authority. Later host reports preserve
+failed closed-driver queries rather than return synthetic progress. Service Close retains
 its exact driver through failure, cancellation and concurrent calls; physical
 cleanup after reaping remains bound to previously attested generation/roots,
 not new live authority. These hosted tests do
@@ -188,15 +189,15 @@ is fixed: all three fresh native members start through controller-driven New
 Open, with exact current-process receipts and initialized storage-mode evidence.
 The probe verifies native process absence and host/factory cleanup afterward,
 retaining local diagnostics on failure. Its separate
-[fresh-formation boundary case](docs/mysql-hosted-lifecycle.md#executed-fresh-primary-role-boundary)
-continues through the controller's standalone Primary-role dispatch. Before a
-configuration exists, initial Role and Epoch now complete with coherent zero
-progress and closed access. The pinned host deliberately reports `None/Recovery`
-until readiness, despite those successful callback receipts. The first later
-executed rejection is the exact **singleton-only fresh bootstrap** guard on the
-controller's three-member Configuration. The gate verifies exact authority,
-the full controller error chain and independent native containment; timeout
-cannot pass. This is **not successful cluster formation or controller Build**.
+[fresh-formation boundary case](docs/mysql-hosted-lifecycle.md#executed-singleton-formation-and-inbound-build-boundary)
+now accepts Primary Role, Epoch and a genuine singleton Configuration, persists
+that topology and prepares an exact IdleSecondary target. Role intent is
+reported independently of serving access. The first later executed rejection
+is **target inbound-Build authority installation**, which still requires private
+Kuberic `NativeRuntimeControl` absent from the custom factory. The gate checks
+exact accepted authority, the full controller error chain, independent native
+singleton membership and application-ingress denial; timeout cannot pass.
+This is **not successful multi-member formation or source Build**.
 Normal composite public storage fences are preserved losslessly with a separate
 2048-byte bound; individual identity domains retain their 255-byte limit.
 
@@ -407,8 +408,12 @@ destructive repair, restart continuation or survivor adoption, TLS, cross-host
 operation, containers, Kubernetes, and production availability, durability,
 performance, or security claims.
 
-The live gate qualifies the exact installed Oracle MySQL 8.4.11 package.
-Any other patch requires an explicit compatibility update.
+The supported version policy is Oracle MySQL Community 8.4.x, not a fixed
+patch. CI installs the available 8.4 LTS package and the native gates report the
+actual installed version. Passing on one patch does not prequalify every future
+patch: vendor/platform, schema, durability, GTID and lifecycle checks still fail
+closed when their contracts change. Immutable source fixtures retain their
+original source commit and tag; they are not relabeled as newer observations.
 
 See [the design's staged delivery and validation
 plan](docs/design.md#staged-delivery) for the evidence required before any
@@ -416,9 +421,8 @@ future support claim.
 
 ## Prerequisites
 
-Repository development and CI require Oracle MySQL Community Server 8.4.11 on
-Linux x86-64. The supported package is
-`mysql-community-server-core=8.4.11-1ubuntu24.04` from `repo.mysql.com`'s
+Repository development and CI require Oracle MySQL Community Server 8.4 LTS on
+Linux x86-64. Install `mysql-community-server-core` from `repo.mysql.com`'s
 `mysql-8.4-lts` component. `/usr/sbin/mysqld` and `/usr/bin/aa-exec` must be
 installed, `protoc` must be available for the pinned Kuberic runtime build, and
 the system `mysql.service` must remain stopped. Install the
@@ -487,7 +491,7 @@ incarnations, and controlled Build/Remove future-drop containment:
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
-  --test kuberic_public_v1_build_live_mysql_8_4_11
+  --test kuberic_public_v1_build_live_mysql_8_4
 ```
 
 The separate serial **real-host** gate uses the production service and the
@@ -496,10 +500,10 @@ existing public lifecycle, not direct-driver callbacks or a replacement service:
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
-  --test kuberic_public_v1_hosted_live_mysql_8_4_11
+  --test kuberic_public_v1_hosted_live_mysql_8_4
 ```
 
-It enforces the same exact Oracle MySQL 8.4.11 preflight. Native data and logs
+It enforces the same Oracle MySQL 8.4 LTS preflight. Native data and logs
 remain in the printed compact fixture roots for inspection, including on
 failure; dispose of them only after owned-child termination is established.
 
@@ -515,14 +519,14 @@ The bounded real-server gateway compatibility gate can be rerun independently:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-tests --test service_proxy_live_mysql_8_4_11
+  -p kuberic-mysql-tests --test service_proxy_live_mysql_8_4
 ```
 
 The fresh formation and controlled-handoff gate can be rerun independently:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-tests --test service_replicator_live_mysql_8_4_11 \
+  -p kuberic-mysql-tests --test service_replicator_live_mysql_8_4 \
   -E 'test(=controlled_handoff_closes_source_before_target_publication)'
 ```
 
@@ -530,15 +534,15 @@ The native observer gate can be rerun independently:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-tests --test adapter_live_mysql_8_4_11 \
-  -E 'test(=qualify_oracle_mysql_8_4_11)'
+  -p kuberic-mysql-tests --test adapter_live_mysql_8_4 \
+  -E 'test(=qualify_oracle_mysql_8_4)'
 ```
 
 The single-process lifecycle gate can be rerun independently:
 
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
-  -p kuberic-mysql-tests --test service_live_mysql_8_4_11 \
+  -p kuberic-mysql-tests --test service_live_mysql_8_4 \
   -E 'test(=one_fresh_owned_instance_lifecycle)'
 ```
 
@@ -547,7 +551,7 @@ The fresh three-member bootstrap/join gate can be rerun independently:
 ```bash
 CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
   -p kuberic-mysql-tests \
-  --test service_group_replication_live_mysql_8_4_11 \
+  --test service_group_replication_live_mysql_8_4 \
   -E 'test(=three_fresh_members_bootstrap_join_and_cleanup)'
 ```
 

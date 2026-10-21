@@ -223,14 +223,14 @@ async fn production_revalidation_rejects_a_replaced_socket_before_connect() {
 #[tokio::test(flavor = "current_thread")]
 async fn connection_loss_at_every_collection_stage_preserves_partial_cause() {
     let queries = [
-        QueryId::Mysql8411ProductIdentityV1,
-        QueryId::Mysql8411LocalStateV1,
-        QueryId::Mysql8411GroupMembersV1,
-        QueryId::Mysql8411LocalMemberStatsV1,
-        QueryId::Mysql8411ExecutedGtidsV1,
-        QueryId::Mysql8411LocalStateV1,
-        QueryId::Mysql8411GroupMembersV1,
-        QueryId::Mysql8411LocalMemberStatsV1,
+        QueryId::Mysql84ProductIdentityV1,
+        QueryId::Mysql84LocalStateV1,
+        QueryId::Mysql84GroupMembersV1,
+        QueryId::Mysql84LocalMemberStatsV1,
+        QueryId::Mysql84ExecutedGtidsV1,
+        QueryId::Mysql84LocalStateV1,
+        QueryId::Mysql84GroupMembersV1,
+        QueryId::Mysql84LocalMemberStatsV1,
     ];
     for (index, query) in queries.into_iter().enumerate() {
         let socket = TestSocket::new(&format!("loss-{index}"));
@@ -285,14 +285,17 @@ async fn authentication_identity_permissions_and_capability_map_with_required_pr
     );
 
     for (fixture, expected) in [
-        ("other-oracle-patch", ProductIssue::UnsupportedPatch),
+        (
+            "unsupported-oracle-version",
+            ProductIssue::UnsupportedVersion,
+        ),
         ("non-oracle-lookalike", ProductIssue::NonOracleCommunity),
     ] {
         let socket = TestSocket::new(fixture);
         let clock = ScriptClock::new(10);
         let tracking = Tracking::default();
         let mut steps = success_steps();
-        steps[0] = phase4_common::result_step(QueryId::Mysql8411ProductIdentityV1, fixture);
+        steps[0] = phase4_common::result_step(QueryId::Mysql84ProductIdentityV1, fixture);
         mutate_step(&mut steps, 0, |result| {
             result.rows[0][4] = bytes("dddddddd-dddd-dddd-dddd-dddddddddddd");
         });
@@ -347,10 +350,7 @@ async fn authentication_identity_permissions_and_capability_map_with_required_pr
     let socket = TestSocket::new("unsupported-capability");
     let clock = ScriptClock::new(10);
     let mut steps = success_steps();
-    steps[1] = failure_step(
-        QueryId::Mysql8411LocalStateV1,
-        SessionErrorSpec::Unsupported,
-    );
+    steps[1] = failure_step(QueryId::Mysql84LocalStateV1, SessionErrorSpec::Unsupported);
     let connector = ScriptedConnector::new(clock.clone(), steps, Tracking::default());
     let report = observe_with(&request(&socket, clock), &connector).await;
     assert!(matches!(
@@ -364,10 +364,8 @@ async fn malformed_duplicate_and_disconnect_failures_map_without_success_fallbac
     let socket = TestSocket::new("malformed");
     let clock = ScriptClock::new(10);
     let mut steps = success_steps();
-    steps[4] = phase4_common::result_step(
-        QueryId::Mysql8411ExecutedGtidsV1,
-        "unexpected-required-null",
-    );
+    steps[4] =
+        phase4_common::result_step(QueryId::Mysql84ExecutedGtidsV1, "unexpected-required-null");
     let connector = ScriptedConnector::new(clock.clone(), steps, Tracking::default());
     let report = observe_with(&request(&socket, clock), &connector).await;
     assert!(matches!(
@@ -381,7 +379,7 @@ async fn malformed_duplicate_and_disconnect_failures_map_without_success_fallbac
     let socket = TestSocket::new("duplicate");
     let clock = ScriptClock::new(10);
     let mut steps = success_steps();
-    steps[2] = phase4_common::result_step(QueryId::Mysql8411GroupMembersV1, "duplicate-member-id");
+    steps[2] = phase4_common::result_step(QueryId::Mysql84GroupMembersV1, "duplicate-member-id");
     let connector = ScriptedConnector::new(clock.clone(), steps, Tracking::default());
     let report = observe_with(&request(&socket, clock), &connector).await;
     assert!(matches!(
