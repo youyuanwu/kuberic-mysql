@@ -20,11 +20,12 @@ The [fresh hosted lifecycle gate](mysql-hosted-lifecycle.md) additionally
 qualifies ordinary authenticated generic initialization, New/Open, singleton
 formation, real Granted proxy DML and complete-GTID progress without a private
 MySQL store. Unauthorized/stale requests are rejected with nonmutation checks.
-Ordinary Close/Abort and subsequent GetStatus return
-`Unavailable: runtime is closed`; exact native containment and retained
+Ordinary Close/Abort return exact successful completion receipts; subsequent
+GetStatus remains available with explicit failed closed-driver progress and
+capability queries, not a synthetic zero. Exact native containment and retained
 identity/data/logs are independently proved before fallback. This bounded
-qualification does not supply successful terminal wire acknowledgment,
-replay/restart authority or production-controller acceptance.
+qualification supplies no replay/restart authority or multi-member
+production-controller acceptance.
 
 The delivered `kuberic_mysql::adapter` module already satisfies the
 application-state part of this proposal: it accepts one observation request,
@@ -42,7 +43,7 @@ fixture reset even if surviving MySQL state appears healthy.
 
 The delivered adapter translates public replica/process/storage/epoch/role/
 configuration/progress/access values from `kuberic-runtime` commit
-`dabe144670303b22b1fe13f5ced78ab57ad3f98c` into the one-member MySQL engine.
+`e2a47b6c631c974aa0135e81c3a7e3a439980ded` into the one-member MySQL engine.
 The fixed three-member manager and three-engine handoff fixture remain
 qualification infrastructure. Runtime correctness does not depend on a
 private MySQL lifecycle, observation, access, evidence, or receipt capability;
@@ -567,11 +568,12 @@ synchronous containment operations.
 
 ### Lost acknowledgement
 
-For the delivered ordinary hosted Close/Abort path, the exact pinned runtime
-constructs a live report after terminal callbacks; the closed driver rejects it.
-The observed unsuccessful RPC plus independent containment is not a public
-completion receipt. The broader replay/recovery contract below is not qualified
-by that observation and must not be inferred from retained native diagnostics.
+For the delivered ordinary hosted Close/Abort path, the pinned runtime now
+returns exact successful public completion receipts, while preserving the
+closed driver's query failures in a non-serving report. The former whole-RPC
+failure is superseded. Successful terminal acknowledgment plus independently
+proved containment does not qualify the broader replay/recovery contract below
+and must not be treated as authority to reconstruct a native owner.
 
 Every public operation has an operation ID and canonical immutable input. If
 the agent committed completion but its response was lost, replay returns the

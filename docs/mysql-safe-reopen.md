@@ -176,14 +176,15 @@ adapter process requires reset, not reconstruction from saved evidence.
 ## Public Kuberic boundary and pin
 
 Both crates and Cargo.lock now pin
-`dabe144670303b22b1fe13f5ced78ab57ad3f98c`. The historical 2026-10-18 assessment
+`e2a47b6c631c974aa0135e81c3a7e3a439980ded`. The historical 2026-10-18 assessment
 checked the former pin `be4f83b43567c59f48472025d55dd731efecc4c6` against immutable upstream
 `c0e52ee6ef361d86cf9e984e1f0682bc1f479013`, then checked the complete delta to
 `11d804425bbdbe7759dfd18208a0d73ce667a9f4`, including controller admission,
 authenticated agent dispatch, lifecycle/factory attachment, logical renewal,
 physical resource retirement and selected built-in recovery. No public combined
-accepted-envelope/retained-native-owner handoff was found. The unselected SF V1
-substrate does not solve this gap. The
+accepted-envelope/retained-native-owner handoff was found. The current pin
+selects the classic V1 runtime, but that selection does not qualify a custom
+MySQL retained-owner handoff. The
 [recovery authority contract](mysql-recovery-authority.md) records exact public
 evidence, required authority/custody sequencing, failure rules and future gates;
 it is a contract-only deliverable, not runtime integration. The later dependency

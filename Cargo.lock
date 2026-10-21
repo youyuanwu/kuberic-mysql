@@ -1513,7 +1513,7 @@ dependencies = [
 [[package]]
 name = "kuberic-controller"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic?rev=dabe144670303b22b1fe13f5ced78ab57ad3f98c#dabe144670303b22b1fe13f5ced78ab57ad3f98c"
+source = "git+https://github.com/youyuanwu/kuberic?rev=e2a47b6c631c974aa0135e81c3a7e3a439980ded#e2a47b6c631c974aa0135e81c3a7e3a439980ded"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1569,7 +1569,7 @@ dependencies = [
 [[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
-source = "git+https://github.com/youyuanwu/kuberic?rev=dabe144670303b22b1fe13f5ced78ab57ad3f98c#dabe144670303b22b1fe13f5ced78ab57ad3f98c"
+source = "git+https://github.com/youyuanwu/kuberic?rev=e2a47b6c631c974aa0135e81c3a7e3a439980ded#e2a47b6c631c974aa0135e81c3a7e3a439980ded"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1584,6 +1584,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2656,7 +2657,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2759,6 +2760,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "slab",

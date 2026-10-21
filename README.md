@@ -25,7 +25,7 @@ per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
 infrastructure, not production topology owners. The normal crate surface
 includes the public adapter against `kuberic-runtime` pinned exactly to commit
-`dabe144670303b22b1fe13f5ced78ab57ad3f98c`; no private managed lifecycle,
+`e2a47b6c631c974aa0135e81c3a7e3a439980ded`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
 ## Status
@@ -159,22 +159,23 @@ The [hosted lifecycle gate](docs/mysql-hosted-lifecycle.md) runs the actual
 production service in a real public `ReplicaHost`/`RunningReplica` at the same
 pin, initially for **one fresh member**. It covers New/Open and actual custom
 factory registration, the existing bundled `InitialPrimary` role/configuration
-route, registered provider-backed progress, native application proxy admission
+route, native-proved current progress, native application proxy admission
 and DML, Close, Abort, and cancellation after actual mysqld server spawn.
 Existing `hosted_*` cases use the runtime's testing facade. Separate ordinary
 authenticated cases now cover generic initialization through New/Open, singleton
 formation, Granted proxy DML, independently cross-checked complete-GTID progress,
 and unauthorized/stale rejection without native mutation. Ordinary Close/Abort
-and subsequent GetStatus explicitly return `Unavailable: runtime is closed`;
-independent containment is proved before fallback cleanup. This is **not
-successful terminal wire acknowledgment** or controller/recovery acceptance.
+return exact successful completion receipts; subsequent GetStatus preserves
+typed failed closed-driver queries rather than inventing live progress.
+Independent containment is proved before fallback cleanup. This is not
+controller Build or recovery acceptance.
 Only genuine host admission opens native application access.
 
 Production service terminal containment retains data and moves its exact owned
 runtime directory to the original path plus `.retained`, preserving native
 logs/binlogs without leaving the active runtime name. It never overwrites an
-existing destination or grants reopen authority. Later live host reports reject
-the closed driver rather than return synthetic progress. Service Close retains
+existing destination or grants reopen authority. Later host reports preserve
+failed closed-driver queries rather than return synthetic progress. Service Close retains
 its exact driver through failure, cancellation and concurrent calls; physical
 cleanup after reaping remains bound to previously attested generation/roots,
 not new live authority. These hosted tests do
@@ -188,15 +189,15 @@ is fixed: all three fresh native members start through controller-driven New
 Open, with exact current-process receipts and initialized storage-mode evidence.
 The probe verifies native process absence and host/factory cleanup afterward,
 retaining local diagnostics on failure. Its separate
-[fresh-formation boundary case](docs/mysql-hosted-lifecycle.md#executed-fresh-primary-role-boundary)
-continues through the controller's standalone Primary-role dispatch. Before a
-configuration exists, initial Role and Epoch now complete with coherent zero
-progress and closed access. The pinned host deliberately reports `None/Recovery`
-until readiness, despite those successful callback receipts. The first later
-executed rejection is the exact **singleton-only fresh bootstrap** guard on the
-controller's three-member Configuration. The gate verifies exact authority,
-the full controller error chain and independent native containment; timeout
-cannot pass. This is **not successful cluster formation or controller Build**.
+[fresh-formation boundary case](docs/mysql-hosted-lifecycle.md#executed-singleton-formation-and-inbound-build-boundary)
+now accepts Primary Role, Epoch and a genuine singleton Configuration, persists
+that topology and prepares an exact IdleSecondary target. Role intent is
+reported independently of serving access. The first later executed rejection
+is **target inbound-Build authority installation**, which still requires private
+Kuberic `NativeRuntimeControl` absent from the custom factory. The gate checks
+exact accepted authority, the full controller error chain, independent native
+singleton membership and application-ingress denial; timeout cannot pass.
+This is **not successful multi-member formation or source Build**.
 Normal composite public storage fences are preserved losslessly with a separate
 2048-byte bound; individual identity domains retain their 255-byte limit.
 

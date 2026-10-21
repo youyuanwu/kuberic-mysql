@@ -28,13 +28,14 @@ use kuberic_runtime::application::OpenMode;
 use kuberic_runtime::host::ApplicationStorageState;
 use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationClass, PublicOperationProgram, PublicProgressRole,
-    PublicV1AcceptedOperationCompletion, PublicV1AgentReport, PublicV1CallKind,
+    INVALID_LSN, ProgressQueryResult, PublicOperationClass, PublicOperationProgram,
+    PublicProgressRole, PublicV1AcceptedOperationCompletion, PublicV1AgentReport, PublicV1CallKind,
     PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, ReplicaRole};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder};
+use tokio::io::AsyncReadExt;
 
 use live_support::{
     APPARMOR_EXEC, MYSQL_X_PORT, MYSQLD, ReservedPorts, assert_no_application_store,
@@ -43,8 +44,7 @@ use live_support::{
 
 const GROUP_UUID: &str = "03e84887-4d65-42d0-b941-0f691cb0aa16";
 const CHILD_MODE: &str = "KUBERIC_MYSQL_INPROCESS_PROBE_CHILD";
-const CONFIGURATION_ERROR: &str =
-    "invalid replication evidence: fresh MySQL bootstrap requires exactly the local Primary member";
+const BUILD_AUTHORITY_ERROR: &str = "command rejected: runtime is not open";
 
 #[test]
 fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> {
@@ -55,10 +55,9 @@ fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> 
 }
 
 #[test]
-fn controller_fresh_primary_reports_before_exact_multimember_configuration_boundary() -> Result<()>
-{
+fn controller_singleton_forms_before_exact_inbound_build_authority_boundary() -> Result<()> {
     run_native_probe(
-        "controller_fresh_primary_reports_before_exact_multimember_configuration_boundary",
+        "controller_singleton_forms_before_exact_inbound_build_authority_boundary",
         true,
     )
 }
@@ -68,18 +67,19 @@ fn formation_boundary_rejects_unrelated_errors() {
     for message in [
         "Execute timed out",
         "runtime is closed",
+        "runtime is not open",
         "invalid replication evidence: Primary committed progress requires an applicable configuration proof",
-        "fresh MySQL bootstrap requires exactly the local Primary member",
-        "invalid replication evidence: fresh MySQL bootstrap requires a different member",
+        "invalid replication evidence: fresh MySQL bootstrap requires exactly the local Primary member",
+        BUILD_AUTHORITY_ERROR,
     ] {
-        assert!(assert_configuration_rejection(message).is_err());
+        assert!(assert_build_authority_rejection(message).is_err());
     }
     for result in [
         PublicV1OperationResult::Succeeded,
-        PublicV1OperationResult::Ambiguous(CONFIGURATION_ERROR.into()),
+        PublicV1OperationResult::Ambiguous(BUILD_AUTHORITY_ERROR.into()),
         PublicV1OperationResult::Cancelled,
     ] {
-        assert!(assert_configuration_rejection(&format!("{result:?}")).is_err());
+        assert!(assert_build_authority_rejection(&format!("{result:?}")).is_err());
     }
 }
 
@@ -125,7 +125,7 @@ fn run_native_probe(native_test: &str, formation: bool) -> Result<()> {
     }
     if formation {
         eprintln!(
-            "bounded configuration diagnostics retained: {}",
+            "bounded inbound-Build diagnostics retained: {}",
             root.keep().display()
         );
     }
@@ -328,9 +328,21 @@ impl MysqlFactory {
             .collect()
     }
 
-    async fn assert_native_unformed(&self) -> Result<()> {
+    async fn assert_native_singleton(&self) -> Result<()> {
         for member in self.members()? {
-            assert_tcp_refuses(member.proxy).map_err(anyhow::Error::msg)?;
+            if member.proxy == self.proxies[0] {
+                let mut client = tokio::net::TcpStream::connect(member.proxy).await?;
+                let mut greeting = [0];
+                let received =
+                    tokio::time::timeout(Duration::from_secs(5), client.read(&mut greeting))
+                        .await??;
+                ensure!(
+                    received == 0,
+                    "singleton proxy issued a MySQL greeting without write authority"
+                );
+            } else {
+                assert_tcp_refuses(member.proxy).map_err(anyhow::Error::msg)?;
+            }
             let mut connection = Conn::new(
                 OptsBuilder::default()
                     .ip_or_hostname("127.0.0.1")
@@ -345,19 +357,27 @@ impl MysqlFactory {
                     .user(Some("root")),
             )
             .await?;
-            let evidence: (u8, String, u64) = connection
+            let evidence: (u8, String, u64, u64) = connection
                 .query_first(
                     "SELECT @@GLOBAL.group_replication_bootstrap_group, \
                      @@GLOBAL.gtid_executed, \
                      (SELECT COUNT(*) FROM performance_schema.replication_group_members \
-                      WHERE MEMBER_STATE <> 'OFFLINE')",
+                      WHERE MEMBER_STATE <> 'OFFLINE'), \
+                     (SELECT COUNT(*) FROM performance_schema.replication_group_members \
+                      WHERE MEMBER_STATE = 'ONLINE' AND MEMBER_ROLE = 'PRIMARY' \
+                        AND MEMBER_ID = @@GLOBAL.server_uuid)",
                 )
                 .await?
                 .context("missing native formation evidence")?;
             connection.disconnect().await?;
             ensure!(
-                evidence == (0, String::new(), 0),
-                "role-boundary member bootstrapped, joined a group, or had native transactions: {evidence:?}"
+                evidence
+                    == if member.proxy == self.proxies[0] {
+                        (0, String::new(), 1, 1)
+                    } else {
+                        (0, String::new(), 0, 0)
+                    },
+                "native membership differs from the exact singleton/untouched targets: {evidence:?}"
             );
         }
         Ok(())
@@ -442,7 +462,7 @@ async fn controller_probe(formation: bool) -> Result<()> {
     let finished = cluster
         .finish(if capture_boundary {
             Err(anyhow::anyhow!(
-                "capture exact bounded configuration rejection"
+                "capture exact bounded inbound-Build rejection"
             ))
         } else {
             result
@@ -464,7 +484,7 @@ async fn controller_probe(formation: bool) -> Result<()> {
             diagnostics["pendingTaskOwners"] == 0,
             "native task owners did not drain"
         );
-        assert_configuration_rejection(
+        assert_build_authority_rejection(
             diagnostics["lastReconcileError"]
                 .as_str()
                 .context("missing exact controller rejection")?,
@@ -563,11 +583,10 @@ async fn drive_until_formation_boundary(
                         && opened.storage_incarnation == report.storage_incarnation
                         && opened.replicator_creation_id == report.replicator_creation_id
                         && opened.history == report.history
-                }) && report.progress.first == 0
-                    && report.progress.last == 0
-                    && report.read_status != AccessStatus::Granted
+                }) && report.progress.current() == Some(0)
+                    && report.progress.capability() == Some(INVALID_LSN)
                     && report.write_status != AccessStatus::Granted,
-                "fresh report changed owner/history/progress or gained admission"
+                "fresh report changed owner/history/progress or gained write admission"
             );
             if let Some(command) = role_command.as_ref()
                 && report.replica == command.target
@@ -579,23 +598,33 @@ async fn drive_until_formation_boundary(
                         && completion.result == PublicV1OperationResult::Succeeded
                 })
             {
-                // The pinned custom host projects serving readiness into its
-                // public role: before epoch+configuration it deliberately
-                // reports None/Recovery despite a successful Role receipt.
                 ensure!(
-                    report.role == ReplicaRole::None
-                        && report.progress.role == PublicProgressRole::Recovery,
-                    "initial Role receipt unexpectedly granted configured reporting"
+                    report.role == ReplicaRole::Primary
+                        && report.progress.role == PublicProgressRole::Primary,
+                    "successful Primary Role is not truthfully reported"
                 );
+                if !report.completed_operations.iter().any(|completion| {
+                    completion.call_kind == PublicV1CallKind::Configuration
+                        && completion.result == PublicV1OperationResult::Succeeded
+                }) {
+                    ensure!(
+                        report.read_status != AccessStatus::Granted,
+                        "standalone Role granted read admission before Configuration"
+                    );
+                }
                 role_reported = true;
             } else {
                 ensure!(
-                    report.role == ReplicaRole::None
+                    matches!(report.role, ReplicaRole::None | ReplicaRole::IdleSecondary)
+                        && report.read_status != AccessStatus::Granted
                         && report
                             .completed_operations
                             .iter()
-                            .all(|completion| { completion.call_kind == PublicV1CallKind::Open }),
-                    "an unrelated member received role or lifecycle credit"
+                            .all(|completion| matches!(
+                                completion.call_kind,
+                                PublicV1CallKind::Open | PublicV1CallKind::Role
+                            )),
+                    "an unbuilt member received configuration or serving credit"
                 );
             }
         }
@@ -618,7 +647,7 @@ async fn drive_until_formation_boundary(
         let role = role_command
             .as_ref()
             .context("missing frozen initial Role")?;
-        assert_pending_configuration_boundary(
+        assert_pending_build_boundary(
             status,
             &fresh,
             &observation
@@ -627,7 +656,7 @@ async fn drive_until_formation_boundary(
                 .collect::<Vec<_>>(),
             role,
         )?;
-        assert_rejects_changed_configuration_evidence(
+        assert_rejects_changed_build_evidence(
             status,
             &fresh,
             &observation
@@ -636,11 +665,13 @@ async fn drive_until_formation_boundary(
                 .collect::<Vec<_>>(),
             role,
         )?;
-        cluster.probe(factory.assert_native_unformed()).await?;
+        cluster.probe(factory.assert_native_singleton()).await?;
         eprintln!(
-            "controller accepted three New Opens, standalone Primary Role and Epoch; \
-             coherent fresh reports remain zero and closed; exact multi-member \
-             configuration rejected before native formation ({} reconciliation errors observed)",
+            "controller accepted three New Opens, Primary Role, Epoch and singleton \
+             Configuration, then prepared an idle target; exact inbound-Build \
+             authority installation rejected before source Build; the singleton \
+             proxy rejects pre-authentication ingress and unbuilt proxies refuse \
+             connects ({} reconciliation errors observed)",
             observation
                 .reconcile_errors()
                 .saturating_sub(initial_errors),
@@ -770,33 +801,45 @@ fn assert_rejects_changed_role_evidence(
     Ok(())
 }
 
-fn assert_configuration_rejection(error: &str) -> Result<()> {
-    let callback = format!("runtime error: {CONFIGURATION_ERROR}");
-    let rejected = format!(
-        "command rejected: Public V1 operation did not complete successfully: Some(Failed({callback:?}))"
-    );
+fn assert_build_authority_rejection(error: &str) -> Result<()> {
     let expected = format!(
         "agent returned invalid evidence: agent is unavailable: code: \
-         'The system is not in a state required for the operation's execution', message: {rejected:?}"
+         'The system is not in a state required for the operation's execution', message: {BUILD_AUTHORITY_ERROR:?}"
     );
     ensure!(
         error == expected,
-        "not the exact fresh multi-member configuration rejection: {error}"
+        "not the exact inbound-Build authority rejection: {error}"
     );
     Ok(())
 }
 
-fn assert_pending_configuration_boundary(
+fn assert_pending_build_boundary(
     status: &KubericSetStatus,
     fresh: &[PublicV1AgentReport],
     reports: &[PublicV1AgentReport],
     role: &PublicV1OperationCommand,
 ) -> Result<()> {
     ensure!(
-        status.public_v1_topology.is_none()
+        fresh.len() == 3
+            && reports.len() == 3
             && status.public_v1_session_renewal.is_none()
             && status.public_v1_replacement.is_none(),
-        "unexpected topology/recovery authority at configuration boundary"
+        "unexpected recovery authority at Build boundary"
+    );
+    let singleton = status
+        .public_v1_topology
+        .as_ref()
+        .context("missing accepted singleton topology")?
+        .configuration()
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        singleton.epoch == Epoch::new(0, 1)
+            && singleton.primary_id == role.target.replica_id
+            && singleton.members.len() == 1
+            && singleton.members[0].identity == role.target
+            && singleton.members[0].role == ReplicaRole::Primary
+            && singleton.write_quorum == 1,
+        "accepted topology is not the exact local Primary singleton"
     );
     let authority = status
         .public_v1_authority
@@ -813,47 +856,42 @@ fn assert_pending_configuration_boundary(
     let command = status
         .public_v1_operation
         .as_ref()
-        .context("missing configuration operation")?
+        .context("missing Build operation")?
         .command()
         .map_err(anyhow::Error::msg)?;
-    let Some(PublicOperationProgram::Configuration(configuration)) =
-        command.intent.program.as_ref()
-    else {
-        bail!("later rejected operation is not Configuration");
+    let Some(PublicOperationProgram::Build(build)) = command.intent.program.as_ref() else {
+        bail!("later rejected operation is not Build");
     };
+    let target = reports
+        .iter()
+        .find(|report| report.replica == build.replica)
+        .context("Build target has no current report")?;
     ensure!(
         command.target == role.target
             && command.intent.identity == role.intent.identity
             && command.intent.process_session_id == role.intent.process_session_id
             && command.intent.lifecycle.is_none()
-            && command.intent.class == PublicOperationClass::Authority
+            && command.intent.class
+                == PublicOperationClass::Build {
+                    target: target.replica.replica_id,
+                }
             && command.intent.input_digest == command.intent.program.as_ref().unwrap().digest()
-            && configuration.previous.is_none()
-            && configuration.current.epoch == Epoch::new(0, 1)
-            && configuration.current.primary_id == role.target.replica_id
-            && configuration.current.members.len() == 3
-            && configuration.replicas.len() == 2
-            && configuration.replicas.iter().all(|replica| {
-                fresh.iter().any(|opened| {
-                    opened.replica == replica.identity
-                        && opened.process_session_id == replica.process_session_id
-                        && Some(&opened.storage_incarnation) == replica.storage_incarnation.as_ref()
-                        && opened.replication_address.as_deref()
-                            == Some(replica.replication_address.as_str())
-                        && replica.current_progress == opened.progress.last
-                        && replica.catch_up_capability == opened.progress.first
-                })
-            })
-            && configuration.current.members.iter().all(|member| {
-                fresh.iter().any(|report| report.replica == member.identity)
-                    && member.role
-                        == if member.identity == role.target {
-                            ReplicaRole::Primary
-                        } else {
-                            ReplicaRole::ActiveSecondary
-                        }
-            }),
-        "configuration target/program/descriptor differs from exact fresh authority"
+            && build.attempt == command.intent.operation_id
+            && build.epoch == singleton.epoch
+            && build.current_configuration_id.as_ref() == Some(&singleton.configuration_id)
+            && build.replica.replica_id.value() == 2
+            && build.replica == target.replica
+            && build.process_session_id == target.process_session_id
+            && build.target_storage == target.storage_incarnation
+            && Some(build.replication_address.as_str()) == target.replication_address.as_deref()
+            && build.history.as_ref() == Some(&target.history)
+            && target.role == ReplicaRole::IdleSecondary
+            && target.progress.role == PublicProgressRole::Secondary
+            && target.progress.current() == Some(0)
+            && target.progress.capability() == Some(INVALID_LSN)
+            && target.read_status != AccessStatus::Granted
+            && target.write_status != AccessStatus::Granted,
+        "Build target/program/descriptor differs from exact fresh authority"
     );
     let primary = reports
         .iter()
@@ -862,31 +900,62 @@ fn assert_pending_configuration_boundary(
     let opened = fresh
         .iter()
         .find(|report| report.replica == command.target)
-        .context("configuration target not freshly opened")?;
+        .context("Build source not freshly opened")?;
     ensure!(
         primary.identity == opened.identity
             && primary.process_session_id == opened.process_session_id
             && primary.storage_incarnation == opened.storage_incarnation
             && primary.history == opened.history
             && primary.replicator_creation_id == opened.replicator_creation_id
-            && primary.role == ReplicaRole::None
-            && primary.progress.role == PublicProgressRole::Recovery
-            && primary.progress.first == 0
-            && primary.progress.last == 0
-            && primary.read_status != AccessStatus::Granted
-            && primary.write_status != AccessStatus::Granted
+            && primary.role == ReplicaRole::Primary
+            && primary.progress.role == PublicProgressRole::Primary
+            && primary.progress.current() == Some(0)
+            && primary.progress.capability() == Some(INVALID_LSN)
+            && primary.read_status == AccessStatus::Granted
+            && primary.write_status == AccessStatus::NoWriteQuorum
+            && build.source_address == primary.replication_address.as_deref().unwrap()
             && transition.evidence == authority
             && transition.intent.operation_id == command.intent.operation_id
             && transition.intent.revision == command.intent.revision
-            && transition.intent.call_kind == PublicV1CallKind::Configuration
+            && transition.intent.call_kind == PublicV1CallKind::Build
             && transition.intent.source.storage_incarnation == primary.storage_incarnation
+            && transition.intent.target.as_ref().is_some_and(|authority| {
+                authority.storage_incarnation == target.storage_incarnation
+            })
             && transition.intent.process_session_id == primary.process_session_id
             && transition.intent.history == primary.history
             && transition.intent.input_digest == command.intent.input_digest
-            && authority.completed_operations.len() == 5,
-        "configuration differs from frozen accepted Open/Role/Epoch authority"
+            && transition.intent.current_configuration_id.as_ref()
+                == Some(&singleton.configuration_id)
+            && authority.completed_operations.len() == 7,
+        "Build differs from frozen accepted Open/Role/Epoch/Configuration authority"
     );
     for opened in fresh {
+        let current = reports
+            .iter()
+            .find(|report| report.replica == opened.replica)
+            .context("a fresh-open member disappeared")?;
+        assert_fresh_open_report(current)?;
+        ensure!(
+            current.identity == opened.identity
+                && current.process_session_id == opened.process_session_id
+                && current.storage_incarnation == opened.storage_incarnation
+                && current.history == opened.history
+                && current.replicator_creation_id == opened.replicator_creation_id,
+            "a Build participant changed its fresh owner/history"
+        );
+        if current.replica != primary.replica && current.replica != target.replica {
+            ensure!(
+                current.role == ReplicaRole::None
+                    && current.progress.role == PublicProgressRole::Recovery
+                    && current.progress.current() == Some(0)
+                    && current.progress.capability() == Some(INVALID_LSN)
+                    && current.read_status != AccessStatus::Granted
+                    && current.write_status != AccessStatus::Granted
+                    && current.completed_operations.len() == 1,
+                "untouched third member received lifecycle or serving credit"
+            );
+        }
         ensure!(
             opened.completed_operations.iter().any(|completion| {
                 completion.call_kind == PublicV1CallKind::Open
@@ -907,6 +976,17 @@ fn assert_pending_configuration_boundary(
             }
             .digest(),
         ),
+        (
+            PublicV1CallKind::Configuration,
+            PublicOperationProgram::Configuration(
+                kuberic_runtime::protocol::public_operations::PublicConfiguration {
+                    current: singleton,
+                    previous: None,
+                    replicas: Vec::new(),
+                },
+            )
+            .digest(),
+        ),
     ] {
         ensure!(
             primary.completed_operations.iter().any(|completion| {
@@ -924,40 +1004,59 @@ fn assert_pending_configuration_boundary(
         );
     }
     ensure!(
-        primary.completed_operations.len() == 3
+        primary.completed_operations.len() == 4
             && primary
                 .completed_operations
                 .iter()
                 .all(|completion| matches!(
                     completion.call_kind,
-                    PublicV1CallKind::Open | PublicV1CallKind::Role | PublicV1CallKind::Epoch
+                    PublicV1CallKind::Open
+                        | PublicV1CallKind::Role
+                        | PublicV1CallKind::Epoch
+                        | PublicV1CallKind::Configuration
                 )),
-        "configuration unexpectedly received report completion credit"
+        "Build unexpectedly received source completion credit"
+    );
+    let idle = PublicOperationProgram::Role {
+        epoch: Epoch::new(0, 1),
+        role: ReplicaRole::IdleSecondary,
+    };
+    ensure!(
+        target.completed_operations.len() == 2
+            && target.completed_operations.iter().any(|completion| {
+                completion.call_kind == PublicV1CallKind::Role
+                    && completion.input_digest == idle.digest()
+                    && completion.process_session_id == target.process_session_id
+                    && completion.storage_incarnation == target.storage_incarnation
+                    && completion.history == target.history
+                    && completion.result == PublicV1OperationResult::Succeeded
+                    && authority.completed_operations.contains(
+                        &PublicV1AcceptedOperationCompletion::from_completion(completion),
+                    )
+            }),
+        "controller did not accept the exact idle-target preparation"
     );
     Ok(())
 }
 
-fn assert_rejects_changed_configuration_evidence(
+fn assert_rejects_changed_build_evidence(
     status: &KubericSetStatus,
     fresh: &[PublicV1AgentReport],
     reports: &[PublicV1AgentReport],
     role: &PublicV1OperationCommand,
 ) -> Result<()> {
     let check = |status: &KubericSetStatus, reports: &[PublicV1AgentReport]| {
-        assert_pending_configuration_boundary(status, fresh, reports, role)
+        assert_pending_build_boundary(status, fresh, reports, role)
     };
     let mut changed = status.clone();
     changed.public_v1_operation = None;
-    ensure!(
-        check(&changed, reports).is_err(),
-        "missing Configuration passed"
-    );
+    ensure!(check(&changed, reports).is_err(), "missing Build passed");
     let mut changed = status.clone();
     changed.public_v1_operation =
         Some(PublicV1OperationStatus::from_command(role).map_err(anyhow::Error::msg)?);
     ensure!(
         check(&changed, reports).is_err(),
-        "Role substituted for Configuration passed"
+        "Role substituted for Build passed"
     );
     let mut changed = status.clone();
     changed
@@ -973,24 +1072,57 @@ fn assert_rejects_changed_configuration_evidence(
         .iter()
         .position(|report| report.replica == role.target)
         .unwrap();
-    for dimension in 0..8 {
+    for mutation in [
+        "source session",
+        "source storage",
+        "source history",
+        "missing epoch receipt",
+        "missing all receipts",
+        "source progress",
+        "source role",
+        "source write grant",
+    ] {
         let mut changed = reports.to_vec();
-        match dimension {
-            0 => changed[primary].process_session_id = fresh[1].process_session_id.clone(),
-            1 => changed[primary].storage_incarnation = fresh[1].storage_incarnation.clone(),
-            2 => changed[primary].history.data_loss_number += 1,
-            3 => changed[primary]
+        match mutation {
+            "source session" => {
+                changed[primary].process_session_id = fresh[1].process_session_id.clone()
+            }
+            "source storage" => {
+                changed[primary].storage_incarnation = fresh[1].storage_incarnation.clone()
+            }
+            "source history" => changed[primary].history.data_loss_number += 1,
+            "missing epoch receipt" => changed[primary]
                 .completed_operations
                 .retain(|c| c.call_kind != PublicV1CallKind::Epoch),
-            4 => changed[primary].completed_operations.clear(),
-            5 => changed[primary].progress.first = 1,
-            6 => changed[primary].role = ReplicaRole::ActiveSecondary,
-            7 => changed[primary].write_status = AccessStatus::Granted,
+            "missing all receipts" => changed[primary].completed_operations.clear(),
+            "source progress" => {
+                changed[primary].progress.current_progress = ProgressQueryResult::Value(1)
+            }
+            "source role" => changed[primary].role = ReplicaRole::ActiveSecondary,
+            "source write grant" => changed[primary].write_status = AccessStatus::Granted,
             _ => unreachable!(),
         }
         ensure!(
             check(status, &changed).is_err(),
-            "changed configuration evidence dimension {dimension} passed"
+            "changed Build evidence {mutation} passed"
+        );
+    }
+    for outcome in [
+        ProgressQueryResult::NotReady,
+        ProgressQueryResult::NotQueried("incomplete native observation".into()),
+        ProgressQueryResult::Failed("native observation failed".into()),
+    ] {
+        let mut changed = reports.to_vec();
+        changed[primary].progress.current_progress = outcome.clone();
+        ensure!(
+            check(status, &changed).is_err(),
+            "unavailable source progress passed as fresh zero"
+        );
+        let mut changed = reports.to_vec();
+        changed[primary].progress.catch_up_capability = outcome;
+        ensure!(
+            check(status, &changed).is_err(),
+            "unavailable capability passed as explicit INVALID_LSN"
         );
     }
     Ok(())

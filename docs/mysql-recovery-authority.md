@@ -10,7 +10,7 @@ enumeration and reliable sending”, #169), and subsequently observed current ma
 `11d804425bbdbe7759dfd18208a0d73ce667a9f4` (U, “Port unselected SF V1 copy
 build gates and retargeting”, #170). That assessment did not justify a repin.
 The current dependency is now
-`dabe144670303b22b1fe13f5ced78ab57ad3f98c`; P/H/U remain historical evidence,
+`e2a47b6c631c974aa0135e81c3a7e3a439980ded`; P/H/U remain historical evidence,
 not aliases for the current pin. The later
 [in-process harness assessment](mysql-hosted-lifecycle.md#upstream-in-process-harness-applicability)
 does not qualify this recovery contract.
