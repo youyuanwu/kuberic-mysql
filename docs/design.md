@@ -15,7 +15,7 @@ MySQL-owned Stage 2 integration foundation, and a bounded Kuberic Public V1
 adapter. The publish-disabled `kuberic-mysql` crate exposes these as the
 `core`, `adapter`, and `service` modules, including the public
 service/factory/replicator bundle against `kuberic-runtime` pinned exactly to
-`e2a47b6c631c974aa0135e81c3a7e3a439980ded`. The native adapter observes exactly
+`996dc487b85450ca25f68a3b9b9c22869e58f12b`. The native adapter observes exactly
 one caller-selected Oracle MySQL Community Server 8.4.x through a private
 Unix-domain socket. The service owns one fresh, restart-stateless process
 generation, composes exactly three fresh generations for the older topology
@@ -44,8 +44,11 @@ Group Replication distributed recovery, freezes the exact source GTID boundary
 reported for the invocation, keeps the target externally closed, and requires
 exact successor membership plus `ONLINE`/`SECONDARY` and structured GTID
 containment. Build does not admit voting membership; later configuration
-callbacks do. The production controller cannot yet dispatch this custom path
-because its target inbound-authority control is crate-private.
+callbacks do. The production controller cannot yet dispatch this MySQL path:
+the upstream public `CustomReplicatorControl` seam is available, but MySQL's
+factory does not yet implement or attach its exact native authority and
+drainage effects. This is downstream integration work, not the former upstream
+private-control blocker.
 
 Build interruption has two distinct owners. Before source account DDL, cleanup
 owns the exact request account identity; after native target work is armed,

@@ -1,4 +1,5 @@
-//! Native custom-replicator capability probe, not settled-cluster qualification.
+//! Native custom-replicator probe without the optional controller companion.
+//! Missing MySQL companion support is not an upstream private-API limitation.
 
 #[path = "service_live_support/mod.rs"]
 mod live_support;
@@ -44,7 +45,8 @@ use live_support::{
 
 const GROUP_UUID: &str = "03e84887-4d65-42d0-b941-0f691cb0aa16";
 const CHILD_MODE: &str = "KUBERIC_MYSQL_INPROCESS_PROBE_CHILD";
-const BUILD_AUTHORITY_ERROR: &str = "command rejected: runtime is not open";
+const BUILD_AUTHORITY_ERROR: &str =
+    "command rejected: application error: replicator does not support controller Build authority";
 
 #[test]
 fn controller_fresh_new_open_starts_and_contains_native_members() -> Result<()> {
@@ -70,6 +72,9 @@ fn formation_boundary_rejects_unrelated_errors() {
         "runtime is not open",
         "invalid replication evidence: Primary committed progress requires an applicable configuration proof",
         "invalid replication evidence: fresh MySQL bootstrap requires exactly the local Primary member",
+        "agent returned invalid evidence: agent is unavailable: code: \
+         'The system is not in a state required for the operation's execution', message: \
+         \"command rejected: runtime is not open\"",
         BUILD_AUTHORITY_ERROR,
     ] {
         assert!(assert_build_authority_rejection(message).is_err());
@@ -668,8 +673,8 @@ async fn drive_until_formation_boundary(
         cluster.probe(factory.assert_native_singleton()).await?;
         eprintln!(
             "controller accepted three New Opens, Primary Role, Epoch and singleton \
-             Configuration, then prepared an idle target; exact inbound-Build \
-             authority installation rejected before source Build; the singleton \
+             Configuration, then prepared an idle target; missing MySQL custom-control \
+             attachment rejected inbound authority before source Build; the singleton \
              proxy rejects pre-authentication ingress and unbuilt proxies refuse \
              connects ({} reconciliation errors observed)",
             observation
@@ -901,6 +906,18 @@ fn assert_pending_build_boundary(
         .iter()
         .find(|report| report.replica == command.target)
         .context("Build source not freshly opened")?;
+    let installed = primary
+        .configuration
+        .as_ref()
+        .context("host configuration was suppressed by unavailable engine diagnostics")?;
+    ensure!(
+        installed.voting.current == singleton
+            && installed.voting.previous.is_none()
+            && installed.voting.replicas.is_empty()
+            && reports.iter().all(|report| report.engine_idle.is_none())
+            && primary.remote_builds.is_empty(),
+        "installed singleton, unavailable idle diagnostics or undispatched Build were conflated"
+    );
     ensure!(
         primary.identity == opened.identity
             && primary.process_session_id == opened.process_session_id
@@ -1072,6 +1089,10 @@ fn assert_rejects_changed_build_evidence(
         .iter()
         .position(|report| report.replica == role.target)
         .unwrap();
+    let other = fresh
+        .iter()
+        .find(|report| report.replica != role.target)
+        .context("missing alternate fresh owner for changed Build evidence")?;
     for mutation in [
         "source session",
         "source storage",
@@ -1081,14 +1102,15 @@ fn assert_rejects_changed_build_evidence(
         "source progress",
         "source role",
         "source write grant",
+        "missing installed configuration",
     ] {
         let mut changed = reports.to_vec();
         match mutation {
             "source session" => {
-                changed[primary].process_session_id = fresh[1].process_session_id.clone()
+                changed[primary].process_session_id = other.process_session_id.clone()
             }
             "source storage" => {
-                changed[primary].storage_incarnation = fresh[1].storage_incarnation.clone()
+                changed[primary].storage_incarnation = other.storage_incarnation.clone()
             }
             "source history" => changed[primary].history.data_loss_number += 1,
             "missing epoch receipt" => changed[primary]
@@ -1100,6 +1122,7 @@ fn assert_rejects_changed_build_evidence(
             }
             "source role" => changed[primary].role = ReplicaRole::ActiveSecondary,
             "source write grant" => changed[primary].write_status = AccessStatus::Granted,
+            "missing installed configuration" => changed[primary].configuration = None,
             _ => unreachable!(),
         }
         ensure!(

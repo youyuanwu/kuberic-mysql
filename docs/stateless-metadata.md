@@ -43,7 +43,7 @@ fixture reset even if surviving MySQL state appears healthy.
 
 The delivered adapter translates public replica/process/storage/epoch/role/
 configuration/progress/access values from `kuberic-runtime` commit
-`e2a47b6c631c974aa0135e81c3a7e3a439980ded` into the one-member MySQL engine.
+`996dc487b85450ca25f68a3b9b9c22869e58f12b` into the one-member MySQL engine.
 The fixed three-member manager and three-engine handoff fixture remain
 qualification infrastructure. Runtime correctness does not depend on a
 private MySQL lifecycle, observation, access, evidence, or receipt capability;

@@ -3,7 +3,7 @@
 This is a bounded host-local qualification slice, not a production deployment
 or restart-recovery claim. It runs the **actual** `MysqlPublicV1Service` in
 `ReplicaHost`/`RunningReplica` on Kuberic
-[`e2a47b6c631c974aa0135e81c3a7e3a439980ded`](https://github.com/youyuanwu/kuberic/tree/e2a47b6c631c974aa0135e81c3a7e3a439980ded).
+[`996dc487b85450ca25f68a3b9b9c22869e58f12b`](https://github.com/youyuanwu/kuberic/tree/996dc487b85450ca25f68a3b9b9c22869e58f12b).
 The target contains two explicitly separate routes: existing `hosted_*` cases
 use the pin's testing facade for generic initialization/dispatch/observation;
 the `authenticated::*` native cases use ordinary authenticated control RPCs
@@ -11,6 +11,11 @@ for all of those steps. Neither replaces the production service, factory,
 registered provider, native MySQL, access guard or client proxy. The adapter
 corrects fresh reporting and terminal ownership locally; no upstream runtime,
 private engine or controller authority is patched.
+
+This pin uses host metadata schema 14 and control protocol 13. Older generic
+host metadata is rejected, not migrated or defaulted into new authority.
+The fresh fixtures initialize new generic stores; the repin does not authorize
+reuse of old host metadata or MySQL retained-owner recovery.
 
 **Terminal outcome:** ordinary authenticated Close and Abort now return exact
 successful completion receipts. GetStatus remains available, with both native
@@ -167,8 +172,8 @@ or successful ordinary terminal acknowledgment
 
 ## Upstream in-process harness applicability
 
-The current 2026-10-21 pin includes the public
-[`kuberic_controller::test_util`](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/docs/features/kuberic/in-process-testing.md)
+The current 2026-10-23 pin includes the public
+[`kuberic_controller::test_util`](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/docs/features/kuberic/in-process-testing.md)
 harness behind the controller's dev-only `test-util` feature. It runs the
 production reconciler and authenticated agent RPCs against real hosted
 applications, with a private Kubernetes resource implementation rather than a
@@ -176,7 +181,7 @@ real cluster. It is a useful foundation, but **not a drop-in replacement for
 the MySQL fixtures**.
 
 The public
-[`ApplicationFactory`](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/test_util/application.rs#L11-L86)
+[`ApplicationFactory`](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-controller/src/test_util/application.rs)
 is now implemented by the
 [MySQL integration probe](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4.rs).
 It constructs inert production `MysqlPublicV1Service` instances, classifies
@@ -201,21 +206,24 @@ The current boundaries are concrete:
   full-three-member Configuration rejection is superseded, not weakened locally.
   A singleton under the three-member policy has read Granted and write
   NoWriteQuorum; the MySQL proxy denies application ingress.
-- The harness creates a
-  [three-replica persisted set](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/test_util/cluster.rs#L164-L192),
-  not the existing single-member hosted journey. Production controller Build
-  [first installs target inbound authority](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/cluster_api.rs#L3166-L3189).
-  The agent's
-  [installation path](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L792-L819)
-  still requires the built-in private `NativeRuntimeControl`; MySQL's custom
-  factory does not attach it, so that path returns `NotOpen` before source Build.
-  The newly public harness does not remove this controller-integration gap.
-  This is now the executed rejection: target authority installation fails before
-  the source's Build callback. No successful Build or joined secondary is claimed.
-- Network isolation and armed Build-dial faults
-  [require an acknowledged built-in routed engine](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/test_util/cluster.rs#L2199-L2268).
-  They reject unsupported custom engines rather than cutting MySQL's native
-  Group Replication/recovery sockets.
+- **The upstream private-control blocker is resolved.**
+  [youyuanwu/kuberic#198](https://github.com/youyuanwu/kuberic/pull/198) adds public
+  [`CustomReplicatorControl`](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-runtime/src/replicator/custom.rs#L24-L51)
+  and
+  [`ReplicatorInterfaces::with_custom_control`](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-runtime/src/replicator/mod.rs#L590-L619).
+  [youyuanwu/kuberic#199](https://github.com/youyuanwu/kuberic/pull/199) shares
+  creation-bound authority and retained operation ownership across engines.
+  MySQL's factory does not yet attach that supported companion. Target inbound
+  installation therefore still fails before source Build, now explicitly with
+  `replicator does not support controller Build authority`.
+- **Installed host configuration no longer requires engine idle diagnostics.**
+  Reports separate `configuration.voting`, optional `engine_idle` and exact
+  journal-derived `remote_builds`. The native probe verifies the accepted
+  singleton is reported while engine diagnostics remain unavailable (`None`),
+  not invented empty membership or completed Build evidence.
+- The probe retains its default three-member set. Upstream now also provides
+  singleton/spec-scaling controls, but those controls do not implement MySQL's
+  companion or cut native Group Replication/recovery sockets for fault tests.
 - Contained restart reuses storage, whereas
   [MySQL service Open](../crates/kuberic-mysql/src/service/kuberic/service.rs#L341-L354)
   deliberately rejects `Existing`. Harness restart/failover controls do not
@@ -265,8 +273,9 @@ repository-owned configuration.
 Fresh/New dispatch is now verified, without removing storage bindings or
 permitting MySQL Existing adoption. The separate case below captures the first
 executed boundary after singleton formation. Multi-member formation and source
-Build remain unresolved. Keep the existing native and ordinary authenticated
-gates; dependency updates alone do not supply custom inbound-Build authority.
+Build remain unqualified for MySQL. Keep the existing native and ordinary
+authenticated gates; dependency updates alone do not implement MySQL's native
+effects for the supported inbound-Build companion.
 
 ### Executed singleton formation and inbound-Build boundary
 
@@ -276,7 +285,7 @@ case establishes three exact successful New Opens, then
 continues public `TestCluster::step`, without manual callback dispatch, generic
 store mutation or fake built-in runtime control.
 
-1. Upstream's [singleton-first bootstrap](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/evaluator/public_v1_topology.rs#L122-L135)
+1. Upstream's [singleton-first bootstrap](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-controller/src/evaluator/public_v1_topology.rs)
    selects the local Primary at epoch 0/1. Role intent is truthfully reported
    as Primary before configuration, without granting serving access. Role,
    Epoch and the genuine singleton Configuration all complete and enter
@@ -288,15 +297,18 @@ store mutation or fake built-in runtime control.
 3. The next frozen operation is source Build for that target, bound to exact
    source/target sessions, storage, endpoint, history, epoch, configuration,
    attempt, revision and digest. Before invoking the source, the controller
-   installs target inbound authority. The custom host rejects that installation:
-   `command rejected: runtime is not open`. Its private
-   [NativeRuntimeControl requirement](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L792-L819)
-   has no public custom-engine attachment.
+   installs target inbound authority. The
+   [host rejects the missing companion](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-runtime/src/host/hosting.rs#L892-L908):
+   `command rejected: application error: replicator does not support controller Build authority`.
+   The previous `runtime is not open` assertion is deliberately rejected by the
+   updated oracle; it is not the current failure.
 
 The [gate](../crates/kuberic-mysql-tests/tests/kuberic_inprocess_live_mysql_8_4.rs)
 checks exact receipts and rejects changed operation/credit,
 session/storage/history, missing Epoch, changed progress/role/access, and
-unavailable query outcomes. Timeout and an unrelated `NotOpen` string cannot
+unavailable query outcomes. It also requires the exact installed singleton
+without optional engine idle observations or undispatched source Build credit.
+Timeout, the superseded error and an unrelated missing-capability string cannot
 qualify. Earlier native-Open RPC retries are not proof of the boundary.
 
 The source has no completed Build receipt. To observe the exact
@@ -322,13 +334,21 @@ This is positive **controller-driven singleton formation**, not multi-member
 formation, source Build, secondary replication or application writes. The old
 full-three-member Configuration rejection at pin `dabe1446` is superseded.
 Upstream now also has staged native role/configuration/catch-up choreography,
-but the custom MySQL journey cannot qualify that later admission while inbound
-authority installation remains blocked. Cross-epoch native proof support,
-custom installed-configuration observation, native fault routing and Existing
-recovery are not supplied by this repin.
+but the custom MySQL journey cannot qualify later admission until its companion
+is implemented. That companion must fence real native inbound effects, revoke
+exact attempts without withdrawing admitted voters, report actual native
+observations and join owned work. No no-op attachment, borrowed built-in control
+or fabricated progress is acceptable. Cross-epoch MySQL Build-proof integration
+and subsequent role/catch-up/configuration remain downstream qualification;
+native fault routing and Existing recovery are not supplied by this repin.
 
-Remaining shared requirements are tracked by
-[youyuanwu/kuberic#190](https://github.com/youyuanwu/kuberic/issues/190).
+[youyuanwu/kuberic#190](https://github.com/youyuanwu/kuberic/issues/190) is now
+closed upstream. Its former private-API and configuration-report limitations
+are superseded; closure is not downstream MySQL multi-member qualification.
+The initial 2026-10-23 run on Oracle MySQL 8.4.13 reached the new exact error and
+failed only the obsolete error assertion in this boundary case. The updated
+gate asserts the new explicit capability error without relaxing native,
+authority, admission or cleanup requirements.
 
 Run both native controller cases and the negative error checks with the same
 mandatory MySQL prerequisites below:
@@ -340,6 +360,16 @@ CARGO_BUILD_JOBS=1 cargo nextest run --locked --offline --profile ci \
 
 The existing workspace nextest archive and qualification partitions discover
 this target automatically. No separate CI gate or Cargo feature is added.
+
+On 2026-10-23, the combined controller, hosted/authenticated and public contract
+selection ran **31 cases: 30 passed and one boundary case failed**. Its changed-
+session negative check assumed observation ordering and could substitute the
+Primary's own session. Selecting a different owner by replica identity fixes
+both session and storage substitutions. The final targeted native boundary
+and unrelated-error checks then passed **2/2**, including the exact installed
+singleton/absent idle-diagnostics assertions and physical cleanup. These are
+scoped results on Oracle MySQL 8.4.13, not a clean full-workspace run or a
+successful source Build.
 
 ### Historical fresh-Open mismatch
 
