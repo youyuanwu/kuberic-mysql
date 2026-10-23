@@ -25,7 +25,7 @@ per replica plus a narrow adapter seam. The fixed three-process topology
 manager and the three-engine handoff fixture remain qualification
 infrastructure, not production topology owners. The normal crate surface
 includes the public adapter against `kuberic-runtime` pinned exactly to commit
-`e2a47b6c631c974aa0135e81c3a7e3a439980ded`; no private managed lifecycle,
+`996dc487b85450ca25f68a3b9b9c22869e58f12b`; no private managed lifecycle,
 observation, access, or receipt capability is attached.
 
 ## Status
@@ -193,10 +193,17 @@ retaining local diagnostics on failure. Its separate
 now accepts Primary Role, Epoch and a genuine singleton Configuration, persists
 that topology and prepares an exact IdleSecondary target. Role intent is
 reported independently of serving access. The first later executed rejection
-is **target inbound-Build authority installation**, which still requires private
-Kuberic `NativeRuntimeControl` absent from the custom factory. The gate checks
-exact accepted authority, the full controller error chain, independent native
-singleton membership and application-ingress denial; timeout cannot pass.
+is **target inbound-Build authority installation**: MySQL has not yet implemented
+or attached the supported `CustomReplicatorControl` companion. Upstream
+[youyuanwu/kuberic#198](https://github.com/youyuanwu/kuberic/pull/198) and
+[youyuanwu/kuberic#199](https://github.com/youyuanwu/kuberic/pull/199) resolve the
+old private-API limitation; the host now reports the explicit missing-capability
+error `replicator does not support controller Build authority`.
+Installed host voting configuration is reported even without optional engine
+idle diagnostics; the probe checks that unavailable diagnostics are not
+invented empty membership. It also checks exact accepted authority, the full
+controller error chain, independent native singleton membership and
+application-ingress denial; timeout cannot pass.
 This is **not successful multi-member formation or source Build**.
 Normal composite public storage fences are preserved losslessly with a separate
 2048-byte bound; individual identity domains retain their 255-byte limit.
@@ -306,9 +313,12 @@ active-member Remove, data-loss acceptance,
 non-projectable or unproved catch-up, and automated/unplanned failover. It does
 not claim cross-host, TLS, Kubernetes, durable interrupted-effect recovery, or
 production readiness. Its custom Build path is process-local and follows the
-direct PostgreSQL example shape. Production-controller dispatch into a custom
-replicator remains separately unsupported because the controller's target inbound
-authority installation uses crate-private runtime control.
+direct PostgreSQL example shape. Production-controller dispatch into MySQL
+remains unsupported until its factory attaches a genuine
+`CustomReplicatorControl` implementation for exact inbound grant installation,
+revocation, native observations and owned drainage. The upstream public seam is
+available; this repin does not implement those MySQL effects or qualify later
+cross-epoch Build/admission.
 
 The application endpoint is a generation-fenced plaintext loopback MySQL
 Classic Protocol gateway backed by the exact private UDS. It admits one

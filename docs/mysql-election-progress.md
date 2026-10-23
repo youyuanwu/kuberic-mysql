@@ -7,8 +7,8 @@ projection, researched on 2026-10-16. This status records the selected design;
 it does not expand the lifecycle behavior delivered by the current adapter.
 The historical comparison below intentionally retains its reviewed Kuberic
 commit. The delivered adapter is now pinned to
-`e2a47b6c631c974aa0135e81c3a7e3a439980ded` (upstream main resolved once on
-2026-10-21 and frozen for both crates). Host reports now expose independent
+`996dc487b85450ca25f68a3b9b9c22869e58f12b` (upstream main resolved once on
+2026-10-23 and frozen for both crates). Host reports expose independent
 `current_progress` and `catch_up_capability` query outcomes, not an
 applied/committed pair. MySQL retains its stronger native Primary commitment
 proof; its unknown catch-up capability is explicitly `Value(INVALID_LSN)`.
@@ -312,9 +312,9 @@ binding fail closed. Idle Build targets still require both fields to be
 
 Current contract sources:
 
-- [Kuberic replication trait contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/traits.rs)
-- [Kuberic provider contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/traits.rs)
-- [SF semantics and quiet-copy proof boundary](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/docs/features/kuberic/service-fabric-api-semantics.md)
+- [Kuberic replication trait contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-runtime/src/replicator/traits.rs)
+- [Kuberic provider contracts at the delivered pin](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-runtime/src/traits.rs)
+- [Selected classic V1 runtime and SF semantics](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/docs/features/kuberic/classic-v1-runtime.md)
 
 The adapter also does not supply durable cross-restart `HistoryContext`,
 restart adoption, retained-binlog catch-up capability, arbitrary differing

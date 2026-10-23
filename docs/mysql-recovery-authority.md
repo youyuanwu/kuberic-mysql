@@ -10,7 +10,7 @@ enumeration and reliable sending”, #169), and subsequently observed current ma
 `11d804425bbdbe7759dfd18208a0d73ce667a9f4` (U, “Port unselected SF V1 copy
 build gates and retargeting”, #170). That assessment did not justify a repin.
 The current dependency is now
-`e2a47b6c631c974aa0135e81c3a7e3a439980ded`; P/H/U remain historical evidence,
+`996dc487b85450ca25f68a3b9b9c22869e58f12b`; P/H/U remain historical evidence,
 not aliases for the current pin. The later
 [in-process harness assessment](mysql-hosted-lifecycle.md#upstream-in-process-harness-applicability)
 does not qualify this recovery contract.
@@ -222,13 +222,15 @@ actual selected production interface; a fixture-only route cannot qualify Q1.
 | R2: Physical retirement/retained-owner transfer | Logical renewal, resource retirement and factory abort do not supply B/C. Reconsider only with linear exact-owner custody, callback/peer drain, retained storage/log preservation and cancellation/error/drop semantics covering Q3–Q6. |
 | R3: Initial no-progress custom attachment | Existing progress/report methods are not a qualification of recovered MySQL progress. Reconsider only when the production attachment can remain genuinely unassigned/closed without publishing unqualified scalar/provider data (D/Q7). R1/R2 alone do not waive this gate. |
 
-The **separate production-controller custom-Build blocker remains separate**:
-the public custom Build callback exists, but controller
-[`Build` dispatch](https://github.com/youyuanwu/kuberic/blob/c0e52ee6ef361d86cf9e984e1f0682bc1f479013/kuberic-controller/src/cluster_api.rs#L2849-L2892)
-first installs target inbound authority via
-[`agent handling`](https://github.com/youyuanwu/kuberic/blob/c0e52ee6ef361d86cf9e984e1f0682bc1f479013/kuberic-runtime/src/host/service.rs#L759-L783)
-and private [`StatelessRuntimeControl`](https://github.com/youyuanwu/kuberic/blob/c0e52ee6ef361d86cf9e984e1f0682bc1f479013/kuberic-runtime/src/host/hosting.rs#L630-L653).
-Fixing that dispatch is neither this deliverable nor evidence for R1–R3.
+The **separate production-controller MySQL Build integration remains separate**.
+The former private-control limitation is resolved upstream through public
+[`CustomReplicatorControl`](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-runtime/src/replicator/custom.rs#L24-L51)
+and its creation-bound
+[`with_custom_control` attachment](https://github.com/youyuanwu/kuberic/blob/996dc487b85450ca25f68a3b9b9c22869e58f12b/kuberic-runtime/src/replicator/mod.rs#L590-L619).
+MySQL has not implemented that companion, and its fresh controller journey
+still stops before source Build with an explicit missing-capability error.
+That fresh-Build seam is not an accepted recovery envelope or retained-native
+owner transfer; the repin does not reassess or qualify R1–R3.
 
 No API additions, owner extraction, repin or hosted `OpenMode::Existing` change
 is authorized merely by this contract. It excludes interrupted Build/Remove
